@@ -15,6 +15,18 @@ namespace ClarionDbg.Cli
         public BpSpec(string module, int line) { Module = module; Line = line; }
     }
 
+    /// <summary>One resolved call-stack frame (frame 0 = current EIP, rest = return addresses).</summary>
+    internal sealed class StackFrame
+    {
+        public uint Rva;
+        public uint Va;
+        public uint StackAddr;     // stack slot holding the return address (0 for frame 0)
+        public string Proc;        // demangled symbol, null when unknown
+        public string Kind;        // procedure | method | routine | other, null when unknown
+        public string Module;      // .clw name, null when unresolved
+        public int Line;
+    }
+
     /// <summary>One logical user breakpoint: a module:line bound to its code RVAs.</summary>
     internal sealed class UserBreakpoint
     {
@@ -628,7 +640,7 @@ namespace ClarionDbg.Cli
             if (EmitJson)
                 Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved,
                     haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs quit");
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs stack quit");
 
             while (true)
             {
@@ -676,6 +688,10 @@ namespace ClarionDbg.Cli
 
                     case "mem":
                         HandleMemCommand(parts);
+                        break;
+
+                    case "stack": case "bt": case "where":
+                        HandleStackCommand(parts, ref ctx, haveCtx);
                         break;
 
                     case "quit": case "q": case "kill":
@@ -734,7 +750,7 @@ namespace ClarionDbg.Cli
                     case "step": case "stepinto": case "s": case "i":
                     case "stepover": case "next": case "n":
                     case "stepout": case "out": case "finish": case "o":
-                    case "mem": case "regs":
+                    case "mem": case "regs": case "stack": case "bt": case "where":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:
@@ -799,6 +815,128 @@ namespace ClarionDbg.Cli
             // the read came back short; bytes carries only what was actually read
             if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len));
             else Console.WriteLine($"  mem 0x{addr:X}: {BitConverter.ToString(buf, 0, read).Replace("-", "")}");
+        }
+
+        // ------------------------------------------------------------------ call stack
+
+        private const int STACK_SCAN_BYTES = 0x4000;   // how far up from ESP to scan for return addrs
+        private const uint FRAME_GAP_MAX = 0x800;      // max distance past a line record for a code addr
+        private const int STACK_FRAMES_DEFAULT = 32;
+        private const int STACK_FRAMES_MAX = 256;
+
+        /// <summary>stack [maxFrames] — resolved call stack while paused (frame 0 = current EIP).</summary>
+        private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
+            if (!haveCtx) { EmitError("stack: no thread context"); return; }
+            int max = STACK_FRAMES_DEFAULT;
+            if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX))
+            {
+                EmitError($"stack: max frames must be 1..{STACK_FRAMES_MAX}");
+                return;
+            }
+            var frames = BuildStack(ctx.Eip, ctx.Esp, max);
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Stack(frames));
+            Console.WriteLine($"  stack ({frames.Count} frame(s)):");
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                string name = f.Proc ?? "(unknown)";
+                string loc = f.Module != null ? $"  {f.Module}:{f.Line}" : "";
+                Console.WriteLine($"    #{i,-2} {name}{loc}  RVA 0x{f.Rva:X}{(f.Kind != null ? "  [" + f.Kind + "]" : "")}");
+            }
+        }
+
+        /// <summary>
+        /// Build the call stack WITHOUT an EBP walk (Clarion frames don't reliably chain EBP — even
+        /// the native debugger shows Unknown frames). Frame 0 is the current EIP; the rest come from
+        /// scanning the stack upward from ESP for plausible return addresses: a dword is a frame iff
+        /// (a) it resolves into TSWD-mapped code (a +0x1C record within FRAME_GAP_MAX) and
+        /// (b) the bytes immediately before it form a CALL instruction (call-precedes heuristic).
+        /// Scan-based stacks can include stale frames from dead stack regions — acceptable noise,
+        /// matching the entryRVA-range-binding plan (NOT EBP).
+        /// </summary>
+        private List<StackFrame> BuildStack(uint eip, uint esp, int maxFrames)
+        {
+            var frames = new List<StackFrame> { FrameAt(eip - _loadBase, eip, 0) };
+
+            var stack = new byte[STACK_SCAN_BYTES];
+            int got = ReadBlock(esp, stack);
+            for (int off = 0; off + 4 <= got && frames.Count < maxFrames; off += 4)
+            {
+                uint cand = BitConverter.ToUInt32(stack, off);
+                if (cand <= _loadBase) continue;
+                uint rva = cand - _loadBase;
+
+                int line; int mi; uint recRva;
+                if (!_dbg.ResolveAddr(rva, out line, out mi, out recRva)) continue;
+                if (rva - recRva > FRAME_GAP_MAX) continue;     // not Clarion-mapped code
+                if (!CallPrecedes(cand)) continue;              // not a return address
+
+                frames.Add(FrameAt(rva, cand, esp + (uint)off));
+            }
+            return frames;
+        }
+
+        private StackFrame FrameAt(uint rva, uint va, uint stackAddr)
+        {
+            int line; int mi; uint recRva;
+            bool resolved = _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            ProcSymbol sym;
+            bool hasSym = _dbg.ResolveSymbol(rva, out sym);
+            // same moduleIdx cross-check as ProcNameAt: don't name cold/init code with the
+            // previous module's last symbol
+            bool symOk = hasSym && (!resolved || sym.ModuleIdx == mi);
+            return new StackFrame
+            {
+                Rva = rva,
+                Va = va,
+                StackAddr = stackAddr,
+                Proc = symOk ? sym.Name : null,
+                Kind = symOk ? sym.Kind.ToString().ToLowerInvariant() : null,
+                Module = resolved ? _dbg.ModuleNameForIdx(mi) : null,
+                Line = resolved ? line : 0
+            };
+        }
+
+        /// <summary>
+        /// Do the bytes immediately before a candidate return address form a CALL instruction?
+        /// Checks the x86 encodings by length: E8 rel32 (5), FF /2 reg-or-[reg] (2), FF /2 disp8 or
+        /// SIB (3), FF /2 disp32 or [mem] (6), FF /2 SIB+disp32 (7), 9A far (7). No decoder needed —
+        /// combined with the TSWD-resolvability gate this filters nearly all stale stack noise.
+        /// </summary>
+        private bool CallPrecedes(uint va)
+        {
+            if (va < 8) return false;
+            var b = new byte[8];                      // b[i] = byte at va-8+i, so byte at va-k is b[8-k]
+            int read;
+            if (!Native.ReadProcessMemory(_hProcess, (IntPtr)(va - 8), b, 8, out read) || read != 8)
+                return false;
+            if (b[3] == 0xE8) return true;                                  // call rel32
+            if (b[6] == 0xFF && (b[7] & 0x38) == 0x10) return true;         // call reg / [reg]
+            if (b[5] == 0xFF && ((b[6] & 0xF8) == 0x50 || b[6] == 0x14)) return true;  // disp8 / SIB
+            if (b[2] == 0xFF && ((b[3] & 0xF8) == 0x90 || b[3] == 0x15)) return true;  // disp32 / [mem]
+            if (b[1] == 0xFF && b[2] == 0x94) return true;                  // SIB + disp32
+            if (b[1] == 0x9A) return true;                                  // far call ptr16:32
+            return false;
+        }
+
+        /// <summary>Read up to buf.Length bytes at va, page-by-page so a guard page or the stack top
+        /// truncates the read instead of failing it entirely. Returns bytes actually read.</summary>
+        private int ReadBlock(uint va, byte[] buf)
+        {
+            int total = 0;
+            while (total < buf.Length)
+            {
+                int chunk = Math.Min(0x1000 - (int)((va + (uint)total) & 0xFFF), buf.Length - total);
+                var page = new byte[chunk];
+                int read;
+                if (!Native.ReadProcessMemory(_hProcess, (IntPtr)(va + (uint)total), page, chunk, out read) || read <= 0)
+                    break;
+                Array.Copy(page, 0, buf, total, read);
+                total += read;
+                if (read < chunk) break;
+            }
+            return total;
         }
 
         private void EmitResumed(string mode)

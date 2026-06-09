@@ -192,6 +192,29 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
+        /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
+        public static string Stack(List<StackFrame> frames)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"stack\",\"frames\":[");
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"frame\":").Append(i)
+                  .Append(",\"proc\":").Append(Str(f.Proc))
+                  .Append(",\"kind\":").Append(Str(f.Kind))
+                  .Append(",\"module\":").Append(Str(f.Module))
+                  .Append(",\"line\":").Append(f.Line)
+                  .Append(",\"rva\":\"0x").Append(f.Rva.ToString("X")).Append('"')
+                  .Append(",\"va\":\"0x").Append(f.Va.ToString("X")).Append('"')
+                  .Append(",\"stackAddr\":\"0x").Append(f.StackAddr.ToString("X")).Append('"')
+                  .Append('}');
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
         public static string Error(string message)
         {
             return "{\"event\":\"error\",\"message\":" + Str(message) + "}";

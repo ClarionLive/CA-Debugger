@@ -63,7 +63,8 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      --bp may repeat; breakpoints persist (re-armed after each hit).");
             Console.WriteLine("      --interactive: pause at each hit and read stdin commands —");
             Console.WriteLine("        continue | step | stepover | stepout | bp add M:L | bp del M:L | bp list");
-            Console.WriteLine("        | mem 0xADDR LEN | regs | quit   (while running: bp add/del/list, quit)");
+            Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | quit");
+            Console.WriteLine("        (while running: bp add/del/list, quit)");
         }
 
         private static (PeImage pe, TswdDebugInfo dbg) LoadDebug(string exe)
