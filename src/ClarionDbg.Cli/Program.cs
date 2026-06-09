@@ -139,15 +139,30 @@ namespace ClarionDbg.Cli
             {
                 uint rva = ParseNum(val);
                 if (rva >= pe.ImageBase) rva -= pe.ImageBase; // accept VA or RVA
-                if (dbg.TryResolve(rva, out var m, out int line, out uint recRva))
-                    Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> {m.Name} line {line}  (record RVA 0x{recRva:X})");
+                // v2 primary: the +0x1C address table (clean, RVA-ascending, carries moduleIdx).
+                if (dbg.ResolveAddr(rva, out int l2, out int mi2, out uint rr2))
+                    Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> moduleIdx {mi2} line {l2}  (+0x1C, record RVA 0x{rr2:X})");
                 else
-                    Console.WriteLine($"RVA 0x{rva:X} -> no line record at or before this address");
+                    Console.WriteLine($"RVA 0x{rva:X} -> no +0x1C record at or before this address");
+                // legacy module-sliced path, for comparison
+                if (dbg.TryResolve(rva, out var m, out int line, out uint recRva))
+                    Console.WriteLine($"  [legacy +0x10] -> {m.Name} line {line}  (record RVA 0x{recRva:X})");
                 return 0;
             }
             if (opt == "--line")
             {
                 int line = (int)ParseNum(val);
+                // v2 primary: resolve within a compiland by moduleIdx via the +0x1C table.
+                string modIdxOpt = GetOpt(args, "--modidx");
+                if (modIdxOpt != null)
+                {
+                    int mi = (int)ParseNum(modIdxOpt);
+                    var rvas2 = dbg.LineToRvasInModuleIdx(mi, line);
+                    if (rvas2.Count == 0) { Console.WriteLine($"moduleIdx {mi} line {line} -> no record (+0x1C)"); return 0; }
+                    Console.WriteLine($"moduleIdx {mi} line {line} -> {rvas2.Count} address(es) (+0x1C):");
+                    foreach (var rva in rvas2) Console.WriteLine($"    RVA 0x{rva:X}  (VA 0x{pe.ImageBase + rva:X})");
+                    return 0;
+                }
                 if (module != null)
                 {
                     int planted = line;

@@ -13,6 +13,30 @@ namespace ClarionDbg.Core
     }
 
     /// <summary>
+    /// One record of the TOC +0x1C address table — the CLEAN line table: 8-byte
+    /// {u32 codeRVA, u16 line, u16 moduleIdx}, strictly RVA-ascending with NO line resets.
+    /// moduleIdx partitions all code into compilands (one per code .clw), in .text LINK order
+    /// (NOT module-name-array order — bind to a name by content/symbol, never by index rank).
+    /// This is the primary address-&gt;line path (binary-search by RVA) and the per-proc tag source.
+    /// </summary>
+    public struct AddrRec
+    {
+        public uint Rva;
+        public int Line;
+        public int ModuleIdx;
+        public AddrRec(uint rva, int line, int moduleIdx) { Rva = rva; Line = line; ModuleIdx = moduleIdx; }
+    }
+
+    /// <summary>Per-compiland summary derived from the +0x1C table's moduleIdx partition.</summary>
+    public sealed class CompilandInfo
+    {
+        public int ModuleIdx;
+        public uint EntryRva;     // lowest RVA for this moduleIdx (proc prologue, for these binaries)
+        public uint HiRva;        // highest RVA
+        public int RecordCount;
+    }
+
+    /// <summary>
     /// A contiguous ascending line-major RUN within Table A. Table A is ONE continuous 6-byte
     /// {u16 line, u32 rva} grid from blob+OffLineTableA; runs are delimited by line RESETS (the line
     /// number dropping back to ~9-17 at a compiland-group boundary), NOT by the +0x10 byte map (which
@@ -69,8 +93,15 @@ namespace ClarionDbg.Core
         public List<ModuleSlice> Modules { get; private set; }
 
         /// <summary>Table A decoded correctly: one continuous grid segmented into line-major runs
-        /// (compiland groups). This is the v2 source of truth for line&lt;-&gt;address resolution.</summary>
+        /// (compiland groups). Cross-check / fallback for line&lt;-&gt;address (the +0x1C table is primary).</summary>
         public List<LineRun> Runs { get; private set; }
+
+        /// <summary>The TOC +0x1C address table (clean, RVA-ascending {rva,line,moduleIdx}). PRIMARY
+        /// path for address-&gt;line and the per-proc (moduleIdx) partition. See <see cref="AddrRec"/>.</summary>
+        public List<AddrRec> AddrTable { get; private set; }
+
+        /// <summary>Per-moduleIdx summary (entry/hi RVA, record count) from the +0x1C partition.</summary>
+        public Dictionary<int, CompilandInfo> Compilands { get; private set; }
 
         // Raw TOC offsets (relative to blob base), exposed for diagnostics.
         public int OffModuleNameArray { get; private set; }
@@ -148,6 +179,10 @@ namespace ClarionDbg.Core
             // --- v2: decode Table A as ONE continuous grid, segment into line-major runs by resets.
             //     This is the correct model (the +0x10 byte slices above cut mid-run). ---
             BuildRuns();
+
+            // --- v2 primary: the TOC +0x1C address table — clean {u32 rva,u16 line,u16 moduleIdx},
+            //     RVA-ascending, moduleIdx partitions code per-compiland. ---
+            BuildAddrTable();
 
             // --- DIAGNOSTIC ONLY: flat parse of the same region. This drifts out of phase at
             //     module boundaries (slices are not 6-byte multiples) and is unreliable — kept
@@ -241,6 +276,71 @@ namespace ClarionDbg.Core
                 cur.Records.Add(new LineRec(line, rva));
             }
             CloseRun(ref cur);
+        }
+
+        /// <summary>
+        /// Parse the TOC +0x1C address table: 8-byte {u32 codeRVA, u16 line, u16 moduleIdx} records over
+        /// [OffTableAfterB, OffSymbolPool). It is strictly RVA-ascending with no line resets — the clean
+        /// address-&gt;line path. Also builds the per-moduleIdx compiland summary (entry/hi RVA, count).
+        /// </summary>
+        private void BuildAddrTable()
+        {
+            AddrTable = new List<AddrRec>();
+            Compilands = new Dictionary<int, CompilandInfo>();
+            for (int o = OffTableAfterB; o + 8 <= OffSymbolPool; o += 8)
+            {
+                uint rva = U32(o);
+                int line = U16(o + 4);
+                int modIdx = U16(o + 6);
+                if (rva < _textLo || rva >= _textHi) continue;   // skip stray non-.text records
+                AddrTable.Add(new AddrRec(rva, line, modIdx));
+
+                CompilandInfo ci;
+                if (!Compilands.TryGetValue(modIdx, out ci))
+                {
+                    ci = new CompilandInfo { ModuleIdx = modIdx, EntryRva = rva, HiRva = rva };
+                    Compilands[modIdx] = ci;
+                }
+                if (rva < ci.EntryRva) ci.EntryRva = rva;
+                if (rva > ci.HiRva) ci.HiRva = rva;
+                ci.RecordCount++;
+            }
+            // The table is documented RVA-ascending; sort defensively so the binary search is safe
+            // even if a future build reorders it.
+            AddrTable.Sort((a, b) => a.Rva.CompareTo(b.Rva));
+        }
+
+        /// <summary>
+        /// PRIMARY address-&gt;line: binary-search the +0x1C table for the greatest record RVA &lt;= target,
+        /// returning its source line and moduleIdx. moduleIdx maps to a .clw via a content/symbol bind
+        /// (done by the caller — it is link order, not name-array order). Returns false if no record precedes.
+        /// </summary>
+        public bool ResolveAddr(uint rva, out int line, out int moduleIdx, out uint recordRva)
+        {
+            line = 0; moduleIdx = -1; recordRva = 0;
+            if (AddrTable == null || AddrTable.Count == 0) return false;
+            int lo = 0, hi = AddrTable.Count - 1, ans = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (AddrTable[mid].Rva <= rva) { ans = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            if (ans < 0) return false;
+            var r = AddrTable[ans];
+            line = r.Line; moduleIdx = r.ModuleIdx; recordRva = r.Rva;
+            return true;
+        }
+
+        /// <summary>line-&gt;RVAs within a compiland (moduleIdx) using the +0x1C table. Gate user
+        /// breakpoints to lines within the file (the table carries cumulative-tail values past EOF).</summary>
+        public List<uint> LineToRvasInModuleIdx(int moduleIdx, int line)
+        {
+            var list = new List<uint>();
+            if (AddrTable != null)
+                foreach (var r in AddrTable)
+                    if (r.ModuleIdx == moduleIdx && r.Line == line) list.Add(r.Rva);
+            return list;
         }
 
         /// <summary>Commit a run if it carries enough records to be real (drops stray fragments).</summary>
