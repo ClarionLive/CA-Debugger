@@ -150,23 +150,25 @@ namespace ClarionDbg.Cli
             Console.WriteLine("*** BREAKPOINT HIT ***");
             Console.WriteLine($"  VA 0x{addr:X}  (loadBase 0x{_loadBase:X} + RVA 0x{rva:X})");
 
-            ModuleSlice m; int line; uint recRva;
-            bool resolved = _dbg.TryResolve(rva, out m, out line, out recRva);
+            // v2: resolve via the clean +0x1C table (rva -> {line, moduleIdx}); .clw name = names[moduleIdx].
+            int line; int moduleIdx; uint recRva;
+            bool resolved = _dbg.ResolveAddr(rva, out line, out moduleIdx, out recRva);
+            string modName = resolved ? _dbg.ModuleNameForIdx(moduleIdx) : null;
             uint gap = resolved ? rva - recRva : 0;
             if (resolved)
             {
                 if (gap == 0)
-                    Console.WriteLine($"  -> {m.Name} line {line}   (exact line record)");
+                    Console.WriteLine($"  -> {modName} line {line}   (exact line record)");
                 else if (gap <= 64)
-                    Console.WriteLine($"  -> {m.Name} line {line}   (in statement, +0x{gap:X} into its code)");
+                    Console.WriteLine($"  -> {modName} line {line}   (in statement, +0x{gap:X} into its code)");
                 else
-                    Console.WriteLine($"  -> nearest line: {m.Name} line {line} (+0x{gap:X} away — likely startup/library code with no Clarion line)");
+                    Console.WriteLine($"  -> nearest line: {modName} line {line} (+0x{gap:X} away — likely startup/library code with no Clarion line)");
             }
             else
                 Console.WriteLine("  -> (no source line for this address)");
 
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Hit(resolved ? m.Name : null, line, rva, addr, gap, resolved));
+                Console.WriteLine("@JSON " + Json.Hit(modName, line, rva, addr, gap, resolved));
 
             // read & report the thread context
             var ctx = NewContext();

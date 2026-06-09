@@ -1,0 +1,47 @@
+TSWD proc-symbol decode  (clbrws.exe) -- DETERMINISTIC modIdx -> proc + .clw
+============================================================================
+Symbol DEFINITION record (byte-granular, NOT 4-aligned) = 12 bytes LE:
+   { u32 nameRef(pool-rel, NUL-preceded) ; u32 entryRVA ; u32 moduleBackref }
+   moduleBackref == one of the 61 values in the +0x28 array; its index = MODULE index.
+KEY RESULT: that module index EQUALS the +0x1C moduleIdx AND the +0x08 name-array index.
+   => modIdx -> .clw name is TRIVIAL: names[modIdx]. No content-matching needed.
+   (verified: SELECTJOBS@F->0x48D5C->mod37=clbrws011 ; BROWSEAUTHORSEIP@F->0x32D64->mod29=clbrws003)
+SEMANTIC: generated proc modules carry exactly 1 top-level proc (1:1); the main module
+   (clbrws.clw) carries several; library modules carry class methods (0 top-level procs).
+Note: entryRVA (proc symbol) may be ABOVE the modIdx region Lo -- Clarion emits some proc
+   code (init/embed/cold) below the named entry. Use +0x1C records (filtered by modIdx) for
+   line<->addr; use entryRVA as the proc's canonical start.
+
+modIdx  .clw(names[modIdx])   procDefCount  procName(entryRVA)   regionLo..Hi(+0x1C)
+   18   CWUTIL.CLW                1        GETTEMPPATH(0x85554)   0x0851BC..0x0855B1
+   27   clbrws001.clw             1        BROWSEAUTHORS(0x2E670) 0x02B560..0x02ED51
+   28   clbrws002.clw             1        MAIN(0x2F170)          0x02EDE0..0x02F6D7
+   29   clbrws003.clw             1        BROWSEAUTHORSEIP(0x32D64) 0x02F70C..0x033594
+   30   clbrws004.clw             1        BROWSEROYSCHGBALT(0x35B98) 0x033620..0x03617E
+   31   clbrws005.clw             1        BROWSEROYSCHCONDC(0x38258) 0x0361EC..0x03883E
+   32   clbrws006.clw             1        BROWSETITLEAUTHORSODL(0x3AC28) 0x0388AC..0x03B2AB
+   33   clbrws007.clw             1        BROWSEDISCOUNTS(0x3D564) 0x03B324..0x03DB8D
+   34   clbrws008.clw             1        SELECTSTORES(0x3FBFC)  0x03DBFC..0x040236
+   35   clbrws009.clw             1        BROWSESALESEIP(0x438D8) 0x0402A4..0x044196
+   36   clbrws010.clw             1        SELECTTITLES(0x46668)  0x04421C..0x046D0F
+   37   clbrws011.clw             1        SELECTJOBS(0x48D5C)    0x046D9C..0x04938A
+   38   clbrws012.clw             1        BROWSEEMPEIP(0x4CDE4)  0x0493F4..0x04D758
+   39   clbrws013.clw             1        SELECTPUBLISHERS(0x4F7F0) 0x04D7F0..0x04FE2A
+   40   clbrws014.clw             1        BROWSEEMPLOYEE(0x53050) 0x04FE98..0x053855
+   41   clbrws015.clw             1        BROWSEJOBS(0x55B70)    0x0538F0..0x056147
+   42   clbrws016.clw             1        BROWSEPUBLISHERS(0x59990) 0x0561B0..0x05A1CD
+   43   clbrws017.clw             1        BROWSETITLESQUERY(0x5C7A4) 0x05A26C..0x05D0E8
+   44   clbrws018.clw             1        VIEWALLPUBLISHERS(0x5EDEC) 0x05D154..0x05F399
+   45   clbrws019.clw             1        BROWSEROYSCHGB(0x61934) 0x05F404..0x061F1A
+   46   clbrws020.clw             1        BROWSESTORES(0x6460C)  0x061F88..0x064C3C
+   47   clbrws021.clw             1        BROWSETITLEAUTHOR(0x66F48) 0x064C9C..0x067721
+   48   clbrws022.clw             1        BROWSETITLES(0x69E64)  0x06779C..0x085EF8
+   49   clbrws023.clw             1        BROWSEROYSCHGBSC(0x6C810) 0x06A55C..0x06CDF6
+   50   clbrws024.clw             1        BROWSEJOBSEIP(0x701DC) 0x06CE64..0x070984
+   51   clbrws025.clw             1        BROWSETITLESEIP(0x74080) 0x070A0C..0x074960
+   52   clbrws026.clw             1        SPLASHSCREEN(0x74CB8)  0x0749EC..0x074F3F
+   53   clbrws027.clw             1        BROWSEPUBINFO(0x768C4) 0x074F60..0x076EA5
+   54   clbrws028.clw             1        BROWSEROYSCHCOLOR(0x78EBC) 0x076F04..0x0794A2
+   55   clbrws029.clw             1        BROWSEJOBSGRAPHS(0x7D68C) 0x079510..0x0860B8
+   56   clbrws030.clw             1        UPDATESTORES(0x7E934)  0x07E1E8..0x07F060
+   60   ?                         3        RISAVEERROR(0x81F24), NEXTREALSTOP(0x82918), NEXTSTRINGSTOP(0x829CC) (no +0x1C)

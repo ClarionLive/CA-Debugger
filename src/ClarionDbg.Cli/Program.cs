@@ -127,6 +127,21 @@ namespace ClarionDbg.Cli
             Console.WriteLine($"  {name}: {recs.Count} records, {inText} in .text ({pct:F1}%), line {minL}..{maxL}");
         }
 
+        /// <summary>Nearest breakable line to a request: smallest &gt;= line (forward snap), else
+        /// largest &lt; line. Returns -1 if the list is empty. (Sorted-list scan; lists are small.)</summary>
+        private static int NearestIn(System.Collections.Generic.List<int> sorted, int line)
+        {
+            if (sorted == null || sorted.Count == 0) return -1;
+            int fwd = int.MaxValue, back = -1;
+            foreach (int v in sorted)
+            {
+                if (v == line) return line;
+                if (v > line && v < fwd) fwd = v;
+                if (v < line && v > back) back = v;
+            }
+            return fwd != int.MaxValue ? fwd : back;
+        }
+
         private static int Resolve(string[] args)
         {
             if (args.Length < 4) { Usage(); return 1; }
@@ -141,7 +156,10 @@ namespace ClarionDbg.Cli
                 if (rva >= pe.ImageBase) rva -= pe.ImageBase; // accept VA or RVA
                 // v2 primary: the +0x1C address table (clean, RVA-ascending, carries moduleIdx).
                 if (dbg.ResolveAddr(rva, out int l2, out int mi2, out uint rr2))
-                    Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> moduleIdx {mi2} line {l2}  (+0x1C, record RVA 0x{rr2:X})");
+                {
+                    string nm = dbg.ModuleNameForIdx(mi2) ?? "?";
+                    Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> {nm} (moduleIdx {mi2}) line {l2}  (+0x1C, record RVA 0x{rr2:X})");
+                }
                 else
                     Console.WriteLine($"RVA 0x{rva:X} -> no +0x1C record at or before this address");
                 // legacy module-sliced path, for comparison
@@ -165,17 +183,22 @@ namespace ClarionDbg.Cli
                 }
                 if (module != null)
                 {
+                    // v2: resolve the module NAME to a +0x1C moduleIdx (name-array index == moduleIdx),
+                    // then line->addr via the clean +0x1C table, snapping to the nearest breakable line.
+                    int mi = dbg.FindModuleIdx(module);
+                    if (mi < 0) { Console.WriteLine($"{module} -> unknown module"); return 0; }
                     int planted = line;
-                    var rvas = dbg.LineToRvasInModule(module, line);
+                    var rvas = dbg.LineToRvasInModuleIdx(mi, line);
                     if (rvas.Count == 0)
                     {
-                        int snapped = dbg.NearestLineWithCode(module, line);
-                        if (snapped > 0) { planted = snapped; rvas = dbg.LineToRvasInModule(module, snapped); }
+                        var breakable = dbg.BreakableLinesInModuleIdx(mi);
+                        int snapped = NearestIn(breakable, line);
+                        if (snapped > 0) { planted = snapped; rvas = dbg.LineToRvasInModuleIdx(mi, snapped); }
                     }
-                    if (rvas.Count == 0) { Console.WriteLine($"{module} line {line} -> no code (module has no line records)"); return 0; }
+                    if (rvas.Count == 0) { Console.WriteLine($"{module} (moduleIdx {mi}) line {line} -> no code records"); return 0; }
                     if (planted != line)
                         Console.WriteLine($"{module} line {line} has no record; nearest breakable line is {planted}:");
-                    Console.WriteLine($"{module} line {planted} -> {rvas.Count} address(es):");
+                    Console.WriteLine($"{module} (moduleIdx {mi}) line {planted} -> {rvas.Count} address(es):");
                     foreach (var rva in rvas) Console.WriteLine($"    RVA 0x{rva:X}  (VA 0x{pe.ImageBase + rva:X})");
                 }
                 else
@@ -227,7 +250,9 @@ namespace ClarionDbg.Cli
             string module = GetOpt(args, "--module");
             if (module == null) { Console.Error.WriteLine("specify --module NAME"); return 1; }
 
-            var lines = dbg.BreakableLines(module);
+            // v2: name -> moduleIdx -> breakable lines from the +0x1C table.
+            int mi = dbg.FindModuleIdx(module);
+            var lines = mi >= 0 ? dbg.BreakableLinesInModuleIdx(mi) : new List<int>();
             if (HasFlag(args, "--json"))
             {
                 Console.WriteLine("@LINES " + Json.Lines(module, lines));
@@ -273,21 +298,25 @@ namespace ClarionDbg.Cli
                 var hits = new List<uint>();
                 if (module != null)
                 {
+                    // v2: name -> moduleIdx (name-array index == moduleIdx), line -> addr via +0x1C.
+                    int mi = dbg.FindModuleIdx(module);
+                    if (mi < 0) { Console.Error.WriteLine($"unknown module {module}"); return 2; }
                     int planted = line;
-                    hits = dbg.LineToRvasInModule(module, line);
+                    hits = dbg.LineToRvasInModuleIdx(mi, line);
                     if (hits.Count == 0)
                     {
                         // Clarion's line table is sparse — snap to the nearest line that has a record.
-                        int snapped = dbg.NearestLineWithCode(module, line);
-                        if (snapped > 0) { planted = snapped; hits = dbg.LineToRvasInModule(module, snapped); }
+                        int snapped = NearestIn(dbg.BreakableLinesInModuleIdx(mi), line);
+                        if (snapped > 0) { planted = snapped; hits = dbg.LineToRvasInModuleIdx(mi, snapped); }
                     }
                     if (hits.Count > 0 && planted != line)
                         Console.WriteLine($"line {line} has no code record in {module}; breakpoint moved to nearest line {planted}");
                 }
                 else
                 {
-                    var all = dbg.LineToRvasAll(line);
-                    foreach (var h in all) hits.Add(h.Value);
+                    // No module: match the line across all compilands via +0x1C (ambiguous — prefer --module).
+                    if (dbg.AddrTable != null)
+                        foreach (var r in dbg.AddrTable) if (r.Line == line) hits.Add(r.Rva);
                 }
                 if (hits.Count == 0) { Console.Error.WriteLine($"no code for line {line}{(module != null ? " in " + module : "")} (and no nearby breakable line)"); return 2; }
                 rvas.AddRange(hits);

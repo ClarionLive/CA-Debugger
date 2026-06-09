@@ -386,6 +386,44 @@ namespace ClarionDbg.Core
             _addrIndex = list;
         }
 
+        /// <summary>
+        /// The +0x1C moduleIdx for a .clw module name. The +0x08 module-name-array index IS the
+        /// moduleIdx (== the symbol moduleBackref index) — verified deterministically — so this is a
+        /// direct index match against <see cref="ModuleNames"/>, NOT a content bind. Accepts the name
+        /// with or without extension, case-insensitive. Returns -1 if not found.
+        /// </summary>
+        public int FindModuleIdx(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return -1;
+            for (int i = 0; i < ModuleNames.Count; i++)
+            {
+                string mn = ModuleNames[i];
+                if (string.Equals(mn, name, StringComparison.OrdinalIgnoreCase)) return i;
+                int dot = mn.LastIndexOf('.');
+                string stem = dot > 0 ? mn.Substring(0, dot) : mn;
+                if (string.Equals(stem, name, StringComparison.OrdinalIgnoreCase)) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>The .clw module name for a moduleIdx (== ModuleNames[idx]); null if out of range.</summary>
+        public string ModuleNameForIdx(int idx)
+        {
+            return (idx >= 0 && idx < ModuleNames.Count) ? ModuleNames[idx] : null;
+        }
+
+        /// <summary>The distinct source lines that carry a +0x1C code record for a compiland (moduleIdx) —
+        /// the lines a breakpoint binds to exactly. Sorted ascending. Gate user picks to line &lt;= file
+        /// length (the +0x1C table can carry cumulative-tail values past EOF).</summary>
+        public List<int> BreakableLinesInModuleIdx(int moduleIdx)
+        {
+            var set = new SortedSet<int>();
+            if (AddrTable != null)
+                foreach (var r in AddrTable)
+                    if (r.ModuleIdx == moduleIdx) set.Add(r.Line);
+            return new List<int>(set);
+        }
+
         public ModuleSlice FindModule(string name)
         {
             if (string.IsNullOrEmpty(name)) return null;
