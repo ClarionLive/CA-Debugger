@@ -228,12 +228,83 @@ names[37] == "clbrws011.clw" ;  names[29] == "clbrws003.clw"
   (Table-A-by-+0x10) are superseded — replace with the +0x1C path. `OffTableAfterB`
   (`U32(0x1C)`) is the +0x1C base; the previous `ByAddr` parse read the wrong region/width.
 
+## The +0x2C region — the typed symbol/scope tree (Phase 3 decode, 2026-06-09)
+
+The bulk of the blob (`[+0x2C, +0x34)` ≈ 654 KB here) is a **typed symbol tree**: data
+symbols (globals, file record buffers + fields, stack locals, class properties) with
+offsets/addresses, type codes, sizes, and parent/child structure. Decoded from spike probes
+(`spikes/tswd-datasym*.ps1`); grammar understood structurally, full walker still to write.
+
+### Record grammar (as far as proven)
+
+Symbol records open with a **tag byte**, then a `u32 link`, then the payload. The two
+families probed end-to-end:
+
+```
+tag 0x04  — top-level symbol definition (proc OR static data):
+    04 | u32 link | u32 nameRef | u32 rva | u32 moduleBackref | <type info...>
+tag 0x0C  — member/child symbol (record field, class property, local):
+    0C | u32 link | u32 nameRef | i32 offset | u32 parentRef | <type info...>
+```
+
+- **The item-1 "12-byte def record" is the middle of a tag-04 record.** The
+  `{nameRef, entryRVA, moduleBackref}` triple the proc scan matches is preceded by
+  `04 <link>` — that is why def records appeared "byte-granular and scattered": they are
+  embedded in this stream. One grammar covers procs AND static data.
+- `link` values ascend with the stream (≈ self/next-record offsets relative to a base near
+  `tbl2C − 0x12`; exact base convention still to pin down — derive it from the walker, not
+  from constants).
+- **`offset` meaning depends on the family**: tag-04 statics carry an absolute **RVA**
+  (e.g. `JOBS$JOB:RECORD → 0xCD1F4`, in `.cwtls` — threaded statics live there; plain
+  globals/VMTs in `.data`); tag-0C fields carry the offset **within the parent record**
+  (`JOB:JOBID → 0`, first field of `JOB:RECORD`); tag-0C stack locals carry a **negative
+  EBP-relative frame offset** (`BRW1::LASTSORTORDER → -163` in one browse).
+- `parentRef` of a tag-0C record points at the owning symbol's record (same link-space);
+  tag-04 records carry the `+0x28` module backref instead (same module binding as procs).
+
+### Type info (observed, enum not yet complete)
+
+After the location fields comes type information, e.g.:
+
+```
+JOBS$JOB:RECORD : 00 08 <u32 size=0x37> 04 00 00 00 <u32 child-ptr ×4>   (GROUP/RECORD,
+                  55 bytes, 4 child field records — the JOB: fields)
+JOB:JOBID       : 11 <u32 size=2>                                        (SHORT?)
+BRW1::LASTSORTORDER : 04 12 <u32 size=1>                                 (BYTE?)
+```
+
+Working hypotheses: `0x08` = GROUP/RECORD (carries child list), `0x11` = SHORT, `0x12` =
+BYTE; sizes match the Clarion declarations. The full type-code enum (STRING/CSTRING/
+PSTRING/LONG/DECIMAL/REAL/QUEUE/...) needs systematic validation against the clbrws
+dictionary — record strides of 10/22/23/12/13 bytes in different areas say several record
+shapes exist (class properties around blob+0x880xx, per-proc locals blocks, etc.).
+
+### Scan findings (clbrws.exe, this build)
+
+- The `.text`-filtered def scan finds 2057 records; allowing all sections finds +159 in
+  `.data`/`.cwtls` (VMT$ vtables, library statics like `DEFAULTERRORS`, `ZOOMPRESETS`) —
+  consistent with the TOC `+0x30` count (2236).
+- App-level data names (`JOB:JOBID`, `BRW1::LASTSORTORDER`, `SAVEPATH`,
+  `BRW1::AUTO::SAVE:JOB:JOBID`, …) appear ONLY inside the +0x2C tree, not as 12-byte
+  top-level defs. `BRW1::LASTSORTORDER` appears 26× — once per browse procedure's locals
+  block (each browse has its own local instance).
+
+### Watch-by-name resolution chains (the goal)
+
+```
+global static : name → tag-04 record → RVA (+ loadBase) → address; type+size render it
+file field    : FILE$REC:RECORD tag-04 → record base RVA; field tag-0C → +offset
+stack local   : proc scope → tag-0C frame offset → EBP + offset (needs paused thread ctx)
+```
+
 ## Open items (Phase 3 — watch/value support)
 
-- **Symbol → storage**: tie each name (via the `+0x28` / symbol records) to its
-  `{address or stack-frame offset, type code}` for data symbols.
-- **Clarion type-code enumeration** — map type codes → STRING / CSTRING / PSTRING / BYTE /
-  SHORT / LONG / DECIMAL / REAL / GROUP / QUEUE / `&FILE:RECORD` etc., with picture/size, so
-  raw memory can be rendered. Reuse the dictionary/FileSchema type model.
-- **Threaded variables** — instances allocated at runtime; resolved via a runtime library
-  call (same `DEBUGHOOK` caveat the native debugger has). Not a regression.
+- **Walker**: parse the +0x2C stream systematically (record framing per tag byte, link
+  base convention, scope tree), instead of name-ref probing.
+- **Clarion type-code enumeration** — validate codes (0x08 GROUP, 0x11 SHORT?, 0x12 BYTE?,
+  0x16 ?, …) against the clbrws dictionary; map → STRING / CSTRING / PSTRING / BYTE /
+  SHORT / LONG / DECIMAL / REAL / GROUP / QUEUE etc. with picture/size.
+- **Threaded variables** — `.cwtls` statics are per-thread instances allocated at runtime;
+  the blob RVA is the template. Resolving a live thread's instance needs a runtime call
+  (same `DEBUGHOOK` caveat the native debugger has). Test whether the main thread's
+  instance sits at the template RVA before building anything fancier.
