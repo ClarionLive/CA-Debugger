@@ -20,6 +20,7 @@ namespace ClarionDbg.Cli
                     case "modules": return Modules(args);
                     case "runs": return Runs(args);
                     case "lines": return Lines(args);
+                    case "symbols": return Symbols(args);
                     case "break": return Break(args);
                     default: Usage(); return 1;
                 }
@@ -44,6 +45,10 @@ namespace ClarionDbg.Cli
             Console.WriteLine("  ClarionDbg lines <exe> --module NAME [--json]");
             Console.WriteLine("      List the breakable source lines for a module (lines that carry a code record).");
             Console.WriteLine("      These are the only lines a breakpoint binds to exactly; others get snapped.");
+            Console.WriteLine();
+            Console.WriteLine("  ClarionDbg symbols <exe> [--module NAME] [--kind proc|method|routine|other] [--json]");
+            Console.WriteLine("      List decoded symbol definitions (procedures, class methods, routines) with");
+            Console.WriteLine("      entry RVA + owning module. Default text view groups top-level procs by module.");
             Console.WriteLine();
             Console.WriteLine("  ClarionDbg resolve <exe> --addr 0xRVA");
             Console.WriteLine("      Map a code RVA (or VA) to its module + source line (address -> line).");
@@ -282,6 +287,70 @@ namespace ClarionDbg.Cli
                 if (i < xs.Count) { start = xs[i]; prev = xs[i]; }
             }
             return sb.ToString();
+        }
+
+        private static int Symbols(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (pe, dbg) = LoadDebug(args[1]);
+            var syms = dbg.Symbols ?? new List<ProcSymbol>();
+
+            string module = GetOpt(args, "--module");
+            if (module != null)
+            {
+                int mi = dbg.FindModuleIdx(module);
+                if (mi < 0) { Console.Error.WriteLine($"{module} -> unknown module"); return 3; }
+                syms = syms.Where(s => s.ModuleIdx == mi).ToList();
+            }
+            string kind = GetOpt(args, "--kind");
+            if (kind != null)
+            {
+                SymbolKind k;
+                switch (kind.ToLowerInvariant())
+                {
+                    case "proc": case "procedure": k = SymbolKind.Procedure; break;
+                    case "method": k = SymbolKind.Method; break;
+                    case "routine": k = SymbolKind.Routine; break;
+                    case "other": k = SymbolKind.Other; break;
+                    default: Console.Error.WriteLine($"unknown --kind '{kind}'"); return 1;
+                }
+                syms = syms.Where(s => s.Kind == k).ToList();
+            }
+
+            if (HasFlag(args, "--json"))
+            {
+                Console.WriteLine("@SYMBOLS " + Json.Symbols(syms, dbg));
+                return syms.Count > 0 ? 0 : 3;
+            }
+
+            int nProc = syms.Count(s => s.Kind == SymbolKind.Procedure);
+            int nMeth = syms.Count(s => s.Kind == SymbolKind.Method);
+            int nRtn = syms.Count(s => s.Kind == SymbolKind.Routine);
+            int nOther = syms.Count(s => s.Kind == SymbolKind.Other);
+            Console.WriteLine($"{syms.Count} symbol definitions (TOC +0x30 count field = {dbg.SymbolCountField}):");
+            Console.WriteLine($"  {nProc} procedures, {nMeth} methods, {nRtn} routines, {nOther} other");
+            Console.WriteLine();
+
+            // group top-level procs per module (matches spikes/tswd-symbols.txt for validation)
+            Console.WriteLine($"{"modIdx",6}  {"module",-20} {"procs",5}  procName(entryRVA)");
+            var byMod = syms.Where(s => s.Kind == SymbolKind.Procedure)
+                            .GroupBy(s => s.ModuleIdx).OrderBy(g => g.Key);
+            foreach (var g in byMod)
+            {
+                string nm = dbg.ModuleNameForIdx(g.Key) ?? "?";
+                string lst = string.Join(", ", g.OrderBy(s => s.EntryRva)
+                                               .Select(s => $"{s.Name}(0x{s.EntryRva:X})"));
+                Console.WriteLine($"{g.Key,6}  {nm,-20} {g.Count(),5}  {lst}");
+            }
+
+            if (module != null)
+            {
+                // single-module view: show everything (methods/routines too), address-ordered
+                Console.WriteLine();
+                foreach (var s in syms.OrderBy(s => s.EntryRva))
+                    Console.WriteLine($"  0x{s.EntryRva:X6}  {s.Kind,-9}  {s.Name}  [{s.RawName}]");
+            }
+            return 0;
         }
 
         private static int Break(string[] args)

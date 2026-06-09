@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Text;
+using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
@@ -54,6 +55,27 @@ namespace ClarionDbg.Cli
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"lines\",\"module\":").Append(Str(module)).Append(",\"lines\":[");
             for (int i = 0; i < lines.Count; i++) { if (i > 0) sb.Append(','); sb.Append(lines[i]); }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
+        /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module.</summary>
+        public static string Symbols(List<ProcSymbol> syms, TswdDebugInfo dbg)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"symbols\",\"count\":").Append(syms.Count).Append(",\"symbols\":[");
+            for (int i = 0; i < syms.Count; i++)
+            {
+                var s = syms[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"name\":").Append(Str(s.Name))
+                  .Append(",\"raw\":").Append(Str(s.RawName))
+                  .Append(",\"kind\":").Append(Str(s.Kind.ToString().ToLowerInvariant()))
+                  .Append(",\"rva\":\"0x").Append(s.EntryRva.ToString("X")).Append('"')
+                  .Append(",\"moduleIdx\":").Append(s.ModuleIdx)
+                  .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
+                  .Append('}');
+            }
             sb.Append("]}");
             return sb.ToString();
         }

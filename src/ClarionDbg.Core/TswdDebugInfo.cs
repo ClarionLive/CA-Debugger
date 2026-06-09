@@ -36,6 +36,32 @@ namespace ClarionDbg.Core
         public int RecordCount;
     }
 
+    /// <summary>Kind of a code symbol, derived from Clarion's name mangling.</summary>
+    public enum SymbolKind
+    {
+        Procedure,   // NAME@F or NAME@F<digits>          (top-level PROCEDURE)
+        Method,      // NAME@F<len><CLASSNAME>...          (class method)
+        Routine,     // R$PROC::ROUTINE                    (ROUTINE inside a proc)
+        Other        // _main, clbrws$$$__attach_process … (runtime / compiler symbols)
+    }
+
+    /// <summary>
+    /// One symbol DEFINITION from the TSWD blob: 12-byte little-endian
+    /// {u32 nameRef, u32 entryRVA, u32 moduleBackref}, byte-granular (NOT aligned), scattered
+    /// after the +0x28 backref array. The {nameRef, entryRVA} pair also appears at CALL SITES,
+    /// so definitions are selected by requiring the 3rd field to be a valid +0x28 backref value
+    /// (whose array index IS the moduleIdx) and skipping __thunk.* names (a thunk lives in the
+    /// caller's module). See docs/TSWD-format.md and spikes/tswd-procsym-decode.ps1.
+    /// </summary>
+    public sealed class ProcSymbol
+    {
+        public string RawName;    // mangled, e.g. SELECTJOBS@F, R$BRW1::SELECTSORT, UPDATE@F8INICLASS
+        public string Name;       // demangled, e.g. SELECTJOBS, BRW1::SELECTSORT, INICLASS.UPDATE
+        public SymbolKind Kind;
+        public uint EntryRva;     // canonical proc start (may sit ABOVE the module's +0x1C floor)
+        public int ModuleIdx;     // == +0x08 name-array index == +0x1C moduleIdx
+    }
+
     /// <summary>
     /// A contiguous ascending line-major RUN within Table A. Table A is ONE continuous 6-byte
     /// {u16 line, u32 rva} grid from blob+OffLineTableA; runs are delimited by line RESETS (the line
@@ -88,6 +114,10 @@ namespace ClarionDbg.Core
         /// <summary>Best-effort list of symbol names from the symbol string pool (not yet structured).</summary>
         public List<string> SymbolPool { get; private set; }
 
+        /// <summary>Structured code-symbol definitions (procs/methods/routines/runtime), sorted by
+        /// EntryRva. Built from the 12-byte definition records — see <see cref="ProcSymbol"/>.</summary>
+        public List<ProcSymbol> Symbols { get; private set; }
+
         /// <summary>Per-module line sub-tables (LEGACY: sliced by the +0x10 byte map — mis-buckets
         /// records because the map cuts mid-run. Kept for diagnostics/compat; prefer <see cref="Runs"/>).</summary>
         public List<ModuleSlice> Modules { get; private set; }
@@ -112,6 +142,12 @@ namespace ClarionDbg.Core
         public int OffTableAfterB { get; private set; }
         public int OffSymbolPool { get; private set; }
         public int OffSymbolNameArray { get; private set; }
+        /// <summary>TOC +0x2C table offset (purpose not yet decoded — Phase 3 data-symbol candidate).</summary>
+        public int OffTable2C { get; private set; }
+        /// <summary>TOC +0x30 symbol count field — validates the definition-record scan.</summary>
+        public int SymbolCountField { get; private set; }
+        /// <summary>TOC +0x34 near-end table offset (purpose not yet decoded — Phase 3 candidate).</summary>
+        public int OffTable34 { get; private set; }
 
         // .text bounds (RVA) used to validate record framing; 0..uint.Max disables the check.
         private readonly uint _textLo;
@@ -163,6 +199,9 @@ namespace ClarionDbg.Core
             OffSymbolPool      = (int)U32(0x20);
             ModuleCountField   = (int)U32(0x24);
             OffSymbolNameArray = (int)U32(0x28);
+            OffTable2C         = (int)U32(0x2C);
+            SymbolCountField   = (int)U32(0x30);
+            OffTable34         = (int)U32(0x34);
 
             // --- module names: iterate the u32 offset array up to the start of the string pool.
             // (The +0x24 count field is NOT the array length, so derive count from geometry.)
@@ -201,6 +240,9 @@ namespace ClarionDbg.Core
                 if (i2 > start) SymbolPool.Add(ReadCStringRange(start, i2));
                 i2++; // skip the NUL
             }
+
+            // --- structured symbol definitions: 12-byte {nameRef, entryRVA, moduleBackref} ---
+            BuildSymbols();
         }
 
         // ----- module-scoped line table -----
@@ -341,6 +383,135 @@ namespace ClarionDbg.Core
                 foreach (var r in AddrTable)
                     if (r.ModuleIdx == moduleIdx && r.Line == line) list.Add(r.Rva);
             return list;
+        }
+
+        // ----- structured symbol table (Phase 3) -----
+
+        /// <summary>
+        /// Scan [OffSymbolNameArray, blob end) byte-granularly for 12-byte symbol DEFINITION
+        /// records (see <see cref="ProcSymbol"/>). Filters: nameRef must land on a NUL-preceded
+        /// printable string inside the +0x20 pool, entryRVA must be in .text, and the 3rd field
+        /// must be one of the +0x28 backref values (its index = moduleIdx). __thunk.* names are
+        /// call-site artifacts, not definitions — skipped. Mirrors spikes/tswd-procsym-decode.ps1.
+        /// </summary>
+        private void BuildSymbols()
+        {
+            Symbols = new List<ProcSymbol>();
+            int poolLen = OffSymbolNameArray - OffSymbolPool;
+            if (poolLen <= 0) return;
+
+            // +0x28 backref array: value -> module index. Length = the +0x24 count field (61 for
+            // the reference build; one more than the 60-entry name array — the extra is a
+            // runtime/error module with no name entry).
+            var backrefs = new Dictionary<uint, int>();
+            int nBack = ModuleCountField;
+            for (int i = 0; i < nBack; i++)
+            {
+                int o = OffSymbolNameArray + i * 4;
+                if (_base + o + 4 > _b.Length) break;
+                uint v = U32(o);
+                if (!backrefs.ContainsKey(v)) backrefs[v] = i;
+            }
+
+            var seen = new HashSet<string>();
+            int end = _b.Length - _base - 12;
+            for (int o = OffSymbolNameArray; o <= end; o++)
+            {
+                uint nameRef = U32(o);
+                if (nameRef < 1 || nameRef >= (uint)poolLen) continue;
+                uint rva = U32(o + 4);
+                if (rva < _textLo || rva >= _textHi) continue;
+                uint backref = U32(o + 8);
+                int modIdx;
+                if (!backrefs.TryGetValue(backref, out modIdx)) continue;
+                string raw = SymbolNameAt((int)nameRef, poolLen);
+                if (raw == null) continue;
+                if (raw.StartsWith("__thunk.", StringComparison.Ordinal)) continue;
+                if (!seen.Add(raw + "|" + rva)) continue;
+
+                var sym = new ProcSymbol { RawName = raw, EntryRva = rva, ModuleIdx = modIdx };
+                Demangle(raw, sym);
+                Symbols.Add(sym);
+            }
+            Symbols.Sort((a, b) => a.EntryRva.CompareTo(b.EntryRva));
+        }
+
+        /// <summary>Validated name read for a pool-relative ref: must be NUL-preceded (a real
+        /// string start), begin with a printable non-space char, and run printable to a NUL.</summary>
+        private string SymbolNameAt(int rel, int poolLen)
+        {
+            int s = _base + OffSymbolPool + rel;
+            if (s <= 0 || s >= _b.Length) return null;
+            if (_b[s - 1] != 0) return null;
+            if (_b[s] < 0x21 || _b[s] >= 0x7F) return null;
+            int e = s;
+            while (e < _b.Length && _b[e] >= 0x20 && _b[e] < 0x7F) e++;
+            if (e >= _b.Length || _b[e] != 0) return null;
+            return Encoding.ASCII.GetString(_b, s, e - s);
+        }
+
+        /// <summary>
+        /// Derive Kind + display name from Clarion's mangling:
+        ///   R$PROC::RTN / R$NAME   -> Routine   "PROC::RTN" / "NAME"
+        ///   NAME@F / NAME@F123     -> Procedure "NAME"
+        ///   NAME@F8CLASSNAME...    -> Method    "CLASSNAME.NAME" (len-prefixed class name)
+        ///   anything else          -> Other     (raw, e.g. _main)
+        /// </summary>
+        private static void Demangle(string raw, ProcSymbol sym)
+        {
+            if (raw.StartsWith("R$", StringComparison.Ordinal) && raw.Length > 2)
+            {
+                sym.Kind = SymbolKind.Routine;
+                sym.Name = raw.Substring(2);
+                return;
+            }
+            int at = raw.IndexOf("@F", StringComparison.Ordinal);
+            if (at > 0)
+            {
+                string head = raw.Substring(0, at);
+                string tail = raw.Substring(at + 2);
+                int d = 0;
+                while (d < tail.Length && char.IsDigit(tail[d])) d++;
+                if (d == tail.Length)
+                {
+                    sym.Kind = SymbolKind.Procedure;   // NAME@F or NAME@F<digits>
+                    sym.Name = head;
+                    return;
+                }
+                sym.Kind = SymbolKind.Method;
+                int len;
+                if (d > 0 && int.TryParse(tail.Substring(0, d), out len) && d + len <= tail.Length)
+                    sym.Name = tail.Substring(d, len) + "." + head;
+                else
+                    sym.Name = head;                   // unparsed method mangling — keep the proc part
+                return;
+            }
+            sym.Kind = SymbolKind.Other;
+            sym.Name = raw;
+        }
+
+        /// <summary>
+        /// Bind a code RVA to the symbol whose entry it falls under: the greatest EntryRva &lt;=
+        /// the target (binary search over the sorted table). Because routines/methods are symbols
+        /// too, this names stack frames at sub-procedure granularity. Returns false if no symbol
+        /// precedes the address. NOTE: a proc can emit code BELOW its named entry (init/cold), so
+        /// the floor of a module's +0x1C region may bind to the previous module's last symbol —
+        /// callers that have a moduleIdx should cross-check it against <see cref="ProcSymbol.ModuleIdx"/>.
+        /// </summary>
+        public bool ResolveSymbol(uint rva, out ProcSymbol sym)
+        {
+            sym = null;
+            if (Symbols == null || Symbols.Count == 0) return false;
+            int lo = 0, hi = Symbols.Count - 1, ans = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (Symbols[mid].EntryRva <= rva) { ans = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            if (ans < 0) return false;
+            sym = Symbols[ans];
+            return true;
         }
 
         /// <summary>Commit a run if it carries enough records to be real (drops stray fragments).</summary>
