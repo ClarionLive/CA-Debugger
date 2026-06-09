@@ -36,11 +36,12 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
-        public static string Hit(string module, int line, uint rva, uint va, uint gap, bool resolved)
+        public static string Hit(string module, string proc, int line, uint rva, uint va, uint gap, bool resolved)
         {
             return "{\"event\":\"hit\""
                  + ",\"resolved\":" + (resolved ? "true" : "false")
                  + ",\"module\":" + Str(module)
+                 + ",\"proc\":" + Str(proc)
                  + ",\"line\":" + line
                  + ",\"rva\":\"0x" + rva.ToString("X") + "\""
                  + ",\"va\":\"0x" + va.ToString("X") + "\""
@@ -107,13 +108,15 @@ namespace ClarionDbg.Cli
                  + ",\"eflags\":\"0x" + eflags.ToString("X8") + "\"}";
         }
 
-        /// <summary>Target paused (breakpoint hit, step complete, or step-limit). regsJson may be null.</summary>
-        public static string Paused(string reason, string module, int line, uint rva, uint va, uint gap, bool resolved, string regsJson)
+        /// <summary>Target paused (breakpoint hit, step complete, or step-limit). regsJson may be null.
+        /// proc = demangled symbol containing the pause address (null when unknown).</summary>
+        public static string Paused(string reason, string module, string proc, int line, uint rva, uint va, uint gap, bool resolved, string regsJson)
         {
             return "{\"event\":\"paused\""
                  + ",\"reason\":" + Str(reason)
                  + ",\"resolved\":" + (resolved ? "true" : "false")
                  + ",\"module\":" + Str(module)
+                 + ",\"proc\":" + Str(proc)
                  + ",\"line\":" + line
                  + ",\"rva\":\"0x" + rva.ToString("X") + "\""
                  + ",\"va\":\"0x" + va.ToString("X") + "\""

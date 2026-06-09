@@ -168,7 +168,11 @@ namespace ClarionDbg.Cli
                 if (dbg.ResolveAddr(rva, out int l2, out int mi2, out uint rr2))
                 {
                     string nm = dbg.ModuleNameForIdx(mi2) ?? "?";
-                    Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> {nm} (moduleIdx {mi2}) line {l2}  (+0x1C, record RVA 0x{rr2:X})");
+                    // symbol bind, cross-checked against the +0x1C moduleIdx (cold/init code below a
+                    // module's named entry binds to the previous module's last symbol — say unknown)
+                    string proc = dbg.ResolveSymbol(rva, out ProcSymbol sym) && sym.ModuleIdx == mi2
+                        ? $"{sym.Name} [{sym.Kind.ToString().ToLowerInvariant()}]" : null;
+                    Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> {nm} (moduleIdx {mi2}) line {l2}{(proc != null ? " in " + proc : "")}  (+0x1C, record RVA 0x{rr2:X})");
                 }
                 else
                     Console.WriteLine($"RVA 0x{rva:X} -> no +0x1C record at or before this address");

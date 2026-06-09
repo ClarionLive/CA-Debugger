@@ -404,21 +404,23 @@ namespace ClarionDbg.Cli
             int line; int moduleIdx; uint recRva;
             bool resolved = _dbg.ResolveAddr(rva, out line, out moduleIdx, out recRva);
             string modName = resolved ? _dbg.ModuleNameForIdx(moduleIdx) : null;
+            string proc = ProcNameAt(rva, resolved ? moduleIdx : -1);
             uint gap = resolved ? rva - recRva : 0;
             if (resolved)
             {
+                string inProc = proc != null ? $" in {proc}" : "";
                 if (gap == 0)
-                    Console.WriteLine($"  -> {modName} line {line}   (exact line record)");
+                    Console.WriteLine($"  -> {modName} line {line}{inProc}   (exact line record)");
                 else if (gap <= 64)
-                    Console.WriteLine($"  -> {modName} line {line}   (in statement, +0x{gap:X} into its code)");
+                    Console.WriteLine($"  -> {modName} line {line}{inProc}   (in statement, +0x{gap:X} into its code)");
                 else
-                    Console.WriteLine($"  -> nearest line: {modName} line {line} (+0x{gap:X} away — likely startup/library code with no Clarion line)");
+                    Console.WriteLine($"  -> nearest line: {modName} line {line}{inProc} (+0x{gap:X} away — likely startup/library code with no Clarion line)");
             }
             else
                 Console.WriteLine("  -> (no source line for this address)");
 
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Hit(modName, line, rva, va, gap, resolved));
+                Console.WriteLine("@JSON " + Json.Hit(modName, proc, line, rva, va, gap, resolved));
 
             if (haveCtx)
             {
@@ -620,12 +622,13 @@ namespace ClarionDbg.Cli
             bool resolved = haveCtx && _dbg.ResolveAddr(rva, out line, out mi, out recRva);
             if (!resolved) { line = 0; mi = -1; recRva = 0; }
             string mod = resolved ? _dbg.ModuleNameForIdx(mi) : null;
+            string proc = haveCtx ? ProcNameAt(rva, resolved ? mi : -1) : null;
             uint gap = resolved ? rva - recRva : 0;
 
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Paused(reason, mod, resolved ? line : 0, rva, va, gap, resolved,
+                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved,
                     haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")} — commands: continue step stepover stepout bp mem regs quit");
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs quit");
 
             while (true)
             {
@@ -829,6 +832,20 @@ namespace ClarionDbg.Cli
             t.IsBackground = true;
             t.Name = "stdin-commands";
             t.Start();
+        }
+
+        /// <summary>
+        /// Demangled symbol (proc/method/routine) containing a code RVA, or null when unknown.
+        /// Cross-checks the symbol's module against the +0x1C moduleIdx when the caller has one:
+        /// code emitted BELOW a module's named entry (init/cold) would otherwise bind to the
+        /// previous module's last symbol — better to say "unknown" than name the wrong proc.
+        /// </summary>
+        private string ProcNameAt(uint rva, int moduleIdx)
+        {
+            ProcSymbol sym;
+            if (!_dbg.ResolveSymbol(rva, out sym)) return null;
+            if (moduleIdx >= 0 && sym.ModuleIdx != moduleIdx) return null;
+            return sym.Name;
         }
 
         /// <summary>Is there a line record in [rva, rva+window]? (Used to spot Clarion callees.)</summary>
