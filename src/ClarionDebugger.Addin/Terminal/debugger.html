@@ -154,13 +154,13 @@
   </div>
 
   <div class="toolbar">
-    <button class="tbtn primary" id="btnStart">▶ Start</button>
-    <button class="tbtn" id="btnContinue">▶ Continue</button>
-    <button class="tbtn" id="btnStepOver">⤼ Step Over</button>
-    <button class="tbtn" id="btnStepInto">⤓ Step Into</button>
-    <button class="tbtn" id="btnStepOut">⤒ Step Out</button>
+    <button class="tbtn primary" id="btnStart" title="Launch the target EXE and begin a debug session (F5)">▶ Start</button>
+    <button class="tbtn" id="btnContinue" title="Resume execution until the next breakpoint or exception (F5)">▶ Continue</button>
+    <button class="tbtn" id="btnStepOver" title="Execute the current line, stepping over any procedure calls (F10)">⤼ Step Over</button>
+    <button class="tbtn" id="btnStepInto" title="Execute the current line, stepping into any procedure call (F11)">⤓ Step Into</button>
+    <button class="tbtn" id="btnStepOut" title="Run until the current procedure returns to its caller (Shift+F11)">⤒ Step Out</button>
     <div class="tsep"></div>
-    <button class="tbtn" id="btnStop" style="color:#f48771">■ Stop</button>
+    <button class="tbtn" id="btnStop" style="color:#f48771" title="Terminate the debug session and the target process (Shift+F5)">■ Stop</button>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
     <button class="tbtn" id="btnTheme" title="Toggle light / dark" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
@@ -238,6 +238,20 @@
   $('btnStop').onclick     =()=>send('stop');
   $('btnBrowse').onclick   =()=>send('browse');
   $('exe').addEventListener('change',()=>send('setExe',$('exe').value.trim()));
+
+  // ---- keyboard shortcuts (VS Code debugger bindings) ----
+  // F5 Start/Continue · F10 Step Over · F11 Step Into · Shift+F11 Step Out · Shift+F5 Stop
+  document.addEventListener('keydown',e=>{
+    const t=e.target;
+    if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable)) return;
+    let id=null;
+    if(e.key==='F5')        id = e.shiftKey ? 'btnStop' : (paused ? 'btnContinue' : 'btnStart');
+    else if(e.key==='F10')  id = 'btnStepOver';
+    else if(e.key==='F11')  id = e.shiftKey ? 'btnStepOut' : 'btnStepInto';
+    if(!id) return;
+    e.preventDefault();
+    const b=$(id); if(b&&!b.disabled) b.click();
+  });
 
   // ---- theme toggle (persisted) ----
   function applyTheme(t){ document.body.classList.toggle('light', t==='light'); try{ localStorage.setItem('caDbgTheme',t); }catch(e){} }

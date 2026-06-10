@@ -1,0 +1,16 @@
+{
+  "id": "61a7884f",
+  "name": "CA Debugger",
+  "description": "Standalone Clarion debugger: the ClarionDbg TSWD debug engine (CLI + Core) and the CA Debugger IDE addin (src/ClarionDebugger.Addin). Installs in the Clarion IDE independently of Clarion Assistant — native gutter breakpoints, stepping, call stack with proc names, watch-by-name. Extracted from ClarionAssistant (task 74c792f8).",
+  "changeLog": null,
+  "currentVersion": "1.0.0",
+  "createdAt": "2026-06-10T10:59:17.1172566-07:00",
+  "lastOpenedAt": "2026-06-10T11:00:57.6514219-07:00",
+  "isPinned": false,
+  "defaultTerminal": "claude-code",
+  "prompts": [
+  ],
+  "team": {
+    "agents": []
+  }
+}

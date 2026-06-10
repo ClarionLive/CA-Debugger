@@ -15,3 +15,7 @@ packages/
 # OS
 Thumbs.db
 .DS_Store
+
+# MultiTerminal (track project.json, ignore per-task worktrees & local settings)
+.claude/worktrees/
+.claude/settings.local.json
