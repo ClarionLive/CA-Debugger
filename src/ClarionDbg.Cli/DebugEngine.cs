@@ -844,7 +844,23 @@ namespace ClarionDbg.Cli
             // echo the REQUESTED len so the host can correlate the reply to its request even when
             // the read came back short; bytes carries only what was actually read
             if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len));
-            else Console.WriteLine($"  mem 0x{addr:X}: {BitConverter.ToString(buf, 0, read).Replace("-", "")}");
+            else
+            {
+                // hex + ASCII sidebar, 16 bytes per row (a flat hex blob hides readable strings)
+                for (int row = 0; row < read; row += 16)
+                {
+                    int n = Math.Min(16, read - row);
+                    var hex = new System.Text.StringBuilder(48);
+                    var asc = new System.Text.StringBuilder(16);
+                    for (int i = 0; i < n; i++)
+                    {
+                        byte v = buf[row + i];
+                        hex.Append(v.ToString("X2")).Append(' ');
+                        asc.Append(v >= 0x20 && v < 0x7F ? (char)v : '.');
+                    }
+                    Console.WriteLine($"  mem 0x{addr + (uint)row:X8}: {hex.ToString().PadRight(48)} {asc}");
+                }
+            }
         }
 
         // ------------------------------------------------------------------ call stack

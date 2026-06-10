@@ -305,6 +305,10 @@ stack local   : proc scope → tag-0C frame offset → EBP + offset (needs pause
   0x16 ?, …) against the clbrws dictionary; map → STRING / CSTRING / PSTRING / BYTE /
   SHORT / LONG / DECIMAL / REAL / GROUP / QUEUE etc. with picture/size.
 - **Threaded variables** — `.cwtls` statics are per-thread instances allocated at runtime;
-  the blob RVA is the template. Resolving a live thread's instance needs a runtime call
-  (same `DEBUGHOOK` caveat the native debugger has). Test whether the main thread's
-  instance sits at the template RVA before building anything fancier.
+  the blob RVA is the template. **Live-tested 2026-06-09 (John, clbrws Jobs browse):** the
+  template VA reads as zeros while the same field shows a live value on screen — per-thread
+  instances do NOT live at the template address, not even for the first/main thread.
+  Non-threaded `.data` symbols DO read live at template VA (verified:
+  `_CLARIONMONTHLISTLONG` → "January February …"). Resolving a thread's instance needs the
+  Clarion runtime's thread-data base (TLS slot / clarun helper — the `DEBUGHOOK` route);
+  follow-up spike.
