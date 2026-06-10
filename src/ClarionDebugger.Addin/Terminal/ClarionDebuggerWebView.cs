@@ -28,6 +28,7 @@ namespace ClarionDebugger.Terminal
         private readonly List<DebugBreakpoint> _pending = new List<DebugBreakpoint>(); // breakpoints while idle
         private readonly HashSet<string> _watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private string _exe = "";
+        private bool _exeAuto; // _exe came from auto-resolve (re-resolvable); a manual choice clears this
 
         public ClarionDebuggerWebView()
         {
@@ -96,7 +97,7 @@ namespace ClarionDebugger.Terminal
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
-                    case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (!string.IsNullOrEmpty(_exe)) Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}"); break;
+                    case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe(); if (!string.IsNullOrEmpty(_exe)) Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}"); break;
                     case "start": StartSession(); break;
                     case "continue": _svc.Continue(); break;
                     case "stepover": _svc.StepOver(); break;
@@ -104,7 +105,7 @@ namespace ClarionDebugger.Terminal
                     case "stepout": _svc.StepOut(); break;
                     case "stop": _svc.Stop(); break;
                     case "browse": Browse(); break;
-                    case "setExe": _exe = data ?? ""; break;
+                    case "setExe": _exe = data ?? ""; _exeAuto = false; break;
                     case "watch":
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) _svc.Watch(data); }
                         break;
@@ -119,6 +120,35 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
+                // Auto-detected target: re-confirm against the current IDE solution at launch (the user may have
+                // switched solutions since 'ready'), and also try to resolve when the field is still blank (the pad
+                // may have opened before a solution loaded). Best-effort; never throw.
+                if (_exeAuto || string.IsNullOrEmpty(_exe))
+                {
+                    try
+                    {
+                        string fresh = ProjectTargetService.ResolveTargetExe();
+                        if (!string.IsNullOrEmpty(fresh))
+                        {
+                            if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase))
+                            {
+                                _exe = fresh;
+                                _exeAuto = true;
+                                Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}");
+                                Console("info", "target updated to: " + Path.GetFileName(_exe));
+                            }
+                        }
+                        else if (_exeAuto)
+                        {
+                            // Could not confirm the auto-detected target for the CURRENT solution — refuse to launch a
+                            // possibly-stale EXE. Keep _exe (don't wipe) so a transient resolve failure can retry on the
+                            // next Start; the user can also Browse to choose explicitly.
+                            Console("err", "Auto-detected target could no longer be confirmed for the current solution — press Start again or Browse to choose a Target EXE.");
+                            return;
+                        }
+                    }
+                    catch { }
+                }
                 if (string.IsNullOrEmpty(_exe) || !File.Exists(_exe)) { Console("err", "Pick a valid Target EXE first."); return; }
                 // merge gutter (red-dot) breakpoints set before launch
                 foreach (var gb in _gutter.Snapshot())
@@ -143,6 +173,25 @@ namespace ClarionDebugger.Terminal
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
         }
 
+        /// <summary>
+        /// Auto-fill _exe from the IDE's active project when the field is still blank. Best-effort:
+        /// ProjectTargetService never throws and returns null when it can't decide on a single EXE.
+        /// </summary>
+        private void TryAutoResolveExe()
+        {
+            try
+            {
+                string result = ProjectTargetService.ResolveTargetExe();
+                if (!string.IsNullOrEmpty(result))
+                {
+                    _exe = result;
+                    _exeAuto = true;
+                    Console("info", "auto-detected target: " + Path.GetFileName(_exe));
+                }
+            }
+            catch { }
+        }
+
         private void Browse()
         {
             using (var dlg = new OpenFileDialog { Filter = "Clarion executables (*.exe)|*.exe|All files (*.*)|*.*" })
@@ -150,6 +199,7 @@ namespace ClarionDebugger.Terminal
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     _exe = dlg.FileName;
+                    _exeAuto = false; // a manual pick is authoritative — don't re-resolve over it
                     Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}");
                 }
             }

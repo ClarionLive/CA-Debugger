@@ -128,11 +128,11 @@ namespace ClarionDebugger.Services
         {
             var workbench = ICSharpCode.SharpDevelop.Gui.WorkbenchSingleton.Workbench;
             if (workbench == null) return null;
-            object activeWindow = GetProp(workbench, "ActiveWorkbenchWindow") ?? GetProp(workbench, "ActiveContent");
+            object activeWindow = ReflectionHelpers.GetProp(workbench, "ActiveWorkbenchWindow") ?? ReflectionHelpers.GetProp(workbench, "ActiveContent");
             if (activeWindow == null) return null;
-            object viewContent = GetProp(activeWindow, "ViewContent") ?? GetProp(activeWindow, "ActiveViewContent") ?? activeWindow;
+            object viewContent = ReflectionHelpers.GetProp(activeWindow, "ViewContent") ?? ReflectionHelpers.GetProp(activeWindow, "ActiveViewContent") ?? activeWindow;
 
-            object editor = GetProp(viewContent, "TextEditorControl") ?? GetProp(viewContent, "Control");
+            object editor = ReflectionHelpers.GetProp(viewContent, "TextEditorControl") ?? ReflectionHelpers.GetProp(viewContent, "Control");
             var ta = TextAreaFrom(editor);
             if (ta != null) return ta;
 
@@ -169,24 +169,12 @@ namespace ClarionDebugger.Services
             try
             {
                 var workbench = ICSharpCode.SharpDevelop.Gui.WorkbenchSingleton.Workbench;
-                object activeWindow = workbench != null ? GetProp(workbench, "ActiveWorkbenchWindow") : null;
-                var toolTip = activeWindow != null ? GetProp(activeWindow, "ToolTipText") as string : null;
+                object activeWindow = workbench != null ? ReflectionHelpers.GetProp(workbench, "ActiveWorkbenchWindow") : null;
+                var toolTip = activeWindow != null ? ReflectionHelpers.GetProp(activeWindow, "ToolTipText") as string : null;
                 if (!string.IsNullOrEmpty(toolTip) && toolTip.Contains("\\") && toolTip.Contains(".")) return toolTip;
             }
             catch { }
             return null;
-        }
-
-        private static object GetProp(object obj, string name)
-        {
-            if (obj == null) return null;
-            try
-            {
-                // NonPublic: some workbench window properties are internal in the Clarion IDE build
-                var p = obj.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                return p != null ? p.GetValue(obj, null) : null;
-            }
-            catch { return null; }
         }
     }
 }
