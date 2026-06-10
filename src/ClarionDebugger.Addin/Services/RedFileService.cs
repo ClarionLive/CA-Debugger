@@ -56,7 +56,7 @@ namespace ClarionDebugger.Services
         /// <summary>
         /// Load and parse a .red file using macros from the version config.
         /// </summary>
-        public bool Load(string redFilePath, Dictionary<string, string> macros)
+        public bool Load(string redFilePath, Dictionary<string, string> macros, bool publishActive = true)
         {
             if (string.IsNullOrEmpty(redFilePath) || !File.Exists(redFilePath))
                 return false;
@@ -84,7 +84,7 @@ namespace ClarionDebugger.Services
             try
             {
                 Parse(File.ReadAllLines(redFilePath));
-                Active = this;
+                if (publishActive) Active = this;
                 return true;
             }
             catch
@@ -122,7 +122,7 @@ namespace ClarionDebugger.Services
         /// If a .red file exists in the project directory, it completely
         /// supersedes the version-level .red file.
         /// </summary>
-        public bool LoadForProject(string projectDirectory, ClarionVersionConfig config)
+        public bool LoadForProject(string projectDirectory, ClarionVersionConfig config, bool publishActive = true)
         {
             if (config == null) return false;
 
@@ -144,12 +144,12 @@ namespace ClarionDebugger.Services
             {
                 string localRed = FindLocalRedFile(projectDirectory);
                 if (localRed != null)
-                    return Load(localRed, macros);
+                    return Load(localRed, macros, publishActive);
             }
 
             // Fall back to the version-level .red
             if (!string.IsNullOrEmpty(config.RedFilePath))
-                return Load(config.RedFilePath, macros);
+                return Load(config.RedFilePath, macros, publishActive);
 
             return false;
         }
