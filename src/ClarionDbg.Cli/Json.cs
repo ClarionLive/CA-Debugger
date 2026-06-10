@@ -215,6 +215,39 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
+        /// <summary>Static data symbols (globals + file record buffers with fields) for the Variables tree.</summary>
+        public static string Globals(List<DataSymbol> syms, TswdDebugInfo dbg)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"globals\",\"count\":").Append(syms.Count).Append(",\"symbols\":[");
+            for (int i = 0; i < syms.Count; i++)
+            {
+                var s = syms[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"name\":").Append(Str(s.Name))
+                  .Append(",\"type\":\"0x").Append(s.TypeCode.ToString("X2")).Append('"')
+                  .Append(",\"typeName\":").Append(Str(TswdDebugInfo.TypeCodeName(s.TypeCode)))
+                  .Append(",\"size\":").Append(s.Size)
+                  .Append(",\"rva\":\"0x").Append(s.Rva.ToString("X")).Append('"')
+                  .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
+                  .Append(",\"fields\":[");
+                if (s.Fields != null)
+                    for (int f = 0; f < s.Fields.Count; f++)
+                    {
+                        var fl = s.Fields[f];
+                        if (f > 0) sb.Append(',');
+                        sb.Append("{\"name\":").Append(Str(fl.Name))
+                          .Append(",\"offset\":").Append(fl.Offset)
+                          .Append(",\"type\":\"0x").Append(fl.TypeCode.ToString("X2")).Append('"')
+                          .Append(",\"typeName\":").Append(Str(TswdDebugInfo.TypeCodeName(fl.TypeCode)))
+                          .Append(",\"size\":").Append(fl.Size).Append('}');
+                    }
+                sb.Append("]}");
+            }
+            sb.Append("]}");
+            return sb.ToString();
+        }
+
         /// <summary>Resolved data symbol for watch-by-name. typeName null = unproven code (render hex).</summary>
         public static string Sym(string name, bool found, uint rva, uint va, byte typeCode, string typeName, uint size, string container)
         {

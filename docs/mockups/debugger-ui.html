@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CA Debugger — Phase 3 UI mockup</title>
+<style>
+  :root {
+    --bg:#1e1e1e; --panel:#252526; --titlebar:#323233; --border:#1b1b1b;
+    --fg:#cccccc; --fg-dim:#8a8a8a; --fg-bright:#ffffff;
+    --accent:#0e639c; --accent-hi:#1177bb; --sel:#094771; --hover:#2a2d2e;
+    --green:#4ec9b0; --yellow:#dcdcaa; --blue:#569cd6; --orange:#ce9178;
+    --purple:#c586c0; --red:#f48771; --num:#b5cea8; --section:#bbbbbb;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; }
+  body {
+    background:var(--bg); color:var(--fg);
+    font:13px/1.45 "Segoe UI",system-ui,sans-serif;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  .mono { font-family:"Cascadia Code",Consolas,"Courier New",monospace; }
+
+  .exebar { display:flex; align-items:center; gap:8px; padding:6px 10px; flex:none;
+    background:#1e1e1e; border-bottom:1px solid var(--border); }
+  .exebar .lbl { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); white-space:nowrap; }
+  .exebar input { flex:1; min-width:0; background:#3c3c3c; border:1px solid #3c3c3c; color:var(--fg);
+    border-radius:3px; padding:4px 9px; font-size:12px; outline:none; }
+  .exebar input:focus { border-color:var(--accent-hi); }
+  .exebar button { background:#0e639c; color:#fff; border:none; border-radius:3px; padding:4px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .exebar button:hover { background:#1177bb; }
+
+  .toolbar { display:flex; align-items:center; gap:2px; padding:5px 8px;
+    background:var(--titlebar); border-bottom:1px solid var(--border); flex:none; }
+  .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px;
+    border:none; border-radius:4px; background:transparent; color:var(--fg);
+    font-size:12px; cursor:pointer; white-space:nowrap; }
+  .tbtn:hover { background:#ffffff14; }
+  .tbtn.primary { color:#9cdcfe; }
+  .tsep { width:1px; align-self:stretch; margin:4px 6px; background:#ffffff1f; }
+  .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
+  .dot { width:8px; height:8px; border-radius:50%; background:#e2b341; box-shadow:0 0 6px #e2b34188; }
+
+  .locbar { flex:none; padding:5px 12px; background:#2d2d2d; border-bottom:1px solid var(--border); font-size:12px; }
+  .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
+
+  .main { flex:1; display:flex; min-height:0; }
+  .sidebar { width:340px; min-width:180px; background:var(--panel);
+             display:flex; flex-direction:column; overflow-y:auto; flex:none; }
+  .splitter { width:6px; cursor:col-resize; flex:none; background:var(--border); position:relative; }
+  .splitter::after { content:""; position:absolute; inset:0 2px; }
+  .splitter:hover, .splitter.drag { background:var(--accent-hi); }
+  .rightcol { flex:1; display:flex; flex-direction:column; min-width:0; }
+
+  .section { border-bottom:1px solid #00000040; }
+  .section > summary { list-style:none; cursor:pointer; user-select:none; display:flex; align-items:center; gap:5px;
+    padding:5px 8px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); }
+  .section > summary::-webkit-details-marker { display:none; }
+  .section > summary:hover { color:var(--fg-bright); }
+  .twisty { width:12px; display:inline-block; transition:transform .12s; color:var(--fg-dim); }
+  .section[open] .twisty { transform:rotate(90deg); }
+  .count { margin-left:6px; font-weight:600; color:var(--fg-dim); font-size:10px; background:#ffffff14; border-radius:9px; padding:0 6px; }
+  .hint { margin-left:auto; font-weight:400; font-size:10px; color:#6f6f6f; text-transform:none; letter-spacing:0; }
+  .body { padding:2px 0 7px; }
+
+  .row { display:flex; align-items:center; gap:4px; padding:2px 8px 2px 14px; font-size:13px; cursor:default; white-space:nowrap; }
+  .row:hover { background:var(--hover); }
+  .row .ar { width:12px; color:var(--fg-dim); font-size:10px; cursor:pointer; }
+  .row.lvl1 { padding-left:30px; } .row.lvl2 { padding-left:46px; }
+  .vname { color:#9cdcfe; } .vname.field { color:#c8c8c8; }
+  .vtype { color:var(--green); font-size:11px; margin-left:6px; }
+  .veq { color:var(--fg-dim); margin:0 5px; }
+  .vval { color:var(--orange); max-width:190px; overflow:hidden; text-overflow:ellipsis;
+          white-space:nowrap; display:inline-block; vertical-align:bottom; }
+  .vval.num { color:var(--num); }
+  .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
+  .vval.trunc { cursor:help; }
+  .valtip { position:fixed; z-index:60; max-width:520px; background:#1b1b1b; border:1px solid #454545;
+    border-radius:5px; box-shadow:0 6px 20px #000b; padding:7px 11px; font-size:12px; color:var(--orange);
+    white-space:pre-wrap; word-break:break-all; display:none; }
+  .valtip.show { display:block; }
+  .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
+  .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center;
+         color:#6f6f6f; opacity:0; cursor:pointer; }
+  .pin svg, .dact svg { display:block; }
+  .row:hover .pin { opacity:1; }
+  .pin:hover { color:#e2b341; }
+  .pin.pinned { opacity:1; color:#e2b341; }
+
+  .addwatch { display:flex; gap:6px; padding:5px 10px 5px 14px; position:relative; }
+  .addwatch input { flex:1; background:#3c3c3c; border:1px solid #3c3c3c; color:var(--fg);
+    border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
+  .addwatch input:focus { border-color:var(--accent-hi); }
+  .addwatch input::placeholder { color:#6f6f6f; }
+  .typeahead { position:absolute; top:30px; left:14px; right:10px; z-index:30; background:#252526;
+    border:1px solid #454545; border-radius:4px; box-shadow:0 4px 14px #000a; overflow:hidden; display:none; }
+  .typeahead.show { display:block; }
+  .ta-item { display:flex; align-items:center; gap:8px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  .ta-item:hover, .ta-item.sel { background:var(--sel); }
+  .ta-item .tn { color:#9cdcfe; } .ta-item .tt { color:var(--green); font-size:11px; margin-left:auto; }
+
+  .frame { display:flex; align-items:baseline; gap:8px; padding:3px 8px 3px 14px; cursor:pointer; font-size:13px; white-space:nowrap; }
+  .frame:hover { background:var(--hover); } .frame.cur { background:var(--sel); }
+  .frame .fn { color:var(--fg-bright); } .frame.cur .fn { font-weight:600; }
+  .frame .floc { color:var(--fg-dim); font-size:11px; } .frame .file { color:var(--blue); } .frame .ln { color:var(--num); }
+  .frame .kind { margin-left:auto; color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 5px; }
+  .stacknote { padding:4px 14px 2px; color:#6f6f6f; font-size:11px; font-style:italic; }
+
+  .bp { display:flex; align-items:center; gap:7px; padding:3px 8px 3px 14px; font-size:13px; }
+  .bp:hover { background:var(--hover); }
+  .bp .chk { width:13px; height:13px; border-radius:3px; border:1px solid #888; flex:none; display:inline-flex; align-items:center; justify-content:center; }
+  .bp .chk.on { background:#e51400; border-color:#e51400; }
+  .bp .chk.on::after { content:""; width:7px; height:7px; border-radius:50%; background:#fff; }
+  .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
+  .bp.snapped .ln::after { content:" (snapped)"; color:#6f6f6f; font-size:10px; }
+
+  .regs { display:grid; grid-template-columns:repeat(2,1fr); gap:1px 14px; padding:4px 14px; }
+  .reg { font-size:11.5px; } .reg .rn { color:var(--blue); } .reg .rv { color:var(--num); }
+
+  .srchdr { flex:none; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
+  .srchdr .file { color:var(--fg); }
+  .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; position:relative; }
+  .sline { display:flex; font-size:12.5px; line-height:1.6; padding:0 12px; }
+  .sline .gut { width:42px; text-align:right; color:#6e7681; margin-right:14px; user-select:none; flex:none; }
+  .sline.cur { background:#3a3d1f; } .sline.cur .gut { color:#e2b341; font-weight:700; }
+  .sline.bp .gut::before { content:"●"; color:#e51400; margin-right:6px; }
+  .kw { color:var(--purple); } .id { color:#9cdcfe; cursor:pointer; border-radius:2px; }
+  .id:hover { background:#ffffff22; }
+  .str { color:var(--orange); } .cm { color:#6a9955; } .fnname { color:var(--yellow); }
+
+  .console { flex:none; height:140px; border-top:1px solid var(--border); background:var(--bg); display:flex; flex-direction:column; }
+  .console .chdr { background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
+  .console .clog { flex:1; overflow:auto; padding:5px 12px; font-size:12px; }
+  .clog .ln-hit { color:#73c991; } .clog .ln-pause { color:#e2b341; } .clog .ln-info { color:var(--fg-dim); } .clog .ln-cmd { color:#9cdcfe; }
+
+  /* context menu */
+  .ctxmenu { position:fixed; z-index:50; background:#252526; border:1px solid #454545; border-radius:5px;
+    box-shadow:0 6px 20px #000b; padding:4px 0; min-width:170px; display:none; font-size:12px; }
+  .ctxmenu.show { display:block; }
+  .ctxmenu .mi { padding:5px 14px; cursor:pointer; display:flex; gap:10px; align-items:center; }
+  .ctxmenu .mi:hover { background:var(--accent); color:#fff; }
+  .ctxmenu .msep { height:1px; margin:4px 0; background:#ffffff14; }
+  .ctxmenu .mi .mk { margin-left:auto; color:#6f6f6f; font-size:11px; }
+
+  /* hover data-tip */
+  .datatip { position:fixed; z-index:50; background:#252526; border:1px solid #454545; border-radius:5px;
+    box-shadow:0 6px 20px #000b; padding:6px 10px; font-size:12px; display:none; align-items:flex-start; gap:8px; max-width:560px; }
+  .datatip.show { display:flex; }
+  .datatip .dn { color:#9cdcfe; white-space:nowrap; } .datatip .dt { color:var(--green); font-size:11px; white-space:nowrap; }
+  .datatip .dv { color:var(--orange); white-space:pre-wrap; word-break:break-word; max-width:360px; }
+  .datatip .dacts { display:flex; gap:3px; margin-left:6px; padding-left:8px; border-left:1px solid #ffffff1f; }
+  .datatip .dact { cursor:pointer; color:#8a8a8a; font-size:13px; width:22px; height:22px; border-radius:4px;
+    display:inline-flex; align-items:center; justify-content:center; }
+  .datatip .dact:hover { background:#ffffff14; color:#e2b341; }
+  .datatip .dact.bp:hover { color:#e51400; }
+  .datatip .dact.copy:hover { color:#9cdcfe; }
+
+  .toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:80;
+    background:#0e639c; color:#fff; padding:7px 16px; border-radius:5px; font-size:12px; box-shadow:0 4px 14px #0007;
+    opacity:0; transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+
+  <div class="exebar">
+    <span class="lbl">Target EXE</span>
+    <input class="mono" spellcheck="false" value="C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe" />
+    <button>Browse…</button>
+  </div>
+
+  <div class="toolbar">
+    <button class="tbtn primary">▶ Continue</button>
+    <button class="tbtn">⤼ Step Over</button>
+    <button class="tbtn">⤓ Step Into</button>
+    <button class="tbtn">⤒ Step Out</button>
+    <div class="tsep"></div>
+    <button class="tbtn">↻ Restart</button>
+    <button class="tbtn" style="color:#f48771">■ Stop</button>
+    <div class="runstate"><span class="dot"></span>Paused — breakpoint</div>
+  </div>
+
+  <div class="locbar">Paused in <span class="proc">SELECTJOBS</span> at <span class="file">clbrws011.clw</span>:<span class="ln">317</span> &nbsp;·&nbsp; thread 1</div>
+
+  <div class="main">
+    <div class="sidebar">
+
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Variables<span class="hint">hover a row → ☆ to watch</span></summary>
+        <div class="body" id="varTree">
+          <div class="row"><span class="ar">▾</span><span class="vname">File Buffers</span></div>
+          <div class="row lvl1"><span class="ar">▾</span><span class="vname">JOB:RECORD</span><span class="vtype">GROUP(55)</span><span class="thread-tag">THREAD</span></div>
+          <div class="row lvl2" data-name="JOB:JOBID" data-type="SHORT" data-val="5"><span class="ar"></span><span class="vname field">JOB:JOBID</span><span class="vtype">SHORT</span><span class="veq">=</span><span class="vval num">5</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl2" data-name="JOB:JOB_DESC" data-type="STRING" data-val="'Acquisitions'"><span class="ar"></span><span class="vname field">JOB:JOB_DESC</span><span class="vtype">STRING(51)</span><span class="veq">=</span><span class="vval">'Acquisitions'</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl2" data-name="JOB:MIN_LVL" data-type="BYTE" data-val="25"><span class="ar"></span><span class="vname field">JOB:MIN_LVL</span><span class="vtype">BYTE</span><span class="veq">=</span><span class="vval num">25</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl2" data-name="JOB:MAX_LVL" data-type="BYTE" data-val="100"><span class="ar"></span><span class="vname field">JOB:MAX_LVL</span><span class="vtype">BYTE</span><span class="veq">=</span><span class="vval num">100</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl1"><span class="ar">▸</span><span class="vname">EMP:RECORD</span><span class="vtype">GROUP(141)</span><span class="thread-tag">THREAD</span></div>
+          <div class="row lvl2" data-name="EMP:EMPID" data-type="STRING" data-val="'PTC42316M'"><span class="ar"></span><span class="vname field">EMP:EMPID</span><span class="vtype">STRING(10)</span><span class="veq">=</span><span class="vval">'PTC42316M'</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl2" data-name="EMP:FNAME" data-type="STRING" data-val="'Philip'"><span class="ar"></span><span class="vname field">EMP:FNAME</span><span class="vtype">STRING(21)</span><span class="veq">=</span><span class="vval">'Philip'</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl2" data-name="EMP:JOBID" data-type="SHORT" data-val="12"><span class="ar"></span><span class="vname field">EMP:JOBID</span><span class="vtype">SHORT</span><span class="veq">=</span><span class="vval num">12</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row"><span class="ar">▾</span><span class="vname">Globals</span></div>
+          <div class="row lvl1" data-name="GLO:ErrorCode" data-type="LONG" data-val="0"><span class="ar"></span><span class="vname field">GLO:ErrorCode</span><span class="vtype">LONG</span><span class="veq">=</span><span class="vval num">0</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+          <div class="row lvl1" data-name="GLO:LastSQL" data-type="CSTRING" data-val="long"><span class="ar"></span><span class="vname field">GLO:LastSQL</span><span class="vtype">CSTRING(512)</span><span class="veq">=</span><span class="vval">'SELECT JOB.JOBID, JOB.JOB_DESC, JOB.MIN_LVL, JOB.MAX_LVL FROM JOBS WHERE JOB.MIN_LVL &gt;= 25 ORDER BY JOB.JOB_DESC DESC'</span><span class="pin"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span></div>
+        </div>
+      </details>
+
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Watch <span class="count" id="watchCount">2</span><span class="hint">＋ name · ☆ from tree · right-click source</span></summary>
+        <div class="body">
+          <div class="addwatch">
+            <input id="watchInput" placeholder="Add watch — type, or use ☆ / right-click / hover" autocomplete="off" />
+            <div class="typeahead" id="typeahead"></div>
+          </div>
+          <div id="watchList">
+            <div class="row" data-name="JOB:JOB_DESC"><span class="ar"></span><span class="vname">JOB:JOB_DESC</span><span class="vtype">STRING</span><span class="veq">=</span><span class="vval changed">'Acquisitions'</span><span class="thread-tag">THREAD</span></div>
+            <div class="row" data-name="BRW1::LastSortOrder"><span class="ar"></span><span class="vname">BRW1::LastSortOrder</span><span class="vtype">BYTE</span><span class="veq">=</span><span class="vval num">1</span></div>
+          </div>
+        </div>
+      </details>
+
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Call Stack <span class="count">4</span></summary>
+        <div class="body">
+          <div class="frame cur"><span class="fn">SELECTJOBS</span><span class="floc"><span class="file">clbrws011.clw</span>:<span class="ln">317</span></span><span class="kind">proc</span></div>
+          <div class="frame"><span class="fn">BRW1::TakeNewSelection</span><span class="floc"><span class="file">clbrws011.clw</span>:<span class="ln">704</span></span><span class="kind">routine</span></div>
+          <div class="frame"><span class="fn">REFRESHWINDOW</span><span class="floc"><span class="file">clbrws011.clw</span>:<span class="ln">287</span></span><span class="kind">routine</span></div>
+          <div class="frame"><span class="fn">MAIN</span><span class="floc"><span class="file">clbrws002.clw</span>:<span class="ln">136</span></span><span class="kind">proc</span></div>
+          <div class="stacknote">deeper frames hidden — scan-based, may include startup remnants</div>
+        </div>
+      </details>
+
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Breakpoints <span class="count">2</span></summary>
+        <div class="body">
+          <div class="bp"><span class="chk on"></span><span class="file">clbrws011.clw</span>:<span class="ln">317</span></div>
+          <div class="bp snapped"><span class="chk on"></span><span class="file">clbrws002.clw</span>:<span class="ln">299</span></div>
+        </div>
+      </details>
+
+      <details class="section">
+        <summary><span class="twisty">▶</span>Registers</summary>
+        <div class="body regs mono">
+          <div class="reg"><span class="rn">EIP</span> <span class="rv">009CF1AA</span></div>
+          <div class="reg"><span class="rn">ESP</span> <span class="rv">008FF59C</span></div>
+          <div class="reg"><span class="rn">EBP</span> <span class="rv">008FF5B8</span></div>
+          <div class="reg"><span class="rn">EAX</span> <span class="rv">00000000</span></div>
+        </div>
+      </details>
+    </div>
+
+    <div class="splitter" id="splitter"></div>
+
+    <div class="rightcol">
+      <div class="srchdr">▣ <span class="file">clbrws011.clw</span> — SELECTJOBS &nbsp;·&nbsp; right-click a variable, or hover one, to watch it</div>
+      <div class="src mono">
+        <div class="sline"><span class="gut">315</span><span><span class="kw">END</span></span></div>
+        <div class="sline bp"><span class="gut">316</span><span>&nbsp;&nbsp;<span class="cm">! refresh the selected row</span></span></div>
+        <div class="sline cur"><span class="gut">317</span><span><span class="id" data-name="BRW1::LastSortOrder" data-type="BYTE" data-val="1">BRW1::LastSortOrder</span> = <span class="id" data-name="BRW1::SortOrder" data-type="BYTE" data-val="2">BRW1::SortOrder</span></span></div>
+        <div class="sline"><span class="gut">318</span><span><span class="kw">DO</span> <span class="fnname">RefreshWindow</span></span></div>
+        <div class="sline"><span class="gut">319</span><span><span class="id" data-name="JOB:JOBID" data-type="SHORT" data-val="5">JOB:JOBID</span> = <span class="id" data-name="BRW1::SortOrder" data-type="BYTE" data-val="2">BRW1::SortOrder</span></span></div>
+        <div class="sline"><span class="gut">320</span><span><span class="kw">RETURN</span></span></div>
+      </div>
+
+      <div class="console">
+        <div class="chdr">Debug Console</div>
+        <div class="clog mono">
+          <div class="ln-hit">*** HIT  clbrws011.clw:317 in SELECTJOBS  (exact)</div>
+          <div class="ln-pause">paused [breakpoint] clbrws011.clw line 317 in SELECTJOBS</div>
+          <div class="ln-cmd">&gt; watch JOB:JOB_DESC</div>
+          <div class="ln-info">JOB:JOB_DESC: STRING size 51 = 'Acquisitions'  (threaded; live instance 0xB8661E)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- floating UI -->
+  <div class="ctxmenu" id="ctxmenu">
+    <div class="mi" data-act="watch">👁 Add Watch <span class="mk" id="ctxName"></span></div>
+    <div class="mi" data-act="bp">● Add Breakpoint</div>
+    <div class="msep"></div>
+    <div class="mi" data-act="copy">⧉ Copy Value</div>
+  </div>
+  <div class="datatip" id="datatip">
+    <span class="dn" id="dtName"></span><span class="dt" id="dtType"></span><span class="veq">=</span><span class="dv" id="dtVal"></span>
+    <span class="dacts">
+      <span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span>
+      <span class="dact bp" id="dtBp" title="Add Breakpoint">●</span>
+      <span class="dact copy" id="dtCopy" title="Copy Value">⧉</span>
+    </span>
+  </div>
+  <div class="valtip" id="valtip"></div>
+  <div class="toast" id="toast"></div>
+
+<script>
+  const ALL_SYMS = [
+    ['JOB:JOBID','SHORT'],['JOB:JOB_DESC','STRING'],['JOB:MIN_LVL','BYTE'],['JOB:MAX_LVL','BYTE'],
+    ['EMP:EMPID','STRING'],['EMP:FNAME','STRING'],['EMP:JOBID','SHORT'],['EMP:JOB_LVL','BYTE'],
+    ['GLO:ErrorCode','LONG'],['GLO:LastSQL','CSTRING'],['BRW1::LastSortOrder','BYTE'],['BRW1::SortOrder','BYTE'],
+    ['_ClarionMonthListLong','STRING']
+  ];
+  const watched = new Set(['JOB:JOB_DESC','BRW1::LastSortOrder']);
+
+  function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1400); }
+
+  function addWatch(name,type){
+    if(watched.has(name)){ toast(name+' already watched'); return; }
+    watched.add(name);
+    const list=document.getElementById('watchList');
+    const row=document.createElement('div'); row.className='row'; row.dataset.name=name;
+    row.innerHTML='<span class="ar"></span><span class="vname">'+name+'</span><span class="vtype">'+(type||'')+'</span><span class="veq">=</span><span class="vval changed">(reading…)</span>';
+    list.appendChild(row);
+    attachTip(row);
+    document.getElementById('watchCount').textContent=watched.size;
+    toast('Watching '+name);
+  }
+
+  // 1) ☆ pin from the Variables tree
+  document.querySelectorAll('.pin').forEach(p=>{
+    p.addEventListener('click',e=>{ const r=e.target.closest('.row'); p.classList.add('pinned'); p.textContent='★'; addWatch(r.dataset.name,r.dataset.type); });
+  });
+
+  // 2) right-click an identifier in the source
+  const ctx=document.getElementById('ctxmenu'); let ctxTarget=null;
+  document.querySelectorAll('.src .id').forEach(id=>{
+    id.addEventListener('contextmenu',e=>{
+      e.preventDefault(); ctxTarget={name:id.dataset.name,type:id.dataset.type,val:id.dataset.val};
+      // a right-click supersedes any hover tooltips — hide them so they don't cover the menu
+      document.getElementById('datatip').classList.remove('show');
+      document.getElementById('valtip').classList.remove('show');
+      document.getElementById('ctxName').textContent=id.dataset.name;
+      ctx.style.left=e.clientX+'px'; ctx.style.top=e.clientY+'px'; ctx.classList.add('show');
+    });
+  });
+  ctx.querySelectorAll('.mi').forEach(mi=>mi.addEventListener('click',()=>{
+    const a=mi.dataset.act; ctx.classList.remove('show');
+    if(a==='watch') addWatch(ctxTarget.name,ctxTarget.type);
+    else if(a==='bp') toast('Breakpoint added');
+    else if(a==='copy') toast('Copied: '+ctxTarget.val);
+  }));
+  document.addEventListener('click',()=>ctx.classList.remove('show'));
+
+  // 3) hover data-tip with pin
+  const tip=document.getElementById('datatip'); let tipTarget=null, tipTimer=null;
+  function showTipFor(el){
+    const vEl=el.querySelector('.vval'), tEl=el.querySelector('.vtype');
+    const name=el.dataset.name||'';
+    const type=el.dataset.type||(tEl?tEl.textContent.trim():'');
+    const val=vEl?vEl.textContent.trim():(el.dataset.val!==undefined?el.dataset.val:'');
+    tipTarget={name,type,val};
+    document.getElementById('dtName').textContent=name;
+    document.getElementById('dtType').textContent=type;
+    document.getElementById('dtVal').textContent=val;
+    const r=el.getBoundingClientRect();
+    tip.style.left=Math.min(r.left,window.innerWidth-560)+'px';
+    tip.style.top=(r.bottom+4)+'px';
+    tip.classList.add('show');
+  }
+  function attachTip(el){
+    el.addEventListener('mouseenter',()=>{ clearTimeout(tipTimer); showTipFor(el); });
+    el.addEventListener('mouseleave',()=>{ tipTimer=setTimeout(()=>tip.classList.remove('show'),250); });
+  }
+  // source identifiers + any sidebar row that carries a value (file buffers, globals, watches)
+  document.querySelectorAll('.src .id').forEach(attachTip);
+  document.querySelectorAll('.sidebar .row').forEach(r=>{ if(r.querySelector('.vval')) attachTip(r); });
+  tip.addEventListener('mouseenter',()=>clearTimeout(tipTimer));
+  tip.addEventListener('mouseleave',()=>tip.classList.remove('show'));
+  document.getElementById('dtPin').addEventListener('click',()=>{ addWatch(tipTarget.name,tipTarget.type); tip.classList.remove('show'); });
+  document.getElementById('dtBp').addEventListener('click',()=>{ toast('Breakpoint on change: '+tipTarget.name); tip.classList.remove('show'); });
+  document.getElementById('dtCopy').addEventListener('click',()=>{ try{navigator.clipboard&&navigator.clipboard.writeText(tipTarget.val);}catch(e){} toast('Copied: '+tipTarget.val); tip.classList.remove('show'); });
+
+  // 4) type-ahead dropdown
+  const inp=document.getElementById('watchInput'), ta=document.getElementById('typeahead');
+  function renderTA(q){
+    const m=ALL_SYMS.filter(s=>s[0].toLowerCase().includes(q.toLowerCase())).slice(0,7);
+    if(!q||!m.length){ ta.classList.remove('show'); return; }
+    ta.innerHTML=m.map(s=>'<div class="ta-item" data-name="'+s[0]+'" data-type="'+s[1]+'"><span class="tn">'+s[0]+'</span><span class="tt">'+s[1]+'</span></div>').join('');
+    ta.classList.add('show');
+    ta.querySelectorAll('.ta-item').forEach(it=>it.addEventListener('click',()=>{ addWatch(it.dataset.name,it.dataset.type); inp.value=''; ta.classList.remove('show'); }));
+  }
+  inp.addEventListener('input',()=>renderTA(inp.value));
+  inp.addEventListener('keydown',e=>{ if(e.key==='Enter'&&inp.value.trim()){ addWatch(inp.value.trim(),''); inp.value=''; ta.classList.remove('show'); } if(e.key==='Escape') ta.classList.remove('show'); });
+  inp.addEventListener('blur',()=>setTimeout(()=>ta.classList.remove('show'),180));
+
+  // 5) resizable splitter between sidebar and source/console
+  const splitter=document.getElementById('splitter'), sb=document.querySelector('.sidebar');
+  let dragging=false;
+  splitter.addEventListener('mousedown',e=>{ dragging=true; splitter.classList.add('drag'); document.body.style.userSelect='none'; e.preventDefault(); });
+  document.addEventListener('mousemove',e=>{ if(!dragging)return; let w=e.clientX; w=Math.max(180,Math.min(w,window.innerWidth-280)); sb.style.width=w+'px'; });
+  document.addEventListener('mouseup',()=>{ if(!dragging)return; dragging=false; splitter.classList.remove('drag'); document.body.style.userSelect=''; });
+
+  // (long truncated values are shown in full by the unified data-tip above — no separate value tooltip)
+
+  // 7) collapsible Variables tree (flat rows + indent levels → hide deeper rows under a collapsed node)
+  (function(){
+    const tree=document.getElementById('varTree'); if(!tree) return;
+    const rows=[...tree.querySelectorAll('.row')];
+    const collapsed=new Set();
+    const levelOf=r=> r.classList.contains('lvl2')?2 : r.classList.contains('lvl1')?1 : 0;
+    const arrowOf=r=>{ const a=r.querySelector('.ar'); return a?a.textContent.trim():''; };
+    const isParent=r=>{ const t=arrowOf(r); return t==='▾'||t==='▸'; };
+    function recompute(){
+      const stack=[];
+      for(const row of rows){
+        const lvl=levelOf(row);
+        while(stack.length && lvl<=stack[stack.length-1]) stack.pop();
+        const hidden=stack.length>0;
+        row.style.display=hidden?'none':'';
+        if(!hidden && collapsed.has(row)) stack.push(lvl);
+      }
+    }
+    rows.forEach(r=>{
+      if(!isParent(r)) return;
+      const ar=r.querySelector('.ar');
+      r.style.cursor='pointer';
+      if(arrowOf(r)==='▸') collapsed.add(r);
+      const toggle=e=>{
+        if(e){ if(e.target.closest('.pin')) return; e.stopPropagation(); }
+        if(collapsed.has(r)){ collapsed.delete(r); ar.textContent='▾'; }
+        else { collapsed.add(r); ar.textContent='▸'; }
+        recompute();
+      };
+      ar.addEventListener('click',toggle);
+      r.addEventListener('click',toggle);
+    });
+    recompute();
+  })();
+</script>
+</body>
+</html>

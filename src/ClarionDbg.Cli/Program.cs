@@ -384,6 +384,12 @@ namespace ClarionDbg.Cli
                                     || (s.Fields != null && s.Fields.Any(f => f.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)))
                            .ToList();
 
+            if (HasFlag(args, "--json"))
+            {
+                Console.WriteLine("@GLOBALS " + Json.Globals(syms, dbg));
+                return syms.Count > 0 ? 0 : 3;
+            }
+
             int groups = syms.Count(s => s.Fields != null);
             Console.WriteLine($"{syms.Count} data symbol(s), {groups} with fields:");
             foreach (var s in syms)
