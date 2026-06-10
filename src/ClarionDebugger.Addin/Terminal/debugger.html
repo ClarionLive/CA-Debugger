@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>CA Debugger</title>
+<style>
+  :root {
+    --bg:#1e1e1e; --panel:#252526; --titlebar:#323233; --border:#1b1b1b;
+    --fg:#cccccc; --fg-dim:#8a8a8a; --fg-bright:#ffffff;
+    --accent:#0e639c; --accent-hi:#1177bb; --sel:#094771; --hover:#2a2d2e;
+    --green:#4ec9b0; --yellow:#dcdcaa; --blue:#569cd6; --orange:#ce9178;
+    --purple:#c586c0; --red:#f48771; --num:#b5cea8; --section:#bbbbbb;
+    --input:#3c3c3c; --cur:#3a3d1f; --popup:#252526; --popup-border:#454545; --btnhover:#ffffff14;
+  }
+  body.light {
+    --bg:#ffffff; --panel:#f3f3f3; --titlebar:#e9e9ec; --border:#d3d3d6;
+    --fg:#24292e; --fg-dim:#6a737d; --fg-bright:#000000;
+    --accent:#0066b8; --accent-hi:#106ebe; --sel:#cfe4fa; --hover:#e8eaed;
+    --green:#0a7a5a; --yellow:#8a6d00; --blue:#0451a5; --orange:#a31515;
+    --purple:#9b2393; --red:#cd3131; --num:#0a7a3a; --section:#555a60;
+    --input:#ffffff; --cur:#fff6c8; --popup:#ffffff; --popup-border:#c4c4c8; --btnhover:#0000000d;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--fg); font:13px/1.45 "Segoe UI",system-ui,sans-serif;
+    display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+  .mono { font-family:"Cascadia Code",Consolas,"Courier New",monospace; }
+
+  .exebar { display:flex; align-items:center; gap:8px; padding:6px 10px; flex:none; background:#1e1e1e; border-bottom:1px solid var(--border); }
+  .exebar .lbl { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); white-space:nowrap; }
+  .exebar input { flex:1; min-width:0; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:4px 9px; font-size:12px; outline:none; }
+  .exebar input:focus { border-color:var(--accent-hi); }
+  .exebar button { background:#0e639c; color:#fff; border:none; border-radius:3px; padding:4px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .exebar button:hover { background:#1177bb; }
+
+  .toolbar { display:flex; align-items:center; gap:2px; padding:5px 8px; background:var(--titlebar); border-bottom:1px solid var(--border); flex:none; }
+  .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; border:none; border-radius:4px; background:transparent; color:var(--fg); font-size:12px; cursor:pointer; white-space:nowrap; }
+  .tbtn:hover { background:var(--btnhover); }
+  .tbtn.primary { color:#9cdcfe; }
+  .tbtn[disabled] { opacity:.35; cursor:default; } .tbtn[disabled]:hover { background:transparent; }
+  .tsep { width:1px; align-self:stretch; margin:4px 6px; background:#ffffff1f; }
+  .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
+  .dot { width:8px; height:8px; border-radius:50%; background:#888; }
+  .runstate.paused .dot { background:#e2b341; box-shadow:0 0 6px #e2b34188; }
+  .runstate.running .dot { background:#4ec9b0; box-shadow:0 0 6px #4ec9b088; }
+  .runstate.idle .dot { background:#888; }
+
+  .locbar { flex:none; padding:5px 12px; background:var(--titlebar); border-bottom:1px solid var(--border); font-size:12px; color:var(--fg-dim); }
+  .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
+
+  .main { flex:1; display:flex; min-height:0; }
+  .sidebar { width:360px; min-width:180px; background:var(--panel); display:flex; flex-direction:column; overflow-y:auto; flex:none; }
+  .splitter { width:6px; cursor:col-resize; flex:none; background:var(--border); }
+  .splitter:hover, .splitter.drag { background:var(--accent-hi); }
+  .rightcol { flex:1; display:flex; flex-direction:column; min-width:0; }
+
+  .section { border-bottom:1px solid #00000040; }
+  .section > summary { list-style:none; cursor:pointer; user-select:none; display:flex; align-items:center; gap:5px; padding:5px 8px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); }
+  .section > summary::-webkit-details-marker { display:none; }
+  .section > summary:hover { color:var(--fg-bright); }
+  .twisty { width:12px; display:inline-block; transition:transform .12s; color:var(--fg-dim); }
+  .section[open] .twisty { transform:rotate(90deg); }
+  .count { margin-left:6px; font-weight:600; color:var(--fg-dim); font-size:10px; background:#ffffff14; border-radius:9px; padding:0 6px; }
+  .hint { margin-left:auto; font-weight:400; font-size:10px; color:#6f6f6f; text-transform:none; letter-spacing:0; }
+  .body { padding:2px 0 7px; }
+  .empty { padding:4px 14px; color:#6f6f6f; font-size:11px; font-style:italic; }
+
+  .row { display:flex; align-items:center; gap:4px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
+  .row:hover { background:var(--hover); }
+  .row.selrow { user-select:none; cursor:default; }
+  .row.selrow.selected, .row.selrow.selected:hover { background:var(--sel); }
+  .ctxmenu { position:fixed; z-index:60; background:var(--popup); border:1px solid var(--popup-border); border-radius:5px; box-shadow:0 6px 20px #0007; padding:4px 0; min-width:180px; display:none; font-size:12px; }
+  .ctxmenu.show { display:block; }
+  .ctxmenu .mi { padding:6px 14px; cursor:pointer; display:flex; align-items:center; gap:9px; }
+  .ctxmenu .mi:hover { background:var(--accent); color:#fff; }
+  .row .ar { width:12px; color:var(--fg-dim); font-size:10px; cursor:pointer; }
+  .row.lvl1 { padding-left:30px; } .row.lvl2 { padding-left:46px; }
+  .vname { color:#9cdcfe; } .vname.field { color:#c8c8c8; }
+  .vtype { color:var(--green); font-size:11px; margin-left:6px; }
+  .veq { color:var(--fg-dim); margin:0 5px; }
+  .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
+  .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
+  .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
+  .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
+  .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
+  .pin svg, .dact svg { display:block; }
+  .row:hover .pin { opacity:1; } .pin:hover { color:#e2b341; } .pin.pinned { opacity:1; color:#e2b341; }
+  .rmw { margin-left:auto; width:20px; text-align:center; color:#6f6f6f; opacity:0; cursor:pointer; }
+  .row:hover .rmw { opacity:1; } .rmw:hover { color:#f48771; }
+
+  .watchrow .wch { cursor:pointer; visibility:hidden; }
+  .watchrow.clipped .wch { visibility:visible; }
+  .wdetail { padding:3px 14px 6px 32px; color:var(--orange); font-family:"Cascadia Code",Consolas,monospace;
+    font-size:12px; white-space:pre-wrap; word-break:break-all; user-select:text; background:#00000018; border-bottom:1px solid #00000022; }
+  .addwatch { display:flex; gap:6px; padding:5px 10px 5px 14px; position:relative; }
+  .addwatch input { flex:1; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
+  .addwatch input:focus { border-color:var(--accent-hi); }
+  .addwatch input::placeholder { color:#6f6f6f; }
+  .typeahead { position:absolute; top:30px; left:14px; right:10px; z-index:30; background:var(--popup); border:1px solid var(--popup-border); border-radius:4px; box-shadow:0 4px 14px #0006; overflow:hidden; display:none; max-height:220px; overflow-y:auto; }
+  .typeahead.show { display:block; }
+  .ta-item { display:flex; align-items:center; gap:8px; padding:4px 10px; font-size:12px; cursor:pointer; }
+  .ta-item:hover { background:var(--sel); }
+  .ta-item .tn { color:#9cdcfe; } .ta-item .tt { color:var(--green); font-size:11px; margin-left:auto; }
+
+  .frame { display:flex; align-items:baseline; gap:8px; padding:3px 8px 3px 14px; cursor:pointer; font-size:13px; white-space:nowrap; }
+  .frame:hover { background:var(--hover); } .frame.cur { background:var(--sel); }
+  .frame .fn { color:var(--fg-bright); } .frame.cur .fn { font-weight:600; }
+  .frame .floc { color:var(--fg-dim); font-size:11px; } .frame .file { color:var(--blue); } .frame .ln { color:var(--num); }
+  .frame .kind { margin-left:auto; color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 5px; }
+  .frame.unknown .fn { color:var(--fg-dim); font-style:italic; }
+
+  .bp { display:flex; align-items:center; gap:7px; padding:3px 8px 3px 14px; font-size:13px; }
+  .bp:hover { background:var(--hover); }
+  .bp .chk { width:13px; height:13px; border-radius:3px; border:1px solid #888; flex:none; display:inline-flex; align-items:center; justify-content:center; }
+  .bp .chk.on { background:#e51400; border-color:#e51400; }
+  .bp .chk.on::after { content:""; width:7px; height:7px; border-radius:50%; background:#fff; }
+  .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
+
+  .regs { display:grid; grid-template-columns:repeat(2,1fr); gap:1px 14px; padding:4px 14px; }
+  .reg { font-size:11.5px; } .reg .rn { color:var(--blue); } .reg .rv { color:var(--num); }
+
+  .srchdr { flex:none; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
+  .srchdr .file { color:var(--fg); }
+  .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
+  .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
+  .sline .gut { width:48px; text-align:right; color:#6e7681; margin-right:14px; user-select:none; flex:none; }
+  .sline.cur { background:var(--cur); } .sline.cur .gut { color:#c8890a; font-weight:700; }
+  .sline.bp .gut::before { content:"●"; color:#e51400; margin-right:6px; margin-left:-12px; }
+  .src .srcid { cursor:help; border-radius:2px; } .src .srcid:hover { background:var(--btnhover); outline:1px solid var(--popup-border); }
+
+  .console { flex:none; height:150px; border-top:1px solid var(--border); background:var(--bg); display:flex; flex-direction:column; }
+  .console .chdr { background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
+  .console .clog { flex:1; overflow:auto; padding:5px 12px; font-size:12px; }
+  .clog div { white-space:pre-wrap; word-break:break-word; }
+  .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:#9cdcfe; } .clog .err { color:#f48771; }
+
+  .datatip { position:fixed; z-index:50; background:var(--popup); border:1px solid var(--popup-border); border-radius:5px; box-shadow:0 6px 20px #0007; padding:6px 10px; font-size:12px; display:none; align-items:flex-start; gap:8px; max-width:560px; }
+  .datatip.show { display:flex; }
+  .datatip .dn { color:#9cdcfe; white-space:nowrap; } .datatip .dt { color:var(--green); font-size:11px; white-space:nowrap; }
+  .datatip .dv { color:var(--orange); white-space:pre-wrap; word-break:break-word; max-width:360px; }
+  .datatip .dacts { display:flex; gap:3px; margin-left:6px; padding-left:8px; border-left:1px solid #ffffff1f; }
+  .datatip .dact { cursor:pointer; color:#8a8a8a; font-size:13px; width:22px; height:22px; border-radius:4px; display:inline-flex; align-items:center; justify-content:center; }
+  .datatip .dact:hover { background:var(--btnhover); color:#c8890a; }
+  .datatip .dact.copy:hover { color:#9cdcfe; }
+  .toast { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:80; background:#0e639c; color:#fff; padding:7px 16px; border-radius:5px; font-size:12px; box-shadow:0 4px 14px #0007; opacity:0; transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+  <div class="exebar">
+    <span class="lbl">Target EXE</span>
+    <input id="exe" class="mono" spellcheck="false" placeholder="Pick a Clarion .exe (built with Full debug info)…" />
+    <button id="btnBrowse">Browse…</button>
+  </div>
+
+  <div class="toolbar">
+    <button class="tbtn primary" id="btnStart">▶ Start</button>
+    <button class="tbtn" id="btnContinue">▶ Continue</button>
+    <button class="tbtn" id="btnStepOver">⤼ Step Over</button>
+    <button class="tbtn" id="btnStepInto">⤓ Step Into</button>
+    <button class="tbtn" id="btnStepOut">⤒ Step Out</button>
+    <div class="tsep"></div>
+    <button class="tbtn" id="btnStop" style="color:#f48771">■ Stop</button>
+    <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
+    <button class="tbtn" id="btnTheme" title="Toggle light / dark" style="margin-left:8px;padding:0 8px">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
+    </button>
+  </div>
+
+  <div class="locbar" id="locbar">Not running — pick a Target EXE and press Start.</div>
+
+  <div class="main">
+    <div class="sidebar">
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span></summary>
+        <div class="body" id="varTree"><div class="empty">Start a session to load file buffers.</div></div>
+      </details>
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span></summary>
+        <div class="body">
+          <div class="addwatch"><input id="watchInput" placeholder="Add watch — type a name (e.g. JOB:JOB_DESC)" autocomplete="off" /><div class="typeahead" id="typeahead"></div></div>
+          <div id="watchList"></div>
+        </div>
+      </details>
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span></summary>
+        <div class="body" id="stackList"><div class="empty">Paused frames appear here.</div></div>
+      </details>
+      <details class="section" open>
+        <summary><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span></summary>
+        <div class="body" id="bpList"><div class="empty">Set breakpoints in the Clarion editor gutter.</div></div>
+      </details>
+      <details class="section">
+        <summary><span class="twisty">▶</span>Registers</summary>
+        <div class="body regs mono" id="regs"><div class="empty">Registers appear when paused.</div></div>
+      </details>
+    </div>
+
+    <div class="splitter" id="splitter"></div>
+
+    <div class="rightcol">
+      <div class="srchdr" id="srchdr">No source — pause to show the current location.</div>
+      <div class="src mono" id="src"></div>
+      <div class="console">
+        <div class="chdr">Debug Console</div>
+        <div class="clog mono" id="clog"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="datatip" id="datatip">
+    <span class="dn" id="dtName"></span><span class="dt" id="dtType"></span><span class="veq">=</span><span class="dv" id="dtVal"></span>
+    <span class="dacts"><span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span><span class="dact copy" id="dtCopy" title="Copy Value">⧉</span></span>
+  </div>
+  <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div></div>
+  <div class="toast" id="toast"></div>
+
+<script>
+  const STAR='<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg>';
+  const $=id=>document.getElementById(id);
+  const wv=window.chrome && window.chrome.webview;
+  function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
+  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
+
+  let paused=false;
+  const watched=new Map();   // name -> {threaded}
+  const values=new Map();    // name -> {value,type,threaded} latest resolved value (for source tips)
+  let allSyms=[];            // [{name,type}] for type-ahead + source-id wrapping
+  let curFile=null, curLine=0;
+
+  // ---- toolbar ----
+  $('btnStart').onclick    =()=>send('start');
+  $('btnContinue').onclick =()=>send('continue');
+  $('btnStepOver').onclick =()=>send('stepover');
+  $('btnStepInto').onclick =()=>send('stepinto');
+  $('btnStepOut').onclick  =()=>send('stepout');
+  $('btnStop').onclick     =()=>send('stop');
+  $('btnBrowse').onclick   =()=>send('browse');
+  $('exe').addEventListener('change',()=>send('setExe',$('exe').value.trim()));
+
+  // ---- theme toggle (persisted) ----
+  function applyTheme(t){ document.body.classList.toggle('light', t==='light'); try{ localStorage.setItem('caDbgTheme',t); }catch(e){} }
+  $('btnTheme').onclick=()=>applyTheme(document.body.classList.contains('light')?'dark':'light');
+  (function(){ let t='dark'; try{ t=localStorage.getItem('caDbgTheme')||'dark'; }catch(e){}
+    try{ const q=new URLSearchParams(location.search).get('theme'); if(q&&!localStorage.getItem('caDbgTheme')) t=q; }catch(e){}
+    applyTheme(t); })();
+
+  function setRunState(state){
+    paused = state==='paused';
+    const rs=$('runstate'), rt=$('runtext');
+    rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
+    rt.textContent = state==='launching'?'launching…':state;
+    const en=(b,on)=>{ $(b).disabled=!on; };
+    en('btnStart', state==='idle');
+    en('btnContinue', paused); en('btnStepOver',paused); en('btnStepInto',paused); en('btnStepOut',paused);
+    en('btnStop', state!=='idle');
+    if(state==='idle'){ $('locbar').textContent='Not running — pick a Target EXE and press Start.'; clearSrc(); }
+  }
+
+  // ---- add a watch (from any of the 4 mechanisms) ----
+  function addWatchSilent(name){
+    if(!name || watched.has(name)) return false;
+    watched.set(name,{}); renderWatchList(); send('watch',name);
+    return true;
+  }
+  function addWatch(name){
+    if(!name) return;
+    if(watched.has(name)){ toast(name+' already watched'); return; }
+    addWatchSilent(name); toast('Watching '+name);
+  }
+  function addWatchMany(names){
+    let n=0; names.forEach(nm=>{ if(addWatchSilent(nm)) n++; });
+    toast(n ? ('Watching '+n+' variable'+(n>1?'s':'')) : 'Already watched');
+  }
+
+  // ---- multi-select in the Variables tree (click / ctrl-click / shift-click → right-click to watch) ----
+  const selSet=new Set(); let selAnchor=null;
+  function visibleSelrows(){ return Array.from(document.querySelectorAll('#varTree .selrow')).filter(r=>r.offsetParent!==null); }
+  function applySel(){ document.querySelectorAll('#varTree .selrow').forEach(r=>r.classList.toggle('selected', selSet.has(r))); }
+  function selOne(r){ selSet.clear(); selSet.add(r); selAnchor=r; applySel(); }
+  function selToggle(r){ if(selSet.has(r)) selSet.delete(r); else selSet.add(r); selAnchor=r; applySel(); }
+  function selRange(r){ const rows=visibleSelrows(); const a=rows.indexOf(selAnchor), b=rows.indexOf(r);
+    if(a<0||b<0){ selOne(r); return; } const lo=Math.min(a,b), hi=Math.max(a,b);
+    selSet.clear(); for(let i=lo;i<=hi;i++) selSet.add(rows[i]); applySel(); }
+  function wireSel(row){
+    row.addEventListener('click',e=>{ if(e.target.closest('.pin')) return;
+      if(e.shiftKey && selAnchor) selRange(row);
+      else if(e.ctrlKey||e.metaKey) selToggle(row);
+      else selOne(row); });
+    row.addEventListener('contextmenu',e=>{ e.preventDefault();
+      if(!selSet.has(row)) selOne(row);
+      const n=selSet.size; $('tmWatch').textContent='👁 Add to Watch'+(n>1?' ('+n+')':'');
+      const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
+  }
+  $('tmWatch').onclick=()=>{ addWatchMany(Array.from(selSet).map(r=>r.dataset.name).filter(Boolean)); $('treeMenu').classList.remove('show'); selSet.clear(); applySel(); };
+  document.addEventListener('click',()=>$('treeMenu').classList.remove('show'));
+  function removeWatch(name){ if(watched.delete(name)){ renderWatchList(); send('unwatch',name); } }
+
+  function renderWatchList(){
+    const list=$('watchList'); list.innerHTML='';
+    $('watchCount').textContent=watched.size;
+    watched.forEach((meta,name)=>{
+      const row=document.createElement('div'); row.className='row watchrow'; row.dataset.name=name;
+      row.innerHTML='<span class="ar wch" title="Show full value">▸</span><span class="vname">'+esc(name)+'</span>'
+        +'<span class="vtype"></span><span class="veq">=</span><span class="vval pending">…</span>'
+        +'<span class="rmw" title="Remove">✕</span>';
+      const detail=document.createElement('div'); detail.className='wdetail'; detail.dataset.detail=name; detail.style.display='none';
+      const toggle=e=>{ if(e&&e.target.closest('.rmw')) return;
+        const open=detail.style.display==='none';
+        detail.style.display=open?'':'none'; row.querySelector('.wch').textContent=open?'▾':'▸';
+        if(open){ const v=values.get(name); detail.textContent=v?v.value:(row.querySelector('.vval').textContent||''); } };
+      row.querySelector('.rmw').onclick=e=>{ e.stopPropagation(); removeWatch(name); };
+      row.onclick=toggle;
+      list.appendChild(row); list.appendChild(detail);
+    });
+  }
+
+  // apply a watch value to any matching row (Watch list + Variables tree)
+  function applyValue(name, found, value, typeName, threaded){
+    if(found) values.set(name,{value:value,type:typeName,threaded:threaded});
+    document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
+      const v=row.querySelector('.vval'); if(!v) return;
+      v.classList.remove('pending');
+      if(!found){ v.textContent='(not found)'; v.classList.add('pending'); return; }
+      v.textContent=value;
+      const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
+      v.classList.toggle('num',!!numeric);
+      const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
+      if(threaded && !row.querySelector('.thread-tag')){
+        const tag=document.createElement('span'); tag.className='thread-tag'; tag.textContent='THREAD';
+        (row.querySelector('.rmw')||row.querySelector('.pin')||row).insertAdjacentElement('beforebegin',tag);
+      }
+      // watch rows: flag clipped values (reveals the ▸ chevron) and refresh an open detail panel
+      if(row.classList.contains('watchrow')){
+        row.classList.toggle('clipped', v.scrollWidth > v.clientWidth + 1);
+        const det=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'"]');
+        if(det && det.style.display!=='none') det.textContent=value;
+      }
+    });
+  }
+  function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
+
+  // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
+  function buildVarTree(symbols){
+    const tree=$('varTree'); tree.innerHTML='';
+    if(!symbols || !symbols.length){ tree.innerHTML='<div class="empty">No static data symbols.</div>'; return; }
+    const isTable=s=> (s.fields && s.fields.length) && /\$.*:record$/i.test(s.name);  // FILE$PREFIX:RECORD
+    const tables=symbols.filter(isTable);
+    const globals=symbols.filter(s=>!isTable(s));
+    treeGroup(tree,'Tables',tables,true);
+    treeGroup(tree,'Global Variables',globals,false);
+  }
+
+  // One collapsible category. Records (GROUPs) expand to fields; scalars are leaves. Fields/leaves
+  // are live-watched only while visible (section open, and for fields the record open too).
+  function treeGroup(tree,label,syms,openByDefault){
+    const hdr=document.createElement('div'); hdr.className='row'; hdr.style.cursor='pointer';
+    hdr.innerHTML='<span class="ar">'+(openByDefault?'▾':'▸')+'</span><span class="vname">'+esc(label)+'</span>'
+      +'<span class="count">'+syms.length+'</span>';
+    tree.appendChild(hdr);
+    let open=openByDefault;
+    const members=[];
+
+    syms.forEach(s=>{
+      const isGroup = s.fields && s.fields.length;
+      const rec=document.createElement('div'); rec.className='row lvl1'; rec.style.display=open?'':'none';
+      rec.innerHTML='<span class="ar">'+(isGroup?'▸':'')+'</span><span class="vname">'+esc(s.name)+'</span>'
+        +'<span class="vtype">'+esc(s.typeName||('size '+s.size))+'</span>';
+      tree.appendChild(rec);
+
+      if(!isGroup){
+        rec.dataset.name=s.name; rec.classList.add('selrow');
+        rec.innerHTML+='<span class="veq">=</span><span class="vval pending">…</span>'; wireSel(rec);
+        members.push({type:'leaf', el:rec, name:s.name});
+      } else {
+        const entry={type:'rec', el:rec, recOpen:false, fields:[]};
+        s.fields.forEach(f=>{
+          const fr=document.createElement('div'); fr.className='row lvl2 selrow'; fr.dataset.name=f.name; fr.style.display='none';
+          fr.innerHTML='<span class="ar"></span><span class="vname field">'+esc(f.name)+'</span>'
+            +'<span class="vtype">'+esc(f.typeName||'')+'</span><span class="veq">=</span><span class="vval pending">…</span>'
+            +'<span class="pin">'+STAR+'</span>';
+          fr.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(f.name); };
+          wireSel(fr);
+          tree.appendChild(fr); entry.fields.push({el:fr,name:f.name});
+        });
+        rec.onclick=e=>{ if(e.target.closest('.pin')) return; e.stopPropagation();
+          entry.recOpen=!entry.recOpen; rec.querySelector('.ar').textContent=entry.recOpen?'▾':'▸'; apply(); };
+        members.push(entry);
+      }
+    });
+
+    function apply(){
+      members.forEach(m=>{
+        if(m.type==='leaf'){
+          m.el.style.display = open?'':'none';
+          if(!watched.has(m.name)) send(open?'watch':'unwatch', m.name);
+        } else {
+          m.el.style.display = open?'':'none';
+          m.fields.forEach(f=>{
+            const show = open && m.recOpen;
+            f.el.style.display = show?'':'none';
+            if(!watched.has(f.name)) send(show?'watch':'unwatch', f.name);
+          });
+        }
+      });
+    }
+    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸'; apply(); };
+    apply();
+  }
+
+  // ---- call stack ----
+  function buildStack(frames){
+    const list=$('stackList'); list.innerHTML=''; $('stackCount').textContent=frames.length;
+    if(!frames.length){ list.innerHTML='<div class="empty">Paused frames appear here.</div>'; return; }
+    frames.forEach((f,i)=>{
+      const el=document.createElement('div'); el.className='frame'+(i===0?' cur':'')+(f.proc?'':' unknown');
+      const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
+      el.innerHTML='<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc+(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
+      if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);
+      list.appendChild(el);
+    });
+  }
+
+  // ---- breakpoints ----
+  let bps=[];
+  function buildBps(list){ bps=list||[];
+    const el=$('bpList'); el.innerHTML=''; $('bpCount').textContent=bps.length;
+    if(!bps.length){ el.innerHTML='<div class="empty">Set breakpoints in the Clarion editor gutter.</div>'; return; }
+    bps.forEach(b=>{ const d=document.createElement('div'); d.className='bp';
+      d.innerHTML='<span class="chk on"></span><span class="file">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
+      el.appendChild(d); });
+    if(curFile) renderBpDots();
+  }
+
+  // ---- registers ----
+  function buildRegs(regs){
+    const el=$('regs'); if(!regs){ el.innerHTML='<div class="empty">Registers appear when paused.</div>'; return; }
+    const order=['eip','esp','ebp','eax','ebx','ecx','edx','esi','edi','eflags']; el.innerHTML='';
+    order.forEach(k=>{ if(regs[k]==null) return; const d=document.createElement('div'); d.className='reg';
+      d.innerHTML='<span class="rn">'+k.toUpperCase()+'</span> <span class="rv">'+esc(regs[k])+'</span>'; el.appendChild(d); });
+  }
+
+  // ---- source snippet (current location) ----
+  function clearSrc(){ $('src').innerHTML=''; $('srchdr').textContent='No source — pause to show the current location.'; curFile=null; }
+  function buildSource(file, proc, startLine, lines, current){
+    curFile=file; curLine=current;
+    $('srchdr').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
+    const src=$('src'); src.innerHTML='';
+    // wrap known data-symbol names so they get the same hover data-tip as the panels
+    let re=null;
+    const names=allSyms.map(s=>s.name).filter(Boolean).sort((a,b)=>b.length-a.length);
+    if(names.length){ try{ re=new RegExp('(?<![A-Za-z0-9_])('+names.map(reEsc).join('|')+')(?![A-Za-z0-9_:])','g'); }catch(e){ re=null; } }
+    lines.forEach((txt,i)=>{ const ln=startLine+i; const d=document.createElement('div');
+      d.className='sline'+(ln===current?' cur':''); d.dataset.line=ln;
+      let body=esc(txt);
+      if(re) body=body.replace(re,'<span class="srcid id" data-name="$1">$1</span>');
+      d.innerHTML='<span class="gut">'+ln+'</span><span>'+body+'</span>'; src.appendChild(d); });
+    src.querySelectorAll('.srcid').forEach(attachTip);
+    renderBpDots();
+    const cur=src.querySelector('.sline.cur'); if(cur) cur.scrollIntoView({block:'center'});
+  }
+  function reEsc(s){ return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'); }
+  function renderBpDots(){
+    const base=(curFile||'').split(/[\\/]/).pop().toLowerCase();
+    document.querySelectorAll('#src .sline').forEach(d=>d.classList.remove('bp'));
+    bps.forEach(b=>{ if((b.module||'').toLowerCase()!==base) return;
+      const d=document.querySelector('#src .sline[data-line="'+b.line+'"]'); if(d) d.classList.add('bp'); });
+  }
+
+  // ---- console ----
+  function logLine(level,text){ const c=$('clog'); const d=document.createElement('div'); d.className=level||'info'; d.textContent=text; c.appendChild(d); c.scrollTop=c.scrollHeight;
+    while(c.childNodes.length>500) c.removeChild(c.firstChild); }
+
+  // ---- unified hover data-tip ----
+  const tip=$('datatip'); let tipTarget=null, tipTimer=null;
+  function showTipFor(el){
+    const vEl=el.querySelector('.vval'), tEl=el.querySelector('.vtype');
+    const name=el.dataset.name||''; const known=values.get(name);
+    const type=(tEl&&tEl.textContent.trim()) || (known&&known.type) || '';
+    let val=(vEl&&vEl.textContent.trim()) || (known&&known.value) || '';
+    if(!val || val==='…') val = known&&known.value ? known.value : '(not watched — ☆ to add)';
+    tipTarget={name,type,val};
+    $('dtName').textContent=name; $('dtType').textContent=type; $('dtVal').textContent=val;
+    // Anchor OVER the row (same Y) so the cursor reaches the tip/icons by moving right —
+    // not down across the next row (which would steal the hover).
+    const r=el.getBoundingClientRect();
+    tip.style.left=Math.min(r.left+24,window.innerWidth-580)+'px';
+    tip.style.top=Math.max(2,r.top-2)+'px';
+    tip.classList.add('show');
+  }
+  function attachTip(el){
+    el.addEventListener('mouseenter',()=>{ if(!el.dataset.name) return; clearTimeout(tipTimer); showTipFor(el); });
+    el.addEventListener('mouseleave',()=>{ tipTimer=setTimeout(()=>tip.classList.remove('show'),250); });
+  }
+  tip.addEventListener('mouseenter',()=>clearTimeout(tipTimer));
+  tip.addEventListener('mouseleave',()=>tip.classList.remove('show'));
+  $('dtPin').onclick=()=>{ if(tipTarget) addWatch(tipTarget.name); tip.classList.remove('show'); };
+  $('dtCopy').onclick=()=>{ if(tipTarget){ try{navigator.clipboard&&navigator.clipboard.writeText(tipTarget.val);}catch(e){} toast('Copied'); } tip.classList.remove('show'); };
+
+  // ---- type-ahead ----
+  const inp=$('watchInput'), ta=$('typeahead');
+  function renderTA(q){
+    const m=allSyms.filter(s=>s.name.toLowerCase().includes(q.toLowerCase())).slice(0,8);
+    if(!q||!m.length){ ta.classList.remove('show'); return; }
+    ta.innerHTML=m.map(s=>'<div class="ta-item" data-n="'+esc(s.name)+'"><span class="tn">'+esc(s.name)+'</span><span class="tt">'+esc(s.type||'')+'</span></div>').join('');
+    ta.classList.add('show');
+    ta.querySelectorAll('.ta-item').forEach(it=>it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); });
+  }
+  inp.addEventListener('input',()=>renderTA(inp.value));
+  inp.addEventListener('keydown',e=>{ if(e.key==='Enter'&&inp.value.trim()){ addWatch(inp.value.trim()); inp.value=''; ta.classList.remove('show'); } if(e.key==='Escape') ta.classList.remove('show'); });
+  inp.addEventListener('blur',()=>setTimeout(()=>ta.classList.remove('show'),180));
+
+  // ---- splitter ----
+  const splitter=$('splitter'), sb=document.querySelector('.sidebar'); let drag=false;
+  splitter.addEventListener('mousedown',e=>{ drag=true; splitter.classList.add('drag'); document.body.style.userSelect='none'; e.preventDefault(); });
+  document.addEventListener('mousemove',e=>{ if(!drag)return; let w=Math.max(180,Math.min(e.clientX,window.innerWidth-280)); sb.style.width=w+'px'; });
+  document.addEventListener('mouseup',()=>{ if(drag){ drag=false; splitter.classList.remove('drag'); document.body.style.userSelect=''; } });
+
+  // ---- inbound messages from the host ----
+  function onMessage(data){
+    let m; try{ m=JSON.parse(data); }catch(e){ return; }
+    switch(m.type){
+      case 'runstate': setRunState(m.state); break;
+      case 'exe': $('exe').value=m.path||''; break;
+      case 'paused':
+        $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
+        buildRegs(m.regs); break;
+      case 'resumed': break;
+      case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
+      case 'stack': buildStack(m.frames||[]); break;
+      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
+      case 'bplist': buildBps(m.bps||[]); break;
+      case 'regs': buildRegs(m.regs); break;
+      case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
+      case 'console': logLine(m.level, m.text); break;
+      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); break;
+    }
+  }
+  function collectSyms(symbols){ const out=[]; (symbols||[]).forEach(s=>{ out.push({name:s.name,type:s.typeName}); (s.fields||[]).forEach(f=>out.push({name:f.name,type:f.typeName})); }); return out; }
+
+  if(wv) wv.addEventListener('message',e=>onMessage(e.data));
+  setRunState('idle');
+  send('ready');
+</script>
+</body>
+</html>

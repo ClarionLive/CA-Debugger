@@ -1,0 +1,70 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone Clarion Debugger IDE addin (extracted from ClarionAssistant, task 74c792f8).
+    Loads in the Clarion IDE independently of the full Clarion Assistant addin. Drives the
+    sibling ClarionDbg.exe engine (launched as a child process) over its @JSON protocol.
+
+    ClarionRoot defaults to C:\Clarion12; override per Clarion version on the command line:
+        msbuild ClarionDebugger.Addin.csproj /p:ClarionRoot=D:\Clarion11.1EE
+    (a ClarionDebugger.Addin.csproj.user / Directory.Build.props.user override also works).
+  -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>x86</PlatformTarget>
+    <AssemblyName>ClarionDebugger</AssemblyName>
+    <RootNamespace>ClarionDebugger</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>1.0.0</Version>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <ClarionRoot Condition="'$(ClarionRoot)' == ''">C:\Clarion12</ClarionRoot>
+  </PropertyGroup>
+
+  <!-- Clarion IDE (SharpDevelop) host assemblies — compile-time only, shipped by the IDE. -->
+  <ItemGroup>
+    <Reference Include="ICSharpCode.Core">
+      <HintPath>$(ClarionRoot)\bin\ICSharpCode.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ICSharpCode.SharpDevelop">
+      <HintPath>$(ClarionRoot)\bin\ICSharpCode.SharpDevelop.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ICSharpCode.TextEditor">
+      <HintPath>$(ClarionRoot)\bin\ICSharpCode.TextEditor.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- .NET Framework assemblies not referenced by default in SDK-style net48 projects. -->
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Xml" />
+  </ItemGroup>
+
+  <!-- WebView2 (debugger panel host). PackageReference copies the runtime loader + native bits. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3800.47" />
+  </ItemGroup>
+
+  <!-- Addin manifest + the debugger panel HTML are deployed alongside the DLL. -->
+  <ItemGroup>
+    <None Include="ClarionDebugger.addin">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="Terminal\debugger.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <Target Name="ValidateClarionRoot" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(ClarionRoot)\bin\ICSharpCode.Core.dll')"
+           Text="Missing Clarion IDE assemblies at $(ClarionRoot)\bin. Set ClarionRoot to your Clarion install (e.g. /p:ClarionRoot=C:\Clarion12)." />
+  </Target>
+
+</Project>

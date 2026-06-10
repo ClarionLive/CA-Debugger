@@ -1,0 +1,22 @@
+<AddIn name="Clarion Debugger" author="John Hickey" description="Standalone Clarion debugger for the Clarion IDE: native gutter breakpoints, stepping, call stack with procedure names, and watch-by-name over the TSWD debug engine. No Clarion Assistant install required.">
+  <Manifest>
+    <Identity name="ClarionDebugger" version="1.0.0"/>
+  </Manifest>
+  <Runtime>
+    <Import assembly="ClarionDebugger.dll"/>
+  </Runtime>
+
+  <!-- Distinct codon ids from the (legacy) ClarionAssistant-bundled debugger so both can load
+       side-by-side during the transition window. The CA-bundled pad is removed once this
+       standalone addin is verified (task 74c792f8, Phase C). -->
+  <Path name="/SharpDevelop/Workbench/Pads">
+    <Pad id="ClarionDebuggerStandalone" category="Tools" title="Clarion Debugger"
+         icon="PadIcons.Output" shortcut="Control|Alt|G"
+         class="ClarionDebugger.ClarionDebuggerPad"/>
+  </Path>
+
+  <Path name="/Workspace/Tools">
+    <MenuItem id="ShowClarionDebuggerStandalone" label="Clarion Debugger"
+              class="ClarionDebugger.ShowClarionDebuggerCommand"/>
+  </Path>
+</AddIn>

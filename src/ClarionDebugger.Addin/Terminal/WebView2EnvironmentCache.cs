@@ -1,0 +1,73 @@
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using Microsoft.Web.WebView2.Core;
+
+namespace ClarionDebugger.Terminal
+{
+    public static class WebView2EnvironmentCache
+    {
+        private static CoreWebView2Environment _environment;
+        private static readonly object _lock = new object();
+        private static Task<CoreWebView2Environment> _initTask;
+
+        public static async Task<CoreWebView2Environment> GetEnvironmentAsync()
+        {
+            if (_environment != null)
+                return _environment;
+
+            Task<CoreWebView2Environment> task;
+            lock (_lock)
+            {
+                if (_initTask == null)
+                    _initTask = CreateEnvironmentAsync();
+                task = _initTask;
+            }
+
+            try
+            {
+                return await task;
+            }
+            catch
+            {
+                // Reset so the next caller can retry initialization
+                lock (_lock)
+                {
+                    if (_initTask == task)
+                        _initTask = null;
+                }
+                throw;
+            }
+        }
+
+        private static async Task<CoreWebView2Environment> CreateEnvironmentAsync()
+        {
+            string userDataFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "ClarionDebugger", "WebView2Data");
+
+            try
+            {
+                if (!Directory.Exists(userDataFolder))
+                    Directory.CreateDirectory(userDataFolder);
+            }
+            catch
+            {
+                userDataFolder = Path.Combine(Path.GetTempPath(), "ClarionDebugger", "WebView2Data");
+                Directory.CreateDirectory(userDataFolder);
+            }
+
+            var options = new CoreWebView2EnvironmentOptions();
+            // Disable GPU rasterization to prevent progressive text rendering
+            // corruption in Monaco editor (characters render as empty squares)
+            options.AdditionalBrowserArguments = "--disable-gpu-rasterization";
+
+            _environment = await CoreWebView2Environment.CreateAsync(
+                browserExecutableFolder: null,
+                userDataFolder: userDataFolder,
+                options: options);
+
+            return _environment;
+        }
+    }
+}
