@@ -68,8 +68,10 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      --bp may repeat; breakpoints persist (re-armed after each hit).");
             Console.WriteLine("      --interactive: pause at each hit and read stdin commands —");
             Console.WriteLine("        continue | step | stepover | stepout | bp add M:L | bp del M:L | bp list");
-            Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | sym NAME | quit");
+            Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | sym NAME | watch NAME | quit");
             Console.WriteLine("        (while running: bp add/del/list, sym, quit)");
+            Console.WriteLine("      watch resolves THREADed (.cwtls) data to the paused thread's live");
+            Console.WriteLine("      instance via a THR$GetInstance func-eval, then dumps the value.");
         }
 
         private static (PeImage pe, TswdDebugInfo dbg) LoadDebug(string exe)
@@ -477,6 +479,13 @@ namespace ClarionDbg.Cli
 
             var engine = new DebugEngine(args[1], dbg, pe.ImageBase, rvas, specs, once, waitMs, interactive);
             engine.EmitJson = HasFlag(args, "--json");
+
+            // threaded-data resolution (watch NAME on THREADed vars) needs the .cwtls range and
+            // the live THR$GetInstance address (read via its IAT slot at runtime)
+            var cwtls = pe.FindSection(".cwtls");
+            uint thrIat = pe.FindImportIatSlotRva("ClaRUN.dll", "THR$GetInstance");
+            if (cwtls != null && thrIat != 0)
+                engine.SetThreadEvalInfo(cwtls.VirtualAddress, cwtls.VirtualAddress + cwtls.Span, thrIat);
             int hits2 = engine.Run();
             if (hits2 < 0) { Console.Error.WriteLine("no breakpoint could be resolved"); return 2; }
             Console.WriteLine($"\ndone — {hits2} breakpoint hit(s).");

@@ -91,6 +91,31 @@ namespace ClarionDbg.Cli
         private struct Rearm { public uint Va; public bool IsTemp; }
         private readonly Dictionary<uint, Rearm> _rearm = new Dictionary<uint, Rearm>();
 
+        // ---- threaded-data func-eval (watch NAME on THREADed .cwtls data) ----
+        // While paused, hijack the CURRENT thread to call ClaRUN!THR$GetInstance(EAX=templateVA,
+        // EBX=.cwtls base) and trap the return at an unmapped magic address. The paused thread IS
+        // the thread whose instance the user wants — per-thread data resolves correctly by design.
+        private const uint EVAL_TRAP_VA = 0x7FFF1000;   // never valid in 32-bit user space
+        private uint _cwtlsLo, _cwtlsHi;                // .cwtls RVA range (0,0 = no threaded support)
+        private uint _thrGetInstanceIatRva;             // IAT slot of ClaRUN.dll!THR$GetInstance
+        private bool _evalActive;
+        private uint _evalTid;
+        private Native.CONTEXT_X86 _evalSavedCtx;
+        private bool _evalHadRearm;
+        private Rearm _evalSavedRearm;
+        private string _evalName;                       // pending watch: symbol + size to read
+        private uint _evalSize;
+        private string _evalTypeName;
+        private byte _evalTypeCode;
+        private uint _evalTemplateVa;
+
+        /// <summary>Enable threaded-data resolution (call before Run). cwtls = the .cwtls section
+        /// RVA range; iatSlotRva = the IAT slot of ClaRUN.dll!THR$GetInstance.</summary>
+        public void SetThreadEvalInfo(uint cwtlsLo, uint cwtlsHi, uint iatSlotRva)
+        {
+            _cwtlsLo = cwtlsLo; _cwtlsHi = cwtlsHi; _thrGetInstanceIatRva = iatSlotRva;
+        }
+
         // source-level stepping state
         private StepMode _mode = StepMode.None;
         private uint _stepTid;
@@ -200,6 +225,12 @@ namespace ClarionDbg.Cli
                         else if (exCode == Native.EXCEPTION_SINGLE_STEP)
                         {
                             status = OnSingleStep(tid);
+                        }
+                        else if (_evalActive && tid == _evalTid && exAddr == EVAL_TRAP_VA)
+                        {
+                            // the hijacked THR$GetInstance call returned into our unmapped magic
+                            // address — EAX now holds the thread's live instance VA
+                            status = OnEvalComplete(tid);
                         }
                         else
                         {
@@ -640,7 +671,7 @@ namespace ClarionDbg.Cli
             if (EmitJson)
                 Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved,
                     haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs stack sym quit");
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs stack sym watch quit");
 
             while (true)
             {
@@ -696,6 +727,15 @@ namespace ClarionDbg.Cli
 
                     case "sym":
                         HandleSymCommand(parts);
+                        break;
+
+                    case "watch":
+                        // resolve + read a data symbol's CURRENT-THREAD value. THREADed (.cwtls)
+                        // names need a func-eval: the target resumes briefly to run
+                        // THR$GetInstance, so we must leave the pause loop; the completion
+                        // handler re-enters it with the original context restored.
+                        if (HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx))
+                            return;
                         break;
 
                     case "quit": case "q": case "kill":
@@ -757,7 +797,7 @@ namespace ClarionDbg.Cli
                     case "step": case "stepinto": case "s": case "i":
                     case "stepover": case "next": case "n":
                     case "stepout": case "out": case "finish": case "o":
-                    case "mem": case "regs": case "stack": case "bt": case "where":
+                    case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:
@@ -813,6 +853,145 @@ namespace ClarionDbg.Cli
             string tn = TswdDebugInfo.TypeCodeName(loc.TypeCode);
             if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, true, loc.Rva, va, loc.TypeCode, tn, loc.Size, loc.Container));
             Console.WriteLine($"  sym {name}: VA 0x{va:X} (RVA 0x{loc.Rva:X}) {(tn ?? $"type 0x{loc.TypeCode:X2}")} size {loc.Size}{(loc.Container != null ? " in " + loc.Container : "")}");
+        }
+
+        // ------------------------------------------------------------------ watch (by name)
+
+        /// <summary>
+        /// watch NAME — resolve a data name and read its CURRENT value on the paused thread.
+        /// Non-threaded data reads directly at template VA (returns false: stay paused).
+        /// THREADed (.cwtls) data launches the THR$GetInstance func-eval (returns true: the
+        /// caller must leave the pause loop so the target can run the call).
+        /// </summary>
+        private bool HandleWatchCommand(string[] parts, uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
+            if (parts.Length < 2) { EmitError("watch expects: watch NAME"); return false; }
+            string name = parts[1];
+            TswdDebugInfo.DataLocation loc;
+            if (!_dbg.ResolveDataName(name, out loc))
+            {
+                if (EmitJson) Console.WriteLine("@JSON " + Json.Watch(name, false, 0, 0, false, 0, null, 0, null, 0));
+                Console.WriteLine($"  watch {name}: not found");
+                return false;
+            }
+            uint templateVa = _loadBase + loc.Rva;
+            bool threaded = loc.Rva >= _cwtlsLo && loc.Rva < _cwtlsHi && _cwtlsHi != 0;
+
+            if (!threaded)
+            {
+                EmitWatchValue(name, templateVa, templateVa, false, loc.TypeCode, loc.Size);
+                return false;
+            }
+
+            if (_thrGetInstanceIatRva == 0)
+            {
+                EmitError($"watch {name}: THREADed data but THR$GetInstance import not found in this EXE");
+                return false;
+            }
+            if (!haveCtx)
+            {
+                EmitError($"watch {name}: no thread context for func-eval");
+                return false;
+            }
+            uint helper = ReadU32(_loadBase + _thrGetInstanceIatRva);
+            if (helper == 0)
+            {
+                EmitError($"watch {name}: could not read THR$GetInstance address from the IAT");
+                return false;
+            }
+
+            // stash what the completion handler needs to finish the read
+            _evalName = name; _evalSize = loc.Size; _evalTypeCode = loc.TypeCode;
+            _evalTypeName = TswdDebugInfo.TypeCodeName(loc.TypeCode);
+            _evalTemplateVa = templateVa;
+
+            // save the real context (deep copy — the struct holds array references)
+            _evalSavedCtx = CloneContext(ref ctx);
+
+            // suspend any pending breakpoint re-plant for this thread: the BP byte is currently
+            // the ORIGINAL instruction, and the eval resume must not consume the re-arm step
+            _evalHadRearm = _rearm.TryGetValue(tid, out _evalSavedRearm);
+            if (_evalHadRearm) _rearm.Remove(tid);
+
+            // hijack: EAX = template VA, EBX = .cwtls base, return lands on the magic trap
+            var e = CloneContext(ref ctx);
+            e.Esp = ctx.Esp - 4;
+            WriteU32(e.Esp, EVAL_TRAP_VA);
+            e.Eax = templateVa;
+            e.Ebx = _loadBase + _cwtlsLo;
+            e.Eip = helper;
+            e.EFlags &= ~TRAP_FLAG;
+            Native.SetThreadContext(hThread, ref e);
+
+            _evalActive = true;
+            _evalTid = tid;
+            return true;   // leave PausedWait; the debug loop continues the event and the call runs
+        }
+
+        /// <summary>The func-eval returned (AV at the magic address): collect EAX = instance VA,
+        /// restore the saved thread state, emit the watch value, and re-enter the pause loop.</summary>
+        private uint OnEvalComplete(uint tid)
+        {
+            _evalActive = false;
+            IntPtr hThread = OpenThreadForContext(tid);
+            var c = NewContext();
+            bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref c);
+            uint instanceVa = haveCtx ? c.Eax : 0;
+
+            // restore the genuine pause state (EIP/ESP/regs exactly as before the eval)
+            if (hThread != IntPtr.Zero) Native.SetThreadContext(hThread, ref _evalSavedCtx);
+            if (_evalHadRearm) { _rearm[tid] = _evalSavedRearm; _evalHadRearm = false; }
+
+            if (instanceVa != 0)
+                EmitWatchValue(_evalName, _evalTemplateVa, instanceVa, true, _evalTypeCode, _evalSize);
+            else
+                EmitError($"watch {_evalName}: THR$GetInstance eval failed");
+
+            // we are logically still paused at the original location — resume the command loop
+            PausedWait(tid, hThread, ref _evalSavedCtx, true, "watch");
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return Native.DBG_CONTINUE;
+        }
+
+        /// <summary>Read and report a watch value (instanceVa = templateVa for non-threaded data).</summary>
+        private void EmitWatchValue(string name, uint templateVa, uint instanceVa, bool threaded, byte typeCode, uint size)
+        {
+            int len = (int)Math.Min(Math.Max(size, 1), 4096);
+            var buf = new byte[len];
+            int read;
+            Native.ReadProcessMemory(_hProcess, (IntPtr)instanceVa, buf, len, out read);
+            if (read < 0) read = 0;
+            string tn = TswdDebugInfo.TypeCodeName(typeCode);
+            if (EmitJson)
+                Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, buf, read));
+            Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}");
+            for (int row = 0; row < read; row += 16)
+            {
+                int n = Math.Min(16, read - row);
+                var hex = new System.Text.StringBuilder(48);
+                var asc = new System.Text.StringBuilder(16);
+                for (int i = 0; i < n; i++)
+                {
+                    byte v = buf[row + i];
+                    hex.Append(v.ToString("X2")).Append(' ');
+                    asc.Append(v >= 0x20 && v < 0x7F ? (char)v : '.');
+                }
+                Console.WriteLine($"    0x{instanceVa + (uint)row:X8}: {hex.ToString().PadRight(48)} {asc}");
+            }
+        }
+
+        private static Native.CONTEXT_X86 CloneContext(ref Native.CONTEXT_X86 src)
+        {
+            var c = src;   // struct copy — but the two byte[] fields still REFERENCE src's arrays
+            c.FltRegisterArea = (byte[])src.FltRegisterArea.Clone();
+            c.ExtendedRegisters = (byte[])src.ExtendedRegisters.Clone();
+            return c;
+        }
+
+        private void WriteU32(uint va, uint value)
+        {
+            int wrote;
+            Native.WriteProcessMemory(_hProcess, (IntPtr)va, BitConverter.GetBytes(value), 4, out wrote);
         }
 
         /// <summary>mem 0xADDR LEN — read target memory while paused (for the watch pane).</summary>

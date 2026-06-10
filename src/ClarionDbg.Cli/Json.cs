@@ -231,6 +231,29 @@ namespace ClarionDbg.Cli
                  + "}";
         }
 
+        /// <summary>Watch-by-name value: instanceVa is the live (per-thread when threaded) address
+        /// the bytes were read from; va is the link-time template address.</summary>
+        public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
+                                   byte typeCode, string typeName, uint size, byte[] bytes, int read)
+        {
+            if (!found)
+                return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false}";
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
+              .Append(",\"found\":true")
+              .Append(",\"templateVa\":\"0x").Append(templateVa.ToString("X")).Append('"')
+              .Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
+              .Append(",\"threaded\":").Append(threaded ? "true" : "false")
+              .Append(",\"type\":\"0x").Append(typeCode.ToString("X2")).Append('"')
+              .Append(",\"typeName\":").Append(Str(typeName))
+              .Append(",\"size\":").Append(size)
+              .Append(",\"read\":").Append(read)
+              .Append(",\"bytes\":\"");
+            for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));
+            sb.Append("\"}");
+            return sb.ToString();
+        }
+
         public static string Error(string message)
         {
             return "{\"event\":\"error\",\"message\":" + Str(message) + "}";
