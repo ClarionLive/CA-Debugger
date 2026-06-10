@@ -54,4 +54,4 @@ clean WebView2 front-end.
 ### Install
 
 Download `CA-Debugger-1.0.1-Setup.exe` from the release assets and run it (close
-the Clarion IDE first). See the [User Guide](docs/user-guide.md) for usage.
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.

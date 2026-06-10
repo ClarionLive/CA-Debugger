@@ -86,7 +86,8 @@ Both appear to be the same tractable TSWD structure — see `docs/TSWD-format.md
 
 ## Documentation
 
-- **[User Guide](docs/user-guide.md)** — installing, opening the pad, setting
+- **[User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html)**
+  ([source](docs/user-guide.html)) — installing, opening the pad, setting
   breakpoints, watches, shortcuts, theming, and troubleshooting.
 - [Feasibility investigation](docs/feasibility-investigation.md) — the spike that
   proved this was buildable.

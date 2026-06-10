@@ -111,14 +111,14 @@ Source: "{#SrcEngine}\ClarionDbg.pdb"; DestDir: "{code:GetC10Path}\accessory\add
 Source: "{#SrcEngine}\ClarionDbg.Core.pdb"; DestDir: "{code:GetC10Path}\accessory\addins\ClarionDebugger"; Components: clarion10; Flags: ignoreversion
 
 ; --- User Guide (shared) ---
-Source: "{#SrcDocs}\user-guide.md"; DestDir: "{app}"; Components: docs; Flags: ignoreversion
+Source: "{#SrcDocs}\user-guide.html"; DestDir: "{app}"; Components: docs; Flags: ignoreversion
 
 ; ============================================================
 ; POST-INSTALL
 ; ============================================================
 
 [Run]
-Filename: "{app}\user-guide.md"; \
+Filename: "{app}\user-guide.html"; \
   Description: "View the User Guide"; \
   Components: docs; \
   Flags: nowait postinstall skipifsilent shellexec unchecked

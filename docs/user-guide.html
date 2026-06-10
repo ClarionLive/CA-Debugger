@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CA Debugger — User Guide</title>
+<style>
+  :root{
+    --bg:#f6f8fa; --card:#ffffff; --ink:#1f2328; --muted:#57606a; --line:#d8dee4;
+    --blue:#0b5cad; --blue-dark:#0a4a8c; --accent:#0969da; --code-bg:#f0f3f6;
+    --head:#1e2530; --head-ink:#e8edf3; --warn:#9a6700; --warn-bg:#fff8e6;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  code,kbd,pre{font-family:"Cascadia Code",Consolas,"SF Mono",Menlo,monospace;}
+  .wrap{max-width:920px;margin:0 auto;padding:0 22px 80px;}
+  header.hero{background:linear-gradient(135deg,#1e2530,#0b3a63);color:var(--head-ink);
+    padding:38px 0 30px;margin-bottom:8px;border-bottom:3px solid var(--blue);}
+  header.hero .wrap{padding-top:0;padding-bottom:0;}
+  header.hero h1{margin:0;font-size:30px;letter-spacing:.2px;}
+  header.hero p{margin:8px 0 0;color:#b9c6d6;font-size:16px;max-width:680px;}
+  .badge{display:inline-block;margin-top:14px;padding:3px 11px;border:1px solid #2f6da3;
+    border-radius:20px;font-size:13px;color:#cfe3f7;background:#11314f;}
+  .tip{background:#eaf3fb;border:1px solid #bcd9f3;border-left:4px solid var(--accent);
+    border-radius:6px;padding:12px 16px;margin:18px 0;font-size:15px;}
+  .warn{background:var(--warn-bg);border:1px solid #f0d68a;border-left:4px solid var(--warn);
+    border-radius:6px;padding:12px 16px;margin:18px 0;font-size:15px;color:#6b4e00;}
+  h2{margin:38px 0 12px;padding-bottom:7px;border-bottom:2px solid var(--line);font-size:23px;}
+  h3{margin:26px 0 8px;font-size:18px;color:var(--head);}
+  p{margin:10px 0;}
+  a{color:var(--accent);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  ul,ol{padding-left:24px;}
+  li{margin:5px 0;}
+  kbd{display:inline-block;background:#fff;border:1px solid #ccd1d6;border-bottom-width:2px;
+    border-radius:5px;padding:1px 7px;font-size:13px;color:#24292f;box-shadow:0 1px 0 #00000010;white-space:nowrap;}
+  code{background:var(--code-bg);padding:2px 6px;border-radius:5px;font-size:14px;color:#0a3d62;}
+  pre{background:var(--head);color:#dbe4ee;padding:16px 18px;border-radius:8px;overflow:auto;
+    font-size:13px;line-height:1.5;}
+  pre code{background:none;color:inherit;padding:0;}
+  table{border-collapse:collapse;width:100%;margin:16px 0;background:var(--card);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:15px;}
+  th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{background:#eef2f6;font-weight:600;}
+  tr:last-child td{border-bottom:none;}
+  td code{white-space:nowrap;}
+  .toc{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 20px;margin:22px 0;}
+  .toc strong{display:block;margin-bottom:6px;color:var(--muted);font-size:13px;
+    text-transform:uppercase;letter-spacing:.6px;}
+  .toc ul{columns:2;column-gap:30px;margin:0;padding-left:18px;}
+  footer{margin-top:50px;padding-top:18px;border-top:1px solid var(--line);
+    color:var(--muted);font-size:14px;}
+  .pill{display:inline-block;min-width:18px;height:18px;border-radius:50%;background:#888;
+    vertical-align:middle;margin-right:4px;}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1>CA Debugger</h1>
+    <p>A modern, source-level debugger for the Clarion IDE — breakpoints in the editor gutter,
+       single-stepping, a real call stack with procedure names, and watch-by-name over your
+       file buffers and globals.</p>
+    <span class="badge">User Guide · v1.0.1</span>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="tip">
+    <strong>At a glance:</strong> open the pad with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd>,
+    pick (or auto-resolve) your Target EXE, set breakpoints in the editor gutter, and press
+    <strong>Start</strong>.
+  </div>
+
+  <div class="toc">
+    <strong>Contents</strong>
+    <ul>
+      <li><a href="#requirements">Requirements</a></li>
+      <li><a href="#installing">Installing</a></li>
+      <li><a href="#opening">Opening the pad</a></li>
+      <li><a href="#window">The window</a></li>
+      <li><a href="#breakpoints">Setting breakpoints</a></li>
+      <li><a href="#inspecting">Inspecting state</a></li>
+      <li><a href="#shortcuts">Keyboard shortcuts</a></li>
+      <li><a href="#theme">Light / dark theme</a></li>
+      <li><a href="#trouble">Troubleshooting</a></li>
+      <li><a href="#how">How it works</a></li>
+    </ul>
+  </div>
+
+  <h2 id="requirements">Requirements</h2>
+  <ul>
+    <li><strong>Clarion 10, 11, or 12</strong> (32-bit — Clarion has no 64-bit compiler).</li>
+    <li>The target application must be <strong>compiled with Full debug information</strong>. This
+      embeds the Clarion <code>TSWD</code> debug symbols the engine reads. Without them you'll see an
+      error like <em>"…was the EXE built with Full debug info?"</em>
+      <ul><li>In Clarion: <strong>Project → Properties → Debug</strong> (or the build configuration) →
+        set debug info to <strong>Full</strong>, then rebuild.</li></ul>
+    </li>
+    <li><strong>Microsoft Edge WebView2 Runtime</strong> — the debugger pad UI runs in WebView2.
+      Most current Windows machines already have it; if not, the installer warns you and you can get it
+      from <a href="https://developer.microsoft.com/en-us/microsoft-edge/webview2/">Microsoft</a>.</li>
+  </ul>
+
+  <h2 id="installing">Installing</h2>
+  <h3>From the installer (recommended)</h3>
+  <ol>
+    <li>Download the latest <code>CA-Debugger-&lt;version&gt;-Setup.exe</code> from the
+      <a href="https://github.com/ClarionLive/CA-Debugger/releases">Releases page</a>.</li>
+    <li>Close the Clarion IDE.</li>
+    <li>Run the installer. It auto-detects your installed Clarion versions — tick the one(s) you want
+      to install into.</li>
+    <li>Start Clarion. A <strong>CA Debugger</strong> entry appears under the <strong>Tools</strong> menu.</li>
+  </ol>
+
+  <h3>From source (developers)</h3>
+  <pre><code>.\deploy-addin.ps1 -Version 12      # or 11, 10, or all</code></pre>
+  <p>This builds the engine + addin and copies the payload into the matching Clarion install. Use
+    <code>-Kill</code> to stop a running IDE first, <code>-NoBuild</code> to deploy without rebuilding.</p>
+
+  <h2 id="opening">Opening the debugger pad</h2>
+  <ul>
+    <li>Press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd>, or</li>
+    <li>Use the menu: <strong>Tools → CA Debugger</strong>.</li>
+  </ul>
+  <p>The pad docks like any other IDE tool window. It coexists with Clarion's built-in debugger —
+    you can use either.</p>
+
+  <h2 id="window">The window</h2>
+  <pre>
+┌───────────────────────────────────────────────────────────────┐
+│ TARGET EXE  [ C:\...\MyApp.exe                    ]  [Browse…] │
+├───────────────────────────────────────────────────────────────┤
+│ ▶Start ▶Continue ⤼Step Over ⤓Step Into ⤒Step Out ■Stop ● idle ⚙◑│
+├───────────────────────────────────────────────────────────────┤
+│  Status line — where execution is paused                      │
+├──────────────────────────┬────────────────────────────────────┤
+│ VARIABLES                │  Source view (current line)         │
+│   Tables (file buffers)  │                                     │
+│   Global Variables       │                                     │
+│ WATCH                    │                                     │
+│ CALL STACK               │                                     │
+│ BREAKPOINTS              ├────────────────────────────────────┤
+│ REGISTERS                │  DEBUG CONSOLE                      │
+└──────────────────────────┴────────────────────────────────────┘</pre>
+
+  <h3>Target EXE</h3>
+  <ul>
+    <li>The field <strong>auto-resolves</strong> from the active IDE project (it reads the project's
+      output type/name), so usually it's already filled in.</li>
+    <li>Otherwise click <strong>Browse…</strong> and pick the <code>.exe</code> (built with Full debug info).</li>
+  </ul>
+
+  <h3>Toolbar &amp; run states</h3>
+  <table>
+    <tr><th>Button</th><th>Action</th></tr>
+    <tr><td><strong>Start</strong></td><td>Launch the target EXE and begin a debug session</td></tr>
+    <tr><td><strong>Continue</strong></td><td>Resume until the next breakpoint or exception</td></tr>
+    <tr><td><strong>Step Over</strong></td><td>Execute the current line, stepping over procedure calls</td></tr>
+    <tr><td><strong>Step Into</strong></td><td>Execute the current line, stepping into a procedure call</td></tr>
+    <tr><td><strong>Step Out</strong></td><td>Run until the current procedure returns to its caller</td></tr>
+    <tr><td><strong>Stop</strong></td><td>Terminate the debug session and the target process</td></tr>
+  </table>
+  <p>The status dot shows <span class="pill" style="background:#888"></span><strong>idle</strong>,
+    <strong>launching…</strong>, <span class="pill" style="background:#4ec9b0"></span><strong>running</strong>,
+    or <span class="pill" style="background:#e2b341"></span><strong>paused</strong>. Buttons enable/disable
+    to match the state (stepping is only available while paused).</p>
+
+  <h2 id="breakpoints">Setting breakpoints</h2>
+  <p>Set breakpoints the normal Clarion way — <strong>click the editor gutter</strong> next to a source
+    line in a generated <code>.clw</code>. CA Debugger listens for gutter changes and lists every
+    breakpoint in the <strong>Breakpoints</strong> pane (<code>file : line</code>). When the debuggee
+    hits one, execution pauses and the source view jumps to and highlights the current line.</p>
+
+  <h2 id="inspecting">Inspecting state (while paused)</h2>
+
+  <h3>Variables</h3>
+  <ul>
+    <li><strong>Tables</strong> — your file record buffers (the <code>FILE$PREFIX:RECORD</code> groups).
+      Expand a record to see its fields.</li>
+    <li><strong>Global Variables</strong> — module/global scalars and groups.</li>
+  </ul>
+  <p>Values resolve live while a node is visible (the section is open, and for fields, the parent record
+    is expanded too). Collapsing a section stops watching its members, keeping the session light.</p>
+
+  <h3>Watch</h3>
+  <p>Watch any variable by name — four ways:</p>
+  <ol>
+    <li><strong>Type a name</strong> in the <em>Add watch</em> box (with type-ahead suggestions) and
+      press Enter — e.g. <code>JOB:JOB_DESC</code>.</li>
+    <li>Click the <strong>☆</strong> star that appears when you hover a field in the Variables tree.</li>
+    <li><strong>Right-click</strong> one or more selected rows in the Variables tree → <em>Add to Watch</em>
+      (<kbd>Ctrl</kbd>-click / <kbd>Shift</kbd>-click to multi-select).</li>
+    <li>From a <strong>hover data-tip</strong> (below), click the star to pin it.</li>
+  </ol>
+  <p>Click a watch row's <strong>▸</strong> chevron to expand a long/clipped value;
+    <strong>✕</strong> removes it.</p>
+
+  <h3>Call Stack</h3>
+  <p>Shows the paused frames with procedure name and <code>module : line</code>. Click a frame to jump
+    the source view to that location.</p>
+
+  <h3>Registers</h3>
+  <p>x86 register values (EIP, ESP, EBP, EAX, …) shown when paused.</p>
+
+  <h3>Hover data-tips</h3>
+  <p>Hover a known variable name <strong>in the source view</strong> (or in a panel row) to get a pop-up
+    showing its name, type, and current value. From the tip you can <strong>pin it to Watch</strong> (★)
+    or <strong>copy the value</strong> (⧉).</p>
+
+  <h3>Debug Console</h3>
+  <p>A running log of session events — breakpoint hits, pauses, commands, and errors.</p>
+
+  <h2 id="shortcuts">Keyboard shortcuts</h2>
+  <div class="warn">
+    Debug commands ship <strong>unbound by default</strong>. The Clarion IDE claims
+    <kbd>F5</kbd> / <kbd>F10</kbd> / <kbd>F11</kbd> before they reach the pad, so you choose your own
+    combinations.
+  </div>
+  <ol>
+    <li>Click the <strong>gear (⚙)</strong> icon → <strong>Settings</strong>.</li>
+    <li>Under <strong>Keyboard Shortcuts</strong>, click <strong>Rebind</strong> next to a command.</li>
+    <li>Press a key combination the IDE doesn't use (e.g. <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>S</kbd>
+      for Start). <strong>Clear</strong> removes a binding.</li>
+  </ol>
+  <p>Bindings persist locally (per machine/user). Shortcuts fire only when the pad has focus and the
+    relevant button is enabled.</p>
+
+  <h2 id="theme">Light / dark theme</h2>
+  <p>Click the <strong>◑</strong> (half-circle) toolbar button to toggle between light and dark. Your
+    choice is remembered. Identifiers, the primary button, and the Target-EXE label are tuned for
+    readable contrast in both themes.</p>
+
+  <h2 id="trouble">Troubleshooting</h2>
+  <table>
+    <tr><th>Symptom</th><th>Fix</th></tr>
+    <tr><td><em>"…built with Full debug info?"</em> on Start</td>
+        <td>Rebuild the target with <strong>Full</strong> debug information (not partial/none).</td></tr>
+    <tr><td><kbd>F5</kbd> / <kbd>F10</kbd> / <kbd>F11</kbd> do nothing</td>
+        <td>Expected — the IDE owns those keys. Bind your own shortcuts in <strong>Settings (⚙)</strong>.</td></tr>
+    <tr><td>Target EXE field is blank</td>
+        <td>Open/activate the project, or pick the EXE with <strong>Browse…</strong>.</td></tr>
+    <tr><td>No source shown on a hit</td>
+        <td>The generated <code>.clw</code> is resolved via the project's <code>.red</code> redirect;
+            make sure the source still exists where the redirect points.</td></tr>
+    <tr><td>Stale theme colors after an update</td>
+        <td>Reopen the pad (the WebView may have cached the previous HTML).</td></tr>
+    <tr><td>Pad won't open</td>
+        <td>Confirm the addin is installed under
+            <code>&lt;ClarionRoot&gt;\accessory\addins\ClarionDebugger\</code> and restart the IDE.</td></tr>
+  </table>
+
+  <h2 id="how">How it works (short version)</h2>
+  <p>The native Clarion engine (<code>Cladbrun.dll</code>) is a sealed GUI box and can't be driven
+    headlessly, so CA Debugger ships its <strong>own</strong> Win32 debug engine
+    (<code>CreateProcess(DEBUG_ONLY_THIS_PROCESS)</code> + <code>WaitForDebugEvent</code>, INT3
+    breakpoints, thread context). It decodes Clarion's <strong>TSWD</strong> debug-symbol format
+    embedded in the EXE to map source lines ↔ addresses and to locate and format variables. The IDE
+    provides the gutter, jump-to-line, and hover plumbing; the pad provides the modern WebView2 UI.</p>
+
+  <footer>
+    CA Debugger · © 2026 ClarionLive · Released under the MIT License ·
+    <a href="https://github.com/ClarionLive/CA-Debugger">github.com/ClarionLive/CA-Debugger</a>
+  </footer>
+
+</div>
+</body>
+</html>
