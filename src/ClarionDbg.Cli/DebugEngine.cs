@@ -27,14 +27,16 @@ namespace ClarionDbg.Cli
         public int Line;
     }
 
-    /// <summary>One logical user breakpoint: a module:line bound to its code RVAs.</summary>
+    /// <summary>One logical user breakpoint: a module:line bound to its code RVAs in the owning image.</summary>
     internal sealed class UserBreakpoint
     {
-        public string Module;          // canonical module name (e.g. clbrws011.clw)
-        public int ModuleIdx;
+        public string Module;          // canonical compiland name (e.g. clbrws011.clw)
+        public int ModuleIdx;          // index within Owner.Dbg (valid once Owner is set)
+        public LoadedModule Owner;     // the mapped/known image whose TSWD carries this compiland; null = pending
         public int RequestedLine;      // the line the user asked for
         public int Line;               // the line actually planted (snapped to nearest record line)
-        public readonly List<uint> Rvas = new List<uint>();
+        public readonly List<uint> Rvas = new List<uint>();   // code RVAs within Owner
+        public bool Pending { get { return Owner == null; } } // owning image not yet loaded/resolved
     }
 
     /// <summary>
@@ -61,8 +63,7 @@ namespace ClarionDbg.Cli
         private const uint ESP_SLACK = 0x10;         // frame-depth slack for step-over stop checks
         private const uint OUT_GAP_MAX = 0x200;      // step-out: max gap for "this looks like the call statement"
 
-        private readonly string _exe;
-        private readonly TswdDebugInfo _dbg;
+        private readonly string _exePath;
         private readonly bool _once;
         private readonly int _waitMs;
         private readonly bool _interactive;
@@ -72,9 +73,13 @@ namespace ClarionDbg.Cli
         /// <summary>When true, emit one machine-readable JSON object per event (for the IDE addin).</summary>
         public bool EmitJson;
 
+        // The module table: the EXE (module 0) plus every loaded DLL. Pre-launch, the EXE and any
+        // solution DLLs are present with LoadBase==0 (not yet mapped) so breakpoints resolve against
+        // their TSWD before launch; the live base is filled in at CREATE_PROCESS / LOAD_DLL.
+        private readonly List<LoadedModule> _modules = new List<LoadedModule>();
+        private LoadedModule _exe;           // module 0 — the launched image
+
         private IntPtr _hProcess = IntPtr.Zero;
-        private uint _imageBase;             // PE preferred base — log/reporting only; never used in live VA math
-        private uint _loadBase;              // actual load base from CREATE_PROCESS event — ALL live VA math uses this
         private bool _seenInitialBreak;
         public int Hits { get; private set; }
 
@@ -96,8 +101,6 @@ namespace ClarionDbg.Cli
         // EBX=.cwtls base) and trap the return at an unmapped magic address. The paused thread IS
         // the thread whose instance the user wants — per-thread data resolves correctly by design.
         private const uint EVAL_TRAP_VA = 0x7FFF1000;   // never valid in 32-bit user space
-        private uint _cwtlsLo, _cwtlsHi;                // .cwtls RVA range (0,0 = no threaded support)
-        private uint _thrGetInstanceIatRva;             // IAT slot of ClaRUN.dll!THR$GetInstance
         private bool _evalActive;
         private uint _evalTid;
         private Native.CONTEXT_X86 _evalSavedCtx;
@@ -109,19 +112,13 @@ namespace ClarionDbg.Cli
         private byte _evalTypeCode;
         private uint _evalTemplateVa;
 
-        /// <summary>Enable threaded-data resolution (call before Run). cwtls = the .cwtls section
-        /// RVA range; iatSlotRva = the IAT slot of ClaRUN.dll!THR$GetInstance.</summary>
-        public void SetThreadEvalInfo(uint cwtlsLo, uint cwtlsHi, uint iatSlotRva)
-        {
-            _cwtlsLo = cwtlsLo; _cwtlsHi = cwtlsHi; _thrGetInstanceIatRva = iatSlotRva;
-        }
-
         // source-level stepping state
         private StepMode _mode = StepMode.None;
         private uint _stepTid;
         private uint _startEsp;       // ESP at step start (stack grows down: larger = shallower)
         private int _startLine;
         private int _startModIdx;
+        private LoadedModule _startModule;   // owning image at step start (moduleIdx is only comparable within it)
         private uint _prevVa;         // EIP at the previous single-step trap (for call-entry detection)
         private int _stepCount;
         private bool _skipRunning;    // running full-speed to a call-skip temp BP; TF off
@@ -129,13 +126,100 @@ namespace ClarionDbg.Cli
 
         private readonly ConcurrentQueue<string> _cmds = new ConcurrentQueue<string>();
 
-        public DebugEngine(string exe, TswdDebugInfo dbg, uint imageBase, List<uint> rawRvas,
-                           List<BpSpec> specs, bool once, int waitMs, bool interactive)
+        public DebugEngine(string exe, PeImage exePe, TswdDebugInfo exeDbg, List<uint> rawRvas,
+                           List<BpSpec> specs, bool once, int waitMs, bool interactive,
+                           IEnumerable<string> solutionDlls = null)
         {
-            _exe = exe; _dbg = dbg; _imageBase = imageBase;
+            _exePath = exe;
             _rawRvas = rawRvas ?? new List<uint>();
             _initialSpecs = specs ?? new List<BpSpec>();
             _once = once; _waitMs = waitMs; _interactive = interactive;
+
+            // Seed the module table with the EXE (module 0) and any solution DLLs the host named, so
+            // breakpoints resolve against their TSWD before launch. LoadBase stays 0 until mapped.
+            _exe = RegisterImageFromPe(exe, exePe, exeDbg);
+            if (solutionDlls != null)
+                foreach (var dll in solutionDlls)
+                    TryPreloadSolutionDll(dll);
+        }
+
+        // ------------------------------------------------------------------ module table
+
+        /// <summary>Add a module entry from an already-parsed PE/TSWD (the EXE, or a pre-loaded
+        /// solution DLL). LoadBase is filled in later when the image maps.</summary>
+        private LoadedModule RegisterImageFromPe(string path, PeImage pe, TswdDebugInfo dbg)
+        {
+            var m = new LoadedModule
+            {
+                Path = path,
+                Name = (System.IO.Path.GetFileName(path) ?? path).ToLowerInvariant(),
+                Pe = pe,
+                Dbg = dbg,
+                Size = pe != null ? pe.SizeOfImage : 0,
+            };
+            m.ResolveThreadedInfo();
+            _modules.Add(m);
+            return m;
+        }
+
+        /// <summary>Pre-parse a solution DLL off disk so its breakpoints resolve before launch.
+        /// Failures are non-fatal (the DLL may be rebuilt/absent); it will re-parse at LOAD_DLL.</summary>
+        private void TryPreloadSolutionDll(string path)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return;
+                string name = System.IO.Path.GetFileName(path).ToLowerInvariant();
+                foreach (var m in _modules) if (m.Name == name) return; // already known
+                var pe = PeImage.Load(path);
+                var dbg = TswdDebugInfo.TryFromPe(pe);
+                RegisterImageFromPe(path, pe, dbg);
+            }
+            catch { /* best-effort pre-load */ }
+        }
+
+        /// <summary>The mapped module whose [LoadBase, LoadBase+Size) contains <paramref name="va"/>,
+        /// or null. Only mapped modules (LoadBase != 0) are candidates.</summary>
+        private LoadedModule ModuleAt(uint va)
+        {
+            foreach (var m in _modules)
+                if (m.LoadBase != 0 && m.ContainsVa(va)) return m;
+            return null;
+        }
+
+        /// <summary>The mapped, debuggable module that owns a TSWD compiland by name (e.g. clbrws011.clw),
+        /// or null when no loaded image carries it yet (deferred breakpoint).</summary>
+        private LoadedModule OwnerOfModule(string clwName)
+        {
+            foreach (var m in _modules)
+                if (m.HasDebug && m.Dbg.FindModuleIdx(clwName) >= 0) return m;
+            return null;
+        }
+
+        /// <summary>Resolve a live VA to its owning module + source line via that image's TSWD.
+        /// Returns false when no mapped module owns it or the owner carries no debug info.</summary>
+        private bool ResolveVa(uint va, out LoadedModule m, out int line, out int moduleIdx, out uint recRva)
+        {
+            line = 0; moduleIdx = -1; recRva = 0;
+            m = ModuleAt(va);
+            if (m == null || m.Dbg == null) return false;
+            return m.Dbg.ResolveAddr(va - m.LoadBase, out line, out moduleIdx, out recRva);
+        }
+
+        /// <summary>Resolve a data name (global / record buffer / field) across all debuggable images,
+        /// preferring the EXE. Returns the owning image so the caller can form a live VA + threaded
+        /// eval against the right .cwtls/THR$GetInstance.</summary>
+        private bool ResolveDataAcrossModules(string name, out LoadedModule owner, out TswdDebugInfo.DataLocation loc)
+        {
+            loc = default(TswdDebugInfo.DataLocation);
+            owner = null;
+            if (_exe != null && _exe.Dbg != null && _exe.Dbg.ResolveDataName(name, out loc)) { owner = _exe; return true; }
+            foreach (var m in _modules)
+            {
+                if (m == _exe || m.Dbg == null) continue;
+                if (m.Dbg.ResolveDataName(name, out loc)) { owner = m; return true; }
+            }
+            return false;
         }
 
         public int Run()
@@ -157,13 +241,13 @@ namespace ClarionDbg.Cli
             si.cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf(si);
             Native.PROCESS_INFORMATION pi;
 
-            string workDir = Path.GetDirectoryName(Path.GetFullPath(_exe));
-            bool ok = Native.CreateProcess(_exe, null, IntPtr.Zero, IntPtr.Zero, false,
+            string workDir = Path.GetDirectoryName(Path.GetFullPath(_exePath));
+            bool ok = Native.CreateProcess(_exePath, null, IntPtr.Zero, IntPtr.Zero, false,
                 Native.DEBUG_ONLY_THIS_PROCESS, IntPtr.Zero, workDir, ref si, out pi);
             if (!ok)
                 throw new InvalidOperationException("CreateProcess failed, win32 error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-            Console.WriteLine($"launched {Path.GetFileName(_exe)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
+            Console.WriteLine($"launched {Path.GetFileName(_exePath)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
             _hProcess = pi.hProcess;
 
             var buf = new byte[1024];
@@ -199,10 +283,25 @@ namespace ClarionDbg.Cli
                 {
                     case Native.CREATE_PROCESS_DEBUG_EVENT:
                         // union @+12: hFile(+12) hProcess(+16) hThread(+20) lpBaseOfImage(+24)
-                        _loadBase = U32(buf, 24);
+                        _exe.LoadBase = U32(buf, 24);
                         PlantAll();
-                        Console.WriteLine($"process created: loadBase=0x{_loadBase:X} (preferred 0x{_imageBase:X}){(_loadBase != _imageBase ? "  [relocated]" : "")}");
-                        if (EmitJson) Console.WriteLine("@JSON " + Json.Loaded(pi.dwProcessId, _loadBase));
+                        uint preferred = _exe.Pe != null ? _exe.Pe.ImageBase : 0;
+                        Console.WriteLine($"process created: loadBase=0x{_exe.LoadBase:X} (preferred 0x{preferred:X}){(_exe.LoadBase != preferred ? "  [relocated]" : "")}");
+                        if (EmitJson)
+                        {
+                            Console.WriteLine("@JSON " + Json.Loaded(pi.dwProcessId, _exe.LoadBase));
+                            Console.WriteLine("@JSON " + Json.ModuleLoaded(_exe));
+                        }
+                        break;
+
+                    case Native.LOAD_DLL_DEBUG_EVENT:
+                        // union @+12: hFile(+12) lpBaseOfDll(+16) ...
+                        OnDllLoaded(U32(buf, 12), U32(buf, 16));
+                        break;
+
+                    case Native.UNLOAD_DLL_DEBUG_EVENT:
+                        // union @+12: lpBaseOfDll(+12)
+                        OnDllUnloaded(U32(buf, 12));
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -246,7 +345,7 @@ namespace ClarionDbg.Cli
                         running = false;
                         break;
 
-                    // CREATE_THREAD / EXIT_THREAD / LOAD_DLL / UNLOAD_DLL / OUTPUT_DEBUG_STRING / RIP: just continue
+                    // CREATE_THREAD / EXIT_THREAD / OUTPUT_DEBUG_STRING / RIP: just continue
                     default:
                         status = Native.DBG_CONTINUE;
                         break;
@@ -263,24 +362,34 @@ namespace ClarionDbg.Cli
 
         // ------------------------------------------------------------------ breakpoint management
 
-        /// <summary>Resolve module:line to RVAs (snapping to the nearest record line) and register it.</summary>
+        /// <summary>Resolve module:line to RVAs (snapping to the nearest record line) and register it.
+        /// If the owning image is not yet loaded, the breakpoint is held PENDING and resolved when that
+        /// image maps (see <see cref="ResolvePendingFor"/>).</summary>
         private void AddBreakpoint(string module, int line)
         {
-            int mi = _dbg.FindModuleIdx(module);
-            if (mi < 0)
+            var owner = OwnerOfModule(module);
+            if (owner == null)
             {
-                Console.WriteLine($"bp: unknown module {module}");
-                if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(module, line, "unknown module"));
+                // No loaded/known image carries this compiland yet — defer. Arms when its DLL loads.
+                foreach (var b in _bps)
+                    if (Eq(b.Module, module) && (b.RequestedLine == line || b.Line == line)) return; // dup
+                var pend = new UserBreakpoint { Module = module, ModuleIdx = -1, RequestedLine = line, Line = line };
+                _bps.Add(pend);
+                Console.WriteLine($"bp: {module}:{line} pending — owning image not loaded yet");
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(module, line, line, pend.Rvas));
                 return;
             }
-            string canon = _dbg.ModuleNameForIdx(mi) ?? module;
+
+            var dbg = owner.Dbg;
+            int mi = dbg.FindModuleIdx(module);
+            string canon = dbg.ModuleNameForIdx(mi) ?? module;
             int planted = line;
-            var rvas = _dbg.LineToRvasInModuleIdx(mi, line);
+            var rvas = dbg.LineToRvasInModuleIdx(mi, line);
             if (rvas.Count == 0)
             {
                 // Clarion's line table is sparse — snap to the nearest line that has a record
-                int snapped = NearestIn(_dbg.BreakableLinesInModuleIdx(mi), line);
-                if (snapped > 0) { planted = snapped; rvas = _dbg.LineToRvasInModuleIdx(mi, snapped); }
+                int snapped = NearestIn(dbg.BreakableLinesInModuleIdx(mi), line);
+                if (snapped > 0) { planted = snapped; rvas = dbg.LineToRvasInModuleIdx(mi, snapped); }
             }
             if (rvas.Count == 0)
             {
@@ -290,56 +399,59 @@ namespace ClarionDbg.Cli
             }
             // adding an existing planted line is a no-op (re-confirm so the UI can sync)
             foreach (var b in _bps)
-                if (b.ModuleIdx == mi && b.Line == planted)
+                if (b.Owner == owner && b.ModuleIdx == mi && b.Line == planted)
                 {
                     if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(b.Module, line, b.Line, b.Rvas));
                     return;
                 }
 
-            var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, RequestedLine = line, Line = planted };
+            var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, Owner = owner, RequestedLine = line, Line = planted };
             bp.Rvas.AddRange(rvas);
             _bps.Add(bp);
-            if (_loadBase != 0) PlantBp(bp);
+            if (owner.LoadBase != 0) PlantBp(bp);
             if (planted != line)
                 Console.WriteLine($"bp: line {line} has no code record in {canon}; breakpoint moved to nearest line {planted}");
             Console.WriteLine($"bp: set {canon}:{planted} ({bp.Rvas.Count} address(es))");
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(canon, line, planted, bp.Rvas));
         }
 
-        /// <summary>Register a raw RVA (legacy --rva/--entry) as an anonymous breakpoint.</summary>
+        /// <summary>Register a raw RVA (legacy --rva/--entry) as an anonymous EXE breakpoint.</summary>
         private void AddRawBreakpoint(uint rva)
         {
-            int line; int mi; uint recRva;
-            bool resolved = _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            int line = 0, mi = -1; uint recRva;
+            bool resolved = _exe.Dbg != null && _exe.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
             var bp = new UserBreakpoint
             {
-                Module = resolved ? _dbg.ModuleNameForIdx(mi) : null,
+                Module = resolved ? _exe.Dbg.ModuleNameForIdx(mi) : null,
                 ModuleIdx = resolved ? mi : -1,
+                Owner = _exe,
                 RequestedLine = resolved ? line : 0,
                 Line = resolved ? line : 0
             };
             bp.Rvas.Add(rva);
             _bps.Add(bp);
-            if (_loadBase != 0) PlantBp(bp);
+            if (_exe.LoadBase != 0) PlantBp(bp);
         }
+
+        private static bool Eq(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
 
         private void RemoveBreakpoint(string module, int line)
         {
-            int mi = _dbg.FindModuleIdx(module);
-            string canon = mi >= 0 ? (_dbg.ModuleNameForIdx(mi) ?? module) : module;
             UserBreakpoint found = null;
             foreach (var b in _bps)
-                if (b.ModuleIdx == mi && (b.Line == line || b.RequestedLine == line)) { found = b; break; }
+                if (Eq(b.Module, module) && (b.Line == line || b.RequestedLine == line)) { found = b; break; }
+            string canon = found != null ? found.Module : module;
             if (found == null)
             {
                 if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no such breakpoint"));
                 return;
             }
+            uint baseVa = found.Owner != null ? found.Owner.LoadBase : 0;
             foreach (var rva in found.Rvas)
             {
-                uint va = _loadBase + rva;
+                uint va = baseVa + rva;
                 byte orig;
-                if (_loadBase != 0 && _armed.TryGetValue(va, out orig))
+                if (baseVa != 0 && _armed.TryGetValue(va, out orig))
                 {
                     // if a thread restored this byte and its re-plant is still pending, cancel the
                     // re-plant instead of writing (the byte is already the original)
@@ -356,16 +468,117 @@ namespace ClarionDbg.Cli
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
         }
 
+        /// <summary>Plant every breakpoint whose owning image is mapped (LoadBase set).</summary>
+        /// <summary>A DLL mapped into the target. Resolve its path (via the file handle), parse its
+        /// TSWD off disk (or reuse a pre-loaded solution entry), set its live base, and arm any
+        /// breakpoints it owns. Tier 3 (no TSWD) is still registered for correct VA attribution.</summary>
+        private void OnDllLoaded(uint hFile, uint baseVa)
+        {
+            try
+            {
+                string path = GetPathFromHandle(hFile);
+                string name = !string.IsNullOrEmpty(path)
+                    ? System.IO.Path.GetFileName(path).ToLowerInvariant()
+                    : $"(0x{baseVa:x})";
+
+                // reuse a pre-loaded solution DLL entry (already has Pe/Dbg parsed) if names match
+                LoadedModule m = null;
+                foreach (var im in _modules)
+                    if (im.LoadBase == 0 && im.Name == name) { m = im; break; }
+
+                if (m != null)
+                {
+                    m.LoadBase = baseVa;
+                    if (m.Path == null && path != null) m.Path = path;
+                }
+                else
+                {
+                    PeImage pe = null; TswdDebugInfo dbg = null;
+                    if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+                    {
+                        try { pe = PeImage.Load(path); dbg = TswdDebugInfo.TryFromPe(pe); } catch { pe = null; dbg = null; }
+                    }
+                    m = new LoadedModule { Path = path, Name = name, Pe = pe, Dbg = dbg };
+                    m.ResolveThreadedInfo();
+                    m.Size = pe != null ? pe.SizeOfImage : ReadRemoteSizeOfImage(baseVa);
+                    m.LoadBase = baseVa;
+                    _modules.Add(m);
+                }
+                if (m.Size == 0) m.Size = ReadRemoteSizeOfImage(baseVa);
+
+                PlantOwnBps(m);          // bps already bound to this image (pre-loaded solution DLL)
+                ResolvePendingFor(m);    // pending bps whose compiland this image carries
+                if (EmitJson) Console.WriteLine("@JSON " + Json.ModuleLoaded(m));
+            }
+            finally
+            {
+                CloseHandleValue(hFile);
+            }
+        }
+
+        /// <summary>A DLL unmapped: drop its armed bytes, return its breakpoints to pending, and
+        /// remove it from the table so stale addresses no longer attribute to it.</summary>
+        private void OnDllUnloaded(uint baseVa)
+        {
+            LoadedModule m = null;
+            foreach (var im in _modules) if (im.LoadBase == baseVa && im != _exe) { m = im; break; }
+            if (m == null) return;
+
+            foreach (var bp in _bps)
+            {
+                if (bp.Owner != m) continue;
+                foreach (var rva in bp.Rvas) _armed.Remove(bp.Owner.LoadBase + rva);
+                bp.Owner = null;          // back to pending; re-arms if the DLL reloads
+                bp.ModuleIdx = -1;
+            }
+            if (EmitJson) Console.WriteLine("@JSON " + Json.ModuleUnloaded(m));
+
+            // Keep the pre-loaded solution entry (Pe/Dbg) around but mark it unmapped; drop runtime-only.
+            bool preloaded = m.Pe != null && IsSolutionPreloaded(m);
+            if (preloaded) m.LoadBase = 0;
+            else _modules.Remove(m);
+        }
+
+        private bool IsSolutionPreloaded(LoadedModule m)
+        {
+            // A solution DLL was registered at construction; runtime-discovered DLLs were added later.
+            // We treat any module with parsed Dbg whose path we still hold as reusable on reload.
+            return m.Path != null && System.IO.File.Exists(m.Path);
+        }
+
+        /// <summary>Read SizeOfImage straight from the target's mapped PE header (fallback when the
+        /// DLL path/file is unavailable), so VA attribution still has a valid module span.</summary>
+        private uint ReadRemoteSizeOfImage(uint baseVa)
+        {
+            uint eLfanew = ReadU32(baseVa + 0x3C);
+            if (eLfanew == 0 || eLfanew > 0x1000) return 0x10000; // sane floor if the header looks odd
+            uint optOff = baseVa + eLfanew + 24;
+            uint size = ReadU32(optOff + 56);
+            return size != 0 ? size : 0x10000;
+        }
+
+        /// <summary>Plant breakpoints already bound to this exact image (used when a pre-loaded
+        /// solution DLL finally maps).</summary>
+        private void PlantOwnBps(LoadedModule m)
+        {
+            foreach (var bp in _bps)
+                if (bp.Owner == m && m.LoadBase != 0) PlantBp(bp);
+        }
+
+        /// <summary>Plant every breakpoint whose owning image is mapped (LoadBase set).</summary>
         private void PlantAll()
         {
-            foreach (var bp in _bps) PlantBp(bp);
+            foreach (var bp in _bps)
+                if (bp.Owner != null && bp.Owner.LoadBase != 0) PlantBp(bp);
         }
 
         private void PlantBp(UserBreakpoint bp)
         {
+            if (bp.Owner == null || bp.Owner.LoadBase == 0) return; // pending — owning image not mapped
+            uint baseVa = bp.Owner.LoadBase;
             foreach (var rva in bp.Rvas)
             {
-                uint va = _loadBase + rva;
+                uint va = baseVa + rva;
                 if (_armed.ContainsKey(va)) continue;
                 byte orig;
                 if (!ReadByte(va, out orig))
@@ -375,6 +588,37 @@ namespace ClarionDbg.Cli
                 }
                 WriteByte(va, 0xCC);
                 _armed[va] = orig;
+            }
+        }
+
+        /// <summary>After an image maps, resolve+plant any pending breakpoints whose compiland it owns.</summary>
+        private void ResolvePendingFor(LoadedModule m)
+        {
+            if (m == null || m.Dbg == null) return;
+            foreach (var bp in _bps)
+            {
+                if (!bp.Pending) continue;
+                int mi = m.Dbg.FindModuleIdx(bp.Module);
+                if (mi < 0) continue; // this image doesn't carry that compiland
+
+                int planted = bp.RequestedLine;
+                var rvas = m.Dbg.LineToRvasInModuleIdx(mi, planted);
+                if (rvas.Count == 0)
+                {
+                    int snapped = NearestIn(m.Dbg.BreakableLinesInModuleIdx(mi), planted);
+                    if (snapped > 0) { planted = snapped; rvas = m.Dbg.LineToRvasInModuleIdx(mi, snapped); }
+                }
+                if (rvas.Count == 0) continue;
+
+                bp.Owner = m;
+                bp.ModuleIdx = mi;
+                bp.Module = m.Dbg.ModuleNameForIdx(mi) ?? bp.Module;
+                bp.Line = planted;
+                bp.Rvas.Clear();
+                bp.Rvas.AddRange(rvas);
+                if (m.LoadBase != 0) PlantBp(bp);
+                Console.WriteLine($"bp: armed pending {bp.Module}:{bp.Line} ({bp.Rvas.Count} address(es)) in {m.Name}");
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(bp.Module, bp.RequestedLine, bp.Line, bp.Rvas));
             }
         }
 
@@ -397,7 +641,8 @@ namespace ClarionDbg.Cli
         private uint OnUserBp(uint tid, uint va)
         {
             Hits++;
-            uint rva = va - _loadBase;
+            var m = ModuleAt(va);
+            uint rva = m != null ? va - m.LoadBase : va;
 
             IntPtr hThread = OpenThreadForContext(tid);
             var ctx = NewContext();
@@ -415,7 +660,7 @@ namespace ClarionDbg.Cli
             _rearm[tid] = new Rearm { Va = va, IsTemp = false };
             CancelStep(); // a real BP hit supersedes any in-flight step (drops temp re-arms, not this one)
 
-            ReportHit(rva, va, ref ctx, haveCtx);
+            ReportHit(m, rva, va, ref ctx, haveCtx);
 
             if (_once)
             {
@@ -438,16 +683,16 @@ namespace ClarionDbg.Cli
             return Native.DBG_CONTINUE;
         }
 
-        private void ReportHit(uint rva, uint va, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        private void ReportHit(LoadedModule m, uint rva, uint va, ref Native.CONTEXT_X86 ctx, bool haveCtx)
         {
             Console.WriteLine();
             Console.WriteLine("*** BREAKPOINT HIT ***");
-            Console.WriteLine($"  VA 0x{va:X}  (loadBase 0x{_loadBase:X} + RVA 0x{rva:X})");
+            Console.WriteLine($"  VA 0x{va:X}  (loadBase 0x{(m != null ? m.LoadBase : 0):X} + RVA 0x{rva:X}{(m != null ? " in " + m.Name : "")})");
 
-            int line; int moduleIdx; uint recRva;
-            bool resolved = _dbg.ResolveAddr(rva, out line, out moduleIdx, out recRva);
-            string modName = resolved ? _dbg.ModuleNameForIdx(moduleIdx) : null;
-            string proc = ProcNameAt(rva, resolved ? moduleIdx : -1);
+            int line = 0, moduleIdx = -1; uint recRva = 0;
+            bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out moduleIdx, out recRva);
+            string modName = resolved ? m.Dbg.ModuleNameForIdx(moduleIdx) : null;
+            string proc = ProcNameAt(m, rva, resolved ? moduleIdx : -1);
             uint gap = resolved ? rva - recRva : 0;
             if (resolved)
             {
@@ -548,7 +793,8 @@ namespace ClarionDbg.Cli
         {
             _stepCount++;
             uint va = ctx.Eip;
-            uint rva = va - _loadBase;
+            var m = ModuleAt(va);
+            uint rva = m != null ? va - m.LoadBase : va;
 
             // call-entry detection: the stack top holds an address just past the previous trap →
             // we just stepped INTO a CALL. Follow Clarion callees (step-into); skip everything else
@@ -558,7 +804,7 @@ namespace ClarionDbg.Cli
                 uint ret = ReadU32(ctx.Esp);
                 if (ret > _prevVa && ret - _prevVa <= CALL_WINDOW && ret != va)
                 {
-                    bool follow = _mode == StepMode.Into && HasRecordInRange(rva, PROLOGUE_WINDOW);
+                    bool follow = _mode == StepMode.Into && HasRecordInRange(m, rva, PROLOGUE_WINDOW);
                     if (!follow)
                     {
                         bool covered = _armed.ContainsKey(ret); // a user BP there already pauses us
@@ -587,11 +833,11 @@ namespace ClarionDbg.Cli
             }
 
             // stop check: pause at the next statement boundary appropriate for the mode
-            int line; int mi; uint recRva;
-            bool resolved = _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            int line = 0, mi = -1; uint recRva = 0;
+            bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
             uint gap = resolved ? rva - recRva : 0;
             bool atRecord = resolved && gap == 0;
-            bool newStatement = atRecord && (line != _startLine || mi != _startModIdx);
+            bool newStatement = atRecord && (m != _startModule || line != _startLine || mi != _startModIdx);
             bool stop = false;
             switch (_mode)
             {
@@ -660,12 +906,13 @@ namespace ClarionDbg.Cli
         private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
         {
             uint va = haveCtx ? ctx.Eip : 0;
-            uint rva = va - _loadBase;
+            var m = haveCtx ? ModuleAt(va) : null;
+            uint rva = m != null ? va - m.LoadBase : va;
             int line = 0; int mi = -1; uint recRva = 0;
-            bool resolved = haveCtx && _dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            bool resolved = haveCtx && m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
             if (!resolved) { line = 0; mi = -1; recRva = 0; }
-            string mod = resolved ? _dbg.ModuleNameForIdx(mi) : null;
-            string proc = haveCtx ? ProcNameAt(rva, resolved ? mi : -1) : null;
+            string mod = resolved ? m.Dbg.ModuleNameForIdx(mi) : null;
+            string proc = haveCtx ? ProcNameAt(m, rva, resolved ? mi : -1) : null;
             uint gap = resolved ? rva - recRva : 0;
 
             if (EmitJson)
@@ -689,19 +936,19 @@ namespace ClarionDbg.Cli
                         return;
 
                     case "step": case "stepinto": case "s": case "i":
-                        BeginStep(StepMode.Into, tid, ref ctx, haveCtx, resolved, line, mi);
+                        BeginStep(StepMode.Into, tid, ref ctx, haveCtx, resolved, line, mi, m);
                         EmitResumed("step");
                         ArmResume(tid, hThread, ref ctx, haveCtx, true);
                         return;
 
                     case "stepover": case "next": case "n":
-                        BeginStep(StepMode.Over, tid, ref ctx, haveCtx, resolved, line, mi);
+                        BeginStep(StepMode.Over, tid, ref ctx, haveCtx, resolved, line, mi, m);
                         EmitResumed("stepover");
                         ArmResume(tid, hThread, ref ctx, haveCtx, true);
                         return;
 
                     case "stepout": case "out": case "finish": case "o":
-                        BeginStep(StepMode.Out, tid, ref ctx, haveCtx, resolved, line, mi);
+                        BeginStep(StepMode.Out, tid, ref ctx, haveCtx, resolved, line, mi, m);
                         EmitResumed("stepout");
                         ArmResume(tid, hThread, ref ctx, haveCtx, true);
                         return;
@@ -749,13 +996,14 @@ namespace ClarionDbg.Cli
             }
         }
 
-        private void BeginStep(StepMode mode, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, bool resolved, int line, int mi)
+        private void BeginStep(StepMode mode, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, bool resolved, int line, int mi, LoadedModule m)
         {
             _mode = mode;
             _stepTid = tid;
             _startEsp = haveCtx ? ctx.Esp : 0;
             _startLine = resolved ? line : -1;
             _startModIdx = resolved ? mi : -1;
+            _startModule = m;
             _prevVa = haveCtx ? ctx.Eip : 0;
             _stepCount = 0;
             _skipRunning = false;
@@ -842,14 +1090,14 @@ namespace ClarionDbg.Cli
         {
             if (parts.Length < 2) { EmitError("sym expects: sym NAME"); return; }
             string name = parts[1];
-            TswdDebugInfo.DataLocation loc;
-            if (!_dbg.ResolveDataName(name, out loc))
+            TswdDebugInfo.DataLocation loc; LoadedModule owner;
+            if (!ResolveDataAcrossModules(name, out owner, out loc))
             {
                 if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, false, 0, 0, 0, null, 0, null));
                 Console.WriteLine($"  sym {name}: not found");
                 return;
             }
-            uint va = _loadBase + loc.Rva;
+            uint va = owner.LoadBase + loc.Rva;
             string tn = TswdDebugInfo.TypeCodeName(loc.TypeCode);
             if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, true, loc.Rva, va, loc.TypeCode, tn, loc.Size, loc.Container));
             Console.WriteLine($"  sym {name}: VA 0x{va:X} (RVA 0x{loc.Rva:X}) {(tn ?? $"type 0x{loc.TypeCode:X2}")} size {loc.Size}{(loc.Container != null ? " in " + loc.Container : "")}");
@@ -867,15 +1115,15 @@ namespace ClarionDbg.Cli
         {
             if (parts.Length < 2) { EmitError("watch expects: watch NAME"); return false; }
             string name = parts[1];
-            TswdDebugInfo.DataLocation loc;
-            if (!_dbg.ResolveDataName(name, out loc))
+            TswdDebugInfo.DataLocation loc; LoadedModule owner;
+            if (!ResolveDataAcrossModules(name, out owner, out loc))
             {
                 if (EmitJson) Console.WriteLine("@JSON " + Json.Watch(name, false, 0, 0, false, 0, null, 0, null, 0));
                 Console.WriteLine($"  watch {name}: not found");
                 return false;
             }
-            uint templateVa = _loadBase + loc.Rva;
-            bool threaded = loc.Rva >= _cwtlsLo && loc.Rva < _cwtlsHi && _cwtlsHi != 0;
+            uint templateVa = owner.LoadBase + loc.Rva;
+            bool threaded = loc.Rva >= owner.CwtlsLo && loc.Rva < owner.CwtlsHi && owner.CwtlsHi != 0;
 
             if (!threaded)
             {
@@ -883,9 +1131,9 @@ namespace ClarionDbg.Cli
                 return false;
             }
 
-            if (_thrGetInstanceIatRva == 0)
+            if (owner.ThrGetInstanceIatRva == 0)
             {
-                EmitError($"watch {name}: THREADed data but THR$GetInstance import not found in this EXE");
+                EmitError($"watch {name}: THREADed data but THR$GetInstance import not found in {owner.Name}");
                 return false;
             }
             if (!haveCtx)
@@ -893,7 +1141,7 @@ namespace ClarionDbg.Cli
                 EmitError($"watch {name}: no thread context for func-eval");
                 return false;
             }
-            uint helper = ReadU32(_loadBase + _thrGetInstanceIatRva);
+            uint helper = ReadU32(owner.LoadBase + owner.ThrGetInstanceIatRva);
             if (helper == 0)
             {
                 EmitError($"watch {name}: could not read THR$GetInstance address from the IAT");
@@ -918,7 +1166,7 @@ namespace ClarionDbg.Cli
             e.Esp = ctx.Esp - 4;
             WriteU32(e.Esp, EVAL_TRAP_VA);
             e.Eax = templateVa;
-            e.Ebx = _loadBase + _cwtlsLo;
+            e.Ebx = owner.LoadBase + owner.CwtlsLo;
             e.Eip = helper;
             e.EFlags &= ~TRAP_FLAG;
             Native.SetThreadContext(hThread, ref e);
@@ -1082,32 +1330,34 @@ namespace ClarionDbg.Cli
         /// </summary>
         private List<StackFrame> BuildStack(uint eip, uint esp, int maxFrames)
         {
-            var frames = new List<StackFrame> { FrameAt(eip - _loadBase, eip, 0) };
+            var frames = new List<StackFrame> { FrameAt(ModuleAt(eip), eip, 0) };
 
             var stack = new byte[STACK_SCAN_BYTES];
             int got = ReadBlock(esp, stack);
             for (int off = 0; off + 4 <= got && frames.Count < maxFrames; off += 4)
             {
                 uint cand = BitConverter.ToUInt32(stack, off);
-                if (cand <= _loadBase) continue;
-                uint rva = cand - _loadBase;
+                var cm = ModuleAt(cand);
+                if (cm == null || cm.Dbg == null) continue;     // not in any debuggable image
+                uint rva = cand - cm.LoadBase;
 
                 int line; int mi; uint recRva;
-                if (!_dbg.ResolveAddr(rva, out line, out mi, out recRva)) continue;
+                if (!cm.Dbg.ResolveAddr(rva, out line, out mi, out recRva)) continue;
                 if (rva - recRva > FRAME_GAP_MAX) continue;     // not Clarion-mapped code
                 if (!CallPrecedes(cand)) continue;              // not a return address
 
-                frames.Add(FrameAt(rva, cand, esp + (uint)off));
+                frames.Add(FrameAt(cm, cand, esp + (uint)off));
             }
             return frames;
         }
 
-        private StackFrame FrameAt(uint rva, uint va, uint stackAddr)
+        private StackFrame FrameAt(LoadedModule m, uint va, uint stackAddr)
         {
-            int line; int mi; uint recRva;
-            bool resolved = _dbg.ResolveAddr(rva, out line, out mi, out recRva);
-            ProcSymbol sym;
-            bool hasSym = _dbg.ResolveSymbol(rva, out sym);
+            uint rva = m != null ? va - m.LoadBase : va;
+            int line = 0, mi = -1; uint recRva = 0;
+            bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            ProcSymbol sym = null;
+            bool hasSym = m != null && m.Dbg != null && m.Dbg.ResolveSymbol(rva, out sym);
             // same moduleIdx cross-check as ProcNameAt: don't name cold/init code with the
             // previous module's last symbol
             bool symOk = hasSym && (!resolved || sym.ModuleIdx == mi);
@@ -1118,7 +1368,7 @@ namespace ClarionDbg.Cli
                 StackAddr = stackAddr,
                 Proc = symOk ? sym.Name : null,
                 Kind = symOk ? sym.Kind.ToString().ToLowerInvariant() : null,
-                Module = resolved ? _dbg.ModuleNameForIdx(mi) : null,
+                Module = resolved ? m.Dbg.ModuleNameForIdx(mi) : null,
                 Line = resolved ? line : 0
             };
         }
@@ -1203,18 +1453,20 @@ namespace ClarionDbg.Cli
         /// code emitted BELOW a module's named entry (init/cold) would otherwise bind to the
         /// previous module's last symbol — better to say "unknown" than name the wrong proc.
         /// </summary>
-        private string ProcNameAt(uint rva, int moduleIdx)
+        private string ProcNameAt(LoadedModule m, uint rva, int moduleIdx)
         {
+            if (m == null || m.Dbg == null) return null;
             ProcSymbol sym;
-            if (!_dbg.ResolveSymbol(rva, out sym)) return null;
+            if (!m.Dbg.ResolveSymbol(rva, out sym)) return null;
             if (moduleIdx >= 0 && sym.ModuleIdx != moduleIdx) return null;
             return sym.Name;
         }
 
-        /// <summary>Is there a line record in [rva, rva+window]? (Used to spot Clarion callees.)</summary>
-        private bool HasRecordInRange(uint rva, uint window)
+        /// <summary>Is there a line record in [rva, rva+window] in this image? (Spots Clarion callees.)</summary>
+        private bool HasRecordInRange(LoadedModule m, uint rva, uint window)
         {
-            var t = _dbg.AddrTable;
+            if (m == null || m.Dbg == null) return false;
+            var t = m.Dbg.AddrTable;
             if (t == null || t.Count == 0) return false;
             int lo = 0, hi = t.Count - 1, ans = -1;
             while (lo <= hi)
@@ -1270,6 +1522,29 @@ namespace ClarionDbg.Cli
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern uint GetFinalPathNameByHandle(IntPtr hFile, System.Text.StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
+
+        /// <summary>Resolve a LOAD_DLL file handle to its on-disk path, stripping the \\?\ device
+        /// prefix. Returns null when the handle is invalid or the path can't be resolved.</summary>
+        private static string GetPathFromHandle(uint hFile)
+        {
+            if (hFile == 0) return null;
+            var sb = new System.Text.StringBuilder(520);
+            uint n = GetFinalPathNameByHandle((IntPtr)hFile, sb, (uint)sb.Capacity, 0);
+            if (n == 0) return null;
+            string p = sb.ToString();
+            if (p.StartsWith(@"\\?\UNC\")) p = @"\\" + p.Substring(8);
+            else if (p.StartsWith(@"\\?\")) p = p.Substring(4);
+            return p;
+        }
+
+        /// <summary>Close a raw debug-event handle (the LOAD_DLL hFile) so we don't leak it.</summary>
+        private static void CloseHandleValue(uint handle)
+        {
+            if (handle != 0) Native.CloseHandle((IntPtr)handle);
+        }
 
         // --- DEBUG_EVENT header accessors (first 12 bytes) ---
         private static uint Code(byte[] b) { return U32(b, 0); }
