@@ -49,7 +49,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError += (m, l, err) => UI(() => Console("err", "breakpoint " + m + ":" + l + " — " + err));
             _svc.EngineError += msg => UI(() => Console("err", "engine: " + msg));
             _svc.LogReceived += s => UI(() => Console("info", s));
-            _svc.Exited += code => UI(() => { Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+            _svc.Exited += code => UI(() => { ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
 
             _gutter.GutterBreakpointAdded += (m, l, f) => UI(() => OnGutterBpAdded(m, l));
             _gutter.GutterBreakpointRemoved += (m, l, f) => UI(() => OnGutterBpRemoved(m, l));
@@ -103,7 +103,7 @@ namespace ClarionDebugger.Terminal
                     case "stepover": _svc.StepOver(); break;
                     case "stepinto": _svc.StepInto(); break;
                     case "stepout": _svc.StepOut(); break;
-                    case "stop": _svc.Stop(); break;
+                    case "stop": ClearCurrentLineMarker(); _svc.Stop(); break;
                     case "browse": Browse(); break;
                     case "setExe": _exe = data ?? ""; _exeAuto = false; break;
                     case "watch":
@@ -370,6 +370,17 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>
+        /// Remove the editor's current-line marker (the yellow → in the gutter) that JumpToCurrentLine
+        /// paints on each pause. The IDE never clears it on its own for an external engine, so the arrow
+        /// would otherwise linger in the Clarion source after the session ends.
+        /// </summary>
+        private static void ClearCurrentLineMarker()
+        {
+            try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.RemoveCurrentLineMarker(); }
+            catch { }
+        }
+
+        /// <summary>
         /// After TryJump moves the Clarion editor to the current line (which steals keyboard focus),
         /// bring the debugger pad back to front and refocus the WebView so the next configured
         /// shortcut is delivered to the debugger page rather than the Clarion editor. Posted via
@@ -475,6 +486,7 @@ namespace ClarionDebugger.Terminal
         {
             if (disposing)
             {
+                try { ClearCurrentLineMarker(); } catch { }
                 try { _svc.Stop(); } catch { }
                 try { _gutter.Dispose(); } catch { }
                 if (_webView != null) { try { _webView.Dispose(); } catch { } _webView = null; }
