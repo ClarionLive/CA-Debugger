@@ -50,6 +50,19 @@ namespace ClarionDebugger.Services
         public string ResolvedPath;
     }
 
+    /// <summary>An image (EXE or DLL) mapped into / out of the target (module-loaded / module-unloaded).</summary>
+    public sealed class DebugModule
+    {
+        public string Name;        // image file name, lowercased (e.g. myapp.dll)
+        public string Path;        // full disk path (null on unload / when unresolved)
+        public string Base;        // load base as a hex string (e.g. 0x65D70000)
+        public bool HasDebug;      // TSWD present — engine can resolve lines/symbols in this image
+
+        /// <summary>Resolved when at least one of this image's compilands maps to real source via the
+        /// .red (Tier 1 = full source debugging vs Tier 2 = symbols/stack only). Set by the service.</summary>
+        public bool HasSource;
+    }
+
     /// <summary>One logical breakpoint as confirmed by the engine (bp-set / bp-list).</summary>
     public sealed class DebugBreakpoint
     {
@@ -107,6 +120,8 @@ namespace ClarionDebugger.Services
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
+        public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
+        public event Action<DebugModule> ModuleUnloaded;           // image unmapped
         public event Action<string> EngineError;                   // engine-reported error event
         public event Action<string> LogReceived;
         public event Action<int> Exited;
@@ -148,6 +163,16 @@ namespace ClarionDebugger.Services
         /// </summary>
         public void StartSession(string targetExe, IEnumerable<DebugBreakpoint> breakpoints)
         {
+            StartSession(targetExe, breakpoints, null);
+        }
+
+        /// <summary>
+        /// Start an interactive debug session, additionally pre-loading the solution's output DLLs so
+        /// breakpoints set in DLL source bind before launch (multi-DLL apps). DLLs not listed here are
+        /// still picked up automatically by the engine as they load.
+        /// </summary>
+        public void StartSession(string targetExe, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
             var args = new System.Text.StringBuilder();
             args.Append("break \"").Append(targetExe).Append("\" --interactive --json");
             if (breakpoints != null)
@@ -155,6 +180,14 @@ namespace ClarionDebugger.Services
                 {
                     if (!IsValidModuleName(bp.Module)) continue; // blocks argument smuggling via module text
                     args.Append(" --bp ").Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
+                }
+            if (solutionDlls != null)
+                foreach (var dll in solutionDlls)
+                {
+                    // dll paths are project-model derived (repo-controlled), like targetExe; the engine
+                    // validates existence. Quote for spaces; reject embedded quotes defensively.
+                    if (string.IsNullOrEmpty(dll) || dll.IndexOf('"') >= 0) continue;
+                    args.Append(" --solution-dll \"").Append(dll).Append('"');
                 }
             Launch(targetExe, args.ToString(), true);
         }
@@ -299,20 +332,44 @@ namespace ClarionDebugger.Services
         /// </summary>
         public static int[] GetBreakableLines(string targetExe, string module)
         {
+            return GetBreakableLines(targetExe, module, null);
+        }
+
+        /// <summary>
+        /// As <see cref="GetBreakableLines(string,string)"/>, but a module owned by a solution DLL
+        /// (not the EXE) is resolved by also searching <paramref name="solutionDlls"/> — the EXE's
+        /// TSWD only carries its own compilands. Returns the first image that yields lines.
+        /// </summary>
+        public static int[] GetBreakableLines(string targetExe, string module, IEnumerable<string> solutionDlls)
+        {
+            if (string.IsNullOrEmpty(module) || !IsValidModuleName(module)) return new int[0];
+            string engine = FindEngine();
+            if (engine == null) return new int[0];
+
+            // EXE first (the common case), then each solution DLL until one carries the compiland.
+            var lines = LinesForImage(engine, targetExe, module);
+            if (lines.Length > 0 || solutionDlls == null) return lines;
+            foreach (var dll in solutionDlls)
+            {
+                lines = LinesForImage(engine, dll, module);
+                if (lines.Length > 0) return lines;
+            }
+            return new int[0];
+        }
+
+        private static int[] LinesForImage(string engine, string imagePath, string module)
+        {
             try
             {
-                string engine = FindEngine();
-                if (engine == null || string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe) || string.IsNullOrEmpty(module))
-                    return new int[0];
-
-                string args = "lines \"" + targetExe + "\" --module " + module + " --json";
+                if (string.IsNullOrEmpty(imagePath) || !File.Exists(imagePath)) return new int[0];
+                string args = "lines \"" + imagePath + "\" --module " + module + " --json";
                 var psi = new ProcessStartInfo(engine, args)
                 {
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
-                    WorkingDirectory = Path.GetDirectoryName(targetExe)
+                    WorkingDirectory = Path.GetDirectoryName(imagePath)
                 };
                 using (var p = Process.Start(psi))
                 {
@@ -360,6 +417,25 @@ namespace ClarionDebugger.Services
             {
                 case "loaded":
                     SetState(DebugSessionState.Running);
+                    break;
+
+                case "module-loaded":
+                    var ml = new DebugModule
+                    {
+                        Name = GetStr(json, "name"),
+                        Path = GetStr(json, "path"),
+                        Base = GetStr(json, "base"),
+                        HasDebug = GetBool(json, "hasDebug")
+                    };
+                    ModuleLoaded?.Invoke(ml);
+                    break;
+
+                case "module-unloaded":
+                    ModuleUnloaded?.Invoke(new DebugModule
+                    {
+                        Name = GetStr(json, "name"),
+                        Base = GetStr(json, "base")
+                    });
                     break;
 
                 case "hit":

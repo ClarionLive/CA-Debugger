@@ -48,6 +48,8 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointListReceived += list => UI(() => SendBps());
             _svc.BreakpointError += (m, l, err) => UI(() => Console("err", "breakpoint " + m + ":" + l + " — " + err));
             _svc.EngineError += msg => UI(() => Console("err", "engine: " + msg));
+            _svc.ModuleLoaded += m => UI(() => OnModuleLoaded(m));
+            _svc.ModuleUnloaded += m => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
             _svc.LogReceived += s => UI(() => Console("info", s));
             _svc.Exited += code => UI(() => { ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
 
@@ -158,8 +160,12 @@ namespace ClarionDebugger.Terminal
                     if (!known) _pending.Add(gb);
                 }
                 Post("{\"type\":\"clear\"}");
-                Console("info", "starting: " + Path.GetFileName(_exe) + "  (" + _pending.Count + " breakpoint(s))");
-                _svc.StartSession(_exe, _pending.ToArray());
+                // Pre-load the solution's output DLLs so breakpoints set in DLL source bind before
+                // launch (multi-DLL apps); other DLLs are still picked up automatically as they load.
+                var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
+                Console("info", "starting: " + Path.GetFileName(_exe) + "  (" + _pending.Count + " breakpoint(s)"
+                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                _svc.StartSession(_exe, _pending.ToArray(), solutionDlls);
 
                 // load static data symbols (file buffers) for the Variables tree, off the UI thread
                 string exe = _exe;
@@ -291,6 +297,20 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append("]}");
             Post(sb.ToString());
+        }
+
+        /// <summary>An image (EXE or DLL) mapped into the target. Surface debuggable images to the
+        /// console and post a structured message a future "Modules" panel can render. Tier 1 vs 2
+        /// (source available) is decided per-compiland when a hit/frame resolves via the .red, so at
+        /// image-load time we only report symbol availability (hasDebug).</summary>
+        private void OnModuleLoaded(DebugModule m)
+        {
+            Post("{\"type\":\"module\",\"name\":" + Str(m.Name)
+                + ",\"path\":" + Str(m.Path)
+                + ",\"base\":" + Str(m.Base)
+                + ",\"hasDebug\":" + (m.HasDebug ? "true" : "false") + "}");
+            // Only log images we can actually debug — don't bury the console under 30+ system DLLs.
+            if (m.HasDebug) Console("info", "module loaded: " + m.Name + " (symbols)");
         }
 
         /// <summary>Read ~±12 lines around the current line from the resolved .clw and show them.</summary>
