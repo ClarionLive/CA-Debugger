@@ -104,6 +104,11 @@ namespace ClarionDbg.Cli
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
+        // Inject a breakpoint into the debuggee on a transient OS thread, so a running target can be
+        // paused from the debugger. Raises EXCEPTION_BREAKPOINT in the debug loop.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool DebugBreakProcess(IntPtr Process);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr hObject);
     }

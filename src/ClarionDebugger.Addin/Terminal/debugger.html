@@ -180,6 +180,7 @@
   <div class="toolbar">
     <button class="tbtn primary" id="btnStart" title="Launch the target EXE and begin a debug session">▶ Start</button>
     <button class="tbtn" id="btnContinue" title="Resume execution until the next breakpoint or exception">▶ Continue</button>
+    <button class="tbtn" id="btnPause" title="Break into the running target and pause at its current location">❚❚ Pause</button>
     <button class="tbtn" id="btnStepOver" title="Execute the current line, stepping over any procedure calls">⤼ Step Over</button>
     <button class="tbtn" id="btnStepInto" title="Execute the current line, stepping into any procedure call">⤓ Step Into</button>
     <button class="tbtn" id="btnStepOut" title="Run until the current procedure returns to its caller">⤒ Step Out</button>
@@ -267,6 +268,7 @@
   // ---- toolbar ----
   $('btnStart').onclick    =()=>send('start');
   $('btnContinue').onclick =()=>send('continue');
+  $('btnPause').onclick     =()=>send('pause');
   $('btnStepOver').onclick =()=>send('stepover');
   $('btnStepInto').onclick =()=>send('stepinto');
   $('btnStepOut').onclick  =()=>send('stepout');
@@ -281,6 +283,7 @@
   const KB_CMDS = [
     {id:'start',    btn:'btnStart',    label:'Start',     tip:'Launch the target EXE and begin a debug session'},
     {id:'continue', btn:'btnContinue', label:'Continue',  tip:'Resume execution until the next breakpoint or exception'},
+    {id:'pause',    btn:'btnPause',    label:'Pause',     tip:'Break into the running target and pause at its current location'},
     {id:'stepover', btn:'btnStepOver', label:'Step Over', tip:'Execute the current line, stepping over any procedure calls'},
     {id:'stepinto', btn:'btnStepInto', label:'Step Into', tip:'Execute the current line, stepping into any procedure call'},
     {id:'stepout',  btn:'btnStepOut',  label:'Step Out',  tip:'Run until the current procedure returns to its caller'},
@@ -381,6 +384,7 @@
     const en=(b,on)=>{ $(b).disabled=!on; };
     en('btnStart', state==='idle');
     en('btnContinue', paused); en('btnStepOver',paused); en('btnStepInto',paused); en('btnStepOut',paused);
+    en('btnPause', state==='running'||state==='launching');   // pause only meaningful while running
     en('btnStop', state!=='idle');
     if(state==='idle'){ $('locbar').textContent='Not running — pick a Target EXE and press Start.'; clearSrc(); }
   }

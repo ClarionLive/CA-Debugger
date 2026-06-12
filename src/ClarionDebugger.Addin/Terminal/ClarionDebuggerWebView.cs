@@ -100,6 +100,7 @@ namespace ClarionDebugger.Terminal
                     case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe(); if (!string.IsNullOrEmpty(_exe)) Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}"); break;
                     case "start": StartSession(); break;
                     case "continue": _svc.Continue(); break;
+                    case "pause": _svc.Pause(); break;
                     case "stepover": _svc.StepOver(); break;
                     case "stepinto": _svc.StepInto(); break;
                     case "stepout": _svc.StepOut(); break;

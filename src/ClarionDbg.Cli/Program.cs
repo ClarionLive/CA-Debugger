@@ -69,7 +69,7 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      --interactive: pause at each hit and read stdin commands —");
             Console.WriteLine("        continue | step | stepover | stepout | bp add M:L | bp del M:L | bp list");
             Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | sym NAME | watch NAME | quit");
-            Console.WriteLine("        (while running: bp add/del/list, sym, quit)");
+            Console.WriteLine("        (while running: pause, bp add/del/list, sym, quit)");
             Console.WriteLine("      watch resolves THREADed (.cwtls) data to the paused thread's live");
             Console.WriteLine("      instance via a THR$GetInstance func-eval, then dumps the value.");
         }

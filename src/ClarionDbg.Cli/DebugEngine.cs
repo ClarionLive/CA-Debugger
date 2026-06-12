@@ -78,6 +78,14 @@ namespace ClarionDbg.Cli
         private bool _seenInitialBreak;
         public int Hits { get; private set; }
 
+        // ---- pause (break into a running target) ----
+        // DebugBreakProcess injects a breakpoint on a throwaway OS thread; when that break arrives we
+        // pick the app thread actually in Clarion code and pause there. Live thread ids are tracked so
+        // we can scan them at pause time (the injected thread is not the one the user cares about).
+        private bool _pauseRequested;
+        private readonly HashSet<uint> _threads = new HashSet<uint>();
+        private uint _mainTid;               // first thread (from CREATE_PROCESS) — pause fallback
+
         // logical user breakpoints + armed-byte map (VA -> original byte)
         private readonly List<UserBreakpoint> _bps = new List<UserBreakpoint>();
         private readonly Dictionary<uint, byte> _armed = new Dictionary<uint, byte>();
@@ -200,9 +208,18 @@ namespace ClarionDbg.Cli
                     case Native.CREATE_PROCESS_DEBUG_EVENT:
                         // union @+12: hFile(+12) hProcess(+16) hThread(+20) lpBaseOfImage(+24)
                         _loadBase = U32(buf, 24);
+                        _mainTid = tid; _threads.Add(tid);
                         PlantAll();
                         Console.WriteLine($"process created: loadBase=0x{_loadBase:X} (preferred 0x{_imageBase:X}){(_loadBase != _imageBase ? "  [relocated]" : "")}");
                         if (EmitJson) Console.WriteLine("@JSON " + Json.Loaded(pi.dwProcessId, _loadBase));
+                        break;
+
+                    case Native.CREATE_THREAD_DEBUG_EVENT:
+                        _threads.Add(tid);
+                        break;
+
+                    case Native.EXIT_THREAD_DEBUG_EVENT:
+                        _threads.Remove(tid);
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -219,6 +236,11 @@ namespace ClarionDbg.Cli
                             {
                                 _seenInitialBreak = true; // OS loader breakpoint — swallow it
                                 status = Native.DBG_CONTINUE;
+                            }
+                            else if (_pauseRequested)
+                            {
+                                _pauseRequested = false;  // our DebugBreakProcess landed → pause here
+                                status = OnPauseBreak(tid);
                             }
                             else status = Native.DBG_CONTINUE;
                         }
@@ -246,7 +268,7 @@ namespace ClarionDbg.Cli
                         running = false;
                         break;
 
-                    // CREATE_THREAD / EXIT_THREAD / LOAD_DLL / UNLOAD_DLL / OUTPUT_DEBUG_STRING / RIP: just continue
+                    // LOAD_DLL / UNLOAD_DLL / OUTPUT_DEBUG_STRING / RIP: just continue
                     default:
                         status = Native.DBG_CONTINUE;
                         break;
@@ -651,6 +673,62 @@ namespace ClarionDbg.Cli
             foreach (var t in drop) _rearm.Remove(t);
         }
 
+        // ------------------------------------------------------------------ pause (break into running)
+
+        /// <summary>Inject a breakpoint into the target so a running session can pause. The break is
+        /// caught by the debug loop and routed to <see cref="OnPauseBreak"/>.</summary>
+        private void RequestPause()
+        {
+            if (_hProcess == IntPtr.Zero) { EmitError("pause: no target running"); return; }
+            _pauseRequested = true;
+            if (!Native.DebugBreakProcess(_hProcess))
+            {
+                _pauseRequested = false;
+                EmitError("pause: DebugBreakProcess failed (" + System.Runtime.InteropServices.Marshal.GetLastWin32Error() + ")");
+            }
+        }
+
+        /// <summary>The injected break arrived. It runs on a throwaway ntdll thread, so pick the app
+        /// thread actually in Clarion code (or the main thread) and pause there. The whole process is
+        /// frozen while we hold this event, so every thread's context is stable to read.</summary>
+        private uint OnPauseBreak(uint breakTid)
+        {
+            uint tid = PickPauseThread(breakTid);
+            IntPtr hThread = OpenThreadForContext(tid);
+            var ctx = NewContext();
+            bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+            CancelStep();
+            if (_interactive)
+                PausedWait(tid, hThread, ref ctx, haveCtx, "pause");
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return Native.DBG_CONTINUE;  // release the injected break thread (it then exits)
+        }
+
+        /// <summary>Choose the most useful thread to report at a pause: prefer one whose EIP is in
+        /// TSWD-mapped Clarion code; else the first readable non-break thread; else the main thread.</summary>
+        private uint PickPauseThread(uint breakTid)
+        {
+            uint fallback = 0;
+            foreach (uint t in _threads)
+            {
+                if (t == breakTid) continue;
+                IntPtr h = OpenThreadForContext(t);
+                if (h == IntPtr.Zero) continue;
+                var c = NewContext();
+                bool ok = Native.GetThreadContext(h, ref c);
+                Native.CloseHandle(h);
+                if (!ok) continue;
+                if (fallback == 0) fallback = t;
+                if (_loadBase != 0)
+                {
+                    int line, mi; uint rec;
+                    if (_dbg.ResolveAddr(c.Eip - _loadBase, out line, out mi, out rec)) return t; // EIP in Clarion code
+                }
+            }
+            if (fallback != 0) return fallback;
+            return _mainTid != 0 ? _mainTid : breakTid;
+        }
+
         // ------------------------------------------------------------------ pause + command loop
 
         /// <summary>
@@ -659,6 +737,7 @@ namespace ClarionDbg.Cli
         /// </summary>
         private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
         {
+            _pauseRequested = false;  // any pause we reach consumes a pending pause request
             uint va = haveCtx ? ctx.Eip : 0;
             uint rva = va - _loadBase;
             int line = 0; int mi = -1; uint recRva = 0;
@@ -789,6 +868,9 @@ namespace ClarionDbg.Cli
                         break;
                     case "sym":
                         HandleSymCommand(parts);   // static lookup — safe while running
+                        break;
+                    case "pause": case "break":
+                        RequestPause();            // inject a break → pause at the app's current location
                         break;
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);

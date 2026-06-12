@@ -229,6 +229,8 @@ namespace ClarionDebugger.Services
         public bool StepInto() { return SendCommand("step"); }
         public bool StepOver() { return SendCommand("stepover"); }
         public bool StepOut() { return SendCommand("stepout"); }
+        /// <summary>Break into a running target (inject a breakpoint and pause at its current location).</summary>
+        public bool Pause() { return SendCommand("pause"); }
 
         /// <summary>Valid Clarion module file name (e.g. clbrws011.clw) — also blocks argument
         /// smuggling and command injection through the engine command line / stdin protocol.</summary>
