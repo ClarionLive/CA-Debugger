@@ -62,7 +62,11 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      Map a source line to code RVAs (line -> address); --module to scope it.");
             Console.WriteLine();
             Console.WriteLine("  ClarionDbg break <exe> [--bp MODULE:LINE ...] [--rva 0xX ...] [--line N --module M]");
-            Console.WriteLine("                         [--entry] [--once] [--interactive] [--json] [--timeout ms]");
+            Console.WriteLine("                         [--solution-dll PATH ...] [--entry] [--once] [--interactive]");
+            Console.WriteLine("                         [--json] [--timeout ms]");
+            Console.WriteLine("      --solution-dll: pre-load a solution DLL's debug info so its breakpoints bind");
+            Console.WriteLine("        before launch (repeatable; PATH may be a ';'-separated list). Other Clarion");
+            Console.WriteLine("        DLLs are still picked up automatically as they load.");
             Console.WriteLine("      Launch under the debugger, plant INT3 breakpoint(s), and on a hit report");
             Console.WriteLine("      the module + source line and register state. --once kills the target after first hit.");
             Console.WriteLine("      --bp may repeat; breakpoints persist (re-armed after each hit).");
@@ -483,15 +487,18 @@ namespace ClarionDbg.Cli
             string to = GetOpt(args, "--timeout");
             if (to != null) waitMs = (int)ParseNum(to);
 
-            var engine = new DebugEngine(args[1], dbg, pe.ImageBase, rvas, specs, once, waitMs, interactive);
-            engine.EmitJson = HasFlag(args, "--json");
+            // Solution DLLs the host wants resolved up front so DLL breakpoints bind before launch.
+            // --solution-dll may repeat; each value may also be a ';'-separated list of paths.
+            var solutionDlls = new List<string>();
+            for (int i = 2; i < args.Length - 1; i++)
+                if (string.Equals(args[i], "--solution-dll", StringComparison.OrdinalIgnoreCase))
+                    foreach (var p in args[i + 1].Split(';'))
+                        if (p.Trim().Length > 0) solutionDlls.Add(p.Trim());
 
-            // threaded-data resolution (watch NAME on THREADed vars) needs the .cwtls range and
-            // the live THR$GetInstance address (read via its IAT slot at runtime)
-            var cwtls = pe.FindSection(".cwtls");
-            uint thrIat = pe.FindImportIatSlotRva("ClaRUN.dll", "THR$GetInstance");
-            if (cwtls != null && thrIat != 0)
-                engine.SetThreadEvalInfo(cwtls.VirtualAddress, cwtls.VirtualAddress + cwtls.Span, thrIat);
+            // The engine now owns the module table (EXE + DLLs); it derives threaded-eval info
+            // (.cwtls + THR$GetInstance IAT) per image, so no SetThreadEvalInfo seeding here.
+            var engine = new DebugEngine(args[1], pe, dbg, rvas, specs, once, waitMs, interactive, solutionDlls);
+            engine.EmitJson = HasFlag(args, "--json");
             int hits2 = engine.Run();
             if (hits2 < 0) { Console.Error.WriteLine("no breakpoint could be resolved"); return 2; }
             Console.WriteLine($"\ndone — {hits2} breakpoint hit(s).");

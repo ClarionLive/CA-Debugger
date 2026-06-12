@@ -88,6 +88,27 @@ namespace ClarionDbg.Cli
             return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\"}";
         }
 
+        /// <summary>An image (EXE or DLL) mapped into the target. hasDebug = TSWD present (the engine
+        /// can resolve lines/symbols there); the host decides Tier 1 vs 2 from source resolvability.</summary>
+        public static string ModuleLoaded(LoadedModule m)
+        {
+            return "{\"event\":\"module-loaded\""
+                 + ",\"name\":" + Str(m.Name)
+                 + ",\"path\":" + Str(m.Path)
+                 + ",\"base\":\"0x" + m.LoadBase.ToString("X") + "\""
+                 + ",\"size\":\"0x" + m.Size.ToString("X") + "\""
+                 + ",\"hasDebug\":" + (m.HasDebug ? "true" : "false")
+                 + "}";
+        }
+
+        public static string ModuleUnloaded(LoadedModule m)
+        {
+            return "{\"event\":\"module-unloaded\""
+                 + ",\"name\":" + Str(m.Name)
+                 + ",\"base\":\"0x" + m.LoadBase.ToString("X") + "\""
+                 + "}";
+        }
+
         public static string Exited(uint code)
         {
             return "{\"event\":\"exited\",\"code\":" + code + "}";

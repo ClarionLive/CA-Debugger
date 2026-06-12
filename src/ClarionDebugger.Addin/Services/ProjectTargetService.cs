@@ -109,6 +109,69 @@ namespace ClarionDebugger.Services
                 || string.Equals(outputType, "WinExe", StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// Resolve the built output DLLs of every non-executable project in the open solution, so the
+        /// debug engine can pre-load their TSWD and bind DLL breakpoints before launch (multi-DLL apps).
+        /// Each path is resolved the same way as the EXE (.red redirection, then projectDir, then bin)
+        /// and only existing files are returned. Never throws into the IDE pump — returns an empty list
+        /// on any failure.
+        /// </summary>
+        public static List<string> ResolveSolutionDlls()
+        {
+            var dlls = new List<string>();
+            try
+            {
+                object currentProject;
+                IList projects = GetSolutionProjects(out currentProject);
+                if (projects == null) return dlls;
+
+                foreach (object proj in projects)
+                {
+                    if (proj == null) continue;
+                    string fn = ReflectionHelpers.GetProp(proj, "FileName") as string;
+                    string outType, outName;
+                    if (!ReadCwproj(fn, out outType, out outName)) continue;
+                    if (IsExecutable(outType)) continue;          // EXE handled by ResolveTargetExe
+
+                    string projectDir = Path.GetDirectoryName(fn);
+                    if (string.IsNullOrEmpty(projectDir)) continue;
+
+                    string baseName = SafeBaseName(outName, fn);
+                    if (string.IsNullOrEmpty(baseName)) continue;
+                    string dllName = baseName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                        ? baseName : baseName + ".dll";
+
+                    string path = ResolveExePath(projectDir, dllName); // generic file resolver (red/dir/bin)
+                    if (!string.IsNullOrEmpty(path) && File.Exists(path) &&
+                        !dlls.Exists(d => string.Equals(d, path, StringComparison.OrdinalIgnoreCase)))
+                        dlls.Add(path);
+                }
+            }
+            catch { }
+            return dlls;
+        }
+
+        /// <summary>OutputName sanitized to a bare base file name (no path/rooted/.. — repo-controlled
+        /// value, never trust as a path), falling back to the .cwproj base name. Null when unusable.</summary>
+        private static string SafeBaseName(string outName, string cwprojPath)
+        {
+            string baseName = outName;
+            if (!string.IsNullOrEmpty(baseName))
+            {
+                baseName = baseName.Trim();
+                bool unsafeName = baseName.Length == 0
+                    || Path.IsPathRooted(baseName)
+                    || baseName.IndexOf('\\') >= 0
+                    || baseName.IndexOf('/') >= 0
+                    || baseName.IndexOf("..", StringComparison.Ordinal) >= 0
+                    || baseName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0;
+                if (unsafeName) baseName = null;
+            }
+            if (string.IsNullOrEmpty(baseName))
+                baseName = Path.GetFileNameWithoutExtension(cwprojPath);
+            return string.IsNullOrEmpty(baseName) ? null : baseName;
+        }
+
         // ------------------------------------------------------------------ IDE reflection
 
         /// <summary>

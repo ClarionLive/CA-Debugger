@@ -195,13 +195,29 @@ namespace ClarionDbg.Core
             if (e.Type != TswdMagic)
                 throw new InvalidOperationException(
                     string.Format("Debug entry type 0x{0:X8} is not TSWD — was the EXE built with Full debug info?", e.Type));
+            return Build(pe, e.PointerToRawData);
+        }
+
+        /// <summary>Non-throwing variant: returns null when the image carries no TSWD debug info
+        /// (no debug directory, or a debug entry of a different type). Used to tier loaded modules
+        /// — a DLL with TSWD becomes debuggable; one without is registered base+size only.</summary>
+        public static TswdDebugInfo TryFromPe(PeImage pe)
+        {
+            PeImage.DebugEntry e;
+            if (!pe.TryReadFirstDebugEntry(out e) || e.Type != TswdMagic) return null;
+            try { return Build(pe, e.PointerToRawData); }
+            catch { return null; }
+        }
+
+        private static TswdDebugInfo Build(PeImage pe, uint blobFileOffset)
+        {
             var t = pe.Text;
             uint lo = t != null ? t.VirtualAddress : 0;
             uint hi = t != null ? t.VirtualAddress + t.VirtualSize : uint.MaxValue;
             uint imageHi = 0;
             foreach (var s in pe.Sections)
                 if (s.VirtualAddress + s.Span > imageHi) imageHi = s.VirtualAddress + s.Span;
-            return new TswdDebugInfo(pe.Bytes, (int)e.PointerToRawData, lo, hi, imageHi);
+            return new TswdDebugInfo(pe.Bytes, (int)blobFileOffset, lo, hi, imageHi);
         }
 
         public TswdDebugInfo(byte[] bytes, int blobOffset)

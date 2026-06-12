@@ -27,6 +27,7 @@ namespace ClarionDbg.Core
         public byte[] Bytes { get; private set; }
         public ushort Machine { get; private set; }
         public uint ImageBase { get; private set; }
+        public uint SizeOfImage { get; private set; }
         public uint EntryPointRva { get; private set; }
         public uint DebugDirRva { get; private set; }
         public uint DebugDirSize { get; private set; }
@@ -56,9 +57,10 @@ namespace ClarionDbg.Core
             if (magic != 0x10B)
                 throw new InvalidDataException("Only PE32 (32-bit) images are supported; Clarion targets are 32-bit.");
 
-            // PE32 optional header: AddressOfEntryPoint @+16, ImageBase @+28.
+            // PE32 optional header: AddressOfEntryPoint @+16, ImageBase @+28, SizeOfImage @+56.
             EntryPointRva = BitConverter.ToUInt32(bytes, optOff + 16);
             ImageBase = BitConverter.ToUInt32(bytes, optOff + 28);
+            SizeOfImage = BitConverter.ToUInt32(bytes, optOff + 56);
 
             // Data directories begin at +96 in PE32; Debug Directory is index 6 (8 bytes each).
             int debugDir = optOff + 96 + 6 * 8;
@@ -175,6 +177,25 @@ namespace ClarionDbg.Core
                 SizeOfData = BitConverter.ToUInt32(Bytes, o + 16),
                 PointerToRawData = BitConverter.ToUInt32(Bytes, o + 24),
             };
+        }
+
+        /// <summary>Non-throwing variant: false when there is no debug directory (or it is not
+        /// mapped to a section), used to tier images that carry no debug info at all.</summary>
+        public bool TryReadFirstDebugEntry(out DebugEntry entry)
+        {
+            entry = default(DebugEntry);
+            if (DebugDirRva == 0 || DebugDirSize == 0) return false;
+            long off = RvaToOffset(DebugDirRva);
+            if (off < 0) return false;
+            int o = (int)off;
+            if (o + 28 > Bytes.Length) return false;
+            entry = new DebugEntry
+            {
+                Type = BitConverter.ToUInt32(Bytes, o + 12),
+                SizeOfData = BitConverter.ToUInt32(Bytes, o + 16),
+                PointerToRawData = BitConverter.ToUInt32(Bytes, o + 24),
+            };
+            return true;
         }
     }
 }
