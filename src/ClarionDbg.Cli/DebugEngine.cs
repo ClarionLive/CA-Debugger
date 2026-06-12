@@ -1307,7 +1307,7 @@ namespace ClarionDbg.Cli
                 EmitError($"stack: max frames must be 1..{STACK_FRAMES_MAX}");
                 return;
             }
-            var frames = BuildStack(ctx.Eip, ctx.Esp, max);
+            var frames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, max);
             if (EmitJson) Console.WriteLine("@JSON " + Json.Stack(frames));
             Console.WriteLine($"  stack ({frames.Count} frame(s)):");
             for (int i = 0; i < frames.Count; i++)
@@ -1320,18 +1320,82 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
-        /// Build the call stack WITHOUT an EBP walk (Clarion frames don't reliably chain EBP — even
-        /// the native debugger shows Unknown frames). Frame 0 is the current EIP; the rest come from
-        /// scanning the stack upward from ESP for plausible return addresses: a dword is a frame iff
-        /// (a) it resolves into TSWD-mapped code (a +0x1C record within FRAME_GAP_MAX) and
-        /// (b) the bytes immediately before it form a CALL instruction (call-precedes heuristic).
-        /// Scan-based stacks can include stale frames from dead stack regions — acceptable noise,
-        /// matching the entryRVA-range-binding plan (NOT EBP).
+        /// Build the call stack. Frame 0 is the current EIP. Primary walk follows the EBP frame chain:
+        /// Clarion's generated procedures and ABC methods set up standard {push ebp; mov ebp,esp}
+        /// frames, so [ebp] = caller EBP and [ebp+4] = return address. This yields the TRUE caller
+        /// links across all images (EXE/DLL/runtime) and terminates naturally when a return address
+        /// leaves debuggable code (into the C runtime / OS) — so it does NOT manufacture the stale
+        /// frames an unconstrained stack scan pulls from dead stack memory (which also made the stack
+        /// differ run-to-run). Each link is still validated (mapped code within FRAME_GAP_MAX + a CALL
+        /// precedes the return) so a corrupt/FPO frame breaks the chain cleanly rather than lying.
+        ///
+        /// Fallback: if the chain yields no caller (e.g. paused before the current frame's prologue
+        /// ran, or an FPO leaf at the top), scan the stack for plausible return addresses — the legacy
+        /// behaviour, which over-includes but never returns an empty stack.
         /// </summary>
-        private List<StackFrame> BuildStack(uint eip, uint esp, int maxFrames)
+        private List<StackFrame> BuildStack(uint eip, uint esp, uint ebp, int maxFrames)
         {
-            var frames = new List<StackFrame> { FrameAt(ModuleAt(eip), eip, 0) };
+            var m0 = ModuleAt(eip);
+            var frames = new List<StackFrame> { FrameAt(m0, eip, 0) };
 
+            // Entry-prologue case: if EIP is exactly at the current procedure's entry, its
+            // {push ebp; mov ebp,esp} has not run yet — EBP still belongs to the CALLER and the
+            // caller's return address sits at [ESP]. Emit that direct caller first; the EBP chain
+            // below (which begins at the caller's frame) then covers the rest without duplication.
+            if (AtProcEntry(m0, eip))
+            {
+                StackFrame f0;
+                if (TryFrameForReturn(ReadU32(esp), esp, out f0)) frames.Add(f0);
+            }
+
+            uint cur = ebp;
+            uint floor = esp;        // frame bases sit at/above ESP and strictly increase up the stack
+            bool first = true;
+            while (frames.Count < maxFrames && cur != 0 && (first ? cur >= floor : cur > floor))
+            {
+                StackFrame f;
+                if (!TryFrameForReturn(ReadU32(cur + 4), cur + 4, out f)) break; // chain end / corrupt
+                frames.Add(f);
+                floor = cur;
+                cur = ReadU32(cur);  // caller's saved EBP
+                first = false;
+            }
+
+            if (frames.Count < 2) ScanStack(frames, esp, maxFrames);
+            return frames;
+        }
+
+        /// <summary>True when <paramref name="va"/> is exactly the entry of its containing procedure
+        /// (prologue not yet run, so the frame's EBP is still the caller's).</summary>
+        private bool AtProcEntry(LoadedModule m, uint va)
+        {
+            if (m == null || m.Dbg == null) return false;
+            ProcSymbol sym;
+            uint rva = va - m.LoadBase;
+            return m.Dbg.ResolveSymbol(rva, out sym) && rva == sym.EntryRva;
+        }
+
+        /// <summary>Validate a candidate return address (mapped Clarion code within FRAME_GAP_MAX,
+        /// preceded by a CALL) and build its frame. False when it isn't a real return address.</summary>
+        private bool TryFrameForReturn(uint ret, uint stackAddr, out StackFrame frame)
+        {
+            frame = null;
+            var rm = ModuleAt(ret);
+            if (rm == null || rm.Dbg == null) return false;     // left debuggable code
+            uint rrva = ret - rm.LoadBase;
+            int line; int mi; uint recRva;
+            if (!rm.Dbg.ResolveAddr(rrva, out line, out mi, out recRva)) return false;
+            if (rrva - recRva > FRAME_GAP_MAX) return false;    // not Clarion-mapped code
+            if (!CallPrecedes(ret)) return false;              // not a return address
+            frame = FrameAt(rm, ret, stackAddr);
+            return true;
+        }
+
+        /// <summary>Fallback stack reconstruction: scan upward from ESP for dwords that resolve into
+        /// TSWD-mapped code (a +0x1C record within FRAME_GAP_MAX) preceded by a CALL. Over-includes
+        /// stale frames from dead stack regions — used only when the EBP chain yields nothing.</summary>
+        private void ScanStack(List<StackFrame> frames, uint esp, int maxFrames)
+        {
             var stack = new byte[STACK_SCAN_BYTES];
             int got = ReadBlock(esp, stack);
             for (int off = 0; off + 4 <= got && frames.Count < maxFrames; off += 4)
@@ -1348,7 +1412,6 @@ namespace ClarionDbg.Cli
 
                 frames.Add(FrameAt(cm, cand, esp + (uint)off));
             }
-            return frames;
         }
 
         private StackFrame FrameAt(LoadedModule m, uint va, uint stackAddr)
