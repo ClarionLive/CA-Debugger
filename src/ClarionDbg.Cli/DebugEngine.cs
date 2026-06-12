@@ -288,9 +288,16 @@ namespace ClarionDbg.Cli
                 if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no code records in module"));
                 return;
             }
-            // adding an existing planted line is a no-op (re-confirm so the UI can sync)
+            // Re-adding the SAME requested line is a no-op (re-confirm so the UI can sync). NOTE: we
+            // key this on the REQUESTED line, not the planted line — several distinct gutter lines can
+            // snap to one planted line (e.g. blank/comment lines above a statement). Each stays its own
+            // logical breakpoint so it can be removed independently; the shared INT3 at the planted
+            // address is ref-counted by PlantBp (skips an already-armed VA) and RemoveBreakpoint (only
+            // unplants when the last referencing breakpoint is gone). Collapsing on the planted line —
+            // the old behaviour — meant removing any of the other gutter lines matched nothing and left
+            // the breakpoint planted and firing.
             foreach (var b in _bps)
-                if (b.ModuleIdx == mi && b.Line == planted)
+                if (b.ModuleIdx == mi && b.RequestedLine == line)
                 {
                     if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(b.Module, line, b.Line, b.Rvas));
                     return;
@@ -335,8 +342,17 @@ namespace ClarionDbg.Cli
                 if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no such breakpoint"));
                 return;
             }
+            // Drop the logical breakpoint first so the ref-count check below sees only the survivors.
+            _bps.Remove(found);
             foreach (var rva in found.Rvas)
             {
+                // Ref-count the physical INT3: another breakpoint (a different gutter line that snapped
+                // to the same address) may still need it. Only unplant when nothing references it.
+                bool stillReferenced = false;
+                foreach (var b in _bps)
+                    if (b.ModuleIdx == found.ModuleIdx && b.Rvas.Contains(rva)) { stillReferenced = true; break; }
+                if (stillReferenced) continue;
+
                 uint va = _loadBase + rva;
                 byte orig;
                 if (_loadBase != 0 && _armed.TryGetValue(va, out orig))
@@ -351,7 +367,6 @@ namespace ClarionDbg.Cli
                     _armed.Remove(va);
                 }
             }
-            _bps.Remove(found);
             Console.WriteLine($"bp: removed {canon}:{found.Line}");
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
         }
