@@ -114,6 +114,8 @@ namespace ClarionDebugger.Terminal
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
                     case "jump": Jump(data); break;
+                    case "openbp": OpenBp(data); break;
+                    case "bpremove": RemoveBp(data); break;
                 }
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] msg: " + ex.Message); }
@@ -224,6 +226,36 @@ namespace ClarionDebugger.Terminal
             else Console("info", "(can't resolve " + module + " — open the app's solution so the .red is active)");
         }
 
+        /// <summary>Open a breakpoint's source in the Clarion editor using the exact .clw path the IDE
+        /// gutter gave us (no fragile re-resolution). Data is "line\tfullPath".</summary>
+        private void OpenBp(string data)
+        {
+            if (string.IsNullOrEmpty(data)) return;
+            int t = data.IndexOf('\t');
+            if (t <= 0) return;
+            int line;
+            if (!int.TryParse(data.Substring(0, t), out line)) return;
+            string path = data.Substring(t + 1);
+            if (!string.IsNullOrEmpty(path) && File.Exists(path)) TryJump(path, line);
+            else Console("info", "(can't open " + path + " — file not found)");
+        }
+
+        /// <summary>Remove a breakpoint from the pane's "x". Removes the IDE gutter bookmark, which
+        /// cascades through BreakPointRemoved → OnGutterBpRemoved (engine/pending + pane refresh) and
+        /// clears the editor's red dot. Falls back to a direct removal if no bookmark is found (e.g. a
+        /// pending bp whose editor was closed). Data is "module:line".</summary>
+        private void RemoveBp(string data)
+        {
+            if (string.IsNullOrEmpty(data)) return;
+            int c = data.LastIndexOf(':');
+            if (c <= 0) return;
+            string module = data.Substring(0, c);
+            int line;
+            if (!int.TryParse(data.Substring(c + 1), out line)) return;
+            if (!_gutter.RemoveByModuleLine(module, line))
+                OnGutterBpRemoved(module, line); // no gutter bookmark matched — keep the pane/engine consistent
+        }
+
         // ------------------------------------------------------------------ host → page
 
         private void OnPaused(DebugPause p)
@@ -289,12 +321,37 @@ namespace ClarionDebugger.Terminal
         {
             var sb = new StringBuilder("{\"type\":\"bplist\",\"bps\":[");
             var list = new List<DebugBreakpoint>(_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray());
+
+            // The engine's bp list carries no source path; the IDE gutter is the source of truth for
+            // the .clw file. Build a (module|line) -> path map from the gutter so each row can carry
+            // the exact path for click-to-open, in both running and stopped states.
+            var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var g in _gutter.Snapshot())
+                {
+                    if (string.IsNullOrEmpty(g.Path) || string.IsNullOrEmpty(g.Module)) continue;
+                    paths[g.Module + "|" + g.Line] = g.Path;
+                    paths[g.Module + "|" + g.RequestedLine] = g.Path;
+                }
+            }
+            catch { }
+
             for (int i = 0; i < list.Count; i++)
             {
                 if (i > 0) sb.Append(',');
-                sb.Append("{\"module\":").Append(Str(list[i].Module))
-                  .Append(",\"line\":").Append(list[i].Line)
-                  .Append(",\"requested\":").Append(list[i].RequestedLine).Append('}');
+                var b = list[i];
+                string path = b.Path;
+                if (string.IsNullOrEmpty(path) && b.Module != null)
+                {
+                    string p;
+                    if (paths.TryGetValue(b.Module + "|" + b.Line, out p)
+                        || paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p)) path = p;
+                }
+                sb.Append("{\"module\":").Append(Str(b.Module))
+                  .Append(",\"line\":").Append(b.Line)
+                  .Append(",\"requested\":").Append(b.RequestedLine)
+                  .Append(",\"path\":").Append(Str(path)).Append('}');
             }
             sb.Append("]}");
             Post(sb.ToString());

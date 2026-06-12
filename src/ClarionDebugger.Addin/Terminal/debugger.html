@@ -117,6 +117,10 @@
   .bp .chk.on { background:#e51400; border-color:#e51400; }
   .bp .chk.on::after { content:""; width:7px; height:7px; border-radius:50%; background:#fff; }
   .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
+  .bp .bplink { color:var(--blue); cursor:pointer; text-decoration:underline; }
+  .bp .bplink:hover { filter:brightness(1.25); }
+  .bp .rm { margin-left:auto; flex:none; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
+  .bp .rm:hover { color:#fff; background:#e51400; opacity:1; }
 
   .regs { display:grid; grid-template-columns:repeat(2,1fr); gap:1px 14px; padding:4px 14px; }
   .reg { font-size:11.5px; } .reg .rn { color:var(--blue); } .reg .rv { color:var(--num); }
@@ -559,7 +563,11 @@
     const el=$('bpList'); el.innerHTML=''; $('bpCount').textContent=bps.length;
     if(!bps.length){ el.innerHTML='<div class="empty">Set breakpoints in the Clarion editor gutter.</div>'; return; }
     bps.forEach(b=>{ const d=document.createElement('div'); d.className='bp';
-      d.innerHTML='<span class="chk on"></span><span class="file">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
+      d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span><span class="rm" title="Remove breakpoint">✕</span>';
+      const lk=d.querySelector('.bplink');
+      if(lk) lk.onclick=()=>{ if(b.path) send('openbp', b.line+'\t'+b.path); else if(b.module) send('jump', b.module+':'+b.line); };
+      const rm=d.querySelector('.rm');
+      if(rm) rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
       el.appendChild(d); });
     if(curFile) renderBpDots();
   }

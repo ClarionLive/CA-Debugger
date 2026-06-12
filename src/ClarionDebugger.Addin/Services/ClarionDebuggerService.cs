@@ -69,6 +69,7 @@ namespace ClarionDebugger.Services
         public string Module;
         public int RequestedLine;
         public int Line;            // line actually planted (snapped to nearest code record)
+        public string Path;         // full .clw path from the IDE gutter bookmark (null if unknown)
     }
 
     /// <summary>One resolved call-stack frame (Phase 3 'stack' command). proc/module null = unknown.</summary>

@@ -86,7 +86,7 @@ namespace ClarionDebugger.Services
                 {
                     string module; int line;
                     if (TryMap(bb, out module, out line))
-                        list.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                        list.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line, Path = bb.FileName });
                 }
             }
             catch { }
@@ -118,6 +118,40 @@ namespace ClarionDebugger.Services
             {
                 return "toggle failed: " + ex.Message;
             }
+        }
+
+        /// <summary>
+        /// Remove the IDE gutter breakpoint bookmark matching (module, 1-based line). Removing the
+        /// bookmark fires DebuggerService.BreakPointRemoved, which the pad already forwards to the
+        /// engine/pending list — so the gutter red dot, the engine, and the pane all stay in sync.
+        /// Returns true if a matching bookmark was found and removed.
+        /// </summary>
+        public bool RemoveByModuleLine(string module, int line)
+        {
+            try
+            {
+                foreach (var bb in DebuggerService.Breakpoints)
+                {
+                    string m; int l;
+                    if (TryMap(bb, out m, out l)
+                        && string.Equals(m, module, StringComparison.OrdinalIgnoreCase) && l == line)
+                    {
+                        // Mirror the add path (ToggleAtCaret) so the IDE removes the bookmark AND
+                        // repaints the editor's icon-bar margin — clearing the red dot. RemoveMark
+                        // alone drops the SharpDevelop-level bookmark but leaves the open document's
+                        // gutter showing a stale dot until its next redraw. Toggling an existing
+                        // breakpoint off fires BreakPointRemoved exactly like a manual gutter removal,
+                        // so the engine/pending + pane cascade (OnGutterBpRemoved) still runs.
+                        if (bb.Document != null)
+                            DebuggerService.ToggleBreakpointAt(bb.Document, bb.FileName, bb.LineNumber);
+                        else
+                            ICSharpCode.SharpDevelop.Bookmarks.BookmarkManager.RemoveMark(bb); // editor closed — no visible dot to repaint
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         // ------------------------------------------------------------------ active editor discovery
