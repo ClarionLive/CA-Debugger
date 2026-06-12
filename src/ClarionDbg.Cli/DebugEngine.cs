@@ -398,9 +398,16 @@ namespace ClarionDbg.Cli
                 if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no code records in module"));
                 return;
             }
-            // adding an existing planted line is a no-op (re-confirm so the UI can sync)
+            // Re-adding the SAME requested line is a no-op (re-confirm so the UI can sync). NOTE: we
+            // key this on the REQUESTED line, not the planted line — several distinct gutter lines can
+            // snap to one planted line (e.g. blank/comment lines above a statement). Each stays its own
+            // logical breakpoint so it can be removed independently; the shared INT3 at the planted
+            // address is ref-counted by PlantBp (skips an already-armed VA) and RemoveBreakpoint (only
+            // unplants when the last referencing breakpoint is gone). Collapsing on the planted line —
+            // the old behaviour — meant removing any of the other gutter lines matched nothing and left
+            // the breakpoint planted and firing.
             foreach (var b in _bps)
-                if (b.Owner == owner && b.ModuleIdx == mi && b.Line == planted)
+                if (b.Owner == owner && b.ModuleIdx == mi && b.RequestedLine == line)
                 {
                     if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(b.Module, line, b.Line, b.Rvas));
                     return;
@@ -439,8 +446,14 @@ namespace ClarionDbg.Cli
         private void RemoveBreakpoint(string module, int line)
         {
             UserBreakpoint found = null;
+            // Prefer an exact requested-line match; only fall back to the planted line if nothing
+            // requested it. Several logical bps can share one planted Line (distinct gutter lines that
+            // snapped to the same record), so a planted-line match alone would remove an arbitrary one.
             foreach (var b in _bps)
-                if (Eq(b.Module, module) && (b.Line == line || b.RequestedLine == line)) { found = b; break; }
+                if (Eq(b.Module, module) && b.RequestedLine == line) { found = b; break; }
+            if (found == null)
+                foreach (var b in _bps)
+                    if (Eq(b.Module, module) && b.Line == line) { found = b; break; }
             string canon = found != null ? found.Module : module;
             if (found == null)
             {
@@ -448,8 +461,19 @@ namespace ClarionDbg.Cli
                 return;
             }
             uint baseVa = found.Owner != null ? found.Owner.LoadBase : 0;
+            // Drop the logical breakpoint first so the ref-count check below sees only the survivors.
+            _bps.Remove(found);
             foreach (var rva in found.Rvas)
             {
+                // Ref-count the physical INT3: another breakpoint (a different gutter line that snapped
+                // to the same address in the SAME image) may still need it. Match on Owner — under
+                // multi-DLL two images can share a ModuleIdx, so an rva-only check could alias across
+                // modules. Only unplant when nothing references it.
+                bool stillReferenced = false;
+                foreach (var b in _bps)
+                    if (b.Owner == found.Owner && b.Rvas.Contains(rva)) { stillReferenced = true; break; }
+                if (stillReferenced) continue;
+
                 uint va = baseVa + rva;
                 byte orig;
                 if (baseVa != 0 && _armed.TryGetValue(va, out orig))
@@ -464,7 +488,6 @@ namespace ClarionDbg.Cli
                     _armed.Remove(va);
                 }
             }
-            _bps.Remove(found);
             Console.WriteLine($"bp: removed {canon}:{found.Line}");
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
         }
