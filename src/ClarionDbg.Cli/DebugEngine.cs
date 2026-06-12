@@ -1470,6 +1470,19 @@ namespace ClarionDbg.Cli
             var m0 = ModuleAt(eip);
             var frames = new List<StackFrame> { FrameAt(m0, eip, 0) };
 
+            // External / frameless top frame — a DebugBreak() int3 (which executes in ntdll), or a
+            // thread paused inside an OS call. EBP here still belongs to the Clarion CALLER (the
+            // frameless callee never pushed its own EBP), so the EBP walk below would read [ebp+4] =
+            // the caller's return and jump a level too far, dropping the frame the user actually cares
+            // about (the line that called DebugBreak / the line we paused at). Reconstruct the Clarion
+            // frames by scanning the stack instead, which recovers that immediate caller.
+            bool topIsClarion = m0 != null && m0.Dbg != null;
+            if (!topIsClarion)
+            {
+                ScanStack(frames, esp, maxFrames);
+                return frames;
+            }
+
             // Entry-prologue case: if EIP is exactly at the current procedure's entry, its
             // {push ebp; mov ebp,esp} has not run yet — EBP still belongs to the CALLER and the
             // caller's return address sits at [ESP]. Emit that direct caller first; the EBP chain
