@@ -180,6 +180,34 @@ namespace ClarionDebugger.Services
         /// falls back to a recursive walk of solution-folder collections. Any null hop → returns an
         /// empty/absent list (and null currentProject).
         /// </summary>
+        /// <summary>
+        /// Returns a stable identity for the IDE's currently-open solution+active-project context, or null
+        /// if no solution is open. Used to tie a one-shot manual Browse selection to the context it was made
+        /// in: if this key changes between Starts, a previously-Browsed target is stale and must be discarded.
+        /// Best-effort; never throws (degrades to null).
+        /// </summary>
+        public static string GetActiveContextKey()
+        {
+            try
+            {
+                Assembly asm = Assembly.Load("ICSharpCode.SharpDevelop");
+                if (asm == null) return null;
+                Type psType = asm.GetType("ICSharpCode.SharpDevelop.Project.ProjectService");
+                if (psType == null) return null;
+
+                object solution = ReflectionHelpers.GetStaticProp(psType, "OpenSolution");
+                if (solution == null) return null;
+                string solutionFile = ReflectionHelpers.GetProp(solution, "FileName") as string;
+                if (string.IsNullOrEmpty(solutionFile)) return null;
+
+                object current = ReflectionHelpers.GetStaticProp(psType, "CurrentProject");
+                string projectFile = current != null ? ReflectionHelpers.GetProp(current, "FileName") as string : null;
+
+                return (solutionFile + "|" + (projectFile ?? "")).ToLowerInvariant();
+            }
+            catch { return null; }
+        }
+
         private static IList GetSolutionProjects(out object currentProject)
         {
             currentProject = null;

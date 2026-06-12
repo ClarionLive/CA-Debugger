@@ -18,17 +18,29 @@ namespace ClarionDebugger.Terminal
     /// toolbar + watch actions back to the engine. Breakpoints are still set in the Clarion editor
     /// gutter (Phase 2 EditorBreakpointService) and merged on session start.
     /// </summary>
-    public sealed class ClarionDebuggerWebView : UserControl
+    public sealed class ClarionDebuggerWebView : UserControl, IDebugSessionTarget
     {
         private WebView2 _webView;
-        private bool _ready, _initializing;
+        // _ready/_startQueued are written from the WebView2 NavigationCompleted callback and read from
+        // command-surface methods; both run on the UI thread, but mark volatile to make the
+        // publish/consume explicit and tolerate any reordering. UI-thread-only access otherwise.
+        private volatile bool _ready;
+        private bool _initializing;
+        private volatile bool _startQueued; // a toolbar Start arrived before the WebView was ready; fire it on NavigationCompleted
 
         private readonly ClarionDebuggerService _svc = new ClarionDebuggerService();
         private readonly EditorBreakpointService _gutter = new EditorBreakpointService();
         private readonly List<DebugBreakpoint> _pending = new List<DebugBreakpoint>(); // breakpoints while idle
         private readonly HashSet<string> _watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private string _exe = "";
-        private bool _exeAuto; // _exe came from auto-resolve (re-resolvable); a manual choice clears this
+        private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
+        private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
+
+        // The exact local file URI the WebView is expected to navigate to. Used to (a) gate _ready on the
+        // navigation actually being our packaged page and (b) reject web messages from any other origin.
+        private string _expectedUri;
+        // Event handlers retained so Dispose can detach them from _svc BEFORE teardown.
+        private CoreWebView2 _coreForEvents;
 
         public ClarionDebuggerWebView()
         {
@@ -37,27 +49,84 @@ namespace ClarionDebugger.Terminal
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
 
-            _svc.StateChanged += s => UI(() => Post("{\"type\":\"runstate\",\"state\":\"" + StateName(s) + "\"}"));
-            _svc.Paused += OnPaused;
-            _svc.Resumed += mode => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
-            _svc.HitReceived += hit => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
-            _svc.StackReceived += frames => UI(() => OnStack(frames));
-            _svc.WatchReceived += w => UI(() => OnWatch(w));
-            _svc.BreakpointSet += bp => UI(() => SendBps());
-            _svc.BreakpointRemoved += (m, l) => UI(() => SendBps());
-            _svc.BreakpointListReceived += list => UI(() => SendBps());
-            _svc.BreakpointError += (m, l, err) => UI(() => Console("err", "breakpoint " + m + ":" + l + " — " + err));
-            _svc.EngineError += msg => UI(() => Console("err", "engine: " + msg));
-            _svc.ModuleLoaded += m => UI(() => OnModuleLoaded(m));
-            _svc.ModuleUnloaded += m => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
-            _svc.LogReceived += s => UI(() => Console("info", s));
-            _svc.Exited += code => UI(() => { ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+            // Wire engine + gutter events via named handlers (stored implicitly by method group) so Dispose
+            // can detach them BEFORE _svc.Stop()/teardown — no late callback can touch a half-disposed pad.
+            _svc.StateChanged          += OnSvcStateChanged;
+            _svc.Paused                += OnPaused;
+            _svc.Resumed               += OnSvcResumed;
+            _svc.HitReceived           += OnSvcHit;
+            _svc.StackReceived         += OnSvcStack;
+            _svc.WatchReceived         += OnSvcWatch;
+            _svc.BreakpointSet         += OnSvcBreakpointSet;
+            _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
+            _svc.BreakpointListReceived += OnSvcBreakpointList;
+            _svc.BreakpointError       += OnSvcBreakpointError;
+            _svc.EngineError           += OnSvcEngineError;
+            _svc.ModuleLoaded          += OnSvcModuleLoaded;
+            _svc.ModuleUnloaded        += OnSvcModuleUnloaded;
+            _svc.LogReceived           += OnSvcLog;
+            _svc.Exited                += OnSvcExited;
 
-            _gutter.GutterBreakpointAdded += (m, l, f) => UI(() => OnGutterBpAdded(m, l));
-            _gutter.GutterBreakpointRemoved += (m, l, f) => UI(() => OnGutterBpRemoved(m, l));
+            _gutter.GutterBreakpointAdded   += OnGutterAdded;
+            _gutter.GutterBreakpointRemoved += OnGutterRemoved;
 
             HandleCreated += OnHandleCreated;
+
+            // Become the live target for the IDE debug toolbar. The latest pad instance wins.
+            DebugSessionController.Register(this);
         }
+
+        /// <summary>Detach every engine/gutter event handler. Called from Dispose BEFORE _svc.Stop() so a
+        /// late off-thread callback (Exited/StateChanged fire off-thread) can't run against a disposing pad.</summary>
+        private void DetachServiceEvents()
+        {
+            _svc.StateChanged           -= OnSvcStateChanged;
+            _svc.Paused                 -= OnPaused;
+            _svc.Resumed                -= OnSvcResumed;
+            _svc.HitReceived            -= OnSvcHit;
+            _svc.StackReceived          -= OnSvcStack;
+            _svc.WatchReceived          -= OnSvcWatch;
+            _svc.BreakpointSet          -= OnSvcBreakpointSet;
+            _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
+            _svc.BreakpointListReceived -= OnSvcBreakpointList;
+            _svc.BreakpointError        -= OnSvcBreakpointError;
+            _svc.EngineError            -= OnSvcEngineError;
+            _svc.ModuleLoaded           -= OnSvcModuleLoaded;
+            _svc.ModuleUnloaded         -= OnSvcModuleUnloaded;
+            _svc.LogReceived            -= OnSvcLog;
+            _svc.Exited                 -= OnSvcExited;
+
+            _gutter.GutterBreakpointAdded   -= OnGutterAdded;
+            _gutter.GutterBreakpointRemoved -= OnGutterRemoved;
+        }
+
+        // ------------------------------------------------------------------ engine event handlers (named, detachable)
+
+        private void OnSvcStateChanged(DebugSessionState s)
+        {
+            // Mirror engine state into the IDE-toolbar controller. Instance-aware: the controller ignores
+            // this if we are no longer the registered target (a stale/disposed pad can't stomp toolbar state).
+            // Fires off-thread (OutputDataReceived/Exited); the Post is marshalled to the UI thread.
+            DebugSessionController.SetState(this, ToControllerState(s));
+            UI(() => Post("{\"type\":\"runstate\",\"state\":\"" + StateName(s) + "\"}"));
+        }
+
+        private void OnSvcResumed(string mode) => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
+        private void OnSvcStack(List<DebugStackFrame> frames) => UI(() => OnStack(frames));
+        private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
+        private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() => SendBps());
+        private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
+        private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() => SendBps());
+        private void OnSvcBreakpointError(string m, int l, string err) => UI(() => Console("err", "breakpoint " + m + ":" + l + " — " + err));
+        private void OnSvcEngineError(string msg) => UI(() => Console("err", "engine: " + msg));
+        private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
+        private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
+        private void OnSvcLog(string s) => UI(() => Console("info", s));
+        private void OnSvcExited(int code) => UI(() => { ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+
+        private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
+        private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
 
         private async void OnHandleCreated(object sender, EventArgs e)
         {
@@ -67,18 +136,110 @@ namespace ClarionDebugger.Terminal
             {
                 var env = await WebView2EnvironmentCache.GetEnvironmentAsync();
                 await _webView.EnsureCoreWebView2Async(env);
-                var st = _webView.CoreWebView2.Settings;
+                var core = _webView.CoreWebView2;
+                _coreForEvents = core;
+                var st = core.Settings;
                 st.IsScriptEnabled = true;
                 st.AreDefaultContextMenusEnabled = false;
                 st.IsStatusBarEnabled = false;
-                _webView.CoreWebView2.WebMessageReceived += OnWebMessage;
-                _webView.CoreWebView2.NavigationCompleted += (s, ev) => { _ready = true; _initializing = false; };
 
                 string html = GetHtmlPath();
-                if (File.Exists(html))
-                    _webView.CoreWebView2.Navigate(new Uri(html).AbsoluteUri + "?theme=dark");
+                if (!File.Exists(html))
+                {
+                    _initializing = false;
+                    _startQueued = false; // nothing to navigate to — don't strand a queued Start
+                    System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] init: debugger.html not found at " + html);
+                    return;
+                }
+                // The exact origin we trust: our packaged debugger.html. Used to gate readiness and to reject
+                // web messages from any other navigation.
+                _expectedUri = new Uri(html).AbsoluteUri;
+
+                core.WebMessageReceived += OnWebMessage;
+                core.NavigationCompleted += OnNavigationCompleted;
+
+                core.Navigate(_expectedUri + "?theme=dark");
             }
-            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] init: " + ex.Message); }
+            catch (Exception ex)
+            {
+                // Initialization failed. Reset the init flags (don't leave _initializing latched) and clear any
+                // queued Start so it isn't silently stranded. NOTE: OnHandleCreated is wired to the one-shot
+                // HandleCreated event and won't re-run, so we deliberately do NOT promise a Start-retry here —
+                // recovery is reopening the pad.
+                _initializing = false;
+                _ready = false;
+                _startQueued = false;
+                System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] init: " + ex.Message);
+                UI(() => Console("err", "debugger view failed to initialize: " + ex.Message + " — reopen the CA Debugger pad to retry."));
+            }
+        }
+
+        /// <summary>
+        /// Gate readiness on the navigation having (a) succeeded and (b) landed on OUR packaged debugger.html
+        /// — not just "any completed navigation". On failure: stay not-ready, surface a console error, and
+        /// CLEAR any queued Start so a toolbar Start isn't silently stranded against a dead view.
+        /// </summary>
+        private void OnNavigationCompleted(object s, CoreWebView2NavigationCompletedEventArgs ev)
+        {
+            bool ok = false;
+            string reason = null;
+            try
+            {
+                if (ev != null && !ev.IsSuccess) reason = "web error " + ev.WebErrorStatus;
+                else if (!IsExpectedSource(SafeSource())) reason = "unexpected navigation target";
+                else ok = true;
+            }
+            catch (Exception ex) { reason = ex.Message; }
+
+            if (ok)
+            {
+                _ready = true; _initializing = false;
+                // Run a queued Start now that the page is live — but re-check idempotency (StartSession only
+                // when still Idle) so the queued path is guarded identically to CmdStart.
+                if (_startQueued)
+                {
+                    _startQueued = false;
+                    // Re-check both gates (pad-local + global controller Idle) before firing the queued Start —
+                    // identical to CmdStart, in case state changed while we were navigating.
+                    UI(() => { try { if (CurrentState == DebugSessionState.Idle && DebugSessionController.State == DebugControllerState.Idle) StartSession(); } catch (Exception ex) { Console("err", "start failed: " + ex.Message); } });
+                }
+            }
+            else
+            {
+                _ready = false; _initializing = false;
+                _startQueued = false; // don't strand a queued Start on a failed navigation
+                // Don't promise a Start-retry: OnHandleCreated is one-shot and won't re-run. Recovery is
+                // reopening the pad (which constructs a fresh WebView + re-runs init).
+                UI(() => Console("err", "debugger view failed to initialize: " + (reason ?? "unknown") + " — reopen the CA Debugger pad to retry."));
+            }
+        }
+
+        /// <summary>The WebView's current document URI, or null if unavailable.</summary>
+        private string SafeSource()
+        {
+            try { return _coreForEvents != null ? _coreForEvents.Source : null; }
+            catch { return null; }
+        }
+
+        /// <summary>The origin URI a web message was posted from (falls back to the WebView's current Source).</summary>
+        private string SafeMessageSource(CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            try { if (e != null && !string.IsNullOrEmpty(e.Source)) return e.Source; }
+            catch { }
+            return SafeSource();
+        }
+
+        /// <summary>True when <paramref name="uri"/> is our packaged debugger.html (ignoring the ?theme query).</summary>
+        private bool IsExpectedSource(string uri)
+        {
+            if (string.IsNullOrEmpty(_expectedUri) || string.IsNullOrEmpty(uri)) return false;
+            try
+            {
+                int q = uri.IndexOf('?');
+                string bare = q >= 0 ? uri.Substring(0, q) : uri;
+                return string.Equals(bare, _expectedUri, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         private static string GetHtmlPath()
@@ -94,21 +255,27 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
+                // Defense-in-depth: only honour messages from our trusted packaged debugger.html. A message
+                // whose origin we can't confirm is dropped (an injected/redirected page can't drive the engine).
+                if (!IsExpectedSource(SafeMessageSource(e)))
+                {
+                    System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] dropped web message from untrusted source");
+                    return;
+                }
+
                 string json = e.TryGetWebMessageAsString();
                 string action = JsonVal(json, "action");
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
-                    case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe(); if (!string.IsNullOrEmpty(_exe)) Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}"); break;
-                    case "start": StartSession(); break;
-                    case "continue": _svc.Continue(); break;
-                    case "pause": _svc.Pause(); break;
-                    case "stepover": _svc.StepOver(); break;
-                    case "stepinto": _svc.StepInto(); break;
-                    case "stepout": _svc.StepOut(); break;
-                    case "stop": ClearCurrentLineMarker(); _svc.Stop(); break;
-                    case "browse": Browse(); break;
-                    case "setExe": _exe = data ?? ""; _exeAuto = false; break;
+                    case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe(); break;
+                    case "start": CmdStart(); break;
+                    case "continue": CmdContinue(); break;
+                    case "pause": CmdPause(); break;
+                    case "stepover": CmdStepOver(); break;
+                    case "stepinto": CmdStepInto(); break;
+                    case "stepout": CmdStepOut(); break;
+                    case "stop": CmdStop(); break;
                     case "watch":
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) _svc.Watch(data); }
                         break;
@@ -121,40 +288,81 @@ namespace ClarionDebugger.Terminal
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] msg: " + ex.Message); }
         }
 
+        // ------------------------------------------------------------------ command surface (IDebugSessionTarget)
+        // One execution path shared by the in-pad buttons' web messages (above) and the IDE toolbar
+        // (via DebugSessionController). All run on the UI thread (web messages arrive on it; the
+        // controller is invoked from AbstractMenuCommand.Run, also on the UI thread).
+
+        /// <summary>True once the WebView has navigated and can accept Post()/commands.</summary>
+        public bool IsReady { get { return _ready && _webView != null; } }
+
+        /// <summary>True when this pad's engine has no live session. Read by the controller (post-dispose-safe:
+        /// _svc outlives the WebView teardown) to decide whether the current target is genuinely idle.</summary>
+        public bool IsSessionIdle { get { try { return _svc.State == DebugSessionState.Idle; } catch { return true; } } }
+
+        // The Cmd* methods are the SINGLE execution point for every command source — the IDE toolbar
+        // (DebugSessionController forwarder -> Cmd*) AND the pad's web-message / keyboard-shortcut path
+        // (OnWebMessage -> Cmd*). They are therefore SELF-GUARDING: each checks whether its command is valid
+        // in the current engine state (the same matrix the toolbar condition evaluator uses) and is a safe
+        // no-op otherwise. This guarantees a pad shortcut for an out-of-state command never reaches _svc and a
+        // 2nd Start while a session is live can never fall through to _svc.StartSession() ("already running").
+        // The controller forwarders keep their own guard as defense-in-depth; this is the authoritative one.
+
+        /// <summary>The engine's current run-state — the source of truth both the toolbar (via the controller
+        /// mirror) and these guards read, so toolbar-enabled == Cmd*-executes.</summary>
+        private DebugSessionState CurrentState { get { return _svc.State; } }
+
+        public void CmdStart()
+        {
+            // Idempotent: only Idle starts a session. A 2nd Start while Launching/Running/Paused is a no-op.
+            if (CurrentState != DebugSessionState.Idle) return;
+            // ALSO require the GLOBAL controller state to be Idle. A reopened pad's own _svc is Idle, so the
+            // pad-local guard alone would let an in-pad shortcut / web-message Start launch a SECOND session
+            // while a PRIOR engine is still tearing down (controller non-idle until Stop() confirms dead — see
+            // ClarionDebuggerService.Stop, now authoritative). This shares the same pre-start gate the IDE
+            // toolbar already gets via the condition evaluator, closing the page/shortcut bypass.
+            if (DebugSessionController.State != DebugControllerState.Idle) return;
+            // The toolbar can fire Start before the pad's WebView has finished navigating (the pad was just
+            // opened). Queue it; NavigationCompleted will run StartSession once the page is live.
+            if (!_ready) { _startQueued = true; return; }
+            StartSession();
+        }
+
+        public void CmdContinue() { if (CurrentState == DebugSessionState.Paused) _svc.Continue(); }
+        public void CmdStepOver() { if (CurrentState == DebugSessionState.Paused) _svc.StepOver(); }
+        public void CmdStepInto() { if (CurrentState == DebugSessionState.Paused) _svc.StepInto(); }
+        public void CmdStepOut()  { if (CurrentState == DebugSessionState.Paused) _svc.StepOut(); }
+
+        public void CmdPause()
+        {
+            var s = CurrentState;
+            if (s == DebugSessionState.Running || s == DebugSessionState.Launching) _svc.Pause();
+        }
+
+        public void CmdStop()
+        {
+            if (CurrentState == DebugSessionState.Idle) return;   // nothing to stop
+            // Clear the editor's yellow current-line marker on the UI thread (it's a UI operation).
+            ClearCurrentLineMarker();
+            // _svc.Stop() blocks (WaitForExit(1500) + Kill); run it off the UI thread so the IDE doesn't
+            // freeze. Results come back via the existing Exited/StateChanged -> UI() path.
+            var svc = _svc;
+            System.Threading.Tasks.Task.Run(() => { try { svc.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] stop: " + ex.Message); } });
+        }
+
         private void StartSession()
         {
             try
             {
-                // Auto-detected target: re-confirm against the current IDE solution at launch (the user may have
-                // switched solutions since 'ready'), and also try to resolve when the field is still blank (the pad
-                // may have opened before a solution loaded). Best-effort; never throw.
-                if (_exeAuto || string.IsNullOrEmpty(_exe))
-                {
-                    try
-                    {
-                        string fresh = ProjectTargetService.ResolveTargetExe();
-                        if (!string.IsNullOrEmpty(fresh))
-                        {
-                            if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase))
-                            {
-                                _exe = fresh;
-                                _exeAuto = true;
-                                Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}");
-                                Console("info", "target updated to: " + Path.GetFileName(_exe));
-                            }
-                        }
-                        else if (_exeAuto)
-                        {
-                            // Could not confirm the auto-detected target for the CURRENT solution — refuse to launch a
-                            // possibly-stale EXE. Keep _exe (don't wipe) so a transient resolve failure can retry on the
-                            // next Start; the user can also Browse to choose explicitly.
-                            Console("err", "Auto-detected target could no longer be confirmed for the current solution — press Start again or Browse to choose a Target EXE.");
-                            return;
-                        }
-                    }
-                    catch { }
-                }
-                if (string.IsNullOrEmpty(_exe) || !File.Exists(_exe)) { Console("err", "Pick a valid Target EXE first."); return; }
+                // The Target EXE field is intentionally gone — Start always sources the target from the app.
+                // On EVERY Start we re-resolve from the active project and use the fresh result. A manual Browse
+                // pick is honoured only as a ONE-SHOT tied to the solution/project context it was chosen for: if
+                // that context has changed (or can't be confirmed the same), the stale pick is discarded and we
+                // re-resolve / re-Browse rather than launching a hidden EXE against a different solution.
+                if (!ResolveTargetForStart()) return;
+
+                // Echo the resolved target so the console always confirms which process is about to launch.
+                Console("info", "target: " + _exe);
                 // merge gutter (red-dot) breakpoints set before launch
                 foreach (var gb in _gutter.Snapshot())
                 {
@@ -183,7 +391,62 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>
-        /// Auto-fill _exe from the IDE's active project when the field is still blank. Best-effort:
+        /// Decide the target EXE for a Start. Always prefers a FRESH ProjectTargetService.ResolveTargetExe()
+        /// against the active project. A manual Browse pick is reused only if the IDE context (solution+project)
+        /// is unchanged AND the file still exists; otherwise the stale manual pick is discarded. When nothing
+        /// auto-resolves, falls back to a one-shot Browse tied to the current context. Returns true if _exe is a
+        /// valid, launchable target; false (with a console message) to abort the Start. Never throws.
+        /// </summary>
+        private bool ResolveTargetForStart()
+        {
+            string ctx = null;
+            try { ctx = ProjectTargetService.GetActiveContextKey(); } catch { }
+
+            // 1) Always re-resolve from the active project first — this is the primary source of truth.
+            string fresh = null;
+            try { fresh = ProjectTargetService.ResolveTargetExe(); } catch { }
+            if (!string.IsNullOrEmpty(fresh))
+            {
+                if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase) || _exeAuto == false)
+                    Console("info", "resolved target: " + Path.GetFileName(fresh));
+                _exe = fresh;
+                _exeAuto = true;
+                _exeManualKey = null;            // an auto-resolve supersedes any prior manual pick
+                if (File.Exists(_exe)) return true;
+                Console("err", "Resolved target does not exist on disk: " + _exe + " — build the app, or choose one to launch.");
+                return BrowseForContext(ctx);
+            }
+
+            // 2) No auto-resolve. Honour a manual pick ONLY if it's still valid for the SAME context.
+            if (!_exeAuto && !string.IsNullOrEmpty(_exe))
+            {
+                bool sameContext = ctx != null && string.Equals(ctx, _exeManualKey, StringComparison.OrdinalIgnoreCase);
+                if (sameContext && File.Exists(_exe)) return true;
+
+                // Context changed (or unconfirmable) — never launch a hidden EXE against a different solution.
+                Console("err", "Previously chosen target no longer matches the active solution — choose a target to launch.");
+                _exe = ""; _exeManualKey = null;
+                return BrowseForContext(ctx);
+            }
+
+            // 3) Nothing to launch — offer a one-shot Browse.
+            Console("err", "Could not auto-detect a Target EXE for the current solution — choose one to launch.");
+            return BrowseForContext(ctx);
+        }
+
+        /// <summary>Browse for a target and bind the manual pick to <paramref name="ctx"/> (the context it was
+        /// chosen for). Returns true only if a valid, existing EXE was selected.</summary>
+        private bool BrowseForContext(string ctx)
+        {
+            if (!Browse()) return false;
+            _exeManualKey = ctx;               // one-shot: only valid while the active context stays this
+            if (!File.Exists(_exe)) { Console("err", "Chosen target does not exist: " + _exe); _exe = ""; _exeManualKey = null; return false; }
+            return true;
+        }
+
+        /// <summary>
+        /// Auto-fill _exe from the IDE's active project when the pad first becomes ready (purely so the console
+        /// can confirm the auto-detected target early). Start always re-resolves regardless. Best-effort:
         /// ProjectTargetService never throws and returns null when it can't decide on a single EXE.
         /// </summary>
         private void TryAutoResolveExe()
@@ -195,23 +458,27 @@ namespace ClarionDebugger.Terminal
                 {
                     _exe = result;
                     _exeAuto = true;
+                    _exeManualKey = null;
                     Console("info", "auto-detected target: " + Path.GetFileName(_exe));
                 }
             }
             catch { }
         }
 
-        private void Browse()
+        /// <summary>Prompt for a Target EXE. Returns true if the user picked one. A manual choice clears
+        /// _exeAuto; the caller (BrowseForContext) binds it to the current context as a one-shot.</summary>
+        private bool Browse()
         {
             using (var dlg = new OpenFileDialog { Filter = "Clarion executables (*.exe)|*.exe|All files (*.*)|*.*" })
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
                     _exe = dlg.FileName;
-                    _exeAuto = false; // a manual pick is authoritative — don't re-resolve over it
-                    Post("{\"type\":\"exe\",\"path\":" + Str(_exe) + "}");
+                    _exeAuto = false; // a manual pick — re-resolve will still take precedence on the next Start
+                    return true;
                 }
             }
+            return false;
         }
 
         private void Jump(string spec)
@@ -499,6 +766,17 @@ namespace ClarionDebugger.Terminal
             switch (s) { case DebugSessionState.Launching: return "launching"; case DebugSessionState.Running: return "running"; case DebugSessionState.Paused: return "paused"; default: return "idle"; }
         }
 
+        private static DebugControllerState ToControllerState(DebugSessionState s)
+        {
+            switch (s)
+            {
+                case DebugSessionState.Launching: return DebugControllerState.Launching;
+                case DebugSessionState.Running:   return DebugControllerState.Running;
+                case DebugSessionState.Paused:    return DebugControllerState.Paused;
+                default:                          return DebugControllerState.Idle;
+            }
+        }
+
         private void Post(string json)
         {
             try { if (_ready && _webView.CoreWebView2 != null) _webView.CoreWebView2.PostWebMessageAsString(json); }
@@ -564,8 +842,51 @@ namespace ClarionDebugger.Terminal
         {
             if (disposing)
             {
+                // Was a session live at close? Capture BEFORE Stop. This decides whether the controller may go
+                // Idle immediately (no live engine to race) or must stay non-idle until teardown confirms done.
+                bool wasLive;
+                try { wasLive = _svc.State != DebugSessionState.Idle; } catch { wasLive = false; }
+
+                // Detach engine/gutter + WebView event handlers BEFORE Stop()/teardown so no late off-thread
+                // callback (StateChanged/Exited fire off-thread) runs against a disposing pad. The
+                // teardown-completion signal goes to the STATIC controller (safe post-dispose), not the WebView.
+                _ready = false;
+                _startQueued = false;
+                try { DetachServiceEvents(); } catch { }
+                if (_coreForEvents != null)
+                {
+                    try { _coreForEvents.WebMessageReceived -= OnWebMessage; } catch { }
+                    try { _coreForEvents.NavigationCompleted -= OnNavigationCompleted; } catch { }
+                    _coreForEvents = null;
+                }
+
                 try { ClearCurrentLineMarker(); } catch { }
-                try { _svc.Stop(); } catch { }
+
+                var svc = _svc;
+                if (wasLive)
+                {
+                    // A session was live. _svc.Stop() blocks (WaitForExit(1500) + Kill) and runs off the UI
+                    // thread. Do NOT Unregister now — that would let the controller report Idle and re-enable
+                    // the toolbar Start while the old engine/target is still dying (close→reopen→re-run-same-exe
+                    // would race a still-terminating process / file lock). Keep the controller's current
+                    // non-idle state; only AFTER Stop() completes do we signal the controller (NotifyStopped),
+                    // which returns to Idle iff the then-current target is genuinely idle, then Unregister this
+                    // instance. Order matters: NotifyStopped before Unregister so a no-reopen close still drops
+                    // to Idle (NotifyStopped sees _target==this whose session is now idle).
+                    System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try { svc.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] dispose stop: " + ex.Message); }
+                        try { DebugSessionController.NotifyStopped(this); } catch { }
+                        try { DebugSessionController.Unregister(this); } catch { }
+                    });
+                }
+                else
+                {
+                    // No live session — safe to stop being the toolbar's target immediately (state already Idle).
+                    try { DebugSessionController.Unregister(this); } catch { }
+                    try { svc.Stop(); } catch { }
+                }
+
                 try { _gutter.Dispose(); } catch { }
                 if (_webView != null) { try { _webView.Dispose(); } catch { } _webView = null; }
             }

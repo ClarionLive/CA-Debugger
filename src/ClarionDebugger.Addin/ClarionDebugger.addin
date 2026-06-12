@@ -3,7 +3,12 @@
     <Identity name="ClarionDebugger" version="1.0.0"/>
   </Manifest>
   <Runtime>
-    <Import assembly="ClarionDebugger.dll"/>
+    <Import assembly="ClarionDebugger.dll">
+      <!-- Greys/un-greys the CA-Debugger toolbar buttons by live debug run-state. One evaluator
+           serves all 7 buttons via the per-button 'debugbutton' attribute. -->
+      <ConditionEvaluator name="ClarionDebugState"
+                          class="ClarionDebugger.ClarionDebugStateConditionEvaluator"/>
+    </Import>
   </Runtime>
 
   <Path name="/SharpDevelop/Workbench/Pads">
@@ -15,5 +20,77 @@
   <Path name="/Workspace/Tools">
     <MenuItem id="ShowClarionDebugger" label="CA Debugger"
               class="ClarionDebugger.ShowClarionDebuggerCommand"/>
+  </Path>
+
+  <!-- CA Debugger control cluster on the main IDE toolbar (VS Code-style: stock icons + tooltip).
+       Anchored after the stock 'BuildProject' button (a stable base-toolbar id) so placement is
+       deterministic. Each button is wrapped in its own ClarionDebugState condition (action=Disable)
+       so the IDE greys it per run-state on the ApplicationIdle cycle — the same way the native
+       IsProcessRunning debug buttons re-grey. -->
+  <Path name="/SharpDevelop/Workbench/ToolBar/Standard">
+    <ToolbarItem id="CADebugSeparator" type="Separator" insertafter="BuildProject"/>
+
+    <Condition name="ClarionDebugState" debugbutton="Start" action="Disable">
+      <ToolbarItem id="CADebugStart"
+                   insertafter="CADebugSeparator"
+                   icon="Icons.16x16.RunProgramIcon"
+                   disabledIcon="Icons.16x16.RunProgramIcon"
+                   tooltip="CA Debugger: Start (auto-resolves the target EXE)"
+                   class="ClarionDebugger.StartDebugCommand"/>
+    </Condition>
+
+    <Condition name="ClarionDebugState" debugbutton="Continue" action="Disable">
+      <ToolbarItem id="CADebugContinue"
+                   insertafter="CADebugStart"
+                   icon="Icons.24x24.Debug.Continue"
+                   disabledIcon="Icons.24x24.Debug.Continue"
+                   tooltip="CA Debugger: Continue"
+                   class="ClarionDebugger.ContinueDebugCommand"/>
+    </Condition>
+
+    <Condition name="ClarionDebugState" debugbutton="Pause" action="Disable">
+      <ToolbarItem id="CADebugPause"
+                   insertafter="CADebugContinue"
+                   icon="Icons.24x24.Debug.Break"
+                   disabledIcon="Icons.24x24.Debug.Break"
+                   tooltip="CA Debugger: Pause (break into the running target)"
+                   class="ClarionDebugger.PauseDebugCommand"/>
+    </Condition>
+
+    <Condition name="ClarionDebugState" debugbutton="StepOver" action="Disable">
+      <ToolbarItem id="CADebugStepOver"
+                   insertafter="CADebugPause"
+                   icon="Icons.24x24.Debug.StepOver"
+                   disabledIcon="Icons.24x24.Debug.StepOver"
+                   tooltip="CA Debugger: Step Over"
+                   class="ClarionDebugger.StepOverDebugCommand"/>
+    </Condition>
+
+    <Condition name="ClarionDebugState" debugbutton="StepInto" action="Disable">
+      <ToolbarItem id="CADebugStepInto"
+                   insertafter="CADebugStepOver"
+                   icon="Icons.24x24.Debug.StepInto"
+                   disabledIcon="Icons.24x24.Debug.StepInto"
+                   tooltip="CA Debugger: Step Into"
+                   class="ClarionDebugger.StepIntoDebugCommand"/>
+    </Condition>
+
+    <Condition name="ClarionDebugState" debugbutton="StepOut" action="Disable">
+      <ToolbarItem id="CADebugStepOut"
+                   insertafter="CADebugStepInto"
+                   icon="Icons.24x24.Debug.StepOut"
+                   disabledIcon="Icons.24x24.Debug.StepOut"
+                   tooltip="CA Debugger: Step Out"
+                   class="ClarionDebugger.StepOutDebugCommand"/>
+    </Condition>
+
+    <Condition name="ClarionDebugState" debugbutton="Stop" action="Disable">
+      <ToolbarItem id="CADebugStop"
+                   insertafter="CADebugStepOut"
+                   icon="Icons.24x24.Debug.StopProcess"
+                   disabledIcon="Icons.24x24.Debug.StopProcess"
+                   tooltip="CA Debugger: Stop"
+                   class="ClarionDebugger.StopDebugCommand"/>
+    </Condition>
   </Path>
 </AddIn>

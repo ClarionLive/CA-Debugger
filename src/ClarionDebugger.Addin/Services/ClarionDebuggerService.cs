@@ -245,16 +245,42 @@ namespace ClarionDebugger.Services
             _proc.BeginErrorReadLine();
         }
 
+        /// <summary>
+        /// Authoritative teardown barrier. When this returns, the engine/target process is GONE and State is
+        /// Idle — every code path (graceful quit, forced kill, or already-dead) guarantees both before return.
+        /// Prefers a clean engine-side quit (which also kills the target); on timeout it Kills and confirms the
+        /// process actually exited via WaitForExit (bounded so a wedged process can't hang the teardown thread
+        /// forever). Always drives State=Idle synchronously at the end — the async _proc.Exited / "exited" path
+        /// that also sets Idle is idempotent (SetState's `changed` guard), so the double-set is harmless.
+        ///
+        /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
+        /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
+        /// synchronously but there is no live process to wait on, so it returns immediately).
+        /// </summary>
         public void Stop()
         {
-            // prefer a clean engine-side teardown (kills the target too); a successful pipe write
-            // does NOT prove the engine consumed the command, so always verify exit and fall back
             try
             {
-                if (SendCommand("quit") && _proc.WaitForExit(1500)) return;
-                if (IsRunning) _proc.Kill();
+                if (IsRunning)
+                {
+                    // A successful pipe write does NOT prove the engine consumed 'quit', so verify exit and fall
+                    // back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
+                    // (Kill only requests termination) before we declare teardown complete.
+                    bool exited = SendCommand("quit") && _proc.WaitForExit(1500);
+                    if (!exited && IsRunning)
+                    {
+                        try { _proc.Kill(); } catch { }
+                        try { _proc.WaitForExit(3000); } catch { } // bounded — don't hang forever on a wedged process
+                    }
+                }
             }
             catch { }
+            finally
+            {
+                // Authoritative: once Stop() returns, the session is over. Synchronous so a teardown driver
+                // (Dispose -> NotifyStopped) sees Idle deterministically without waiting on the async Exited.
+                SetState(DebugSessionState.Idle);
+            }
         }
 
         // ------------------------------------------------------------------ execution control

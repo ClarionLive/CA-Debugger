@@ -28,19 +28,10 @@
     display:flex; flex-direction:column; height:100vh; overflow:hidden; }
   .mono { font-family:"Cascadia Code",Consolas,"Courier New",monospace; }
 
-  .exebar { display:flex; align-items:center; gap:8px; padding:6px 10px; flex:none; background:#1e1e1e; border-bottom:1px solid var(--border); }
-  .exebar .lbl { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:#e8e8e8; white-space:nowrap; }
-  .exebar input { flex:1; min-width:0; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:4px 9px; font-size:12px; outline:none; }
-  .exebar input:focus { border-color:var(--accent-hi); }
-  .exebar button { background:#0e639c; color:#fff; border:none; border-radius:3px; padding:4px 12px; font-size:12px; cursor:pointer; white-space:nowrap; }
-  .exebar button:hover { background:#1177bb; }
-
   .toolbar { display:flex; align-items:center; gap:2px; padding:5px 8px; background:var(--titlebar); border-bottom:1px solid var(--border); flex:none; }
+  .hdr-title { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); padding:0 4px; }
   .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; border:none; border-radius:4px; background:transparent; color:var(--fg); font-size:12px; cursor:pointer; white-space:nowrap; }
   .tbtn:hover { background:var(--btnhover); }
-  .tbtn.primary { color:var(--name); }
-  .tbtn[disabled] { opacity:.35; cursor:default; } .tbtn[disabled]:hover { background:transparent; }
-  .tsep { width:1px; align-self:stretch; margin:4px 6px; background:#ffffff1f; }
   .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
   .dot { width:8px; height:8px; border-radius:50%; background:#888; }
   .runstate.paused .dot { background:#e2b341; box-shadow:0 0 6px #e2b34188; }
@@ -175,21 +166,10 @@
 </style>
 </head>
 <body>
-  <div class="exebar">
-    <span class="lbl">Target EXE</span>
-    <input id="exe" class="mono" spellcheck="false" placeholder="Pick a Clarion .exe (built with Full debug info)…" />
-    <button id="btnBrowse">Browse…</button>
-  </div>
-
+  <!-- Slim header: the 7 debug controls now live on the main IDE toolbar. This keeps only the
+       run-state indicator plus the gear (keyboard shortcuts) and theme toggles. -->
   <div class="toolbar">
-    <button class="tbtn primary" id="btnStart" title="Launch the target EXE and begin a debug session">▶ Start</button>
-    <button class="tbtn" id="btnContinue" title="Resume execution until the next breakpoint or exception">▶ Continue</button>
-    <button class="tbtn" id="btnPause" title="Break into the running target and pause at its current location">❚❚ Pause</button>
-    <button class="tbtn" id="btnStepOver" title="Execute the current line, stepping over any procedure calls">⤼ Step Over</button>
-    <button class="tbtn" id="btnStepInto" title="Execute the current line, stepping into any procedure call">⤓ Step Into</button>
-    <button class="tbtn" id="btnStepOut" title="Run until the current procedure returns to its caller">⤒ Step Out</button>
-    <div class="tsep"></div>
-    <button class="tbtn" id="btnStop" style="color:#f48771" title="Terminate the debug session and the target process">■ Stop</button>
+    <span class="hdr-title">CA Debugger</span>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -199,7 +179,7 @@
     </button>
   </div>
 
-  <div class="locbar" id="locbar">Not running — pick a Target EXE and press Start.</div>
+  <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="main">
     <div class="sidebar">
@@ -269,29 +249,20 @@
   let allSyms=[];            // [{name,type}] for type-ahead + source-id wrapping
   let curFile=null, curLine=0;
 
-  // ---- toolbar ----
-  $('btnStart').onclick    =()=>send('start');
-  $('btnContinue').onclick =()=>send('continue');
-  $('btnPause').onclick     =()=>send('pause');
-  $('btnStepOver').onclick =()=>send('stepover');
-  $('btnStepInto').onclick =()=>send('stepinto');
-  $('btnStepOut').onclick  =()=>send('stepout');
-  $('btnStop').onclick     =()=>send('stop');
-  $('btnBrowse').onclick   =()=>send('browse');
-  $('exe').addEventListener('change',()=>send('setExe',$('exe').value.trim()));
-
   // ---- configurable keyboard shortcuts + Settings popup ----
-  // Debug commands are unbound by default — the Clarion IDE host intercepts the usual
-  // F5/F10/F11 keys before they reach this WebView. Bind each command to an IDE-free
-  // combination via the Settings (gear) popup; bindings persist in localStorage.
+  // The 7 debug controls live on the main IDE toolbar now; the pad keeps optional in-pad keyboard
+  // shortcuts that dispatch the same commands directly to the host (send('<cmd>')). Debug commands are
+  // unbound by default — the Clarion IDE host intercepts the usual F5/F10/F11 keys before they reach
+  // this WebView. Bind each command to an IDE-free combination via the Settings (gear) popup; bindings
+  // persist in localStorage.
   const KB_CMDS = [
-    {id:'start',    btn:'btnStart',    label:'Start',     tip:'Launch the target EXE and begin a debug session'},
-    {id:'continue', btn:'btnContinue', label:'Continue',  tip:'Resume execution until the next breakpoint or exception'},
-    {id:'pause',    btn:'btnPause',    label:'Pause',     tip:'Break into the running target and pause at its current location'},
-    {id:'stepover', btn:'btnStepOver', label:'Step Over', tip:'Execute the current line, stepping over any procedure calls'},
-    {id:'stepinto', btn:'btnStepInto', label:'Step Into', tip:'Execute the current line, stepping into any procedure call'},
-    {id:'stepout',  btn:'btnStepOut',  label:'Step Out',  tip:'Run until the current procedure returns to its caller'},
-    {id:'stop',     btn:'btnStop',     label:'Stop',      tip:'Terminate the debug session and the target process'},
+    {id:'start',    label:'Start',     tip:'Launch the target EXE and begin a debug session'},
+    {id:'continue', label:'Continue',  tip:'Resume execution until the next breakpoint or exception'},
+    {id:'pause',    label:'Pause',     tip:'Break into the running target and pause at its current location'},
+    {id:'stepover', label:'Step Over', tip:'Execute the current line, stepping over any procedure calls'},
+    {id:'stepinto', label:'Step Into', tip:'Execute the current line, stepping into any procedure call'},
+    {id:'stepout',  label:'Step Out',  tip:'Run until the current procedure returns to its caller'},
+    {id:'stop',     label:'Stop',      tip:'Terminate the debug session and the target process'},
   ];
   let keyBinds = {};      // cmd id -> combo string (e.g. 'Ctrl+Alt+S'); absent/empty = unbound
   let capturing = null;   // cmd id currently being rebound, or null
@@ -314,11 +285,6 @@
 
   function settingsOpen(){ return $('settingsBackdrop').classList.contains('show'); }
 
-  // Reflect current bindings into the toolbar button tooltips.
-  function refreshTooltips(){
-    KB_CMDS.forEach(c=>{ const b=$(c.btn); if(b) b.title = c.tip + (keyBinds[c.id] ? ' ('+keyBinds[c.id]+')' : ' (no shortcut — set in Settings)'); });
-  }
-
   function startCapture(id){ capturing=id; if(document.activeElement&&document.activeElement.blur) document.activeElement.blur(); renderSettings(); }
   function endCapture(){ capturing=null; renderSettings(); }
 
@@ -338,7 +304,7 @@
       + '<div class="set-note">The Clarion IDE claims F5 / F10 / F11, so debug commands ship unbound. Click <b>Rebind</b>, then press a key combination the IDE doesn\'t use.</div>'
       + '<div class="kb-list">'+rows+'</div></div>';
     $('settingsBody').querySelectorAll('[data-rebind]').forEach(b=>b.onclick=()=>{ const id=b.dataset.rebind; capturing===id?endCapture():startCapture(id); });
-    $('settingsBody').querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{ const id=b.dataset.clear; delete keyBinds[id]; saveBinds(); renderSettings(); refreshTooltips(); });
+    $('settingsBody').querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{ const id=b.dataset.clear; delete keyBinds[id]; saveBinds(); renderSettings(); });
   }
 
   function openSettings(){ renderSettings(); $('settingsBackdrop').classList.add('show'); }
@@ -355,23 +321,24 @@
       const combo=comboFromEvent(e); if(!combo) return;          // wait for a non-modifier key
       const clash=KB_CMDS.find(c=>c.id!==capturing && keyBinds[c.id]===combo);
       if(clash){ toast('"'+combo+'" is already bound to '+clash.label); return; }
-      keyBinds[capturing]=combo; saveBinds(); capturing=null; renderSettings(); refreshTooltips();
+      keyBinds[capturing]=combo; saveBinds(); capturing=null; renderSettings();
       return;
     }
     // 2) while Settings is open, Esc closes it and debug keys stay inert
     if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
-    // 3) normal dispatch — fire the command bound to this combo if its button is enabled
+    // 3) normal dispatch — send the command bound to this combo straight to the host. The IDE toolbar's
+    // condition evaluator is the source of truth for whether a command is valid in the current state; the
+    // host side no-ops a command that doesn't apply, so the pad shortcut just forwards unconditionally.
     const t=e.target;
     if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable)) return;
     const combo=comboFromEvent(e); if(!combo) return;
-    const matches=KB_CMDS.filter(c=>keyBinds[c.id]===combo);
-    if(!matches.length) return;
+    const c=KB_CMDS.find(c=>keyBinds[c.id]===combo);
+    if(!c) return;
     e.preventDefault();
-    const c=matches.find(c=>{ const b=$(c.btn); return b && !b.disabled; }) || matches[0];
-    const b=$(c.btn); if(b && !b.disabled) b.click();
+    send(c.id);
   });
 
-  loadBinds(); refreshTooltips();
+  loadBinds();
 
   // ---- theme toggle (persisted) ----
   function applyTheme(t){ document.body.classList.toggle('light', t==='light'); try{ localStorage.setItem('caDbgTheme',t); }catch(e){} }
@@ -380,17 +347,14 @@
     try{ const q=new URLSearchParams(location.search).get('theme'); if(q&&!localStorage.getItem('caDbgTheme')) t=q; }catch(e){}
     applyTheme(t); })();
 
+  // The debug controls are IDE-toolbar buttons now (greyed by the host's condition evaluator), so the
+  // pad only reflects run-state in the indicator dot/text + the location bar.
   function setRunState(state){
     paused = state==='paused';
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
-    const en=(b,on)=>{ $(b).disabled=!on; };
-    en('btnStart', state==='idle');
-    en('btnContinue', paused); en('btnStepOver',paused); en('btnStepInto',paused); en('btnStepOut',paused);
-    en('btnPause', state==='running'||state==='launching');   // pause only meaningful while running
-    en('btnStop', state!=='idle');
-    if(state==='idle'){ $('locbar').textContent='Not running — pick a Target EXE and press Start.'; clearSrc(); }
+    if(state==='idle'){ $('locbar').textContent='Not running — press Start on the IDE toolbar.'; clearSrc(); }
   }
 
   // ---- add a watch (from any of the 4 mechanisms) ----
@@ -661,7 +625,6 @@
     let m; try{ m=JSON.parse(data); }catch(e){ return; }
     switch(m.type){
       case 'runstate': setRunState(m.state); break;
-      case 'exe': $('exe').value=m.path||''; break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
         buildRegs(m.regs); break;
