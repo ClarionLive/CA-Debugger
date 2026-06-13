@@ -644,6 +644,22 @@ namespace ClarionDebugger.Services
         /// paths already resolve. Null when unresolved. Safe to call off the UI thread.</summary>
         public string ResolveSourcePath(string module) { return ResolveModulePath(module); }
 
+        /// <summary>Prime the module→source resolver for a known target EXE BEFORE a session starts, so
+        /// pre-run source links (the Procedures list) resolve via the target's .red instead of failing on
+        /// a null _targetDir. Sets _targetDir (the anchor for relative .red paths) the same way Launch does,
+        /// resetting the cached .red on a target change. No-op for a null/empty/missing path.</summary>
+        public void PrimeTarget(string targetExe)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe)) return;
+                string dir = Path.GetDirectoryName(Path.GetFullPath(targetExe));
+                if (!string.Equals(dir, _targetDir, StringComparison.OrdinalIgnoreCase)) _redFallback = null;
+                _targetDir = dir;
+            }
+            catch { }
+        }
+
         // The event JSON has a fixed shape; extract fields directly rather than pulling in a JSON dep.
         private static DebugHit ParseHit(string json)
         {
@@ -820,16 +836,25 @@ namespace ClarionDebugger.Services
                 string outp;
                 using (var p = Process.Start(psi))
                 {
-                    outp = p.StandardOutput.ReadToEnd();
-                    p.WaitForExit(10000);
+                    // Read both pipes asynchronously and kill on timeout: ReadToEnd() before WaitForExit
+                    // can hang forever if a hostile/corrupt EXE makes the child block or flood stderr
+                    // (filling the unread pipe back-pressures stdout). Draining stderr prevents that.
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(10000)) { try { p.Kill(); } catch { } }
+                    try { outp = outTask.Wait(2000) ? outTask.Result : ""; } catch { outp = ""; }
+                    try { errTask.Wait(500); } catch { }   // drained (content unused) so it can't deadlock stdout
                 }
                 int at = outp.IndexOf("@SYMBOLS ", StringComparison.Ordinal);
                 if (at < 0) return list;
-                string json = outp.Substring(at + 9);
+                string json = outp.Substring(at + "@SYMBOLS ".Length);
                 // Each symbol is a brace-delimited object with no nested braces, so a simple {...} match
-                // yields one object at a time (and skips the array wrapper, which contains '[').
+                // yields one object at a time (and skips the array wrapper, which contains '['). Cap the
+                // count to bound DOM/memory if a hostile or pathological EXE emits a huge symbol set.
+                const int MaxProcedures = 20000;
                 foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
                 {
+                    if (list.Count >= MaxProcedures) break;
                     string obj = m.Value;
                     string kind = GetStr(obj, "kind");
                     if (kind != "procedure" && kind != "method") continue;

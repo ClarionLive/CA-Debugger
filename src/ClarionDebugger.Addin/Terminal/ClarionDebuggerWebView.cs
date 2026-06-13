@@ -403,9 +403,12 @@ namespace ClarionDebugger.Terminal
         /// <summary>Enumerate the target's procedures + methods (static parse, off the UI thread) and send
         /// them to the page for the Procedures list. Clicking a row reuses the existing 'jump' handler, so
         /// no new inbound action is needed. Silent on failure (the list just stays empty).</summary>
+        private int _procGen;   // generation token — discard stale async procedure pushes (EXE switch / overlapping ready+start+refresh)
         private void PushProcedures(string exe)
         {
             if (string.IsNullOrEmpty(exe)) return;
+            _svc.PrimeTarget(exe);          // anchor the .red resolver to this EXE so PRE-RUN clicks resolve (UI thread)
+            int gen = ++_procGen;
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
@@ -424,7 +427,7 @@ namespace ClarionDebugger.Terminal
                     }
                     sb.Append("]}");
                     string json = sb.ToString();
-                    UI(() => Post(json));
+                    UI(() => { if (gen == _procGen) Post(json); });   // ignore an out-of-date parse — a newer push won
                 }
                 catch { }
             });

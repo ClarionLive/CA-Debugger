@@ -69,10 +69,10 @@ namespace ClarionDbg.Cli
             {
                 var s = syms[i];
                 if (i > 0) sb.Append(',');
-                // Definition line: resolve the proc's entry RVA against the +0x1C address table (same
-                // source the call stack uses). 0 when no record precedes the entry (not navigable).
-                int line, mi; uint rr;
-                dbg.ResolveAddr(s.EntryRva, out line, out mi, out rr);
+                // Definition line, constrained to the symbol's OWN module — a plain ResolveAddr can bind a
+                // proc whose entry sits below its module's +0x1C floor to the PREVIOUS module's last record
+                // (wrong line, possibly past EOF). LineForEntry stays within s.ModuleIdx. 0 = not navigable.
+                int line = dbg.LineForEntry(s.EntryRva, s.ModuleIdx);
                 sb.Append("{\"name\":").Append(Str(s.Name))
                   .Append(",\"raw\":").Append(Str(s.RawName))
                   .Append(",\"kind\":").Append(Str(s.Kind.ToString().ToLowerInvariant()))

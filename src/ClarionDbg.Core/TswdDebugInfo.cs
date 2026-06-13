@@ -444,6 +444,26 @@ namespace ClarionDbg.Core
             return list;
         }
 
+        /// <summary>Definition line for a symbol's entry RVA, constrained to the symbol's OWN module.
+        /// <see cref="ResolveAddr"/> alone can bind a proc whose entry sits below its module's +0x1C
+        /// floor (cold/init code emitted under the named entry) to the PREVIOUS module's last record —
+        /// wrong file/line. This stays within moduleIdx: the greatest same-module record at/below the
+        /// entry, else the first same-module record above it. Returns 0 when the module has no line
+        /// records (not navigable). AddrTable is sorted ascending by Rva.</summary>
+        public int LineForEntry(uint entryRva, int moduleIdx)
+        {
+            if (AddrTable == null) return 0;
+            int below = 0; bool haveBelow = false;   // greatest same-module record with Rva <= entry
+            int above = 0; bool haveAbove = false;   // first same-module record with Rva > entry
+            foreach (var r in AddrTable)
+            {
+                if (r.ModuleIdx != moduleIdx) continue;
+                if (r.Rva <= entryRva) { below = r.Line; haveBelow = true; }
+                else if (!haveAbove) { above = r.Line; haveAbove = true; }
+            }
+            return haveBelow ? below : (haveAbove ? above : 0);
+        }
+
         // ----- structured symbol table (Phase 3) -----
 
         /// <summary>

@@ -767,11 +767,16 @@
     if(!allProcs.length){ el.innerHTML='<div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div>'; return; }
     el.innerHTML='';
     const frag=document.createDocumentFragment();
-    allProcs.forEach(p=>{ const d=document.createElement('div'); d.className='proc'; d.dataset.key=(p.name||'').toLowerCase();
-      d.innerHTML='<span class="procname">'+esc(p.name||'')+'</span>'
-        +'<span class="procfile" title="Open '+esc(p.module||'')+' at line '+p.line+'">'+esc(p.module||'')+'</span>';
-      const lk=d.querySelector('.procfile');
-      if(lk && p.module) lk.onclick=()=>send('jump', p.module+':'+p.line);   // reuses the host jump handler (resolves path + opens)
+    // Build rows with DOM APIs (textContent + .title), never innerHTML — name/module come from the
+    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE (esc() doesn't escape quotes,
+    // so interpolating them into an HTML attribute would be an injection sink).
+    allProcs.forEach(p=>{ const module=p.module||'', name=p.name||'';
+      const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
+      const nm=document.createElement('span'); nm.className='procname'; nm.textContent=name;
+      const fl=document.createElement('span'); fl.className='procfile'; fl.textContent=module;
+      fl.title='Open '+module+' at line '+p.line;
+      if(module) fl.onclick=()=>send('jump', module+':'+p.line);   // host 'jump' validates the module before opening
+      d.appendChild(nm); d.appendChild(fl);
       frag.appendChild(d); });
     el.appendChild(frag);
     filterProcs($('procFilter') ? $('procFilter').value : '');
