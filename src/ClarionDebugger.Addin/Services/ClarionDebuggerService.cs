@@ -639,6 +639,11 @@ namespace ClarionDebugger.Services
             catch { return null; }
         }
 
+        /// <summary>Public module→source-path resolver (via the active/effective .red) so the host can
+        /// resolve clickable source links — Procedures list, call-stack frames — the same way stack-frame
+        /// paths already resolve. Null when unresolved. Safe to call off the UI thread.</summary>
+        public string ResolveSourcePath(string module) { return ResolveModulePath(module); }
+
         // The event JSON has a fixed shape; extract fields directly rather than pulling in a JSON dep.
         private static DebugHit ParseHit(string json)
         {

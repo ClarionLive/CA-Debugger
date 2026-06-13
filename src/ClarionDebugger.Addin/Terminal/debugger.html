@@ -66,6 +66,9 @@
   .sec-x { margin-left:auto; flex:none; width:18px; text-align:center; line-height:1.4; color:#6f6f6f; opacity:0; cursor:pointer; font-size:11px; border-radius:3px; }
   .section > summary:hover .sec-x { opacity:.7; }
   .sec-x:hover { opacity:1; color:#fff; background:#e51400; }
+  .sec-refresh { flex:none; width:18px; text-align:center; line-height:1.4; color:#6f6f6f; opacity:0; cursor:pointer; font-size:12px; border-radius:3px; }
+  .section > summary:hover .sec-refresh { opacity:.7; }
+  .sec-refresh:hover { opacity:1; color:var(--fg-bright); background:var(--btnhover); }
   .section.dragging { opacity:.45; }
   .section.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
   .section.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
@@ -250,10 +253,10 @@
         <div class="body" id="bpList"><div class="empty">Set breakpoints in the Clarion editor gutter.</div></div>
       </details>
       <details class="section" open data-sec="procedures">
-        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Procedures <span class="count" id="procCount">0</span><span class="hint">click a file to open at its definition</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Procedures <span class="count" id="procCount">0</span><span class="hint">click a file to open at its definition</span><span class="sec-refresh" id="procRefresh" title="Refresh procedure list">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="procfilter"><input id="procFilter" placeholder="Filter procedures — type a name" autocomplete="off" /></div>
-          <div id="procList"><div class="empty">Procedures load when the target EXE is known.</div></div>
+          <div id="procList"><div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div></div>
         </div>
       </details>
       <details class="section" data-sec="registers">
@@ -761,7 +764,7 @@
     allProcs=procs||[];
     const el=$('procList'); if(!el) return;
     $('procCount').textContent=allProcs.length;
-    if(!allProcs.length){ el.innerHTML='<div class="empty">Procedures load when the target EXE is known.</div>'; return; }
+    if(!allProcs.length){ el.innerHTML='<div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div>'; return; }
     el.innerHTML='';
     const frag=document.createDocumentFragment();
     allProcs.forEach(p=>{ const d=document.createElement('div'); d.className='proc'; d.dataset.key=(p.name||'').toLowerCase();
@@ -778,7 +781,8 @@
     q=(q||'').trim().toLowerCase();
     el.querySelectorAll('.proc').forEach(d=>{ d.style.display=(!q || d.dataset.key.indexOf(q)>=0)?'':'none'; });
   }
-  (function(){ const f=$('procFilter'); if(f) f.addEventListener('input',()=>filterProcs(f.value)); })();
+  (function(){ const f=$('procFilter'); if(f) f.addEventListener('input',()=>filterProcs(f.value));
+    const rb=$('procRefresh'); if(rb) rb.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); send('proclist'); }); })();
 
   // ---- registers ----
   function buildRegs(regs){

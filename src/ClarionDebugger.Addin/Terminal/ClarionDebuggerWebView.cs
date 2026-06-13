@@ -287,6 +287,11 @@ namespace ClarionDebugger.Terminal
                     case "jump": Jump(data); break;
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;
+                    case "proclist":   // user asked to (re)list procedures — re-resolve the target if needed
+                        if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
+                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
+                        else Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
+                        break;
                 }
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] msg: " + ex.Message); }
@@ -727,11 +732,14 @@ namespace ClarionDebugger.Terminal
 
         private string ResolvePath(string module)
         {
-            // reuse the service's resolver indirectly via a one-shot pause path is not available here;
-            // fall back to scanning next to the EXE (generated source often sits there or via .red).
             try
             {
                 if (string.IsNullOrEmpty(module) || module != Path.GetFileName(module)) return null;
+                // Primary: the service's .red-based resolver (the same one that resolves call-stack frame
+                // paths). This is what lets clicks open project source that doesn't sit next to the EXE.
+                string viaRed = _svc != null ? _svc.ResolveSourcePath(module) : null;
+                if (!string.IsNullOrEmpty(viaRed) && File.Exists(viaRed)) return viaRed;
+                // Fallback: next to the EXE (generated source often sits there).
                 string dir = string.IsNullOrEmpty(_exe) ? null : Path.GetDirectoryName(_exe);
                 if (dir != null)
                 {
