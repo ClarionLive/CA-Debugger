@@ -58,6 +58,42 @@
   .body { padding:2px 0 7px; }
   .empty { padding:4px 14px; color:#6f6f6f; font-size:11px; font-style:italic; }
 
+  /* ---- rearrangeable / hideable sections ---- */
+  .section.sec-hidden { display:none; }
+  .grip { width:12px; flex:none; display:inline-flex; align-items:center; justify-content:center; margin-left:-2px; color:#5a5a5a; cursor:grab; font-size:12px; opacity:0; transition:opacity .12s; }
+  .section > summary:hover .grip { opacity:1; }
+  .grip:active { cursor:grabbing; }
+  .sec-x { margin-left:auto; flex:none; width:18px; text-align:center; line-height:1.4; color:#6f6f6f; opacity:0; cursor:pointer; font-size:11px; border-radius:3px; }
+  .section > summary:hover .sec-x { opacity:.7; }
+  .sec-x:hover { opacity:1; color:#fff; background:#e51400; }
+  .section.dragging { opacity:.45; }
+  .section.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
+  .section.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
+  .hidden-bar { display:none; flex:none; flex-wrap:wrap; gap:5px; align-items:center; padding:7px 10px; border-top:1px solid var(--border); background:var(--titlebar); }
+  .hidden-bar.show { display:flex; }
+  .sec-chip { display:inline-flex; align-items:center; gap:5px; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:11px; padding:2px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; cursor:pointer; }
+  .sec-chip:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .sec-chip::before { content:"＋"; color:var(--fg-dim); font-weight:400; }
+  .reset-btn { margin-left:auto; background:transparent; border:1px solid var(--popup-border); color:var(--fg-dim); border-radius:4px; padding:2px 9px; font-size:11px; cursor:pointer; }
+  .reset-btn:hover { color:var(--fg-bright); border-color:var(--accent-hi); }
+
+  /* ---- right-column panels (Source + Debug Console) as hideable / reorderable sections ---- */
+  .rsection.sec-hidden { display:none; }
+  .rsection.dragging { opacity:.45; }
+  .rsection.drop-before { box-shadow:inset 0 2px 0 0 var(--accent-hi); }
+  .rsection.drop-after  { box-shadow:inset 0 -2px 0 0 var(--accent-hi); }
+  .rsection[data-sec="source"]:not(.sec-hidden) { flex:1 1 auto; display:flex; flex-direction:column; min-height:120px; min-width:0; }
+  .rsection.console.grow { flex:1 1 auto; height:auto; }   /* console grows to fill when Source isn't visible in the same column */
+  .srchdr:hover .grip, .console .chdr:hover .grip { opacity:1; }
+  .srchdr:hover .sec-x, .console .chdr:hover .sec-x { opacity:.7; }
+
+  /* ---- two columns: either collapses when it has no visible panels, the other then fills ---- */
+  .col { display:flex; flex-direction:column; min-height:0; overflow-y:auto; }
+  .col.col-collapsed { display:none; }
+  .splitter.hidden { display:none; }
+  .main.left-only  #colLeft  { flex:1 1 auto; }   /* right column gone → left fills width */
+  .main.right-only #colRight { flex:1 1 auto; }   /* left column gone → right fills width */
+
   .row { display:flex; align-items:center; gap:4px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .row:hover { background:var(--hover); }
   .row.selrow { user-select:none; cursor:default; }
@@ -116,8 +152,9 @@
   .regs { display:grid; grid-template-columns:repeat(2,1fr); gap:1px 14px; padding:4px 14px; }
   .reg { font-size:11.5px; } .reg .rn { color:var(--blue); } .reg .rv { color:var(--num); }
 
-  .srchdr { flex:none; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
+  .srchdr { flex:none; display:flex; align-items:center; gap:5px; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
   .srchdr .file { color:var(--fg); }
+  #srchdrText { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
   .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
   .sline .gut { width:48px; text-align:right; color:#6e7681; margin-right:14px; user-select:none; flex:none; }
@@ -126,7 +163,7 @@
   .src .srcid { cursor:help; border-radius:2px; } .src .srcid:hover { background:var(--btnhover); outline:1px solid var(--popup-border); }
 
   .console { flex:none; height:150px; border-top:1px solid var(--border); background:var(--bg); display:flex; flex-direction:column; }
-  .console .chdr { background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
+  .console .chdr { display:flex; align-items:center; gap:5px; background:var(--titlebar); padding:3px 12px; font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); border-bottom:1px solid var(--border); }
   .console .clog { flex:1; overflow:auto; padding:5px 12px; font-size:12px; }
   .clog div { white-space:pre-wrap; word-break:break-word; }
   .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; }
@@ -182,43 +219,47 @@
   <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="main">
-    <div class="sidebar">
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span></summary>
+    <div class="sidebar col" id="colLeft">
+      <details class="section" open data-sec="variables">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="varTree"><div class="empty">Start a session to load file buffers.</div></div>
       </details>
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span></summary>
+      <details class="section" open data-sec="watch">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="addwatch"><input id="watchInput" placeholder="Add watch — type a name (e.g. JOB:JOB_DESC)" autocomplete="off" /><div class="typeahead" id="typeahead"></div></div>
           <div id="watchList"></div>
         </div>
       </details>
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span></summary>
+      <details class="section" open data-sec="stack">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="stackList"><div class="empty">Paused frames appear here.</div></div>
       </details>
-      <details class="section" open>
-        <summary><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span></summary>
+      <details class="section" open data-sec="breakpoints">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body" id="bpList"><div class="empty">Set breakpoints in the Clarion editor gutter.</div></div>
       </details>
-      <details class="section">
-        <summary><span class="twisty">▶</span>Registers</summary>
+      <details class="section" data-sec="registers">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Registers<span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body regs mono" id="regs"><div class="empty">Registers appear when paused.</div></div>
       </details>
     </div>
 
     <div class="splitter" id="splitter"></div>
 
-    <div class="rightcol">
-      <div class="srchdr" id="srchdr">No source — pause to show the current location.</div>
-      <div class="src mono" id="src"></div>
-      <div class="console">
-        <div class="chdr">Debug Console</div>
+    <div class="rightcol col" id="colRight">
+      <div class="rsection" data-sec="source">
+        <div class="srchdr" id="srchdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span id="srchdrText">No source — pause to show the current location.</span><span class="sec-x" title="Hide section">✕</span></div>
+        <div class="src mono" id="src"></div>
+      </div>
+      <div class="console rsection" data-sec="console">
+        <div class="chdr"><span class="grip" draggable="true" title="Drag to reorder">⠿</span>Debug Console<span class="sec-x" title="Hide section">✕</span></div>
         <div class="clog mono" id="clog"></div>
       </div>
     </div>
   </div>
+
+  <div class="hidden-bar" id="hiddenBar"></div>
 
   <div class="datatip" id="datatip">
     <span class="dn" id="dtName"></span><span class="dt" id="dtType"></span><span class="veq">=</span><span class="dv" id="dtVal"></span>
@@ -346,6 +387,167 @@
   (function(){ let t='dark'; try{ t=localStorage.getItem('caDbgTheme')||'dark'; }catch(e){}
     try{ const q=new URLSearchParams(location.search).get('theme'); if(q&&!localStorage.getItem('caDbgTheme')) t=q; }catch(e){}
     applyTheme(t); })();
+
+  // ---- layout: drag (grip) / hide (✕ → chip) / collapse, across BOTH columns — persisted (caDbgLayout v2) ----
+  // Every panel carries a stable data-sec id and can live in either column. A panel can be dragged to any
+  // position in either column; when a column has no visible panels left it collapses so the other fills the
+  // width. Which column each panel sits in, the order within each column, the hidden set, and the collapse
+  // state of the collapsible (sidebar) panels all persist to localStorage and restore on startup. Hidden
+  // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
+  const MAIN=document.querySelector('.main');
+  const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
+  const DEFAULT_LEFT=['variables','watch','stack','breakpoints','registers'];
+  const DEFAULT_RIGHT=['source','console'];
+  const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', registers:'Registers', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, registers:true}; // only collapsible (<details>) panels; matches markup
+  let layoutLoaded=false, dragSec=null;
+
+  function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
+  function sectionsIn(col){ return Array.from(col.children).filter(el=>el.dataset && el.dataset.sec); }  // direct panel children, DOM order
+  function allSecEls(){ return ALL_IDS.map(secEl).filter(Boolean); }
+  function isHidden(el){ return el.classList.contains('sec-hidden'); }
+  function isCollapsible(el){ return el.tagName==='DETAILS'; }
+  function orderIn(col){ return sectionsIn(col).map(el=>el.dataset.sec); }
+  function isCustomized(){
+    if(orderIn(COL_LEFT).join(',')!==DEFAULT_LEFT.join(',')) return true;     // moved between columns or reordered
+    if(orderIn(COL_RIGHT).join(',')!==DEFAULT_RIGHT.join(',')) return true;
+    if(allSecEls().some(isHidden)) return true;
+    return ALL_IDS.some(id=>{ const el=secEl(id); return el && isCollapsible(el) && (!el.open)!==!!DEFAULT_COLLAPSED[id]; });
+  }
+
+  function loadLayout(){
+    let raw=null; try{ raw=JSON.parse(localStorage.getItem('caDbgLayout')||'null'); }catch(e){}
+    const L=(raw && typeof raw==='object') ? raw : {};
+    // Resolve the two column lists, then sanitize: drop unknown ids, de-dupe across columns, and append any
+    // missing id to its default column (forward-compat for new panels + recovery from partial saved state).
+    function sanitize(leftArr, rightArr){
+      const seen=new Set();
+      const take=arr=> (Array.isArray(arr)?arr:[]).filter(id=>ALL_IDS.includes(id) && !seen.has(id) && seen.add(id));
+      const left=take(leftArr), right=take(rightArr);
+      ALL_IDS.forEach(id=>{ if(!seen.has(id)){ (DEFAULT_LEFT.includes(id)?left:right).push(id); seen.add(id); } });
+      return {left, right};
+    }
+    let cols;
+    if(Array.isArray(L.left)||Array.isArray(L.right))            cols=sanitize(L.left, L.right);          // v2
+    else if(Array.isArray(L.order)||Array.isArray(L.rcolOrder))  cols=sanitize(L.order, L.rcolOrder);      // migrate v1
+    else                                                         cols={left:DEFAULT_LEFT.slice(), right:DEFAULT_RIGHT.slice()};
+    const hidSrc=(Array.isArray(L.hidden)?L.hidden:[]).concat(Array.isArray(L.rcolHidden)?L.rcolHidden:[]);
+    const hidden=ALL_IDS.filter(id=>hidSrc.includes(id));
+    const collapsed={}; DEFAULT_LEFT.forEach(id=>{ collapsed[id]=(L.collapsed && typeof L.collapsed[id]==='boolean') ? L.collapsed[id] : DEFAULT_COLLAPSED[id]; });
+    return {left:cols.left, right:cols.right, hidden, collapsed};
+  }
+  function saveLayout(){
+    const collapsed={}; DEFAULT_LEFT.forEach(id=>{ const el=secEl(id); collapsed[id]=el?!el.open:DEFAULT_COLLAPSED[id]; });
+    const data={ v:2, left:orderIn(COL_LEFT), right:orderIn(COL_RIGHT), hidden:allSecEls().filter(isHidden).map(el=>el.dataset.sec), collapsed };
+    try{ localStorage.setItem('caDbgLayout', JSON.stringify(data)); }catch(e){}
+  }
+  function applyLayout(L){
+    L.left.forEach(id=>{ const el=secEl(id); if(el) COL_LEFT.appendChild(el); });    // appendChild moves the node in order
+    L.right.forEach(id=>{ const el=secEl(id); if(el) COL_RIGHT.appendChild(el); });
+    allSecEls().forEach(el=>{ const id=el.dataset.sec;
+      el.classList.toggle('sec-hidden', L.hidden.includes(id));
+      if(isCollapsible(el)) el.open=!L.collapsed[id];
+    });
+    refreshLayout();
+  }
+
+  // Recompute derived layout state (column collapse, fill, chip bar). Call after any structural change.
+  function refreshLayout(){ updateColCollapse(); updateFill(); renderHiddenBar(); }
+  function afterChange(){ refreshLayout(); refreshWatchClipping(); saveLayout(); }
+
+  function updateColCollapse(){
+    const leftEmpty=!sectionsIn(COL_LEFT).some(el=>!isHidden(el));
+    const rightEmpty=!sectionsIn(COL_RIGHT).some(el=>!isHidden(el));
+    COL_LEFT.classList.toggle('col-collapsed', leftEmpty);
+    COL_RIGHT.classList.toggle('col-collapsed', rightEmpty);
+    SPLITTER.classList.toggle('hidden', leftEmpty||rightEmpty);
+    MAIN.classList.toggle('left-only',  rightEmpty && !leftEmpty);   // right column gone → left fills
+    MAIN.classList.toggle('right-only', leftEmpty && !rightEmpty);   // left column gone → right fills
+  }
+  // Source fills its column (flex:1). When Console is visible but Source isn't in the same column, let Console
+  // grow to fill instead of sitting at its fixed height with empty space below.
+  function updateFill(){
+    const cons=secEl('console'); if(!cons) return;
+    const src=secEl('source');
+    const srcVisibleSameCol = src && !isHidden(src) && src.parentNode===cons.parentNode;
+    cons.classList.toggle('grow', !isHidden(cons) && !srcVisibleSameCol);
+  }
+
+  function renderHiddenBar(){
+    HBAR.innerHTML='';
+    allSecEls().filter(isHidden).forEach(el=>{ const id=el.dataset.sec;
+      const chip=document.createElement('button'); chip.type='button'; chip.className='sec-chip';
+      chip.textContent=SEC_LABEL[id]||id; chip.title='Show '+(SEC_LABEL[id]||id);
+      chip.onclick=()=>showSection(id);
+      HBAR.appendChild(chip);
+    });
+    if(isCustomized()){
+      const rb=document.createElement('button'); rb.type='button'; rb.className='reset-btn';
+      rb.textContent='↺ Reset layout'; rb.title='Restore the default two-column layout';
+      rb.onclick=resetLayout;
+      HBAR.appendChild(rb);
+    }
+    HBAR.classList.toggle('show', HBAR.childElementCount>0);
+  }
+
+  // Watch rows flag truncated values (.clipped) by comparing scrollWidth vs clientWidth. While the Watch
+  // section is hidden (display:none) clientWidth is 0, so background host updates mark every row clipped;
+  // recompute once the section is visible again so a restored Watch shows correct chevrons.
+  function refreshWatchClipping(){
+    document.querySelectorAll('#watchList .watchrow').forEach(row=>{
+      const v=row.querySelector('.vval'); if(v) row.classList.toggle('clipped', v.scrollWidth > v.clientWidth + 1);
+    });
+  }
+  function hideSection(id){ const el=secEl(id); if(!el) return; el.classList.add('sec-hidden'); afterChange(); }
+  function showSection(id){ const el=secEl(id); if(!el) return; el.classList.remove('sec-hidden');
+    // re-anchor scroll after a panel becomes visible again (scroll ops are no-ops while display:none)
+    if(id==='source'){ const cur=document.querySelector('#src .sline.cur'); if(cur) cur.scrollIntoView({block:'center'}); }
+    if(id==='console'){ const c=$('clog'); if(c) c.scrollTop=c.scrollHeight; }
+    afterChange();
+  }
+  function resetLayout(){
+    DEFAULT_LEFT.forEach(id=>{ const el=secEl(id); if(el) COL_LEFT.appendChild(el); });
+    DEFAULT_RIGHT.forEach(id=>{ const el=secEl(id); if(el) COL_RIGHT.appendChild(el); });
+    allSecEls().forEach(el=>{ el.classList.remove('sec-hidden'); if(isCollapsible(el)) el.open=!DEFAULT_COLLAPSED[el.dataset.sec]; });
+    afterChange();
+  }
+
+  function clearDropMarks(){ allSecEls().forEach(el=>el.classList.remove('drop-before','drop-after')); }
+  function wireSection(el){
+    const grip=el.querySelector('.grip'), x=el.querySelector('.sec-x');
+    if(grip){
+      grip.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); });          // grip click ≠ collapse toggle
+      grip.addEventListener('dragstart',e=>{ dragSec=el; el.classList.add('dragging');
+        try{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain', el.dataset.sec); }catch(_){} });
+      grip.addEventListener('dragend',()=>{ el.classList.remove('dragging'); clearDropMarks(); dragSec=null; });
+    }
+    if(x) x.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); hideSection(el.dataset.sec); });
+    el.addEventListener('dragover',e=>{ if(!dragSec||dragSec===el) return; e.preventDefault();
+      try{ e.dataTransfer.dropEffect='move'; }catch(_){}
+      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
+      clearDropMarks(); el.classList.add(after?'drop-after':'drop-before'); });
+    el.addEventListener('dragleave',()=>el.classList.remove('drop-before','drop-after'));
+    el.addEventListener('drop',e=>{ if(!dragSec||dragSec===el) return; e.preventDefault(); e.stopPropagation();   // stop so the column drop doesn't also fire
+      const r=el.getBoundingClientRect(), after=e.clientY > r.top + r.height/2;
+      clearDropMarks();
+      el.parentNode.insertBefore(dragSec, after ? el.nextSibling : el);   // parentNode = target's column → enables cross-column moves
+      afterChange(); });
+    if(isCollapsible(el)) el.addEventListener('toggle',()=>{ if(layoutLoaded) saveLayout(); });   // persist collapse/expand
+  }
+  // Dropping in a column's empty area (below its panels) appends the dragged panel to the end of that column.
+  function wireColumn(col){
+    col.addEventListener('dragover',e=>{ if(!dragSec) return; e.preventDefault(); });
+    col.addEventListener('drop',e=>{ if(!dragSec) return; e.preventDefault(); clearDropMarks(); col.appendChild(dragSec); afterChange(); });
+  }
+
+  (function initLayout(){
+    if(!MAIN||!COL_LEFT||!COL_RIGHT||!HBAR) return;
+    allSecEls().forEach(wireSection);
+    wireColumn(COL_LEFT); wireColumn(COL_RIGHT);
+    applyLayout(loadLayout());
+    layoutLoaded=true;
+  })();
 
   // The debug controls are IDE-toolbar buttons now (greyed by the host's condition evaluator), so the
   // pad only reflects run-state in the indicator dot/text + the location bar.
@@ -545,10 +747,10 @@
   }
 
   // ---- source snippet (current location) ----
-  function clearSrc(){ $('src').innerHTML=''; $('srchdr').textContent='No source — pause to show the current location.'; curFile=null; }
+  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; }
   function buildSource(file, proc, startLine, lines, current){
     curFile=file; curLine=current;
-    $('srchdr').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
+    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
     const src=$('src'); src.innerHTML='';
     // wrap known data-symbol names so they get the same hover data-tip as the panels
     let re=null;
