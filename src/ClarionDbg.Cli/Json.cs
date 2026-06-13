@@ -69,10 +69,14 @@ namespace ClarionDbg.Cli
             {
                 var s = syms[i];
                 if (i > 0) sb.Append(',');
+                // Definition line bounded to the symbol's OWN [entry, nextEntry) range (a plain ResolveAddr
+                // can bind a proc to a neighbouring proc's / the previous module's record). 0 = not navigable.
+                int line = dbg.DefinitionLine(s);
                 sb.Append("{\"name\":").Append(Str(s.Name))
                   .Append(",\"raw\":").Append(Str(s.RawName))
                   .Append(",\"kind\":").Append(Str(s.Kind.ToString().ToLowerInvariant()))
                   .Append(",\"rva\":\"0x").Append(s.EntryRva.ToString("X")).Append('"')
+                  .Append(",\"line\":").Append(line)
                   .Append(",\"moduleIdx\":").Append(s.ModuleIdx)
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append('}');

@@ -268,7 +268,11 @@ namespace ClarionDebugger.Terminal
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
-                    case "ready": Post("{\"type\":\"runstate\",\"state\":\"idle\"}"); if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe(); break;
+                    case "ready":
+                        Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
+                        if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
+                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
+                        break;
                     case "start": CmdStart(); break;
                     case "continue": CmdContinue(); break;
                     case "pause": CmdPause(); break;
@@ -283,6 +287,11 @@ namespace ClarionDebugger.Terminal
                     case "jump": Jump(data); break;
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;
+                    case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
+                        TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
+                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
+                        else Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
+                        break;
                 }
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] msg: " + ex.Message); }
@@ -386,8 +395,42 @@ namespace ClarionDebugger.Terminal
                     if (!string.IsNullOrEmpty(g))
                         UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
                 });
+                PushProcedures(exe);   // refresh the Procedures list against the just-resolved target
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
+        }
+
+        /// <summary>Enumerate the target's procedures + methods (static parse, off the UI thread) and send
+        /// them to the page for the Procedures list. Clicking a row reuses the existing 'jump' handler, so
+        /// no new inbound action is needed. Silent on failure (the list just stays empty).</summary>
+        private int _procGen;   // generation token — discard stale async procedure pushes (EXE switch / overlapping ready+start+refresh)
+        private void PushProcedures(string exe)
+        {
+            if (string.IsNullOrEmpty(exe)) return;
+            _svc.PrimeTarget(exe);          // anchor the .red resolver to this EXE so PRE-RUN clicks resolve (UI thread)
+            int gen = ++_procGen;
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    var procs = ClarionDebuggerService.GetProcedures(exe);
+                    var sb = new StringBuilder();
+                    sb.Append("{\"type\":\"procedures\",\"procs\":[");
+                    for (int i = 0; i < procs.Count; i++)
+                    {
+                        var p = procs[i];
+                        if (i > 0) sb.Append(',');
+                        sb.Append("{\"name\":").Append(Str(p.Name))
+                          .Append(",\"module\":").Append(Str(p.Module))
+                          .Append(",\"line\":").Append(p.Line)
+                          .Append('}');
+                    }
+                    sb.Append("]}");
+                    string json = sb.ToString();
+                    UI(() => { if (gen == _procGen) Post(json); });   // ignore an out-of-date parse — a newer push won
+                }
+                catch { }
+            });
         }
 
         /// <summary>
@@ -692,11 +735,14 @@ namespace ClarionDebugger.Terminal
 
         private string ResolvePath(string module)
         {
-            // reuse the service's resolver indirectly via a one-shot pause path is not available here;
-            // fall back to scanning next to the EXE (generated source often sits there or via .red).
             try
             {
                 if (string.IsNullOrEmpty(module) || module != Path.GetFileName(module)) return null;
+                // Primary: the service's .red-based resolver (the same one that resolves call-stack frame
+                // paths). This is what lets clicks open project source that doesn't sit next to the EXE.
+                string viaRed = _svc != null ? _svc.ResolveSourcePath(module) : null;
+                if (!string.IsNullOrEmpty(viaRed) && File.Exists(viaRed)) return viaRed;
+                // Fallback: next to the EXE (generated source often sits there).
                 string dir = string.IsNullOrEmpty(_exe) ? null : Path.GetDirectoryName(_exe);
                 if (dir != null)
                 {
