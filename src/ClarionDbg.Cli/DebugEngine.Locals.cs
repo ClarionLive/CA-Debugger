@@ -69,7 +69,8 @@ namespace ClarionDbg.Cli
                 {
                     int mi = sym.ModuleIdx;
                     module = m.Dbg.ModuleNameForIdx(mi);
-                    foreach (var ds in m.Dbg.DataSymbols)
+                    var syms = m.Dbg.DataSymbols;
+                    foreach (var ds in syms ?? new List<DataSymbol>())
                     {
                         if (ds.ModuleIdx != mi) continue;
                         if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))

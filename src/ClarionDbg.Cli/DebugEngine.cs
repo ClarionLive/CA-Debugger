@@ -425,6 +425,8 @@ namespace ClarionDbg.Cli
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 string verb = parts[0].ToLowerInvariant();
+                try
+                {
                 switch (verb)
                 {
                     case "continue": case "c": case "g":
@@ -497,6 +499,13 @@ namespace ClarionDbg.Cli
                     default:
                         EmitError("unknown command: " + verb);
                         break;
+                }
+                }
+                catch (Exception ex)
+                {
+                    // A command-handler bug must never crash the engine — that would terminate the
+                    // debuggee. Report it and keep the pause loop alive.
+                    EmitError("command '" + verb + "' failed: " + ex.Message);
                 }
             }
         }

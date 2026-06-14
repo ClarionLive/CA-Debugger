@@ -663,43 +663,39 @@
   function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
-  // ---- locals (current procedure's variables, refreshed each pause) ----
-  function buildVars(proc, items){
-    const el=$('localsTree'); if(!el) return; items=items||[];
-    const hint=$('varsHint');
-    if(hint) hint.textContent = items.length ? (proc ? proc+' · '+items.length+' locals' : items.length+' locals') : 'file buffers';
+  // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
+  function renderVarGroup(el, label, extra, items){
+    if(!el) return;
     el.innerHTML='';
     if(!items.length) return;
-    const hdr=document.createElement('div'); hdr.className='row';
-    hdr.innerHTML='<span class="ar">▾</span><span class="vname">Locals</span><span class="count">'+items.length+'</span>';
+    let open=true;
+    const hdr=document.createElement('div'); hdr.className='row'; hdr.style.cursor='pointer';
+    hdr.innerHTML='<span class="ar">▾</span><span class="vname">'+esc(label)+'</span>'
+      +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+items.length+'</span>';
     el.appendChild(hdr);
+    const rows=[];
     items.forEach(v=>{
       const isNum=/^-?[0-9]/.test(v.value||'');
       const d=document.createElement('div'); d.className='row';
       d.innerHTML='<span class="ar"></span><span class="vname field">'+esc(v.name)+'</span>'
         +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value)+'</span>'
         +'<span class="vtype">'+esc(v.type)+'</span>';
-      el.appendChild(d);
+      el.appendChild(d); rows.push(d);
     });
+    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸';
+      rows.forEach(d=>d.style.display=open?'':'none'); };
+  }
+
+  // ---- locals (current procedure's variables, refreshed each pause) ----
+  function buildVars(proc, items){
+    items=items||[]; const hint=$('varsHint');
+    if(hint) hint.textContent = items.length ? (proc ? proc+' · '+items.length+' locals' : items.length+' locals') : 'file buffers';
+    renderVarGroup($('localsTree'), 'Locals', null, items);
   }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
   function buildModuleData(module, items){
-    const el=$('moduleTree'); if(!el) return; items=items||[];
-    el.innerHTML='';
-    if(!items.length) return;
-    const hdr=document.createElement('div'); hdr.className='row';
-    hdr.innerHTML='<span class="ar">▾</span><span class="vname">Module Data</span>'
-      +(module?'<span class="vtype">'+esc(module)+'</span>':'')+'<span class="count">'+items.length+'</span>';
-    el.appendChild(hdr);
-    items.forEach(v=>{
-      const isNum=/^-?[0-9]/.test(v.value||'');
-      const d=document.createElement('div'); d.className='row';
-      d.innerHTML='<span class="ar"></span><span class="vname field">'+esc(v.name)+'</span>'
-        +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value)+'</span>'
-        +'<span class="vtype">'+esc(v.type)+'</span>';
-      el.appendChild(d);
-    });
+    renderVarGroup($('moduleTree'), 'Module Data', module, items||[]);
   }
 
   function buildVarTree(symbols){

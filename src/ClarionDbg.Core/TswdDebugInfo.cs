@@ -686,6 +686,10 @@ namespace ClarionDbg.Core
 
                     int frameOff = BitConverter.ToInt32(_b, _base + p + 9);
                     byte code = _b[_base + p + 18];                 // typecode (after the storage byte @+17)
+                    // reject corrupt / false-positive records: a real local has a type and sits within a
+                    // sane distance below the frame pointer (the naive byte-scan can match junk, e.g. a
+                    // HASCHILDREN record decoded with code 0x00 at frame offset -1.35e9).
+                    if (code == 0x00 || frameOff >= 0 || frameOff < -0x100000) continue;
                     byte target = 0; uint size = 0; int places = 0;
                     if (code == 0x16)                              // reference
                     {
