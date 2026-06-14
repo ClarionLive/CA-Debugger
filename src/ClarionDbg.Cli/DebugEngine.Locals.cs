@@ -129,6 +129,8 @@ namespace ClarionDbg.Cli
                     }
                     return "&0x" + ptr.ToString("X");
                 }
+                case 0x08:   // GROUP / CLASS instance — a composite, not a scalar; members not yet expanded
+                    return "{…}";
                 default:
                 {
                     var sb = new StringBuilder("0x");
