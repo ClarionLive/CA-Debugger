@@ -53,6 +53,44 @@ namespace ClarionDbg.Cli
             }
         }
 
+        /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
+        /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
+        /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
+        private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
+            var rows = new List<string>();
+            string module = null;
+
+            if (haveCtx)
+            {
+                var m = ModuleAt(ctx.Eip);
+                ProcSymbol sym;
+                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbol(ctx.Eip - m.LoadBase, out sym))
+                {
+                    int mi = sym.ModuleIdx;
+                    module = m.Dbg.ModuleNameForIdx(mi);
+                    foreach (var ds in m.Dbg.DataSymbols)
+                    {
+                        if (ds.ModuleIdx != mi) continue;
+                        if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
+                            continue;   // file record buffer — belongs to the file-buffer tree, not module data
+                        uint va = m.LoadBase + ds.Rva;
+                        string type = ClarionTypeLabel(ds.TypeCode, 0, ds.Size, 0);
+                        string val = FormatValueAt(ds.TypeCode, 0, ds.Size, 0, va);
+                        rows.Add("{\"name\":" + Json.Str(ds.Name)
+                            + ",\"type\":" + Json.Str(type)
+                            + ",\"value\":" + Json.Str(val) + "}");
+                    }
+                }
+            }
+
+            if (EmitJson)
+                Console.WriteLine("@JSON {\"event\":\"moduledata\",\"module\":" + Json.Str(module)
+                    + ",\"items\":[" + string.Join(",", rows) + "]}");
+            else
+                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"}");
+        }
+
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by
         /// the Locals panel and watch/globals so every scope labels a type the same way.</summary>
         internal static string ClarionTypeLabel(byte code, byte target, uint size, int places)

@@ -140,6 +140,7 @@ namespace ClarionDebugger.Services
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
         public event Action<string, List<DebugLocal>> LocalsReceived; // EXPERIMENT: current proc's locals (proc, items)
+        public event Action<string, List<DebugLocal>> ModuleDataReceived; // EXPERIMENT: current module's module-scope data (module, items)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
@@ -346,6 +347,9 @@ namespace ClarionDebugger.Services
 
         /// <summary>EXPERIMENT: request the current procedure's locals (paused only); result arrives via LocalsReceived.</summary>
         public bool RequestLocals() { return SendCommand("locals"); }
+
+        /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
+        public bool RequestModuleData() { return SendCommand("moduledata"); }
 
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
@@ -568,6 +572,10 @@ namespace ClarionDebugger.Services
 
                 case "locals":
                     LocalsReceived?.Invoke(GetStr(json, "proc"), ParseLocals(json));
+                    break;
+
+                case "moduledata":
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ParseLocals(json));
                     break;
 
                 case "watch":

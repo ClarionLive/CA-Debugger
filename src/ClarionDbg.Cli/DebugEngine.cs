@@ -473,6 +473,10 @@ namespace ClarionDbg.Cli
                         HandleLocalsCommand(parts, ref ctx, haveCtx);
                         break;
 
+                    case "moduledata": case "moddata":
+                        HandleModuleDataCommand(parts, ref ctx, haveCtx);
+                        break;
+
                     case "sym":
                         HandleSymCommand(parts);
                         break;
@@ -538,6 +542,7 @@ namespace ClarionDbg.Cli
                     case "stepout": case "out": case "finish": case "o":
                     case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
                     case "locals": case "vars":
+                    case "moduledata": case "moddata":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:

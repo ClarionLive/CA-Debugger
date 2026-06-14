@@ -57,6 +57,7 @@ namespace ClarionDebugger.Terminal
             _svc.HitReceived           += OnSvcHit;
             _svc.StackReceived         += OnSvcStack;
             _svc.LocalsReceived        += OnSvcLocals;
+            _svc.ModuleDataReceived    += OnSvcModuleData;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -87,6 +88,7 @@ namespace ClarionDebugger.Terminal
             _svc.HitReceived            -= OnSvcHit;
             _svc.StackReceived          -= OnSvcStack;
             _svc.LocalsReceived         -= OnSvcLocals;
+            _svc.ModuleDataReceived     -= OnSvcModuleData;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -119,6 +121,20 @@ namespace ClarionDebugger.Terminal
         private void OnSvcLocals(string proc, List<DebugLocal> items) => UI(() =>
         {
             var sb = new StringBuilder("{\"type\":\"locals\",\"proc\":").Append(Str(proc)).Append(",\"items\":[");
+            for (int i = 0; i < items.Count; i++)
+            {
+                var l = items[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"name\":").Append(Str(l.Name))
+                  .Append(",\"type\":").Append(Str(l.Type))
+                  .Append(",\"value\":").Append(Str(l.Value)).Append('}');
+            }
+            sb.Append("]}");
+            Post(sb.ToString());
+        });
+        private void OnSvcModuleData(string module, List<DebugLocal> items) => UI(() =>
+        {
+            var sb = new StringBuilder("{\"type\":\"moduledata\",\"module\":").Append(Str(module)).Append(",\"items\":[");
             for (int i = 0; i < items.Count; i++)
             {
                 var l = items[i];
@@ -602,6 +618,7 @@ namespace ClarionDebugger.Terminal
                 SendSource(p.ResolvedPath, p.Proc, p.Line);
                 _svc.RequestStack();
                 _svc.RequestLocals();
+                _svc.RequestModuleData();
                 foreach (var name in _watched) _svc.Watch(name);
 
                 if (!string.IsNullOrEmpty(p.ResolvedPath))

@@ -235,7 +235,7 @@
     <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="varTree"><div id="localsTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+        <div class="body" id="varTree"><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
       </details>
       <details class="section" open data-sec="watch">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -683,6 +683,25 @@
     });
   }
 
+  // ---- module-scope data (current module's DATA section, refreshed each pause) ----
+  function buildModuleData(module, items){
+    const el=$('moduleTree'); if(!el) return; items=items||[];
+    el.innerHTML='';
+    if(!items.length) return;
+    const hdr=document.createElement('div'); hdr.className='row';
+    hdr.innerHTML='<span class="ar">▾</span><span class="vname">Module Data</span>'
+      +(module?'<span class="vtype">'+esc(module)+'</span>':'')+'<span class="count">'+items.length+'</span>';
+    el.appendChild(hdr);
+    items.forEach(v=>{
+      const isNum=/^-?[0-9]/.test(v.value||'');
+      const d=document.createElement('div'); d.className='row';
+      d.innerHTML='<span class="ar"></span><span class="vname field">'+esc(v.name)+'</span>'
+        +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value)+'</span>'
+        +'<span class="vtype">'+esc(v.type)+'</span>';
+      el.appendChild(d);
+    });
+  }
+
   function buildVarTree(symbols){
     const tree=$('bufTree'); tree.innerHTML='';
     if(!symbols || !symbols.length){ tree.innerHTML='<div class="empty">No static data symbols.</div>'; return; }
@@ -905,6 +924,7 @@
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
       case 'locals': buildVars(m.proc, m.items||[]); break;
+      case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
