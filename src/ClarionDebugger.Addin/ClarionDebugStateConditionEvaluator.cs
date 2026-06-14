@@ -4,14 +4,15 @@ using ICSharpCode.Core;
 namespace ClarionDebugger
 {
     /// <summary>
-    /// One condition evaluator that greys/un-greys all seven CA-Debugger toolbar buttons according to the
+    /// One condition evaluator that greys/un-greys all CA-Debugger toolbar buttons according to the
     /// live debug run-state held by <see cref="DebugSessionController"/>. The manifest wires each ToolbarItem
-    /// inside a <c>&lt;Condition name="ClarionDebugState" debugbutton="Start|Continue|Pause|StepOver|StepInto|StepOut|Stop" action="Disable"&gt;</c>
+    /// inside a <c>&lt;Condition name="ClarionDebugState" debugbutton="Start|Continue|Pause|StepOver|StepInto|StepOut|Stop|Disassembly" action="Disable"&gt;</c>
     /// so this single class serves every button.
     ///
     /// Enable matrix:
     ///   Start                              -> Idle
     ///   Continue / StepOver / StepInto / StepOut -> Paused
+    ///   Disassembly                        -> Paused
     ///   Pause                              -> Running or Launching
     ///   Stop                               -> not Idle
     ///
@@ -43,6 +44,7 @@ namespace ClarionDebugger
                     case "stepout":  return s == DebugControllerState.Paused;
                     case "pause":    return s == DebugControllerState.Running || s == DebugControllerState.Launching;
                     case "stop":     return s != DebugControllerState.Idle;
+                    case "disassembly": return s == DebugControllerState.Paused;  // disasm needs a stopped target (EIP + readable memory)
                     default:         return false;
                 }
             }

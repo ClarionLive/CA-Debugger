@@ -92,5 +92,18 @@
                    tooltip="CA Debugger: Stop"
                    class="ClarionDebugger.StopDebugCommand"/>
     </Condition>
+
+    <ToolbarItem id="CADebugDisasmSeparator" type="Separator" insertafter="CADebugStop"/>
+
+    <!-- Disassembly view: only meaningful when paused (needs a stopped target — EIP + readable memory),
+         so it greys with the step buttons. Opens/focuses the native Disassembly document tab. -->
+    <Condition name="ClarionDebugState" debugbutton="Disassembly" action="Disable">
+      <ToolbarItem id="CADebugDisassembly"
+                   insertafter="CADebugDisasmSeparator"
+                   icon="Icons.16x16.FormsDesigner.ViewCode"
+                   disabledIcon="Icons.16x16.FormsDesigner.ViewCode"
+                   tooltip="CA Debugger: Disassembly (view machine code at the current instruction)"
+                   class="ClarionDebugger.Disassembly.ShowDisassemblyCommand"/>
+    </Condition>
   </Path>
 </AddIn>
