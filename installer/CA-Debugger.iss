@@ -79,6 +79,7 @@ Source: "{#SrcEngine}\ClarionDbg.exe"; DestDir: "{code:GetC12Path}\accessory\add
 Source: "{#SrcEngine}\ClarionDbg.Core.dll"; DestDir: "{code:GetC12Path}\accessory\addins\ClarionDebugger"; Components: clarion12; Flags: ignoreversion
 Source: "{#SrcEngine}\ClarionDbg.pdb"; DestDir: "{code:GetC12Path}\accessory\addins\ClarionDebugger"; Components: clarion12; Flags: ignoreversion
 Source: "{#SrcEngine}\ClarionDbg.Core.pdb"; DestDir: "{code:GetC12Path}\accessory\addins\ClarionDebugger"; Components: clarion12; Flags: ignoreversion
+Source: "{#SrcEngine}\Iced.dll"; DestDir: "{code:GetC12Path}\accessory\addins\ClarionDebugger"; Components: clarion12; Flags: ignoreversion
 
 ; --- Clarion 11 Addin ---
 Source: "{#SrcC11}\ClarionDebugger.dll"; DestDir: "{code:GetC11Path}\accessory\addins\ClarionDebugger"; Components: clarion11; Flags: ignoreversion
@@ -94,6 +95,7 @@ Source: "{#SrcEngine}\ClarionDbg.exe"; DestDir: "{code:GetC11Path}\accessory\add
 Source: "{#SrcEngine}\ClarionDbg.Core.dll"; DestDir: "{code:GetC11Path}\accessory\addins\ClarionDebugger"; Components: clarion11; Flags: ignoreversion
 Source: "{#SrcEngine}\ClarionDbg.pdb"; DestDir: "{code:GetC11Path}\accessory\addins\ClarionDebugger"; Components: clarion11; Flags: ignoreversion
 Source: "{#SrcEngine}\ClarionDbg.Core.pdb"; DestDir: "{code:GetC11Path}\accessory\addins\ClarionDebugger"; Components: clarion11; Flags: ignoreversion
+Source: "{#SrcEngine}\Iced.dll"; DestDir: "{code:GetC11Path}\accessory\addins\ClarionDebugger"; Components: clarion11; Flags: ignoreversion
 
 ; --- Clarion 10 Addin ---
 Source: "{#SrcC10}\ClarionDebugger.dll"; DestDir: "{code:GetC10Path}\accessory\addins\ClarionDebugger"; Components: clarion10; Flags: ignoreversion
@@ -109,6 +111,7 @@ Source: "{#SrcEngine}\ClarionDbg.exe"; DestDir: "{code:GetC10Path}\accessory\add
 Source: "{#SrcEngine}\ClarionDbg.Core.dll"; DestDir: "{code:GetC10Path}\accessory\addins\ClarionDebugger"; Components: clarion10; Flags: ignoreversion
 Source: "{#SrcEngine}\ClarionDbg.pdb"; DestDir: "{code:GetC10Path}\accessory\addins\ClarionDebugger"; Components: clarion10; Flags: ignoreversion
 Source: "{#SrcEngine}\ClarionDbg.Core.pdb"; DestDir: "{code:GetC10Path}\accessory\addins\ClarionDebugger"; Components: clarion10; Flags: ignoreversion
+Source: "{#SrcEngine}\Iced.dll"; DestDir: "{code:GetC10Path}\accessory\addins\ClarionDebugger"; Components: clarion10; Flags: ignoreversion
 
 ; --- User Guide (shared) ---
 Source: "{#SrcDocs}\user-guide.html"; DestDir: "{app}"; Components: docs; Flags: ignoreversion

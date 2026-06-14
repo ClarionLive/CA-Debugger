@@ -88,8 +88,9 @@ foreach ($ver in $TargetVersions) {
     $loader = Join-Path $AddinOut "runtimes\win-x86\native\WebView2Loader.dll"
     if (Test-Path $loader) { Copy-Item $loader (Join-Path $DeployDir "WebView2Loader.dll") -Force; Write-Host "  OK    WebView2Loader.dll (root)" -ForegroundColor Green }
 
-    # ClarionDbg engine (launched as a child process by the pad).
-    foreach ($e in @("ClarionDbg.exe", "ClarionDbg.pdb", "ClarionDbg.Core.dll", "ClarionDbg.Core.pdb")) {
+    # ClarionDbg engine (launched as a child process by the pad). Iced.dll is the x86 disassembler
+    # the engine hard-references for the disassembly view — ship it or `disasm` throws FileNotFound.
+    foreach ($e in @("ClarionDbg.exe", "ClarionDbg.pdb", "ClarionDbg.Core.dll", "ClarionDbg.Core.pdb", "Iced.dll")) {
         $s = Join-Path $EngineOut $e
         if (-not (Test-Path $s)) { Write-Host "  SKIP  $e (not in engine output)" -ForegroundColor DarkGray; continue }
         Copy-Item $s (Join-Path $DeployDir $e) -Force

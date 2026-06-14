@@ -130,7 +130,9 @@ if (-not $NoBuild) {
 }
 $EngineStage = Join-Path $StageDir "engine"
 New-Item -ItemType Directory -Path $EngineStage | Out-Null
-foreach ($e in @("ClarionDbg.exe", "ClarionDbg.pdb", "ClarionDbg.Core.dll", "ClarionDbg.Core.pdb")) {
+# Iced.dll is the x86 disassembler the engine hard-references for the disassembly view — stage it
+# alongside the engine or a deployed `disasm` throws FileNotFoundException and detaches the debuggee.
+foreach ($e in @("ClarionDbg.exe", "ClarionDbg.pdb", "ClarionDbg.Core.dll", "ClarionDbg.Core.pdb", "Iced.dll")) {
     Copy-Item (Join-Path $EngineOut $e) (Join-Path $EngineStage $e) -Force
 }
 Write-Host "  staged engine ($EngineStage)" -ForegroundColor Green
