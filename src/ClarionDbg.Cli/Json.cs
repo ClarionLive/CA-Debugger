@@ -135,7 +135,7 @@ namespace ClarionDbg.Cli
 
         /// <summary>Target paused (breakpoint hit, step complete, or step-limit). regsJson may be null.
         /// proc = demangled symbol containing the pause address (null when unknown).</summary>
-        public static string Paused(string reason, string module, string proc, int line, uint rva, uint va, uint gap, bool resolved, string regsJson)
+        public static string Paused(string reason, string module, string proc, int line, uint rva, uint va, uint gap, bool resolved, string sym, string regsJson)
         {
             return "{\"event\":\"paused\""
                  + ",\"reason\":" + Str(reason)
@@ -147,6 +147,7 @@ namespace ClarionDbg.Cli
                  + ",\"va\":\"0x" + va.ToString("X") + "\""
                  + ",\"gap\":" + gap
                  + ",\"exact\":" + ((gap == 0 && resolved) ? "true" : "false")
+                 + ",\"sym\":" + Str(sym)               // SPIKE: runtime location for non-TSWD code (or null)
                  + ",\"regs\":" + (regsJson ?? "null")
                  + "}";
         }

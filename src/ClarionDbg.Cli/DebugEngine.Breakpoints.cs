@@ -330,7 +330,16 @@ namespace ClarionDbg.Cli
             {
                 _temp.Remove(va);
                 _skipRunning = false;
-                if (_mode != StepMode.None && haveCtx)
+                if (_mode == StepMode.OverInstr && haveCtx)
+                {
+                    // instruction step-over: the call we stepped has returned — stop AT the return
+                    // address (the next instruction), don't single-step through it. The INT3 advanced
+                    // the thread's EIP to va+1, so commit the corrected EIP (=va) before pausing,
+                    // otherwise the next resume runs from mid-instruction and crashes the target.
+                    Native.SetThreadContext(hThread, ref ctx);
+                    StopStepAndPause(tid, hThread, ref ctx, "stepi");
+                }
+                else if (_mode != StepMode.None && haveCtx)
                 {
                     // back at the caller — resume source-level stepping
                     _prevVa = va;

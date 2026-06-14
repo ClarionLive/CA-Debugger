@@ -54,7 +54,7 @@ namespace ClarionDbg.Cli
     /// </summary>
     internal sealed partial class DebugEngine
     {
-        private enum StepMode { None, Into, Over, Out }
+        private enum StepMode { None, Into, Over, Out, OverInstr }
 
         private const uint TRAP_FLAG = 0x100;        // EFLAGS TF bit
         private const int MAX_STEPS = 2000000;       // hard cap of single-steps per step command
@@ -128,9 +128,15 @@ namespace ClarionDbg.Cli
         private int _startModIdx;
         private LoadedModule _startModule;   // owning image at step start (moduleIdx is only comparable within it)
         private uint _prevVa;         // EIP at the previous single-step trap (for call-entry detection)
+        private uint _stepStartVa;    // EIP when the step began (OverInstr stops once EIP leaves it)
         private int _stepCount;
         private bool _skipRunning;    // running full-speed to a call-skip temp BP; TF off
         private uint _skipEntryEsp;   // ESP at the callee's entry instruction (return depth = this + 4)
+
+        // instruction-level step (stepi): one Trap-Flag step, then pause — independent of the
+        // source-level step machine above (used by the disassembly view).
+        private bool _instrStep;
+        private uint _instrStepTid;
 
         private readonly ConcurrentQueue<string> _cmds = new ConcurrentQueue<string>();
 
@@ -402,6 +408,7 @@ namespace ClarionDbg.Cli
         private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
         {
             _pauseRequested = false;  // any pause we reach consumes a pending pause request
+            _instrStep = false;       // and consumes a pending instruction-step
             uint va = haveCtx ? ctx.Eip : 0;
             var m = haveCtx ? ModuleAt(va) : null;
             uint rva = m != null ? va - m.LoadBase : va;
@@ -411,11 +418,14 @@ namespace ClarionDbg.Cli
             string mod = resolved ? m.Dbg.ModuleNameForIdx(mi) : null;
             string proc = haveCtx ? ProcNameAt(m, rva, resolved ? mi : -1) : null;
             uint gap = resolved ? rva - recRva : 0;
+            // SPIKE: when stopped in non-TSWD code (the runtime), name the location from the live IAT
+            // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
+            string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved,
+                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
                     haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : "")} — commands: continue step stepover stepout bp mem regs stack sym watch quit");
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
 
             while (true)
             {
@@ -435,6 +445,18 @@ namespace ClarionDbg.Cli
                     case "step": case "stepinto": case "s": case "i":
                         BeginStep(StepMode.Into, tid, ref ctx, haveCtx, resolved, line, mi, m);
                         EmitResumed("step");
+                        ArmResume(tid, hThread, ref ctx, haveCtx, true);
+                        return;
+
+                    case "stepi": case "si":   // one instruction, into calls (disassembly view)
+                        _instrStep = true; _instrStepTid = tid;
+                        EmitResumed("stepi");
+                        ArmResume(tid, hThread, ref ctx, haveCtx, true);
+                        return;
+
+                    case "nexti": case "ni":   // one instruction, over calls (disassembly view)
+                        BeginStep(StepMode.OverInstr, tid, ref ctx, haveCtx, resolved, line, mi, m);
+                        EmitResumed("stepi");
                         ArmResume(tid, hThread, ref ctx, haveCtx, true);
                         return;
 
@@ -467,6 +489,10 @@ namespace ClarionDbg.Cli
 
                     case "stack": case "bt": case "where":
                         HandleStackCommand(parts, ref ctx, haveCtx);
+                        break;
+
+                    case "disasm": case "u":
+                        HandleDisasmCommand(parts, ref ctx, haveCtx);
                         break;
 
                     case "sym":
@@ -532,7 +558,9 @@ namespace ClarionDbg.Cli
                     case "step": case "stepinto": case "s": case "i":
                     case "stepover": case "next": case "n":
                     case "stepout": case "out": case "finish": case "o":
+                    case "stepi": case "si": case "nexti": case "ni":
                     case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
+                    case "disasm": case "u":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:

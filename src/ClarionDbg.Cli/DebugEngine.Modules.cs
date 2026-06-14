@@ -124,6 +124,7 @@ namespace ClarionDbg.Cli
                     m.LoadBase = baseVa;
                     _modules.Add(m);
                 }
+                _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
                 if (m.Size == 0) m.Size = ReadRemoteSizeOfImage(baseVa);
 
                 PlantOwnBps(m);          // bps already bound to this image (pre-loaded solution DLL)
@@ -157,6 +158,7 @@ namespace ClarionDbg.Cli
             // reload; drop runtime-discovered DLLs so the table doesn't grow across load/unload churn.
             if (m.Preloaded && m.Pe != null) m.LoadBase = 0;
             else _modules.Remove(m);
+            _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
         }
 
         /// <summary>Read SizeOfImage straight from the target's mapped PE header (fallback when the

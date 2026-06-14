@@ -30,6 +30,10 @@ namespace ClarionDbg.Cli
             if (_mode != StepMode.None && tid == _stepTid && !_skipRunning && haveCtx)
                 StepMachine(tid, hThread, ref ctx);
 
+            // 3) instruction step (stepi): we asked for exactly one TF step — pause here at the new EIP
+            else if (_instrStep && tid == _instrStepTid && haveCtx)
+                PausedWait(tid, hThread, ref ctx, haveCtx, "stepi"); // PausedWait clears _instrStep
+
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
         }
@@ -95,6 +99,11 @@ namespace ClarionDbg.Cli
                 case StepMode.Out:
                     stop = resolved && ctx.Esp > _startEsp && gap <= OUT_GAP_MAX;
                     break;
+                case StepMode.OverInstr:
+                    // one machine instruction, stepping over calls: stop as soon as EIP has left the
+                    // starting instruction (the call-skip above brings us back at the return address).
+                    stop = ctx.Eip != _stepStartVa && ctx.Esp + ESP_SLACK >= _startEsp;
+                    break;
             }
 
             if (!stop && _stepCount >= MAX_STEPS)
@@ -105,7 +114,9 @@ namespace ClarionDbg.Cli
             }
             if (stop)
             {
-                StopStepAndPause(tid, hThread, ref ctx, "step");
+                // instruction-granular step reports as "stepi" so the host keeps focus in the
+                // disassembly view (no jump to the .clw); source-level steps report "step".
+                StopStepAndPause(tid, hThread, ref ctx, _mode == StepMode.OverInstr ? "stepi" : "step");
                 return;
             }
 
@@ -151,6 +162,7 @@ namespace ClarionDbg.Cli
             _startModIdx = resolved ? mi : -1;
             _startModule = m;
             _prevVa = haveCtx ? ctx.Eip : 0;
+            _stepStartVa = _prevVa;
             _stepCount = 0;
             _skipRunning = false;
         }

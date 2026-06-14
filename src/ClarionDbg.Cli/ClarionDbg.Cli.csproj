@@ -12,6 +12,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\ClarionDbg.Core\ClarionDbg.Core.csproj" />
+    <!-- EXPERIMENT: pure-managed x86 disassembler for the disassembly view (no native deps). -->
+    <PackageReference Include="Iced" Version="1.21.0" />
   </ItemGroup>
 
 </Project>

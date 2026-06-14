@@ -94,6 +94,53 @@ namespace ClarionDbg.Core
 
         // import directory (data directory index 1) — for resolving a live import address at runtime
         private uint _importDirRva;
+        private Dictionary<uint, string> _iatNames;   // IAT slot RVA -> "dll!func" (lazy, see BuildIatNameMap)
+
+        /// <summary>Reverse map of every named import: IAT slot RVA -> "dll!func". Lets a disassembler
+        /// name an indirect `call dword [slot]` (the Clarion runtime calls CLIP/FORMAT/etc. go this way).
+        /// By-ordinal imports are skipped (no name). Built once and cached.</summary>
+        public Dictionary<uint, string> BuildIatNameMap()
+        {
+            if (_iatNames != null) return _iatNames;
+            var map = new Dictionary<uint, string>();
+            try
+            {
+                if (_importDirRva == 0)
+                {
+                    int peOff = BitConverter.ToInt32(Bytes, 0x3C);
+                    int optOff = peOff + 24;
+                    _importDirRva = BitConverter.ToUInt32(Bytes, optOff + 96 + 1 * 8);
+                }
+                long dirOff = _importDirRva != 0 ? RvaToOffset(_importDirRva) : -1;
+                for (int d = 0; dirOff >= 0; d++)
+                {
+                    int desc = (int)dirOff + d * 20;
+                    uint oft = BitConverter.ToUInt32(Bytes, desc);        // OriginalFirstThunk (name table)
+                    uint nameRva = BitConverter.ToUInt32(Bytes, desc + 12);
+                    uint ft = BitConverter.ToUInt32(Bytes, desc + 16);    // FirstThunk (the IAT)
+                    if (oft == 0 && nameRva == 0 && ft == 0) break;
+
+                    long nameOff = RvaToOffset(nameRva);
+                    string dll = nameOff >= 0 ? ReadAsciiZ((int)nameOff) : null;
+                    uint thunks = oft != 0 ? oft : ft;
+                    long thunkOff = RvaToOffset(thunks);
+                    if (thunkOff < 0) continue;
+                    for (int i = 0; ; i++)
+                    {
+                        uint entry = BitConverter.ToUInt32(Bytes, (int)thunkOff + i * 4);
+                        if (entry == 0) break;
+                        if ((entry & 0x80000000) != 0) continue;          // by-ordinal — no name
+                        long hintOff = RvaToOffset(entry);
+                        if (hintOff < 0) continue;
+                        string fn = ReadAsciiZ((int)hintOff + 2);
+                        if (!string.IsNullOrEmpty(fn)) map[ft + (uint)i * 4] = (dll != null ? dll + "!" : "") + fn;
+                    }
+                }
+            }
+            catch { }
+            _iatNames = map;
+            return map;
+        }
 
         /// <summary>
         /// The IAT slot RVA for an imported function: at runtime, the u32 at loadBase+slot holds
