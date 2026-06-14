@@ -60,11 +60,14 @@ namespace ClarionDbg.Cli
             {
                 case 0x11: return l.Size == 2 ? "SHORT" : l.Size == 4 ? "LONG" : "SIGNED";
                 case 0x12: return l.Size == 1 ? "BYTE" : l.Size == 2 ? "USHORT" : l.Size == 4 ? "ULONG" : "UNSIGNED";
-                case 0x13: return l.Size == 8 ? "REAL" : "SREAL";
+                case 0x13: case 0x25: return l.Size == 8 ? "REAL" : "SREAL";
                 case 0x18: return "STRING(" + l.Size + ")";   // STRING/CSTRING/PSTRING not yet distinguished
                 case 0x23: return "DECIMAL(" + DecimalDigits(l.Size) + "," + l.Places + ")";
                 case 0x24: return "PDECIMAL(" + DecimalDigits(l.Size) + "," + l.Places + ")";
-                case 0x16: return "&" + (l.Target == 0x18 ? "STRING" : l.Target == 0x08 ? "GROUP" : l.Target == 0x05 ? "CLASS" : "REF");
+                case 0x16:
+                    // a by-ref STRING is, to the user, just a STRING(N) — the pointer is an ABI detail
+                    if (l.Target == 0x18) return "STRING(" + l.Size + ")";
+                    return l.Target == 0x08 ? "&GROUP" : l.Target == 0x05 ? "&CLASS" : "&REF";
                 case 0x08: return "GROUP";
                 default:   return "TYPE(0x" + l.TypeCode.ToString("X2") + ")";
             }
@@ -81,7 +84,7 @@ namespace ClarionDbg.Cli
             {
                 case 0x18: len = (int)Math.Min(l.Size == 0 ? 1u : l.Size, 1024u); break;
                 case 0x23: case 0x24: len = (int)(l.Size == 0 ? 1u : l.Size); break;
-                case 0x11: case 0x12: case 0x13: len = (int)(l.Size == 0 ? 4u : l.Size); break;
+                case 0x11: case 0x12: case 0x13: case 0x25: len = (int)(l.Size == 0 ? 4u : l.Size); break;
                 case 0x16: len = 4; break;
                 default:   len = l.Size > 0 ? (int)Math.Min(l.Size, 64u) : 4; break;
             }
@@ -99,7 +102,7 @@ namespace ClarionDbg.Cli
                     if (l.Size == 1) return buf[0].ToString();
                     if (l.Size == 2) return BitConverter.ToUInt16(buf, 0).ToString();
                     return BitConverter.ToUInt32(buf, 0).ToString();
-                case 0x13:   // float
+                case 0x13: case 0x25:   // float (SREAL / REAL)
                     return l.Size == 8 ? BitConverter.ToDouble(buf, 0).ToString("R")
                                        : BitConverter.ToSingle(buf, 0).ToString("R");
                 case 0x18:   // STRING/CSTRING/PSTRING — show the text (cut at NUL, else trim trailing spaces)
@@ -110,7 +113,22 @@ namespace ClarionDbg.Cli
                 }
                 case 0x23: return FormatBcd(buf, got, l.Places, packed: false);  // DECIMAL (sign-first)
                 case 0x24: return FormatBcd(buf, got, l.Places, packed: true);   // PDECIMAL (sign-last)
-                case 0x16: return "&0x" + BitConverter.ToUInt32(buf, 0).ToString("X");
+                case 0x16:   // reference: the stack slot holds a pointer
+                {
+                    uint ptr = BitConverter.ToUInt32(buf, 0);
+                    if (ptr == 0) return "(null)";
+                    if (l.Target == 0x18)   // &STRING — deref and show the fixed N-char buffer (space-padded)
+                    {
+                        int sn = l.Size > 0 && l.Size <= 4096 ? (int)l.Size : 256;
+                        var sbuf = new byte[sn];
+                        int sg = ReadBlock(ptr, sbuf);
+                        if (sg <= 0) return "&0x" + ptr.ToString("X") + " <unreadable>";
+                        int nz = Array.IndexOf(sbuf, (byte)0, 0, sg);   // CSTRING terminator, if any
+                        if (nz < 0) nz = sg;
+                        return "'" + Encoding.ASCII.GetString(sbuf, 0, nz).TrimEnd(' ') + "'";
+                    }
+                    return "&0x" + ptr.ToString("X");
+                }
                 default:
                 {
                     var sb = new StringBuilder("0x");

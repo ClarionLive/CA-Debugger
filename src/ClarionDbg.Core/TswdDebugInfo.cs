@@ -690,6 +690,7 @@ namespace ClarionDbg.Core
                         size = U32(p + 19);
                         places = _b[_base + p + 23];
                     }
+                    if (size > 0xFFFF) size = 0;   // implausible — a misread tail; treat as unknown
                     outMap[cur].Add(new LocalSym { Name = nm, FrameOff = frameOff, TypeCode = code,
                                                    Target = target, Size = size, Places = places });
                 }
