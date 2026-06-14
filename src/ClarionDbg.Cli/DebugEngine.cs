@@ -469,6 +469,10 @@ namespace ClarionDbg.Cli
                         HandleStackCommand(parts, ref ctx, haveCtx);
                         break;
 
+                    case "locals": case "vars":
+                        HandleLocalsCommand(parts, ref ctx, haveCtx);
+                        break;
+
                     case "sym":
                         HandleSymCommand(parts);
                         break;
@@ -533,6 +537,7 @@ namespace ClarionDbg.Cli
                     case "stepover": case "next": case "n":
                     case "stepout": case "out": case "finish": case "o":
                     case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
+                    case "locals": case "vars":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:

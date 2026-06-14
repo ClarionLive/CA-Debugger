@@ -84,6 +84,16 @@ namespace ClarionDebugger.Services
         public string ResolvedPath; // generated .clw path via the active .red (or null)
     }
 
+    /// <summary>One local variable of the current procedure (EXPERIMENT: Locals/Variables panel),
+    /// value already rendered for display by the engine.</summary>
+    public sealed class DebugLocal
+    {
+        public string Name;       // e.g. LOC:COUNTER
+        public string Type;       // Clarion type label, e.g. LONG, STRING(20), DECIMAL(7,2)
+        public string Value;      // rendered value
+        public int FrameOff;      // frame-pointer-relative offset (diagnostic)
+    }
+
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
     public sealed class DebugWatch
     {
@@ -129,6 +139,7 @@ namespace ClarionDebugger.Services
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
+        public event Action<string, List<DebugLocal>> LocalsReceived; // EXPERIMENT: current proc's locals (proc, items)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
@@ -332,6 +343,9 @@ namespace ClarionDebugger.Services
 
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
         public bool RequestStack() { return SendCommand("stack"); }
+
+        /// <summary>EXPERIMENT: request the current procedure's locals (paused only); result arrives via LocalsReceived.</summary>
+        public bool RequestLocals() { return SendCommand("locals"); }
 
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
@@ -552,6 +566,10 @@ namespace ClarionDebugger.Services
                     StackReceived?.Invoke(frames);
                     break;
 
+                case "locals":
+                    LocalsReceived?.Invoke(GetStr(json, "proc"), ParseLocals(json));
+                    break;
+
                 case "watch":
                     var w = ParseWatch(json);
                     if (w != null) WatchReceived?.Invoke(w);
@@ -735,6 +753,28 @@ namespace ClarionDebugger.Services
                         Module = GetStr(f, "module"),
                         Line = GetInt(f, "line"),
                         Rva = GetStr(f, "rva"),
+                    });
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        private static List<DebugLocal> ParseLocals(string json)
+        {
+            var list = new List<DebugLocal>();
+            try
+            {
+                foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
+                {
+                    string o = m.Value;
+                    if (!o.Contains("\"name\":") || !o.Contains("\"value\":")) continue;
+                    list.Add(new DebugLocal
+                    {
+                        Name = GetStr(o, "name"),
+                        Type = GetStr(o, "type"),
+                        Value = GetStr(o, "value"),
+                        FrameOff = GetInt(o, "frameOff"),
                     });
                 }
             }
