@@ -44,6 +44,8 @@ namespace ClarionDebugger.Services
         public string Va;
         public int Gap;
         public bool Exact;
+        /// <summary>Runtime location for a pause in non-TSWD code (e.g. "ClaRUN.dll!Cla$PushLong+0x7"), or null.</summary>
+        public string Sym;
         /// <summary>x86 registers as hex strings keyed by name (eax..eflags), or null.</summary>
         public Dictionary<string, string> Regs;
         /// <summary>Full path to the source module, resolved via the active .red redirection (or null).</summary>
@@ -56,6 +58,7 @@ namespace ClarionDebugger.Services
         public string Name;        // image file name, lowercased (e.g. myapp.dll)
         public string Path;        // full disk path (null on unload / when unresolved)
         public string Base;        // load base as a hex string (e.g. 0x65D70000)
+        public string Size;        // image size (PE SizeOfImage) as a hex string
         public bool HasDebug;      // TSWD present — engine can resolve lines/symbols in this image
 
         /// <summary>Resolved when at least one of this image's compilands maps to real source via the
@@ -82,6 +85,20 @@ namespace ClarionDebugger.Services
         public int Line;
         public string Rva;
         public string ResolvedPath; // generated .clw path via the active .red (or null)
+    }
+
+    /// <summary>One decoded x86 instruction (EXPERIMENT: disassembly view).</summary>
+    public sealed class DebugDisasmInstr
+    {
+        public string Va;        // instruction VA (hex)
+        public string Bytes;     // raw bytes (hex)
+        public string Text;      // formatted mnemonic + operands
+        public bool Current;     // true = this is the current EIP
+        public string Module;    // .clw it maps to (or null)
+        public int Line;         // source line (0 = none)
+        public string ResolvedPath; // generated .clw path via the active .red (or null)
+        public string Target;    // SPIKE: name a `call` invokes (e.g. ClaRUN.dll!CLIP), or null
+        public string Func;      // containing function for no-source/runtime code (e.g. clarun.dll!Cla$PushLong)
     }
 
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
@@ -112,6 +129,16 @@ namespace ClarionDebugger.Services
     /// </summary>
     public sealed class ClarionDebuggerService
     {
+        /// <summary>The service instance that currently owns (or last owned) a live engine session. Set by
+        /// <see cref="StartSession(string,IEnumerable{DebugBreakpoint},IEnumerable{string})"/>, so an observer
+        /// pad (the native disassembly view) can attach to the running session without the pad that started it
+        /// needing to know it exists. Null until the first session starts.</summary>
+        public static ClarionDebuggerService Active { get; private set; }
+
+        /// <summary>Raised (on the caller of StartSession) when <see cref="Active"/> changes — lets an
+        /// already-open observer pad rebind its event handlers to the new session's service instance.</summary>
+        public static event Action ActiveChanged;
+
         private Process _proc;
         private string _targetDir; // target EXE's directory — anchors relative .red redirection paths
         private readonly object _stateLock = new object();
@@ -129,6 +156,7 @@ namespace ClarionDebugger.Services
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
+        public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
@@ -141,6 +169,26 @@ namespace ClarionDebugger.Services
         public DebugSessionState State
         {
             get { lock (_stateLock) return _state; }
+        }
+
+        /// <summary>EIP (hex) at the current pause, or null when running/idle. Lets a pad that opens
+        /// mid-session (e.g. the Disassembly tab reopened while paused) fetch at the live location
+        /// instead of waiting for the next step.</summary>
+        public string CurrentVa { get; private set; }
+
+        /// <summary>Combined address span of all loaded images [MemLo, MemHi) — the navigable code
+        /// range for the disassembly view's coarse "all-memory" scrollbar. 0 until modules load.</summary>
+        public uint MemLo { get; private set; }
+        public uint MemHi { get; private set; }
+
+        private void TrackModuleSpan(DebugModule m)
+        {
+            uint b = ParseHexU32(m.Base);
+            if (b == 0) return;
+            uint sz = ParseHexU32(m.Size);
+            uint end = b + (sz != 0 ? sz : 0x100000u);
+            if (MemLo == 0 || b < MemLo) MemLo = b;
+            if (end > MemHi) MemHi = end;
         }
 
         /// <summary>Engine-confirmed breakpoints (snapshot).</summary>
@@ -183,6 +231,9 @@ namespace ClarionDebugger.Services
         /// </summary>
         public void StartSession(string targetExe, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
         {
+            // This pad now owns the live session; let observer pads (the disassembly view) rebind to it.
+            if (!ReferenceEquals(Active, this)) { Active = this; ActiveChanged?.Invoke(); }
+            MemLo = MemHi = 0;   // fresh module span for this session (drives the disasm coarse scrollbar)
             var args = new System.Text.StringBuilder();
             args.Append("break \"").Append(targetExe).Append("\" --interactive --json");
             if (breakpoints != null)
@@ -298,6 +349,9 @@ namespace ClarionDebugger.Services
         public bool StepInto() { return SendCommand("step"); }
         public bool StepOver() { return SendCommand("stepover"); }
         public bool StepOut() { return SendCommand("stepout"); }
+        /// <summary>EXPERIMENT: step exactly one machine instruction (for the disassembly view).</summary>
+        public bool StepInstr() { return SendCommand("stepi"); }      // one instruction, into calls
+        public bool StepInstrOver() { return SendCommand("nexti"); }   // one instruction, over calls
         /// <summary>Break into a running target (inject a breakpoint and pause at its current location).</summary>
         public bool Pause() { return SendCommand("pause"); }
 
@@ -333,6 +387,22 @@ namespace ClarionDebugger.Services
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
         public bool RequestStack() { return SendCommand("stack"); }
 
+        /// <summary>EXPERIMENT: request a disassembly listing at the current EIP (paused only);
+        /// result arrives via DisasmReceived.</summary>
+        public bool RequestDisasm() { return SendCommand("disasm"); }
+
+        /// <summary>EXPERIMENT: request a disassembly window starting at a specific VA (hex like
+        /// 0x441109). Used to keep a stable .asm view while instruction-stepping.</summary>
+        public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)
+        {
+            if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
+            // 'before' needs a tag slot ahead of it in the command; default to "win" so positions line up.
+            string t = string.IsNullOrEmpty(tag) ? (before > 0 ? "win" : "") : tag;
+            string cmd = "disasm " + vaHex + " " + count + (string.IsNullOrEmpty(t) ? "" : " " + t);
+            if (before > 0) cmd += " " + before;
+            return SendCommand(cmd);
+        }
+
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
         /// BRW1::LastSortOrder, JOBS$JOB:RECORD). No spaces/newlines — the protocol is line/space-split.</summary>
@@ -348,14 +418,21 @@ namespace ClarionDebugger.Services
 
         /// <summary>Send a raw command line to the engine's stdin. False if no session / stdin closed.
         /// Rejects embedded newlines — the protocol is line-oriented, so a \n would inject a second command.</summary>
+        private readonly object _stdinLock = new object();   // serialize stdin writes — multiple pads now send
+
         public bool SendCommand(string command)
         {
             try
             {
                 if (command == null || command.IndexOf('\n') >= 0 || command.IndexOf('\r') >= 0) return false;
                 if (!IsRunning || !_proc.StartInfo.RedirectStandardInput) return false;
-                _proc.StandardInput.WriteLine(command);
-                _proc.StandardInput.Flush();
+                // The disassembly pad and the WebView share one engine connection; without this lock two
+                // threads' WriteLine calls could interleave characters and corrupt a command line.
+                lock (_stdinLock)
+                {
+                    _proc.StandardInput.WriteLine(command);
+                    _proc.StandardInput.Flush();
+                }
                 return true;
             }
             catch { return false; }
@@ -463,8 +540,10 @@ namespace ClarionDebugger.Services
                         Name = GetStr(json, "name"),
                         Path = GetStr(json, "path"),
                         Base = GetStr(json, "base"),
+                        Size = GetStr(json, "size"),
                         HasDebug = GetBool(json, "hasDebug")
                     };
+                    TrackModuleSpan(ml);
                     ModuleLoaded?.Invoke(ml);
                     break;
 
@@ -490,12 +569,16 @@ namespace ClarionDebugger.Services
                     if (pause != null)
                     {
                         pause.ResolvedPath = ResolveModulePath(pause.Module);
+                        // a 'watch' pause is a transient func-eval round-trip — don't record its trap VA
+                        if (!string.Equals(pause.Reason, "watch", StringComparison.OrdinalIgnoreCase))
+                            CurrentVa = pause.Va;
                         SetState(DebugSessionState.Paused);
                         Paused?.Invoke(pause);
                     }
                     break;
 
                 case "resumed":
+                    CurrentVa = null;
                     SetState(DebugSessionState.Running);
                     Resumed?.Invoke(GetStr(json, "mode"));
                     break;
@@ -546,6 +629,21 @@ namespace ClarionDebugger.Services
                     if (bytes != null) MemoryReceived?.Invoke(addr, memLen, bytes);
                     break;
 
+                case "disasm":
+                    var dlist = ParseDisasm(json);
+                    // Resolve each instruction's .clw to a real path (once per distinct module) so the
+                    // disasm view can pull the actual source line text, not just module:line.
+                    var dpaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var di in dlist)
+                    {
+                        if (string.IsNullOrEmpty(di.Module)) continue;
+                        string rp;
+                        if (!dpaths.TryGetValue(di.Module, out rp)) { rp = ResolveModulePath(di.Module); dpaths[di.Module] = rp; }
+                        di.ResolvedPath = rp;
+                    }
+                    DisasmReceived?.Invoke(GetStr(json, "tag"), dlist);
+                    break;
+
                 case "stack":
                     var frames = ParseStack(json);
                     foreach (var f in frames) f.ResolvedPath = ResolveModulePath(f.Module);
@@ -572,6 +670,7 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "exited":
+                    CurrentVa = null;
                     SetState(DebugSessionState.Idle);
                     break;
 
@@ -701,6 +800,7 @@ namespace ClarionDebugger.Services
                     Va = GetStr(json, "va"),
                     Gap = GetInt(json, "gap"),
                     Exact = GetBool(json, "exact"),
+                    Sym = GetStr(json, "sym"),
                 };
                 // regs block: {"eax":"0x...",...} — flat unique keys, extract directly
                 if (json.Contains("\"regs\":{"))
@@ -735,6 +835,32 @@ namespace ClarionDebugger.Services
                         Module = GetStr(f, "module"),
                         Line = GetInt(f, "line"),
                         Rva = GetStr(f, "rva"),
+                    });
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        private static List<DebugDisasmInstr> ParseDisasm(string json)
+        {
+            var list = new List<DebugDisasmInstr>();
+            try
+            {
+                foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
+                {
+                    string o = m.Value;
+                    if (!o.Contains("\"va\":") || !o.Contains("\"text\":")) continue;
+                    list.Add(new DebugDisasmInstr
+                    {
+                        Va = GetStr(o, "va"),
+                        Bytes = GetStr(o, "bytes"),
+                        Text = GetStr(o, "text"),
+                        Current = GetBool(o, "current"),
+                        Module = GetStr(o, "module"),
+                        Line = GetInt(o, "line"),
+                        Target = GetStr(o, "target"),
+                        Func = GetStr(o, "func"),
                     });
                 }
             }

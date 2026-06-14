@@ -587,7 +587,11 @@ namespace ClarionDebugger.Terminal
                 _svc.RequestStack();
                 foreach (var name in _watched) _svc.Watch(name);
 
-                if (!string.IsNullOrEmpty(p.ResolvedPath))
+                // 'stepi' = a single machine-instruction step driven from the Disassembly view. Keep the
+                // panel refresh above, but DON'T jump the editor to the .clw — that activates the source
+                // tab and steals focus away from the disassembly view on every instruction step.
+                bool instrStep = string.Equals(p.Reason, "stepi", StringComparison.OrdinalIgnoreCase);
+                if (!instrStep && !string.IsNullOrEmpty(p.ResolvedPath))
                 {
                     TryJump(p.ResolvedPath, p.Line);
                     // JumpToCurrentLine activates the Clarion editor and grabs keyboard focus, so the
