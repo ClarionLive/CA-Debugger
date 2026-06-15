@@ -137,7 +137,16 @@ namespace ClarionDebugger.Terminal
                 if (i > 0) sb.Append(',');
                 sb.Append("{\"name\":").Append(Str(l.Name))
                   .Append(",\"type\":").Append(Str(l.Type))
-                  .Append(",\"value\":").Append(Str(l.Value)).Append('}');
+                  .Append(",\"value\":").Append(Str(l.Value));
+                // Forward GROUP/CLASS members so the panel renders the expand triangle (renderVarRow reads
+                // v.children); recurse for nested groups. Omitted entirely for scalar leaves.
+                if (l.Children != null && l.Children.Count > 0)
+                {
+                    sb.Append(",\"children\":[");
+                    AppendVarItems(sb, l.Children);
+                    sb.Append(']');
+                }
+                sb.Append('}');
             }
         }
         private void OnSvcModuleData(string module, List<DebugLocal> items) => UI(() =>

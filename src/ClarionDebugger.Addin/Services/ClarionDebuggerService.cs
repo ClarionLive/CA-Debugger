@@ -95,6 +95,7 @@ namespace ClarionDebugger.Services
         public string Type;       // Clarion type label, e.g. LONG, STRING(20), DECIMAL(7,2)
         public string Value;      // rendered value
         public int FrameOff;      // frame-pointer-relative offset (diagnostic)
+        public List<DebugLocal> Children; // GROUP/CLASS members (engine reads each live); null for scalars
     }
 
     /// <summary>The Locals payload for a pause: the current frame's locals (method/routine) plus, when in a
@@ -947,12 +948,16 @@ namespace ClarionDebugger.Services
                 foreach (string o in SplitObjects(arrayBody))
                 {
                     if (!o.Contains("\"name\":") || !o.Contains("\"value\":")) continue;
+                    // A GROUP/CLASS row carries a nested "children":[…] array of member rows (the engine has
+                    // already read each member's live value). Recurse so the panel can expand it; scalars have
+                    // no children key and parse to null.
                     list.Add(new DebugLocal
                     {
                         Name = GetStr(o, "name"),
                         Type = GetStr(o, "type"),
                         Value = GetStr(o, "value"),
                         FrameOff = GetInt(o, "frameOff"),
+                        Children = o.Contains("\"children\":") ? ParseLocals(ExtractArray(o, "children")) : null,
                     });
                 }
             }
