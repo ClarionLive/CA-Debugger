@@ -21,6 +21,7 @@ namespace ClarionDbg.Cli
         public uint Rva;
         public uint Va;
         public uint StackAddr;     // stack slot holding the return address (0 for frame 0)
+        public uint Ebp;           // this frame's base pointer (for reading its locals); 0 = unknown (scan/FPO frame)
         public string Proc;        // demangled symbol, null when unknown
         public string Kind;        // procedure | method | routine | other, null when unknown
         public string Module;      // .clw name, null when unresolved
@@ -503,6 +504,10 @@ namespace ClarionDbg.Cli
 
                     case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
                         HandleExpandCommand(parts);
+                        break;
+
+                    case "framelocals":   // locals of one call-stack frame (Call-Stack-driven Variables)
+                        HandleFrameLocalsCommand(parts);
                         break;
 
                     case "disasm": case "u":

@@ -355,10 +355,14 @@ namespace ClarionDbg.Cli
                 string kind = mt != null ? mt.Kind.ToString().ToLowerInvariant() : "?";
                 uint sz = mt != null ? mt.Size : 0;
                 string extra = mt != null && (mt.Kind == TypeKind.Decimal || mt.Kind == TypeKind.PDecimal) ? $",{mt.Places}" : "";
-                Console.WriteLine($"{pad}+{mb.Offset,-5} {mb.Name,-26} {kind}/{sz}{extra}"
+                string arr = mt != null && mt.Kind == TypeKind.Array
+                    ? $" [{mt.LoBound}..{mt.LoBound + mt.Length - 1}] of {(mt.ElemType != null ? mt.ElemType.Kind.ToString().ToLowerInvariant() : "?")}/{mt.ElemSize}" : "";
+                Console.WriteLine($"{pad}+{mb.Offset,-5} {mb.Name,-26} {kind}/{sz}{extra}{arr}"
                     + (mt != null ? $" tag=0x{mt.Tag:X2}" : ""));
                 if (mt != null && mt.Kind == TypeKind.Group)
                     DumpTypeMembers(mt, indent + 4);
+                else if (mt != null && mt.Kind == TypeKind.Array && mt.ElemType != null && mt.ElemType.Kind == TypeKind.Group)
+                    DumpTypeMembers(mt.ElemType, indent + 4);
             }
         }
 

@@ -56,6 +56,7 @@ namespace ClarionDbg.Cli
         {
             var m0 = ModuleAt(eip);
             var frames = new List<StackFrame> { FrameAt(m0, eip, 0) };
+            frames[0].Ebp = ebp;   // frame 0's locals are read at the current EBP
 
             // External / frameless top frame — a DebugBreak() int3 (which executes in ntdll), or a
             // thread paused inside an OS call. EBP here still belongs to the Clarion CALLER (the
@@ -77,7 +78,7 @@ namespace ClarionDbg.Cli
             if (AtProcEntry(m0, eip))
             {
                 StackFrame f0;
-                if (TryFrameForReturn(ReadU32(esp), esp, out f0)) frames.Add(f0);
+                if (TryFrameForReturn(ReadU32(esp), esp, out f0)) { f0.Ebp = ebp; frames.Add(f0); }
             }
 
             uint cur = ebp;
@@ -87,9 +88,11 @@ namespace ClarionDbg.Cli
             {
                 StackFrame f;
                 if (!TryFrameForReturn(ReadU32(cur + 4), cur + 4, out f)) break; // chain end / corrupt
+                uint callerEbp = ReadU32(cur);   // caller's saved EBP — that caller frame's base
+                f.Ebp = callerEbp;               // so its locals are read at this base
                 frames.Add(f);
                 floor = cur;
-                cur = ReadU32(cur);  // caller's saved EBP
+                cur = callerEbp;
                 first = false;
             }
 

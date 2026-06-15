@@ -134,7 +134,8 @@
   .ta-item:hover { background:var(--sel); }
   .ta-item .tn { color:var(--name); } .ta-item .tt { color:var(--green); font-size:11px; margin-left:auto; }
 
-  .frame { display:flex; align-items:baseline; gap:8px; padding:3px 8px 3px 14px; cursor:pointer; font-size:13px; white-space:nowrap; }
+  .frame { display:flex; align-items:baseline; gap:6px; padding:3px 8px 3px 8px; cursor:pointer; font-size:13px; white-space:nowrap; }
+  .frame .ar { flex:none; width:12px; color:var(--fg-dim); font-size:10px; cursor:pointer; }
   .frame:hover { background:var(--hover); } .frame.cur { background:var(--sel); }
   .frame .fn { color:var(--fg-bright); } .frame.cur .fn { font-weight:600; }
   .frame .floc { color:var(--fg-dim); font-size:11px; } .frame .file { color:var(--blue); } .frame .ln { color:var(--num); }
@@ -240,7 +241,7 @@
     <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="varTree"><div id="methodTree"></div><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+        <div class="body" id="varTree"><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
       </details>
       <details class="section" open data-sec="watch">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -421,7 +422,7 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['variables','watch','stack','breakpoints','procedures','registers'];
+  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
   const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', source:'Source', console:'Debug Console'};
@@ -730,14 +731,12 @@
     send('expand', id+'|'+v.module+'|'+v.typeRef+'|'+v.addr);
   }
 
-  // ---- locals: current frame (method/routine) + host procedure, refreshed each pause ----
-  function buildVars(m){
-    const meth=m.methodItems||[], proc=m.procItems||[];
-    const methLabel = m.scope==='routine' ? 'Routine Data' : 'Method Data';
-    renderVarGroup($('methodTree'), methLabel, m.method, meth);   // empty when paused in the procedure body
-    renderVarGroup($('localsTree'), 'Procedure Data', m.proc, proc);
-    const hint=$('varsHint');
-    if(hint) hint.textContent = (meth.length||proc.length) ? (meth.length+proc.length)+' locals' : 'file buffers';
+  // ---- per-frame locals (Call-Stack-driven Variables): a frame's locals load lazily on expand ----
+  let _flSeq=0; const _flCbs={};
+  function requestFrameLocals(f, cb){
+    if(!f || !f.va || !f.ebp || f.ebp==='0x0'){ cb([]); return; }
+    const id=++_flSeq; _flCbs[id]=cb;
+    send('framelocals', id+'|'+f.va+'|'+f.ebp);
   }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
@@ -805,15 +804,34 @@
   }
 
   // ---- call stack ----
+  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. Frame 0 (current)
+  // auto-expands. The twisty toggles locals; clicking the frame name jumps the editor to that frame's line.
   function buildStack(frames){
     const list=$('stackList'); list.innerHTML=''; $('stackCount').textContent=frames.length;
     if(!frames.length){ list.innerHTML='<div class="empty">Paused frames appear here.</div>'; return; }
     frames.forEach((f,i)=>{
+      const canLoc = !!(f.proc && f.ebp && f.ebp!=='0x0');
       const el=document.createElement('div'); el.className='frame'+(i===0?' cur':'')+(f.proc?'':' unknown');
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
-      el.innerHTML='<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc+(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
-      if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);
+      el.innerHTML='<span class="ar">'+(canLoc?'▸':'')+'</span>'
+        +'<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc
+        +(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
       list.appendChild(el);
+
+      let box=null, open=false, loaded=false;
+      function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none'; list.insertBefore(box, el.nextSibling); } return box; }
+      function load(){ if(loaded) return; loaded=true; const b=ensureBox();
+        b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">…</div>';
+        requestFrameLocals(f, items=>{ b.innerHTML='';
+          if(!items || !items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
+          else items.forEach(c=>renderVarRow(b, c, 1));
+          if(box) box.style.display=open?'':'none'; }); }
+      function toggle(){ if(!canLoc) return; open=!open; el.querySelector('.ar').textContent=open?'▾':'▸';
+        if(open) load(); if(box) box.style.display=open?'':'none'; }
+      if(canLoc){ const ar=el.querySelector('.ar'); ar.onclick=(e)=>{ e.stopPropagation(); toggle(); }; }
+      if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);   // name click jumps the editor
+
+      if(i===0 && canLoc){ open=true; el.querySelector('.ar').textContent='▾'; load(); }
     });
   }
 
@@ -970,7 +988,7 @@
       case 'resumed': break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
-      case 'locals': buildVars(m); break;
+      case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;

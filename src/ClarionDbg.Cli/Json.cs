@@ -234,6 +234,7 @@ namespace ClarionDbg.Cli
                   .Append(",\"line\":").Append(f.Line)
                   .Append(",\"rva\":\"0x").Append(f.Rva.ToString("X")).Append('"')
                   .Append(",\"va\":\"0x").Append(f.Va.ToString("X")).Append('"')
+                  .Append(",\"ebp\":\"0x").Append(f.Ebp.ToString("X")).Append('"')
                   .Append(",\"stackAddr\":\"0x").Append(f.StackAddr.ToString("X")).Append('"')
                   .Append('}');
             }

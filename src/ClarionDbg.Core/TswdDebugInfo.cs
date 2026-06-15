@@ -113,7 +113,7 @@ namespace ClarionDbg.Core
     }
 
     /// <summary>Kind of a resolved TSWD type record (see <see cref="ClarionType"/>).</summary>
-    public enum TypeKind { Unknown, Group, Array, String, Int, Uint, Float, Char, Decimal, PDecimal, Reference }
+    public enum TypeKind { Unknown, Group, Array, String, Int, Uint, Float, Char, Decimal, PDecimal, Reference, Opaque }
 
     /// <summary>One member of a resolved GROUP type: name + byte offset within the group + its own type.</summary>
     public sealed class TypeMember
@@ -137,8 +137,10 @@ namespace ClarionDbg.Core
         public uint Size;         // total byte size of the type
         public int Places;        // DECIMAL/PDECIMAL scale (digits after the point)
         public byte ElemTag;      // array element type tag (0x18 descriptor)
-        public uint ElemSize;     // array element byte size
+        public uint ElemSize;     // array element byte size (stride between elements)
         public int Length;        // array element count / STRING character count
+        public int LoBound;       // array lower bound (Kind == Array); Clarion DIM is 1-based
+        public ClarionType ElemType;      // Kind == Array: the element's resolved type (may be a GROUP -> tree)
         public List<TypeMember> Members;  // GROUP members (non-null only when Kind == Group)
         public ClarionType Referent;      // Kind == Reference: the pointed-at type (e.g. a by-ref GROUP/QUEUE)
 
@@ -157,6 +159,7 @@ namespace ClarionDbg.Core
                 case TypeKind.Decimal:  code = 0x23; places = Places; break;
                 case TypeKind.PDecimal: code = 0x24; places = Places; break;
                 case TypeKind.Group:    code = 0x08; break;
+                case TypeKind.Opaque:   code = 0x10; size = 4; break;       // opaque stub (window / forward class) — no members
                 case TypeKind.Reference: code = 0x16; size = 4; break;      // a pointer (by-ref)
                 default:                code = 0x00; break;                 // array / unknown — composite
             }
@@ -799,9 +802,11 @@ namespace ClarionDbg.Core
                     // The u32 at tag+1 is the record's typeRef: follow it for the byte-exact aggregate
                     // layout (GROUP members, array/DECIMAL geometry) the inline scalar decode can't give.
                     uint typeRef = U32(p + 1);
-                    // Resolve aggregates: a direct GROUP/QUEUE (0x08) or any reference (0x16) — the latter may
-                    // point at a by-ref GROUP/QUEUE/CLASS (resolved transparently via the type record's referent).
-                    ClarionType aggr = (code == 0x08 || code == 0x16) ? ResolveType(typeRef) : null;
+                    // Resolve aggregates: a direct GROUP/QUEUE (0x08), a class-instance-by-value (0x04, e.g.
+                    // `Toolbar ToolbarClass` — its typeRef also points straight at a 0x08 group), or any
+                    // reference (0x16) — the latter may point at a by-ref GROUP/QUEUE/CLASS/WINDOW (resolved
+                    // transparently via the type record's referent).
+                    ClarionType aggr = (code == 0x04 || code == 0x08 || code == 0x16) ? ResolveType(typeRef) : null;
                     outMap[cur].Add(new LocalSym { Name = nm, FrameOff = frameOff, TypeCode = code,
                                                    Target = target, Size = size, Places = places,
                                                    TypeRef = typeRef, Type = aggr });
@@ -892,14 +897,46 @@ namespace ClarionDbg.Core
                     t.Size = 4;
                     t.Referent = ParseType(SU32(o + 1), depth + 1);
                     break;
+                case 0x10:
+                    // OPAQUE type: a stub with NO member layout (the record is just `10 00 00 00 00`).
+                    // Used INDISTINGUISHABLY for a WINDOW (which has no member layout) AND for by-ref
+                    // class members the compiler emitted only a stub for (e.g. BrowseClass via a
+                    // BROWSEMANAGER ref). Byte-identical to a real window, so we must NOT claim "WINDOW".
+                    // Marked opaque so the renderer shows a non-expandable leaf rather than a bad tree.
+                    t.Kind = TypeKind.Opaque;
+                    t.Size = 4;
+                    break;
                 case 0x18:
                 {
-                    byte elemTag = SB(o + 9);
-                    uint elemSize = SU32(o + 10);
-                    int length = (int)SU32(o + 23);
-                    if (length < 0 || length > 0xFFFF) length = 0;
-                    if (elemTag == 0x14) { t.Kind = TypeKind.String; t.Length = length; t.Size = (uint)length; }
-                    else { t.Kind = TypeKind.Array; t.ElemTag = elemTag; t.ElemSize = elemSize; t.Length = length; t.Size = elemSize * (uint)length; }
+                    // array/string descriptor: 18 <elemTypeRef@+1> <descRef@+5> followed by the INLINED element
+                    // type record and the INLINED 0x0f dimension descriptor. The element TYPE is the typeRef at
+                    // +1 (resolve it — may be a GROUP, which gives an array-of-group its member tree); the BOUNDS
+                    // are in the 0x0f descriptor referenced at +5: lobound@+5, count@+9. (The old decode read the
+                    // count at a fixed +23, which only lands right when the element is a 5-byte CHAR — i.e. a
+                    // STRING; for a group element it read garbage, so arrays never expanded.)
+                    uint elemRef = SU32(o + 1);
+                    ClarionType elem = ParseType(elemRef, depth + 1);
+                    int lo = 1, count = 0;
+                    uint descRef = SU32(o + 5);
+                    if (ValidRef(descRef))
+                    {
+                        int d = OffTable2C + (int)descRef;
+                        if (SB(d) == 0x0f) { lo = SI32(d + 5); count = (int)SU32(d + 9); }
+                    }
+                    if (count < 0 || count > 0xFFFFFF) count = 0;
+                    byte elemTag = elem != null ? elem.Tag : SB(o + 9);
+                    uint elemSize = elem != null && elem.Size > 0 ? elem.Size : SU32(o + 10);
+                    if (elemTag == 0x14 && (elem == null || elem.Kind == TypeKind.Char))
+                    {
+                        // an array of CHAR is, to the user, a STRING(count)
+                        t.Kind = TypeKind.String; t.Length = count; t.Size = (uint)count;
+                    }
+                    else
+                    {
+                        t.Kind = TypeKind.Array; t.ElemTag = elemTag; t.ElemSize = elemSize;
+                        t.ElemType = elem; t.Length = count; t.LoBound = lo;
+                        t.Size = elemSize * (uint)count;
+                    }
                     break;
                 }
                 default:

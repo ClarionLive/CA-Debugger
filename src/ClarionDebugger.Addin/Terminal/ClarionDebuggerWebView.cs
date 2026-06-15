@@ -59,6 +59,7 @@ namespace ClarionDebugger.Terminal
             _svc.LocalsReceived        += OnSvcLocals;
             _svc.ModuleDataReceived    += OnSvcModuleData;
             _svc.ExpandedReceived      += OnSvcExpanded;
+            _svc.FrameLocalsReceived   += OnSvcFrameLocals;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -91,6 +92,7 @@ namespace ClarionDebugger.Terminal
             _svc.LocalsReceived         -= OnSvcLocals;
             _svc.ModuleDataReceived     -= OnSvcModuleData;
             _svc.ExpandedReceived       -= OnSvcExpanded;
+            _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -138,6 +140,9 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
             Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
+
+        private void OnSvcFrameLocals(string reqId, string itemsJson) => UI(() =>
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() => SendBps());
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
@@ -314,6 +319,14 @@ namespace ClarionDebugger.Terminal
                             var a = data.Split('|');
                             if (a.Length == 4 && int.TryParse(a[0], out int rq) && uint.TryParse(a[2], out uint tr))
                                 _svc.RequestExpand(rq, a[1], tr, a[3]);
+                        }
+                        break;
+                    case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
+                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
+                        {
+                            var a = data.Split('|');
+                            if (a.Length == 3 && int.TryParse(a[0], out int rq))
+                                _svc.RequestFrameLocals(rq, a[1], a[2]);
                         }
                         break;
                     case "jump": Jump(data); break;
@@ -616,8 +629,7 @@ namespace ClarionDebugger.Terminal
                 Console("pause", "paused [" + p.Reason + "]  " + (p.Resolved ? p.Module + " line " + p.Line + (p.Proc != null ? " in " + p.Proc : "") : "(unresolved)"));
 
                 SendSource(p.ResolvedPath, p.Proc, p.Line);
-                _svc.RequestStack();
-                _svc.RequestLocals();
+                _svc.RequestStack();          // per-frame locals now load lazily from the Call Stack (frame 0 auto)
                 _svc.RequestModuleData();
                 foreach (var name in _watched) _svc.Watch(name);
 
@@ -647,7 +659,9 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"proc\":").Append(Str(f.Proc))
                   .Append(",\"kind\":").Append(Str(f.Kind))
                   .Append(",\"module\":").Append(Str(f.Module))
-                  .Append(",\"line\":").Append(f.Line).Append('}');
+                  .Append(",\"line\":").Append(f.Line)
+                  .Append(",\"va\":").Append(Str(f.Va))
+                  .Append(",\"ebp\":").Append(Str(f.Ebp)).Append('}');
             }
             sb.Append("]}");
             Post(sb.ToString());

@@ -84,6 +84,8 @@ namespace ClarionDebugger.Services
         public string Module;
         public int Line;
         public string Rva;
+        public string Va;           // frame instruction VA (for per-frame locals resolution)
+        public string Ebp;          // frame base pointer (for reading the frame's locals); "0x0" = unknown
         public string ResolvedPath; // generated .clw path via the active .red (or null)
     }
 
@@ -182,6 +184,7 @@ namespace ClarionDebugger.Services
         public event Action<DebugLocals> LocalsReceived; // EXPERIMENT: current frame + host-procedure locals
         public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
+        public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
@@ -427,6 +430,16 @@ namespace ClarionDebugger.Services
             if (!IsValidModuleName(module)) return false;
             if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]+$")) return false;
             return SendCommand("expand " + reqId + " " + module + " " + typeRef + " " + addrHex);
+        }
+
+        /// <summary>Request the locals of ONE call-stack frame (Call-Stack-driven Variables): the engine reads
+        /// the frame's symbol locals at <paramref name="ebpHex"/>. Result arrives via FrameLocalsReceived keyed
+        /// by <paramref name="reqId"/>. Args are validated to block injection over the space-split stdin protocol.</summary>
+        public bool RequestFrameLocals(int reqId, string vaHex, string ebpHex)
+        {
+            if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
+            if (string.IsNullOrEmpty(ebpHex) || !Regex.IsMatch(ebpHex, "^0x[0-9A-Fa-f]+$")) return false;
+            return SendCommand("framelocals " + reqId + " " + vaHex + " " + ebpHex);
         }
 
         /// <summary>EXPERIMENT: request a disassembly listing at the current EIP (paused only);
@@ -713,6 +726,10 @@ namespace ClarionDebugger.Services
                     ExpandedReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
                     break;
 
+                case "framelocals":
+                    FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
+                    break;
+
                 case "watch":
                     var w = ParseWatch(json);
                     if (w != null) WatchReceived?.Invoke(w);
@@ -898,6 +915,8 @@ namespace ClarionDebugger.Services
                         Module = GetStr(f, "module"),
                         Line = GetInt(f, "line"),
                         Rva = GetStr(f, "rva"),
+                        Va = GetStr(f, "va"),
+                        Ebp = GetStr(f, "ebp"),
                     });
                 }
             }
