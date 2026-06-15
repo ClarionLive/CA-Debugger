@@ -84,6 +84,8 @@ namespace ClarionDebugger.Services
         public string Module;
         public int Line;
         public string Rva;
+        public string Va;           // frame instruction VA (for per-frame locals resolution)
+        public string Ebp;          // frame base pointer (for reading the frame's locals); "0x0" = unknown
         public string ResolvedPath; // generated .clw path via the active .red (or null)
     }
 
@@ -95,18 +97,19 @@ namespace ClarionDebugger.Services
         public string Type;       // Clarion type label, e.g. LONG, STRING(20), DECIMAL(7,2)
         public string Value;      // rendered value
         public int FrameOff;      // frame-pointer-relative offset (diagnostic)
-        public List<DebugLocal> Children; // GROUP/CLASS members (engine reads each live); null for scalars
     }
 
     /// <summary>The Locals payload for a pause: the current frame's locals (method/routine) plus, when in a
-    /// method/routine, the host procedure's locals (Clarion procedure data is in scope inside its methods).</summary>
+    /// method/routine, the host procedure's locals (Clarion procedure data is in scope inside its methods).
+    /// The item arrays are carried as the engine's RAW JSON (passed through to the WebView verbatim) so the
+    /// arbitrarily-nested GROUP <c>children</c> and lazy reference fields survive without a lossy re-parse.</summary>
     public sealed class DebugLocals
     {
-        public string Scope;       // current frame kind: method | routine | procedure
-        public string MethodName;  // current method/routine name (null when paused in the procedure body)
-        public List<DebugLocal> MethodItems = new List<DebugLocal>();
-        public string ProcName;    // host (or current) procedure name
-        public List<DebugLocal> ProcItems = new List<DebugLocal>();
+        public string Scope;          // current frame kind: method | routine | procedure
+        public string MethodName;     // current method/routine name (null when paused in the procedure body)
+        public string MethodItemsJson = ""; // raw JSON array body for the method frame's rows
+        public string ProcName;       // host (or current) procedure name
+        public string ProcItemsJson = "";   // raw JSON array body for the procedure frame's rows
     }
 
     /// <summary>One decoded x86 instruction (EXPERIMENT: disassembly view).</summary>
@@ -179,7 +182,9 @@ namespace ClarionDebugger.Services
         public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
         public event Action<DebugLocals> LocalsReceived; // EXPERIMENT: current frame + host-procedure locals
-        public event Action<string, List<DebugLocal>> ModuleDataReceived; // EXPERIMENT: current module's module-scope data (module, items)
+        public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
+        public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
+        public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
@@ -416,6 +421,26 @@ namespace ClarionDebugger.Services
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
+
+        /// <summary>Lazily expand a reference node: ask the engine to deref <paramref name="addrHex"/> and render
+        /// the referent type's members. Result arrives via ExpandedReceived keyed by <paramref name="reqId"/>.
+        /// Args are validated to block command/arg injection over the space-split stdin protocol.</summary>
+        public bool RequestExpand(int reqId, string module, uint typeRef, string addrHex)
+        {
+            if (!IsValidModuleName(module)) return false;
+            if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]+$")) return false;
+            return SendCommand("expand " + reqId + " " + module + " " + typeRef + " " + addrHex);
+        }
+
+        /// <summary>Request the locals of ONE call-stack frame (Call-Stack-driven Variables): the engine reads
+        /// the frame's symbol locals at <paramref name="ebpHex"/>. Result arrives via FrameLocalsReceived keyed
+        /// by <paramref name="reqId"/>. Args are validated to block injection over the space-split stdin protocol.</summary>
+        public bool RequestFrameLocals(int reqId, string vaHex, string ebpHex)
+        {
+            if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
+            if (string.IsNullOrEmpty(ebpHex) || !Regex.IsMatch(ebpHex, "^0x[0-9A-Fa-f]+$")) return false;
+            return SendCommand("framelocals " + reqId + " " + vaHex + " " + ebpHex);
+        }
 
         /// <summary>EXPERIMENT: request a disassembly listing at the current EIP (paused only);
         /// result arrives via DisasmReceived.</summary>
@@ -681,18 +706,28 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "locals":
+                    // Pass the engine's item arrays through verbatim (balanced extraction) — nested GROUP
+                    // children + lazy reference fields would not survive a flat re-parse.
                     LocalsReceived?.Invoke(new DebugLocals
                     {
                         Scope = GetStr(json, "scope"),
                         MethodName = GetStr(json, "method"),
-                        MethodItems = ParseLocals(ExtractArray(json, "methodItems")),
+                        MethodItemsJson = ExtractArrayBalanced(json, "methodItems"),
                         ProcName = GetStr(json, "proc"),
-                        ProcItems = ParseLocals(ExtractArray(json, "procItems")),
+                        ProcItemsJson = ExtractArrayBalanced(json, "procItems"),
                     });
                     break;
 
                 case "moduledata":
-                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ParseLocals(ExtractArray(json, "items")));
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"));
+                    break;
+
+                case "expanded":
+                    ExpandedReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
+                    break;
+
+                case "framelocals":
+                    FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
                     break;
 
                 case "watch":
@@ -880,6 +915,8 @@ namespace ClarionDebugger.Services
                         Module = GetStr(f, "module"),
                         Line = GetInt(f, "line"),
                         Rva = GetStr(f, "rva"),
+                        Va = GetStr(f, "va"),
+                        Ebp = GetStr(f, "ebp"),
                     });
                 }
             }
@@ -887,17 +924,16 @@ namespace ClarionDebugger.Services
             return list;
         }
 
-        /// <summary>Slice out one named JSON array's body, e.g. ExtractArray(json,"methodItems") -> the text
-        /// between its '[' and the matching ']'. Scans with string- and depth-awareness so a debuggee-controlled
-        /// value containing ']' '[' '{' '}' (a GROUP/CLASS local renders as "{…}", a STRING may hold a bracket)
-        /// can't terminate the array early. The engine's Json.Str does NOT escape brackets/braces, so a naive
-        /// first-']' scan silently drops every row after the first such value.</summary>
-        private static string ExtractArray(string json, string key)
+        /// <summary>Slice out one named JSON array's body honouring nested brackets and quoted strings — e.g.
+        /// the rows of <c>methodItems</c> when those rows themselves contain <c>children:[...]</c> arrays.
+        /// Returns the text between the array's outer [ and its matching ] (exclusive). Robust to '[' / ']' /
+        /// '"' that appear inside string values (engine strings are escaped).</summary>
+        private static string ExtractArrayBalanced(string json, string key)
         {
-            int k = json.IndexOf("\"" + key + "\"", StringComparison.Ordinal);
-            if (k < 0) return "";
-            int open = json.IndexOf('[', k);
-            if (open < 0) return "";
+            if (string.IsNullOrEmpty(json)) return "";
+            int i = json.IndexOf("\"" + key + "\":[", StringComparison.Ordinal);
+            if (i < 0) return "";
+            int open = i + key.Length + 3;       // index of the opening '['
             int depth = 0; bool inStr = false, esc = false;
             for (int p = open; p < json.Length; p++)
             {
@@ -910,59 +946,10 @@ namespace ClarionDebugger.Services
                     continue;
                 }
                 if (c == '"') inStr = true;
-                else if (c == '[' || c == '{') depth++;
-                else if (c == ']' || c == '}') { if (--depth == 0) return json.Substring(open + 1, p - open - 1); }
+                else if (c == '[') depth++;
+                else if (c == ']') { depth--; if (depth == 0) return json.Substring(open + 1, p - open - 1); }
             }
             return "";
-        }
-
-        /// <summary>Yield each top-level '{…}' object in a JSON array body, tracking string state and brace
-        /// depth so a value containing '{' '}' '[' ']' cannot split a row in the wrong place. Replaces the old
-        /// "\{[^{}]*\}" regex, which matched the innermost braces and therefore dropped any row whose value the
-        /// engine rendered with braces (GROUP/CLASS aggregates) — exactly the case this panel shows today.</summary>
-        private static IEnumerable<string> SplitObjects(string arrayBody)
-        {
-            if (string.IsNullOrEmpty(arrayBody)) yield break;
-            int depth = 0, start = -1; bool inStr = false, esc = false;
-            for (int p = 0; p < arrayBody.Length; p++)
-            {
-                char c = arrayBody[p];
-                if (inStr)
-                {
-                    if (esc) esc = false;
-                    else if (c == '\\') esc = true;
-                    else if (c == '"') inStr = false;
-                    continue;
-                }
-                if (c == '"') inStr = true;
-                else if (c == '{') { if (depth++ == 0) start = p; }
-                else if (c == '}') { if (--depth == 0 && start >= 0) { yield return arrayBody.Substring(start, p - start + 1); start = -1; } }
-            }
-        }
-
-        private static List<DebugLocal> ParseLocals(string arrayBody)
-        {
-            var list = new List<DebugLocal>();
-            try
-            {
-                foreach (string o in SplitObjects(arrayBody))
-                {
-                    if (!o.Contains("\"name\":") || !o.Contains("\"value\":")) continue;
-                    // A GROUP/CLASS row carries a nested "children":[…] array of member rows (the engine has
-                    // already read each member's live value). Recurse so the panel can expand it; scalars have
-                    // no children key and parse to null.
-                    list.Add(new DebugLocal
-                    {
-                        Name = GetStr(o, "name"),
-                        Type = GetStr(o, "type"),
-                        Value = GetStr(o, "value"),
-                        FrameOff = GetInt(o, "frameOff"),
-                        Children = o.Contains("\"children\":") ? ParseLocals(ExtractArray(o, "children")) : null,
-                    });
-                }
-            }
-            catch { }
-            return list;
         }
 
         private static List<DebugDisasmInstr> ParseDisasm(string json)

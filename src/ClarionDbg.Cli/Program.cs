@@ -328,12 +328,16 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"  {pname}  (entry 0x{kv.Key:X}) — {kv.Value.Count} local(s):");
                 foreach (var l in kv.Value.OrderByDescending(x => x.FrameOff))
                 {
+                    // direct GROUP/QUEUE, or a by-ref one reached through a single reference hop
+                    var g = l.Type == null ? null
+                          : l.Type.Kind == TypeKind.Group ? l.Type
+                          : (l.Type.Kind == TypeKind.Reference && l.Type.Referent != null && l.Type.Referent.Kind == TypeKind.Group ? l.Type.Referent : null);
                     Console.WriteLine($"      [ebp{(l.FrameOff >= 0 ? "+" : "")}{l.FrameOff}]  {l.Name,-24} "
                         + $"code=0x{l.TypeCode:X2}{(l.Target != 0 ? $" ->0x{l.Target:X2}" : "")} size={l.Size}"
                         + (l.Places != 0 ? $" places={l.Places}" : "")
-                        + (l.Type != null && l.Type.Kind == TypeKind.Group ? $"  GROUP(size={l.Type.Size}) typeRef=0x{l.TypeRef:X}" : ""));
-                    if (l.Type != null && l.Type.Kind == TypeKind.Group)
-                        DumpTypeMembers(l.Type, 10);
+                        + (g != null ? $"  {(l.TypeCode == 0x16 ? "&" : "")}GROUP(size={g.Size}) typeRef=0x{l.TypeRef:X}" : ""));
+                    if (g != null)
+                        DumpTypeMembers(g, 10);
                 }
             }
             return locals.Count > 0 ? 0 : 3;
@@ -351,10 +355,14 @@ namespace ClarionDbg.Cli
                 string kind = mt != null ? mt.Kind.ToString().ToLowerInvariant() : "?";
                 uint sz = mt != null ? mt.Size : 0;
                 string extra = mt != null && (mt.Kind == TypeKind.Decimal || mt.Kind == TypeKind.PDecimal) ? $",{mt.Places}" : "";
-                Console.WriteLine($"{pad}+{mb.Offset,-5} {mb.Name,-26} {kind}/{sz}{extra}"
+                string arr = mt != null && mt.Kind == TypeKind.Array
+                    ? $" [{mt.LoBound}..{mt.LoBound + mt.Length - 1}] of {(mt.ElemType != null ? mt.ElemType.Kind.ToString().ToLowerInvariant() : "?")}/{mt.ElemSize}" : "";
+                Console.WriteLine($"{pad}+{mb.Offset,-5} {mb.Name,-26} {kind}/{sz}{extra}{arr}"
                     + (mt != null ? $" tag=0x{mt.Tag:X2}" : ""));
                 if (mt != null && mt.Kind == TypeKind.Group)
                     DumpTypeMembers(mt, indent + 4);
+                else if (mt != null && mt.Kind == TypeKind.Array && mt.ElemType != null && mt.ElemType.Kind == TypeKind.Group)
+                    DumpTypeMembers(mt.ElemType, indent + 4);
             }
         }
 

@@ -54,68 +54,116 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Build the JSON rows for one frame's locals — its proc's entry RVA keys the local set,
-        /// each value read live at [frameEbp + frameOffset]. GROUP locals expand to nested member rows.
-        /// Shared by the method and host-procedure groups.</summary>
+        /// each value read live at [frameEbp + frameOffset]. Direct GROUP locals expand inline to nested member
+        /// rows; reference locals (incl. by-ref GROUP/QUEUE) are lazy (expanded on demand). Shared by the
+        /// method and host-procedure groups. <paramref name="module"/> tags ref rows so the host can request
+        /// expansion against the right image's TSWD.</summary>
         private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
         {
             var rows = new List<string>();
             List<LocalSym> locals;
             if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
                 foreach (var l in locals)
-                    rows.Add(LocalRowJson(l, frameEbp));
+                {
+                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
+                }
             return rows;
         }
 
-        /// <summary>One local's JSON row. A GROUP local (direct instance or by-ref) expands to nested member
-        /// rows read at the instance base + each member's byte offset; scalars/strings/refs render flat.</summary>
-        private string LocalRowJson(LocalSym l, uint frameEbp)
+        /// <summary>framelocals reqId va ebp — the locals of ONE call-stack frame (the Call-Stack-driven
+        /// Variables model). Reads the frame's symbol locals at the supplied EBP. A ROUTINE has no frame of
+        /// its own (it runs on its procedure's frame via DO), so a routine frame surfaces its enclosing
+        /// procedure's locals read at the same EBP; a METHOD's enclosing procedure is a SEPARATE stack frame,
+        /// so methods show only their own. Emits a `framelocals` event keyed by reqId. Read-only.</summary>
+        private void HandleFrameLocalsCommand(string[] parts)
         {
-            uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-            if (l.Type != null && l.Type.Kind == TypeKind.Group)
+            if (parts.Length < 4) { EmitError("framelocals expects: framelocals reqId va ebp"); return; }
+            string reqId = parts[1];
+            uint va = ParseHexU(parts[2]);
+            uint ebp = ParseHexU(parts[3]);
+            var rows = new List<string>();
+            var m = ModuleAt(va);
+            ProcSymbol sym;
+            if (m != null && m.Dbg != null && ebp != 0 && m.Dbg.ResolveSymbol(va - m.LoadBase, out sym))
             {
-                uint baseVa = slotVa;
-                if (l.TypeCode == 0x16)   // by-ref group: the stack slot holds a pointer to the instance
+                uint entry = sym.EntryRva;
+                if (sym.Kind == SymbolKind.Routine)
                 {
-                    uint ptr = ReadU32(slotVa);
-                    if (ptr == 0)
-                        return "{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str("&GROUP")
-                             + ",\"value\":" + Json.Str("(null)") + ",\"frameOff\":" + l.FrameOff + "}";
-                    baseVa = ptr;
+                    uint pe = EnclosingProcedureEntry(m, va - m.LoadBase);
+                    if (pe != 0) entry = pe;
                 }
-                return TypedValueJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, baseVa, l.FrameOff);
+                rows = LocalRowsFor(m, entry, ebp);
             }
-            return TypedValueJson(l.Name, null, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff);
+            if (EmitJson)
+                Console.WriteLine("@JSON {\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
+                    + ",\"items\":[" + string.Join(",", rows) + "]}");
         }
 
-        /// <summary>The single composite value renderer: emit a typed value as a JSON row, recursing GROUP
-        /// members into a nested "children" array (each read live at va + memberOffset). Leaves go through the
-        /// same <see cref="FormatValueAt"/>/<see cref="ClarionTypeLabel"/> as top-level scalars, so a member
-        /// renders identically to a standalone variable of that type. Shared by locals and module data.</summary>
-        private string TypedValueJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff)
+        /// <summary>The entry RVA of the procedure that lexically contains <paramref name="rva"/> — the
+        /// greatest Procedure-kind symbol entry at or below it. Used to map a routine frame to its host
+        /// procedure (they share a stack frame). 0 when none precedes.</summary>
+        private static uint EnclosingProcedureEntry(LoadedModule m, uint rva)
+        {
+            uint best = 0;
+            if (m == null || m.Dbg == null || m.Dbg.Symbols == null) return 0;
+            foreach (var s in m.Dbg.Symbols)   // sorted ascending by EntryRva
+                if (s.Kind == SymbolKind.Procedure && s.EntryRva <= rva && s.EntryRva >= best)
+                    best = s.EntryRva;
+            return best;
+        }
+
+        /// <summary>The GROUP/QUEUE layout a type describes — directly (a group) or through one reference hop
+        /// (a by-ref group/queue/class). Returns null for non-aggregates.</summary>
+        private static ClarionType GroupTypeOf(ClarionType t)
+        {
+            if (t == null) return null;
+            if (t.Kind == TypeKind.Group) return t;
+            if (t.Kind == TypeKind.Reference && t.Referent != null && t.Referent.Kind == TypeKind.Group) return t.Referent;
+            return null;
+        }
+
+        /// <summary>The single composite value renderer. Three shapes:
+        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
+        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
+        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
+        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
+        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
+        private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
-            if (type != null && type.Kind == TypeKind.Group && type.Members != null)
+            ClarionType g = GroupTypeOf(type);
+
+            if (type != null && type.Kind == TypeKind.Reference && g != null)
             {
-                sb.Append(",\"type\":").Append(Json.Str("GROUP"));
-                sb.Append(",\"value\":").Append(Json.Str("{…}"));
-                sb.Append(",\"children\":[");
-                bool first = true;
-                foreach (var mb in type.Members)
-                {
-                    byte mc, mt; uint msz; int mpl;
-                    CodeForType(mb.Type, out mc, out mt, out msz, out mpl);
-                    uint mva = (uint)((long)va + mb.Offset);
-                    if (!first) sb.Append(',');
-                    first = false;
-                    sb.Append(TypedValueJson(mb.Name ?? "?", mb.Type, mc, mt, msz, mpl, mva, null));
-                }
-                sb.Append(']');
+                // by-ref group/queue/class: the slot holds a pointer. Mirror the old Clarion debugger —
+                // show the POINTER (no "&GROUP" type noise) and nest one "RECORD" deref node that expands
+                // lazily to the members (pointer -> "RECORD" -> fields). Avoids blindly chasing pointers.
+                uint ptr = ReadU32(va);
+                sb.Append(",\"type\":\"\"");
+                if (ptr == 0)
+                    sb.Append(",\"value\":").Append(Json.Str("(null)"));
+                else
+                    sb.Append(",\"value\":").Append(Json.Str("0x" + ptr.ToString("X")))
+                      .Append(",\"children\":[{\"name\":\"RECORD\",\"type\":\"\",\"value\":\"{…}\"")
+                      .Append(",\"ref\":true,\"addr\":\"0x").Append(ptr.ToString("X")).Append('"')
+                      .Append(",\"module\":").Append(Json.Str(module))
+                      .Append(",\"typeRef\":").Append(g.TypeRef).Append("}]");
+            }
+            else if (g != null)
+            {
+                // direct GROUP/QUEUE instance: inline members, no "GROUP" type label (the {…}/fields convey it).
+                sb.Append(",\"type\":\"\",\"value\":").Append(Json.Str("{…}"));
+                sb.Append(",\"children\":[").Append(GroupChildrenJson(g, va, module)).Append(']');
             }
             else if (type != null && type.Kind == TypeKind.Array)
             {
-                sb.Append(",\"type\":").Append(Json.Str("ARRAY(" + type.Length + ")"));
-                sb.Append(",\"value\":").Append(Json.Str("[…]"));   // element expansion is a follow-up
+                int hi = type.LoBound + type.Length - 1;
+                sb.Append(",\"type\":").Append(Json.Str(type.Length > 0 ? "ARRAY[" + type.LoBound + ".." + hi + "]" : "ARRAY"));
+                sb.Append(",\"value\":").Append(Json.Str("[…]"));
+                string kids = ArrayChildrenJson(type, va, module);
+                if (kids.Length > 0) sb.Append(",\"children\":[").Append(kids).Append(']');
             }
             else
             {
@@ -127,13 +175,109 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
+        /// <summary>Render a group's members as a JSON row array, each read at <paramref name="baseVa"/> + its
+        /// byte offset. Shared by inline direct-group expansion and the on-demand <c>expand</c> handler.</summary>
+        private string GroupChildrenJson(ClarionType g, uint baseVa, string module)
+        {
+            if (g == null || g.Members == null) return "";
+            var sb = new StringBuilder();
+            bool first = true;
+            foreach (var mb in g.Members)
+            {
+                byte mc, mt; uint msz; int mpl;
+                CodeForType(mb.Type, out mc, out mt, out msz, out mpl);
+                uint mva = (uint)((long)baseVa + mb.Offset);
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append(NodeJson(mb.Name ?? "?", mb.Type, mc, mt, msz, mpl, mva, null, module));
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Render an array's elements as JSON child rows, each read at baseVa + k*stride. Scalar/string
+        /// elements are eager leaves; GROUP elements become LAZY in-place nodes (ref:true + addr/typeRef) that
+        /// reuse the on-demand <c>expand</c> path — so an array-of-group doesn't explode into members until a
+        /// row is opened, and the expand handler reads members at the element's address directly (no deref).
+        /// Capped to keep the DOM bounded on very large DIMs.</summary>
+        private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module)
+        {
+            if (arr == null || arr.Length <= 0 || arr.ElemSize == 0) return "";
+            const int cap = 1000;
+            int n = Math.Min(arr.Length, cap);
+            var elem = arr.ElemType;
+            var sb = new StringBuilder();
+            for (int k = 0; k < n; k++)
+            {
+                if (k > 0) sb.Append(',');
+                uint eva = (uint)((long)baseVa + (long)k * arr.ElemSize);
+                string idx = "[" + (arr.LoBound + k) + "]";
+                if (elem != null && elem.Kind == TypeKind.Group)
+                {
+                    sb.Append("{\"name\":").Append(Json.Str(idx))
+                      .Append(",\"type\":\"GROUP\",\"value\":").Append(Json.Str("{…}"))
+                      .Append(",\"ref\":true,\"addr\":\"0x").Append(eva.ToString("X")).Append('"')
+                      .Append(",\"module\":").Append(Json.Str(module))
+                      .Append(",\"typeRef\":").Append(elem.TypeRef).Append('}');
+                }
+                else
+                {
+                    byte ec, et; uint esz; int epl;
+                    CodeForType(elem, out ec, out et, out esz, out epl);
+                    sb.Append(NodeJson(idx, elem, ec, et, esz, epl, eva, null, module));
+                }
+            }
+            if (arr.Length > cap)
+                sb.Append(",{\"name\":").Append(Json.Str("…"))
+                  .Append(",\"type\":\"\",\"value\":").Append(Json.Str((arr.Length - cap) + " more")).Append('}');
+            return sb.ToString();
+        }
+
+        /// <summary>On-demand expansion of a reference node: re-resolve its referent type in the owning image's
+        /// TSWD and render that group's members read live at the dereferenced address. Emits an `expanded`
+        /// event keyed by the host's reqId. Read-only — no target code runs.</summary>
+        private void HandleExpandCommand(string[] parts)
+        {
+            // expand <reqId> <module> <typeRef(dec)> <addr(hex)>
+            if (parts.Length < 5) { EmitError("expand expects: expand reqId module typeRef addr"); return; }
+            string reqId = parts[1];
+            uint typeRef; uint.TryParse(parts[3], out typeRef);
+            uint addr = ParseHexU(parts[4]);
+            var rows = new List<string>();
+            var m = ModuleByName(parts[2]);
+            if (m != null && m.Dbg != null && addr != 0)
+            {
+                var t = m.Dbg.ResolveType(typeRef);
+                var g = (t != null && t.Kind == TypeKind.Group) ? t : GroupTypeOf(t);
+                if (g != null) rows.Add(GroupChildrenJson(g, addr, parts[2]));
+            }
+            if (EmitJson)
+                Console.WriteLine("@JSON {\"event\":\"expanded\",\"reqId\":" + Json.Str(reqId)
+                    + ",\"items\":[" + string.Join("", rows) + "]}");
+        }
+
+        private static uint ParseHexU(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            s = s.Trim();
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2);
+            uint v;
+            uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out v);
+            return v;
+        }
+
         /// <summary>Map a resolved member type to the flat (code,target,size,places) the value renderer takes.
         /// Reference/class-ref tags (0x16/0x26/0x29) render as a pointer; the rest defer to RenderHint.</summary>
         private static void CodeForType(ClarionType t, out byte code, out byte target, out uint size, out int places)
         {
             code = 0; target = 0; size = 0; places = 0;
             if (t == null) return;
-            if (t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29) { code = 0x16; size = 4; return; }
+            if (t.Kind == TypeKind.Reference || t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29)
+            {
+                // a reference: pointer leaf, unless it targets a group (then NodeJson makes it lazily expandable)
+                code = 0x16; size = 4;
+                target = (t.Referent != null && t.Referent.Kind == TypeKind.Group) ? (byte)0x08 : (byte)0;
+                return;
+            }
             t.RenderHint(out code, out size, out places);
         }
 
@@ -183,7 +327,7 @@ namespace ClarionDbg.Cli
                             continue;   // file record buffer — belongs to the file-buffer tree, not module data
                         uint va = m.LoadBase + ds.Rva;
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
-                        rows.Add(TypedValueJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null));
+                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name));
                     }
                 }
             }
@@ -211,7 +355,9 @@ namespace ClarionDbg.Cli
                     // a by-ref STRING is, to the user, just a STRING(N) — the pointer is an ABI detail
                     if (target == 0x18) return "STRING(" + size + ")";
                     return target == 0x08 ? "&GROUP" : target == 0x05 ? "&CLASS" : "&REF";
+                case 0x04: return "GROUP";   // class-instance-by-value (e.g. ToolbarClass) — a direct 0x08 group
                 case 0x08: return "GROUP";
+                case 0x10: return "(opaque)";  // stub type with no member layout (window / forward-declared class)
                 default:   return "TYPE(0x" + code.ToString("X2") + ")";
             }
         }

@@ -134,7 +134,8 @@
   .ta-item:hover { background:var(--sel); }
   .ta-item .tn { color:var(--name); } .ta-item .tt { color:var(--green); font-size:11px; margin-left:auto; }
 
-  .frame { display:flex; align-items:baseline; gap:8px; padding:3px 8px 3px 14px; cursor:pointer; font-size:13px; white-space:nowrap; }
+  .frame { display:flex; align-items:baseline; gap:6px; padding:3px 8px 3px 8px; cursor:pointer; font-size:13px; white-space:nowrap; }
+  .frame .ar { flex:none; width:12px; color:var(--fg-dim); font-size:10px; cursor:pointer; }
   .frame:hover { background:var(--hover); } .frame.cur { background:var(--sel); }
   .frame .fn { color:var(--fg-bright); } .frame.cur .fn { font-weight:600; }
   .frame .floc { color:var(--fg-dim); font-size:11px; } .frame .file { color:var(--blue); } .frame .ln { color:var(--num); }
@@ -240,7 +241,7 @@
     <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="varTree"><div id="methodTree"></div><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+        <div class="body" id="varTree"><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
       </details>
       <details class="section" open data-sec="watch">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -421,7 +422,7 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['variables','watch','stack','breakpoints','procedures','registers'];
+  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
   const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', source:'Source', console:'Debug Console'};
@@ -669,8 +670,8 @@
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
-  // GROUP-typed rows carry a `children` array and expand to nested member rows (recursively); the engine
-  // has already read every member's live value, so no per-row round-trip is needed.
+  // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
+  // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
   function renderVarGroup(el, label, extra, items){
     if(!el) return;
     el.innerHTML='';
@@ -685,43 +686,57 @@
       tops.forEach(t=>t.setVisible(open)); };
   }
 
-  // Render one variable row (and, for a GROUP, its nested members). Returns a {setVisible} handle whose
-  // cascade hides/shows this row and all descendants, honouring each group's own expanded/collapsed state.
+  // Render one variable row into `container`, with its descendants in a child box inserted right after it
+  // (nested-container model: collapsing a node just hides its box, so lazy children slot in cleanly).
   function renderVarRow(container, v, depth){
-    const kidsData = v.children || [];
-    const hasKids = kidsData.length > 0;
+    const eager = v.children || null;            // DIRECT group: members already supplied
+    const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
+    const expandable = (eager && eager.length) || isRef;
     const row=document.createElement('div'); row.className='row';
     row.style.paddingLeft=(14+depth*16)+'px';
     const isNum=/^-?[0-9]/.test(v.value||'');
-    row.innerHTML='<span class="ar">'+(hasKids?'▸':'')+'</span>'
+    row.innerHTML='<span class="ar">'+(expandable?'▸':'')+'</span>'
       +'<span class="vname field">'+esc(v.name)+'</span>'
       +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value||'')+'</span>'
       +'<span class="vtype">'+esc(v.type||'')+'</span>';
     container.appendChild(row);
 
-    const kids=[]; let kidOpen=false;
-    if(hasKids){
-      kidsData.forEach(c=>kids.push(renderVarRow(container, c, depth+1)));
-      kids.forEach(k=>k.setVisible(false));
-      const toggle=()=>{ kidOpen=!kidOpen; row.querySelector('.ar').textContent=kidOpen?'▾':'▸';
-        kids.forEach(k=>k.setVisible(kidOpen)); };
-      row.style.cursor='pointer'; row.onclick=toggle;
+    let box=null, open=false, loaded=false;
+    function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
+      container.insertBefore(box, row.nextSibling); } return box; }
+    function renderKids(items){ const b=ensureBox(); b.innerHTML='';
+      (items||[]).forEach(c=>renderVarRow(b, c, depth+1));
+      if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
+    if(eager && eager.length){ renderKids(eager); loaded=true; }
+
+    function toggle(){
+      open=!open; row.querySelector('.ar').textContent=open?'▾':'▸';
+      if(open && isRef && !loaded){
+        loaded=true; const b=ensureBox();
+        b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">…</div>';
+        requestExpand(v, items=>{ renderKids(items); if(box) box.style.display=open?'':'none'; });
+      }
+      if(box) box.style.display=open?'':'none';
     }
-    return { setVisible(b){
-      row.style.display=b?'':'none';
-      if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
-      else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; if(hasKids) row.querySelector('.ar').textContent='▸'; }
-    } };
+    if(expandable){ row.style.cursor='pointer'; row.onclick=toggle; }
+
+    return { setVisible(b){ row.style.display=b?'':'none'; if(box) box.style.display=(b&&open)?'':'none'; } };
   }
 
-  // ---- locals: current frame (method/routine) + host procedure, refreshed each pause ----
-  function buildVars(m){
-    const meth=m.methodItems||[], proc=m.procItems||[];
-    const methLabel = m.scope==='routine' ? 'Routine Data' : 'Method Data';
-    renderVarGroup($('methodTree'), methLabel, m.method, meth);   // empty when paused in the procedure body
-    renderVarGroup($('localsTree'), 'Procedure Data', m.proc, proc);
-    const hint=$('varsHint');
-    if(hint) hint.textContent = (meth.length||proc.length) ? (meth.length+proc.length)+' locals' : 'file buffers';
+  // ---- lazy reference expansion: ask the engine to deref a &GROUP/&QUEUE/&CLASS node and return its members ----
+  let _expandSeq=0; const _expandCbs={};
+  function requestExpand(v, cb){
+    if(!v.module || v.typeRef===undefined || !v.addr){ cb([]); return; }
+    const id=++_expandSeq; _expandCbs[id]=cb;
+    send('expand', id+'|'+v.module+'|'+v.typeRef+'|'+v.addr);
+  }
+
+  // ---- per-frame locals (Call-Stack-driven Variables): a frame's locals load lazily on expand ----
+  let _flSeq=0; const _flCbs={};
+  function requestFrameLocals(f, cb){
+    if(!f || !f.va || !f.ebp || f.ebp==='0x0'){ cb([]); return; }
+    const id=++_flSeq; _flCbs[id]=cb;
+    send('framelocals', id+'|'+f.va+'|'+f.ebp);
   }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
@@ -789,15 +804,34 @@
   }
 
   // ---- call stack ----
+  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. Frame 0 (current)
+  // auto-expands. The twisty toggles locals; clicking the frame name jumps the editor to that frame's line.
   function buildStack(frames){
     const list=$('stackList'); list.innerHTML=''; $('stackCount').textContent=frames.length;
     if(!frames.length){ list.innerHTML='<div class="empty">Paused frames appear here.</div>'; return; }
     frames.forEach((f,i)=>{
+      const canLoc = !!(f.proc && f.ebp && f.ebp!=='0x0');
       const el=document.createElement('div'); el.className='frame'+(i===0?' cur':'')+(f.proc?'':' unknown');
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
-      el.innerHTML='<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc+(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
-      if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);
+      el.innerHTML='<span class="ar">'+(canLoc?'▸':'')+'</span>'
+        +'<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc
+        +(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
       list.appendChild(el);
+
+      let box=null, open=false, loaded=false;
+      function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none'; list.insertBefore(box, el.nextSibling); } return box; }
+      function load(){ if(loaded) return; loaded=true; const b=ensureBox();
+        b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">…</div>';
+        requestFrameLocals(f, items=>{ b.innerHTML='';
+          if(!items || !items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
+          else items.forEach(c=>renderVarRow(b, c, 1));
+          if(box) box.style.display=open?'':'none'; }); }
+      function toggle(){ if(!canLoc) return; open=!open; el.querySelector('.ar').textContent=open?'▾':'▸';
+        if(open) load(); if(box) box.style.display=open?'':'none'; }
+      if(canLoc){ const ar=el.querySelector('.ar'); ar.onclick=(e)=>{ e.stopPropagation(); toggle(); }; }
+      if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);   // name click jumps the editor
+
+      if(i===0 && canLoc){ open=true; el.querySelector('.ar').textContent='▾'; load(); }
     });
   }
 
@@ -959,8 +993,9 @@
       case 'resumed': break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
-      case 'locals': buildVars(m); break;
+      case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
+      case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
