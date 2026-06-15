@@ -669,8 +669,8 @@
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
-  // GROUP-typed rows carry a `children` array and expand to nested member rows (recursively); the engine
-  // has already read every member's live value, so no per-row round-trip is needed.
+  // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
+  // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
   function renderVarGroup(el, label, extra, items){
     if(!el) return;
     el.innerHTML='';
@@ -685,33 +685,49 @@
       tops.forEach(t=>t.setVisible(open)); };
   }
 
-  // Render one variable row (and, for a GROUP, its nested members). Returns a {setVisible} handle whose
-  // cascade hides/shows this row and all descendants, honouring each group's own expanded/collapsed state.
+  // Render one variable row into `container`, with its descendants in a child box inserted right after it
+  // (nested-container model: collapsing a node just hides its box, so lazy children slot in cleanly).
   function renderVarRow(container, v, depth){
-    const kidsData = v.children || [];
-    const hasKids = kidsData.length > 0;
+    const eager = v.children || null;            // DIRECT group: members already supplied
+    const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
+    const expandable = (eager && eager.length) || isRef;
     const row=document.createElement('div'); row.className='row';
     row.style.paddingLeft=(14+depth*16)+'px';
     const isNum=/^-?[0-9]/.test(v.value||'');
-    row.innerHTML='<span class="ar">'+(hasKids?'▸':'')+'</span>'
+    row.innerHTML='<span class="ar">'+(expandable?'▸':'')+'</span>'
       +'<span class="vname field">'+esc(v.name)+'</span>'
       +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value||'')+'</span>'
       +'<span class="vtype">'+esc(v.type||'')+'</span>';
     container.appendChild(row);
 
-    const kids=[]; let kidOpen=false;
-    if(hasKids){
-      kidsData.forEach(c=>kids.push(renderVarRow(container, c, depth+1)));
-      kids.forEach(k=>k.setVisible(false));
-      const toggle=()=>{ kidOpen=!kidOpen; row.querySelector('.ar').textContent=kidOpen?'▾':'▸';
-        kids.forEach(k=>k.setVisible(kidOpen)); };
-      row.style.cursor='pointer'; row.onclick=toggle;
+    let box=null, open=false, loaded=false;
+    function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
+      container.insertBefore(box, row.nextSibling); } return box; }
+    function renderKids(items){ const b=ensureBox(); b.innerHTML='';
+      (items||[]).forEach(c=>renderVarRow(b, c, depth+1));
+      if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
+    if(eager && eager.length){ renderKids(eager); loaded=true; }
+
+    function toggle(){
+      open=!open; row.querySelector('.ar').textContent=open?'▾':'▸';
+      if(open && isRef && !loaded){
+        loaded=true; const b=ensureBox();
+        b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">…</div>';
+        requestExpand(v, items=>{ renderKids(items); if(box) box.style.display=open?'':'none'; });
+      }
+      if(box) box.style.display=open?'':'none';
     }
-    return { setVisible(b){
-      row.style.display=b?'':'none';
-      if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
-      else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; if(hasKids) row.querySelector('.ar').textContent='▸'; }
-    } };
+    if(expandable){ row.style.cursor='pointer'; row.onclick=toggle; }
+
+    return { setVisible(b){ row.style.display=b?'':'none'; if(box) box.style.display=(b&&open)?'':'none'; } };
+  }
+
+  // ---- lazy reference expansion: ask the engine to deref a &GROUP/&QUEUE/&CLASS node and return its members ----
+  let _expandSeq=0; const _expandCbs={};
+  function requestExpand(v, cb){
+    if(!v.module || v.typeRef===undefined || !v.addr){ cb([]); return; }
+    const id=++_expandSeq; _expandCbs[id]=cb;
+    send('expand', id+'|'+v.module+'|'+v.typeRef+'|'+v.addr);
   }
 
   // ---- locals: current frame (method/routine) + host procedure, refreshed each pause ----
@@ -956,6 +972,7 @@
       case 'stack': buildStack(m.frames||[]); break;
       case 'locals': buildVars(m); break;
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
+      case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;

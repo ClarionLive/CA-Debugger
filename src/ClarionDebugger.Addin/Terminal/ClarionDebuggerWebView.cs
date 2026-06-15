@@ -58,6 +58,7 @@ namespace ClarionDebugger.Terminal
             _svc.StackReceived         += OnSvcStack;
             _svc.LocalsReceived        += OnSvcLocals;
             _svc.ModuleDataReceived    += OnSvcModuleData;
+            _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -89,6 +90,7 @@ namespace ClarionDebugger.Terminal
             _svc.StackReceived          -= OnSvcStack;
             _svc.LocalsReceived         -= OnSvcLocals;
             _svc.ModuleDataReceived     -= OnSvcModuleData;
+            _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -118,35 +120,24 @@ namespace ClarionDebugger.Terminal
         private void OnSvcResumed(string mode) => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames) => UI(() => OnStack(frames));
+        // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
+        // fields); forward its array bodies verbatim so the structure survives intact.
         private void OnSvcLocals(DebugLocals d) => UI(() =>
         {
             var sb = new StringBuilder("{\"type\":\"locals\",\"scope\":").Append(Str(d.Scope))
-                .Append(",\"method\":").Append(Str(d.MethodName)).Append(",\"methodItems\":[");
-            AppendVarItems(sb, d.MethodItems);
-            sb.Append("],\"proc\":").Append(Str(d.ProcName)).Append(",\"procItems\":[");
-            AppendVarItems(sb, d.ProcItems);
-            sb.Append("]}");
+                .Append(",\"method\":").Append(Str(d.MethodName)).Append(",\"methodItems\":[")
+                .Append(d.MethodItemsJson ?? "")
+                .Append("],\"proc\":").Append(Str(d.ProcName)).Append(",\"procItems\":[")
+                .Append(d.ProcItemsJson ?? "")
+                .Append("]}");
             Post(sb.ToString());
         });
 
-        private static void AppendVarItems(StringBuilder sb, List<DebugLocal> items)
-        {
-            for (int i = 0; items != null && i < items.Count; i++)
-            {
-                var l = items[i];
-                if (i > 0) sb.Append(',');
-                sb.Append("{\"name\":").Append(Str(l.Name))
-                  .Append(",\"type\":").Append(Str(l.Type))
-                  .Append(",\"value\":").Append(Str(l.Value)).Append('}');
-            }
-        }
-        private void OnSvcModuleData(string module, List<DebugLocal> items) => UI(() =>
-        {
-            var sb = new StringBuilder("{\"type\":\"moduledata\",\"module\":").Append(Str(module)).Append(",\"items\":[");
-            AppendVarItems(sb, items);
-            sb.Append("]}");
-            Post(sb.ToString());
-        });
+        private void OnSvcModuleData(string module, string itemsJson) => UI(() =>
+            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
+
+        private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() => SendBps());
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
@@ -317,6 +308,14 @@ namespace ClarionDebugger.Terminal
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) _svc.Watch(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
+                    case "expand":   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
+                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
+                        {
+                            var a = data.Split('|');
+                            if (a.Length == 4 && int.TryParse(a[0], out int rq) && uint.TryParse(a[2], out uint tr))
+                                _svc.RequestExpand(rq, a[1], tr, a[3]);
+                        }
+                        break;
                     case "jump": Jump(data); break;
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;

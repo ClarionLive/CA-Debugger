@@ -54,41 +54,21 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Build the JSON rows for one frame's locals — its proc's entry RVA keys the local set,
-        /// each value read live at [frameEbp + frameOffset]. GROUP locals expand to nested member rows.
-        /// Shared by the method and host-procedure groups.</summary>
+        /// each value read live at [frameEbp + frameOffset]. Direct GROUP locals expand inline to nested member
+        /// rows; reference locals (incl. by-ref GROUP/QUEUE) are lazy (expanded on demand). Shared by the
+        /// method and host-procedure groups. <paramref name="module"/> tags ref rows so the host can request
+        /// expansion against the right image's TSWD.</summary>
         private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
         {
             var rows = new List<string>();
             List<LocalSym> locals;
             if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
                 foreach (var l in locals)
-                    rows.Add(LocalRowJson(l, frameEbp));
-            return rows;
-        }
-
-        /// <summary>One local's JSON row. A GROUP local (direct instance or by-ref) expands to nested member
-        /// rows read at the instance base + each member's byte offset; scalars/strings/refs render flat.</summary>
-        private string LocalRowJson(LocalSym l, uint frameEbp)
-        {
-            uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-            // A GROUP/QUEUE is either a direct instance (code 0x08) or a reference (code 0x16 whose resolved
-            // type's referent is a group — e.g. a browse QUEUE:BROWSE:n). Expand both; refs deref the pointer.
-            ClarionType g = GroupTypeOf(l.Type);
-            if (g != null)
-            {
-                uint baseVa = slotVa;
-                string label = ClarionTypeLabel(l.TypeCode, l.Target, l.Size, l.Places);   // "GROUP" / "&GROUP" / "&CLASS"
-                if (l.TypeCode == 0x16)   // by-ref: the stack slot holds a pointer to the instance
                 {
-                    uint ptr = ReadU32(slotVa);
-                    if (ptr == 0)
-                        return "{\"name\":" + Json.Str(l.Name) + ",\"type\":" + Json.Str(label)
-                             + ",\"value\":" + Json.Str("(null)") + ",\"frameOff\":" + l.FrameOff + "}";
-                    baseVa = ptr;
+                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
                 }
-                return TypedValueJson(l.Name, g, l.TypeCode, l.Target, l.Size, l.Places, baseVa, l.FrameOff, label);
-            }
-            return TypedValueJson(l.Name, null, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff);
+            return rows;
         }
 
         /// <summary>The GROUP/QUEUE layout a type describes — directly (a group) or through one reference hop
@@ -101,30 +81,38 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>The single composite value renderer: emit a typed value as a JSON row, recursing GROUP
-        /// members into a nested "children" array (each read live at va + memberOffset). Leaves go through the
-        /// same <see cref="FormatValueAt"/>/<see cref="ClarionTypeLabel"/> as top-level scalars, so a member
-        /// renders identically to a standalone variable of that type. Shared by locals and module data.</summary>
-        private string TypedValueJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string groupLabel = null)
+        /// <summary>The single composite value renderer. Three shapes:
+        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
+        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
+        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
+        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
+        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
+        private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
-            if (type != null && type.Kind == TypeKind.Group && type.Members != null)
+            ClarionType g = GroupTypeOf(type);
+
+            if (type != null && type.Kind == TypeKind.Reference && g != null)
             {
-                sb.Append(",\"type\":").Append(Json.Str(groupLabel ?? "GROUP"));
+                // by-ref group/queue/class: the slot holds a pointer; expand lazily so we never blindly chase
+                // pointer chains. Read just the pointer now (null vs expandable + the target address).
+                uint ptr = ReadU32(va);
+                sb.Append(",\"type\":").Append(Json.Str(ClarionTypeLabel(code, target, size, places)));
+                if (ptr == 0)
+                    sb.Append(",\"value\":").Append(Json.Str("(null)"));
+                else
+                    sb.Append(",\"value\":").Append(Json.Str("&0x" + ptr.ToString("X")))
+                      .Append(",\"ref\":true,\"addr\":\"0x").Append(ptr.ToString("X")).Append('"')
+                      .Append(",\"module\":").Append(Json.Str(module))
+                      .Append(",\"typeRef\":").Append(g.TypeRef);
+            }
+            else if (g != null)
+            {
+                // direct GROUP/QUEUE instance: expand inline (bounded by the type — no pointers to chase).
+                sb.Append(",\"type\":").Append(Json.Str(ClarionTypeLabel(code, target, size, places)));
                 sb.Append(",\"value\":").Append(Json.Str("{…}"));
-                sb.Append(",\"children\":[");
-                bool first = true;
-                foreach (var mb in type.Members)
-                {
-                    byte mc, mt; uint msz; int mpl;
-                    CodeForType(mb.Type, out mc, out mt, out msz, out mpl);
-                    uint mva = (uint)((long)va + mb.Offset);
-                    if (!first) sb.Append(',');
-                    first = false;
-                    sb.Append(TypedValueJson(mb.Name ?? "?", mb.Type, mc, mt, msz, mpl, mva, null));
-                }
-                sb.Append(']');
+                sb.Append(",\"children\":[").Append(GroupChildrenJson(g, va, module)).Append(']');
             }
             else if (type != null && type.Kind == TypeKind.Array)
             {
@@ -141,6 +129,58 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
+        /// <summary>Render a group's members as a JSON row array, each read at <paramref name="baseVa"/> + its
+        /// byte offset. Shared by inline direct-group expansion and the on-demand <c>expand</c> handler.</summary>
+        private string GroupChildrenJson(ClarionType g, uint baseVa, string module)
+        {
+            if (g == null || g.Members == null) return "";
+            var sb = new StringBuilder();
+            bool first = true;
+            foreach (var mb in g.Members)
+            {
+                byte mc, mt; uint msz; int mpl;
+                CodeForType(mb.Type, out mc, out mt, out msz, out mpl);
+                uint mva = (uint)((long)baseVa + mb.Offset);
+                if (!first) sb.Append(',');
+                first = false;
+                sb.Append(NodeJson(mb.Name ?? "?", mb.Type, mc, mt, msz, mpl, mva, null, module));
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>On-demand expansion of a reference node: re-resolve its referent type in the owning image's
+        /// TSWD and render that group's members read live at the dereferenced address. Emits an `expanded`
+        /// event keyed by the host's reqId. Read-only — no target code runs.</summary>
+        private void HandleExpandCommand(string[] parts)
+        {
+            // expand <reqId> <module> <typeRef(dec)> <addr(hex)>
+            if (parts.Length < 5) { EmitError("expand expects: expand reqId module typeRef addr"); return; }
+            string reqId = parts[1];
+            uint typeRef; uint.TryParse(parts[3], out typeRef);
+            uint addr = ParseHexU(parts[4]);
+            var rows = new List<string>();
+            var m = ModuleByName(parts[2]);
+            if (m != null && m.Dbg != null && addr != 0)
+            {
+                var t = m.Dbg.ResolveType(typeRef);
+                var g = (t != null && t.Kind == TypeKind.Group) ? t : GroupTypeOf(t);
+                if (g != null) rows.Add(GroupChildrenJson(g, addr, parts[2]));
+            }
+            if (EmitJson)
+                Console.WriteLine("@JSON {\"event\":\"expanded\",\"reqId\":" + Json.Str(reqId)
+                    + ",\"items\":[" + string.Join("", rows) + "]}");
+        }
+
+        private static uint ParseHexU(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return 0;
+            s = s.Trim();
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2);
+            uint v;
+            uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out v);
+            return v;
+        }
+
         /// <summary>Map a resolved member type to the flat (code,target,size,places) the value renderer takes.
         /// Reference/class-ref tags (0x16/0x26/0x29) render as a pointer; the rest defer to RenderHint.</summary>
         private static void CodeForType(ClarionType t, out byte code, out byte target, out uint size, out int places)
@@ -149,7 +189,7 @@ namespace ClarionDbg.Cli
             if (t == null) return;
             if (t.Kind == TypeKind.Reference || t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29)
             {
-                // Render a ref MEMBER as a pointer leaf (no blind deref); label it &GROUP when we know the referent.
+                // a reference: pointer leaf, unless it targets a group (then NodeJson makes it lazily expandable)
                 code = 0x16; size = 4;
                 target = (t.Referent != null && t.Referent.Kind == TypeKind.Group) ? (byte)0x08 : (byte)0;
                 return;
@@ -203,7 +243,7 @@ namespace ClarionDbg.Cli
                             continue;   // file record buffer — belongs to the file-buffer tree, not module data
                         uint va = m.LoadBase + ds.Rva;
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
-                        rows.Add(TypedValueJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null));
+                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name));
                     }
                 }
             }

@@ -501,6 +501,10 @@ namespace ClarionDbg.Cli
                         HandleModuleDataCommand(parts, ref ctx, haveCtx);
                         break;
 
+                    case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
+                        HandleExpandCommand(parts);
+                        break;
+
                     case "disasm": case "u":
                         HandleDisasmCommand(parts, ref ctx, haveCtx);
                         break;

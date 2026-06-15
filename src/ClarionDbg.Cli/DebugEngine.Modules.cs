@@ -54,6 +54,16 @@ namespace ClarionDbg.Cli
             return null;
         }
 
+        /// <summary>The mapped image by file name (e.g. school.exe), case-insensitive — used to re-resolve a
+        /// reference node's type in its owning image's TSWD for lazy `expand`. Null if not loaded.</summary>
+        private LoadedModule ModuleByName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            foreach (var m in _modules)
+                if (m.LoadBase != 0 && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
+            return null;
+        }
+
         /// <summary>The mapped, debuggable module that owns a TSWD compiland by name (e.g. clbrws011.clw),
         /// or null when no loaded image carries it yet (deferred breakpoint).</summary>
         private LoadedModule OwnerOfModule(string clwName)

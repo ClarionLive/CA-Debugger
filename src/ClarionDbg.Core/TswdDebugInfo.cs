@@ -131,6 +131,7 @@ namespace ClarionDbg.Core
     /// </summary>
     public sealed class ClarionType
     {
+        public uint TypeRef;      // this record's typeRef key (relative to OffTable2C) — for lazy re-resolution
         public byte Tag;          // raw type-record tag: 0x08 group, 0x18 array/string desc, 0x23/0x24 decimal, 0x11-0x14 scalar
         public TypeKind Kind;
         public uint Size;         // total byte size of the type
@@ -845,7 +846,7 @@ namespace ClarionDbg.Core
             if (_typeCache.TryGetValue(typeRef, out ClarionType cached)) return cached;
             if (!ValidRef(typeRef) || depth > 16) return null;
 
-            var t = new ClarionType();
+            var t = new ClarionType { TypeRef = typeRef };
             _typeCache[typeRef] = t;                 // seed BEFORE recursing so cyclic refs terminate
             int o = OffTable2C + (int)typeRef;        // the type record's tag byte (blob-relative)
             byte tag = SB(o);
