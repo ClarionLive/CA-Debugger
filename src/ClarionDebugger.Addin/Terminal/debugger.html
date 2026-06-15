@@ -923,10 +923,15 @@
   // copy / clear the console. Copy uses the async clipboard API where available (WebView2 is a secure
   // context), with a hidden-textarea + execCommand fallback for older runtimes.
   function consoleText(){ return Array.from($('clog').children).map(d=>d.textContent).join('\n'); }
-  function copyText(t){
-    try { if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t); return; } } catch(e){}
+  function execCopyFallback(t){
     const ta=document.createElement('textarea'); ta.value=t; ta.style.position='fixed'; ta.style.opacity='0';
     document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); }catch(e){} document.body.removeChild(ta);
+  }
+  function copyText(t){
+    // writeText is async — a synchronous return would skip the fallback when the promise REJECTS
+    // (e.g. document not focused / permission denied). Chain the fallback off .catch so it engages.
+    try { if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t).catch(()=>execCopyFallback(t)); return; } } catch(e){}
+    execCopyFallback(t);
   }
   function flashAct(el,msg){ const o=el.textContent; el.textContent=msg; setTimeout(()=>{ el.textContent=o; },900); }
   $('copyLog').onclick=()=>{ const t=consoleText(); if(!t) return; copyText(t); flashAct($('copyLog'),'Copied'); };
@@ -956,7 +961,7 @@
   tip.addEventListener('mouseenter',()=>clearTimeout(tipTimer));
   tip.addEventListener('mouseleave',()=>tip.classList.remove('show'));
   $('dtPin').onclick=()=>{ if(tipTarget) addWatch(tipTarget.name); tip.classList.remove('show'); };
-  $('dtCopy').onclick=()=>{ if(tipTarget){ try{navigator.clipboard&&navigator.clipboard.writeText(tipTarget.val);}catch(e){} toast('Copied'); } tip.classList.remove('show'); };
+  $('dtCopy').onclick=()=>{ if(tipTarget){ copyText(tipTarget.val); toast('Copied'); } tip.classList.remove('show'); };
 
   // ---- type-ahead ----
   const inp=$('watchInput'), ta=$('typeahead');
