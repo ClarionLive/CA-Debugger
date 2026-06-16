@@ -843,8 +843,24 @@ namespace ClarionDebugger.Terminal
             return null;
         }
 
+        /// <summary>Pause-time jump to the current execution line. With ClarionAssistant's Monaco overlay
+        /// on, the stock editor sits hidden behind Monaco, so JumpToCurrentLine moves an invisible caret and
+        /// the visible Monaco editor never scrolls. Prefer the Monaco navigator (its frozen contract covers
+        /// overlay ON and OFF and self-queues if the page isn't ready); only fall back to the stock editor's
+        /// current-line jump — which also paints the execution-line marker — when ClarionAssistant is absent.</summary>
         private static void TryJump(string path, int line)
         {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                var nav = ResolveMonacoNavigator();
+                if (nav != null)
+                {
+                    object handled = nav.Invoke(null, new object[] { path, line, 1 });
+                    if (handled is bool && (bool)handled) return;
+                }
+            }
+            catch { }
             try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
             catch { }
         }
