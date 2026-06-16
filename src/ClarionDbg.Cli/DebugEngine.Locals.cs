@@ -131,6 +131,13 @@ namespace ClarionDbg.Cli
             {
                 sb.Append(",\"type\":").Append(Json.Str(ClarionTypeLabel(code, target, size, places)));
                 sb.Append(",\"value\":").Append(Json.Str(FormatValueAt(code, target, size, places, va)));
+                // edit-variable-value: carry the live address + type so the UI can write the cell back.
+                // Only editable scalar codes get this; refs/groups/unknowns stay read-only (no metadata).
+                if (IsEditableCode(code))
+                    sb.Append(",\"va\":\"0x").Append(va.ToString("X")).Append('"')
+                      .Append(",\"typeCode\":\"0x").Append(code.ToString("X2")).Append('"')
+                      .Append(",\"size\":").Append(size)
+                      .Append(",\"places\":").Append(places);
             }
             if (frameOff.HasValue) sb.Append(",\"frameOff\":").Append(frameOff.Value);
             sb.Append('}');

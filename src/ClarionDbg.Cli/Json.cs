@@ -197,6 +197,16 @@ namespace ClarionDbg.Cli
             return "{\"event\":\"bp-del\",\"module\":" + Str(module) + ",\"line\":" + line + "}";
         }
 
+        /// <summary>Result of an edit-variable-value write: the address, whether it landed, the re-read
+        /// canonical value (on success), and a user-facing error (on failure).</summary>
+        public static string VarSet(uint va, bool ok, string value, string error)
+        {
+            return "{\"event\":\"varset\",\"va\":\"0x" + va.ToString("X") + "\""
+                 + ",\"ok\":" + (ok ? "true" : "false")
+                 + ",\"value\":" + Str(value)
+                 + ",\"error\":" + Str(error) + "}";
+        }
+
         /// <summary>A tracepoint fired: the interpolated message + the breakpoint's live hit count. The
         /// host surfaces this in the debugger console without the target ever pausing.</summary>
         public static string Trace(string module, int line, string message, int hitCount)

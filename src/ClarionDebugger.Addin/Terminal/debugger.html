@@ -113,6 +113,13 @@
   .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
   .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
   .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
+  .vval.editable { cursor:text; border-radius:3px; }
+  .paused .vval.editable:hover { background:#ffffff14; outline:1px dotted #ffffff33; }
+  .vedit { font:inherit; color:var(--fg); background:var(--titlebar); border:1px solid var(--blue); border-radius:3px; padding:0 3px; min-width:70px; max-width:170px; }
+  /* per-row edit-value pencil — shown only while paused, like the breakpoint gear */
+  .vedit-btn { display:none; cursor:pointer; color:var(--blue); opacity:.55; margin:0 5px; font-size:12px; line-height:1; user-select:none; flex:none; }
+  .paused .vedit-btn { display:inline; }
+  .vedit-btn:hover { opacity:1; }
   .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
   .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .pin svg, .dact svg { display:block; }
@@ -651,7 +658,7 @@
         +'<span class="vtype"></span><span class="veq">=</span><span class="vval pending">…</span>'
         +'<span class="rmw" title="Remove">✕</span>';
       const detail=document.createElement('div'); detail.className='wdetail'; detail.dataset.detail=name; detail.style.display='none';
-      const toggle=e=>{ if(e&&e.target.closest('.rmw')) return;
+      const toggle=e=>{ if(e&&e.target.closest('.rmw,.vval.editable,.vedit')) return;
         const open=detail.style.display==='none';
         detail.style.display=open?'':'none'; row.querySelector('.wch').textContent=open?'▾':'▸';
         if(open){ const v=values.get(name); detail.textContent=v?v.value:(row.querySelector('.vval').textContent||''); } };
@@ -661,14 +668,25 @@
     });
   }
 
+  // edit-variable-value: build the inline data-attrs for an editable scalar cell (engine-controlled
+  // hex/number metadata — safe in attributes); empty string for non-editable rows.
+  function editAttrs(v){ return v.va ? (' data-va="'+v.va+'" data-tc="'+v.typeCode+'" data-sz="'+(v.size||0)+'" data-pl="'+(v.places||0)+'"') : ''; }
+  function setEditMeta(cell, meta){
+    if(!cell || !meta || !meta.va) return;
+    cell.classList.add('editable');
+    cell.dataset.va=meta.va; cell.dataset.tc=meta.typeCode||''; cell.dataset.sz=meta.size||0; cell.dataset.pl=meta.places||0;
+  }
+
   // apply a watch value to any matching row (Watch list + Variables tree)
-  function applyValue(name, found, value, typeName, threaded){
+  function applyValue(name, found, value, typeName, threaded, meta){
     if(found) values.set(name,{value:value,type:typeName,threaded:threaded});
     document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
       v.classList.remove('pending');
       if(!found){ v.textContent='(not found)'; v.classList.add('pending'); return; }
       v.textContent=value;
+      setEditMeta(v, meta);
+      wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -685,6 +703,45 @@
     });
   }
   function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
+
+  // ---- edit-variable-value: double-click a value cell to write a new value into the live process ----
+  let isPaused=false;
+  function setPaused(p){ isPaused=p; document.body.classList.toggle('paused', p); }
+  function stripEditQuotes(s){ s=s==null?'':(''+s); return (s.length>=2 && s[0]==="'" && s[s.length-1]==="'") ? s.slice(1,-1) : s; }
+  function beginEdit(cell){
+    if(!cell || cell._editing || !isPaused || !cell.dataset.va) return;
+    cell._editing=true;
+    const old=cell.textContent;
+    const meta={va:cell.dataset.va, typeCode:cell.dataset.tc, size:+cell.dataset.sz||0, places:+cell.dataset.pl||0};
+    const inp=document.createElement('input'); inp.className='vedit'; inp.value=stripEditQuotes(old);
+    cell.textContent=''; cell.appendChild(inp); inp.focus(); inp.select();
+    let finished=false;
+    function done(commit){
+      if(finished) return; finished=true; cell._editing=false;
+      cell.textContent=old;                 // restore now; a successful write repaints via the 'varset' reply
+      if(commit) send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size, places:meta.places, value:inp.value}));
+    }
+    inp.onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); done(true); } else if(e.key==='Escape'){ e.preventDefault(); done(false); } };
+    inp.onblur=()=>done(false);
+  }
+  document.addEventListener('dblclick', e=>{ const cell=e.target.closest && e.target.closest('.vval.editable'); if(cell){ e.preventDefault(); beginEdit(cell); } });
+  // primary affordance: a ✎ pencil on each editable row (the value cell may carry edit metadata from
+  // either the Variables/Call-Stack tree or the Watch panel). Clicking it edits in place; it shows only
+  // while paused (CSS). Locals can't be watched, so this is the only way to edit a Call-Stack local.
+  function wireEdit(row){
+    if(!row) return;
+    const cell=row.querySelector('.vval'); if(!cell || !cell.dataset.va) return;
+    if(row.querySelector('.vedit-btn')) return;
+    const btn=document.createElement('span'); btn.className='vedit-btn'; btn.title='Edit value'; btn.textContent='✎';
+    btn.onclick=e=>{ e.stopPropagation(); beginEdit(cell); };
+    cell.insertAdjacentElement('afterend', btn);
+  }
+  function onVarSet(m){
+    if(!m || !m.ok) return;                  // failures are surfaced in the console by the host
+    document.querySelectorAll('.vval.editable').forEach(c=>{
+      if(c.dataset.va===m.va){ c.textContent=m.value; c.classList.add('changed'); setTimeout(()=>c.classList.remove('changed'),1600); }
+    });
+  }
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
@@ -715,9 +772,10 @@
     const isNum=/^-?[0-9]/.test(v.value||'');
     row.innerHTML='<span class="ar">'+(expandable?'▸':'')+'</span>'
       +'<span class="vname field">'+esc(v.name)+'</span>'
-      +'<span class="vval'+(isNum?' num':'')+'">'+esc(v.value||'')+'</span>'
+      +'<span class="vval'+(isNum?' num':'')+(v.va?' editable':'')+'"'+editAttrs(v)+'>'+esc(v.value||'')+'</span>'
       +'<span class="vtype">'+esc(v.type||'')+'</span>';
     container.appendChild(row);
+    wireEdit(row);   // adds the ✎ edit-value pencil when this row carries edit metadata
 
     let box=null, open=false, loaded=false;
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
@@ -1046,23 +1104,24 @@
   function onMessage(data){
     let m; try{ m=JSON.parse(data); }catch(e){ return; }
     switch(m.type){
-      case 'runstate': setRunState(m.state); break;
+      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
-        buildRegs(m.regs); break;
-      case 'resumed': break;
+        buildRegs(m.regs); setPaused(true); break;
+      case 'resumed': setPaused(false); break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
       case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded); break;
+      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places}); break;
+      case 'varset': onVarSet(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
       case 'regs': buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;
-      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); break;
+      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); break;
     }
   }
   function collectSyms(symbols){ const out=[]; (symbols||[]).forEach(s=>{ out.push({name:s.name,type:s.typeName}); (s.fields||[]).forEach(f=>out.push({name:f.name,type:f.typeName})); }); return out; }

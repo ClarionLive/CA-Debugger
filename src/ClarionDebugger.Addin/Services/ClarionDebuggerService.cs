@@ -119,6 +119,9 @@ namespace ClarionDebugger.Services
         public string TypeName;     // GROUP/SHORT/BYTE/STRING or null (unproven code)
         public string Value;        // rendered display string (or null when not found)
         public string Va;           // live instance VA (hex)
+        public string TypeCode;     // raw Clarion type code as hex (e.g. "0x11") — for edit-variable-value
+        public int Size;            // byte width — for edit-variable-value
+        public int Places;          // DECIMAL scale (watch reports 0; correct places only for frame locals)
     }
 
     /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
@@ -171,6 +174,7 @@ namespace ClarionDebugger.Services
         public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
+        public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
         public event Action<string> EngineError;                   // engine-reported error event
@@ -462,6 +466,21 @@ namespace ClarionDebugger.Services
         /// current thread's live value (incl. THREADed); result arrives via WatchReceived.</summary>
         public bool Watch(string name) { return IsValidWatchName(name) && SendCommand("watch " + name); }
 
+        /// <summary>Edit-variable-value: write <paramref name="value"/> into the live variable at
+        /// <paramref name="vaHex"/> (interpreted per <paramref name="typeCodeHex"/>/<paramref name="size"/>/
+        /// <paramref name="places"/>). Valid only while paused. The value is base64-encoded so any text (with
+        /// spaces) survives the line/space-split stdin protocol; va and type code are validated as hex to block
+        /// command injection. Result arrives via <see cref="VariableSet"/>.</summary>
+        public bool SetVariable(string vaHex, string typeCodeHex, int size, int places, string value)
+        {
+            if (State != DebugSessionState.Paused) return false;
+            if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
+            if (string.IsNullOrEmpty(typeCodeHex) || !Regex.IsMatch(typeCodeHex, "^0x[0-9A-Fa-f]+$")) return false;
+            if (size <= 0 || size > 4096) return false;
+            string b64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value ?? string.Empty));
+            return SendCommand("setval " + vaHex + " " + typeCodeHex + " " + size + " " + places + " " + b64);
+        }
+
         /// <summary>Send a raw command line to the engine's stdin. False if no session / stdin closed.
         /// Rejects embedded newlines — the protocol is line-oriented, so a \n would inject a second command.</summary>
         private readonly object _stdinLock = new object();   // serialize stdin writes — multiple pads now send
@@ -711,6 +730,10 @@ namespace ClarionDebugger.Services
                 case "watch":
                     var w = ParseWatch(json);
                     if (w != null) WatchReceived?.Invoke(w);
+                    break;
+
+                case "varset":   // edit-variable-value result
+                    VariableSet?.Invoke(GetStr(json, "va"), GetBool(json, "ok"), GetStr(json, "value"), GetStr(json, "error"));
                     break;
 
                 case "sym":
@@ -965,6 +988,9 @@ namespace ClarionDebugger.Services
                 w.Threaded = GetBool(json, "threaded");
                 w.TypeName = GetStr(json, "typeName");
                 w.Va = GetStr(json, "va");
+                w.TypeCode = GetStr(json, "type");   // raw code as hex ("0x11") for edit-variable-value
+                w.Size = GetInt(json, "size");
+                w.Places = GetInt(json, "places");   // 0 when absent (watch doesn't carry DECIMAL scale)
                 // Value is now formatted engine-side by the shared Clarion value renderer (same one the
                 // Locals panel uses) and shipped ready-to-display — no separate client-side formatting.
                 w.Value = GetStr(json, "value");

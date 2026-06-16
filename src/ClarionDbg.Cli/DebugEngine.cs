@@ -543,6 +543,10 @@ namespace ClarionDbg.Cli
                         HandleMemCommand(parts);
                         break;
 
+                    case "setval":   // write a new value into a live variable (edit-variable-value)
+                        HandleSetValCommand(parts);
+                        break;
+
                     case "stack": case "bt": case "where":
                         HandleStackCommand(parts, ref ctx, haveCtx);
                         break;
@@ -638,6 +642,7 @@ namespace ClarionDbg.Cli
                     case "locals": case "vars":
                     case "moduledata": case "moddata":
                     case "disasm": case "u":
+                    case "setval":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:
@@ -833,6 +838,14 @@ namespace ClarionDbg.Cli
             int wrote;
             Native.WriteProcessMemory(_hProcess, (IntPtr)va, new[] { value }, 1, out wrote);
             Native.FlushInstructionCache(_hProcess, (IntPtr)va, (IntPtr)1);
+        }
+
+        /// <summary>Write a block of bytes to target memory (data writes — edit-variable-value). Returns
+        /// true only when every byte was written. No instruction-cache flush: this is data, not code.</summary>
+        private bool WriteBlock(uint va, byte[] buf)
+        {
+            int wrote;
+            return Native.WriteProcessMemory(_hProcess, (IntPtr)va, buf, buf.Length, out wrote) && wrote == buf.Length;
         }
 
         private uint ReadU32(uint va)

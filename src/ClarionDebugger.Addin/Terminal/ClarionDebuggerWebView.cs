@@ -60,6 +60,7 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
             _svc.WatchReceived         += OnSvcWatch;
+            _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
             _svc.BreakpointListReceived += OnSvcBreakpointList;
@@ -93,6 +94,7 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
             _svc.WatchReceived          -= OnSvcWatch;
+            _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
             _svc.BreakpointListReceived -= OnSvcBreakpointList;
@@ -134,6 +136,12 @@ namespace ClarionDebugger.Terminal
         private void OnSvcFrameLocals(string reqId, string itemsJson) => UI(() =>
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
+        private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
+        {
+            Post("{\"type\":\"varset\",\"va\":" + Str(va) + ",\"ok\":" + (ok ? "true" : "false")
+                + ",\"value\":" + Str(value) + ",\"error\":" + Str(error) + "}");
+            if (!ok) Console("err", "edit value failed: " + (error ?? "unknown"));
+        });
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() => SendBps());
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
         private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() => SendBps());
@@ -320,6 +328,7 @@ namespace ClarionDebugger.Terminal
                                 _svc.RequestFrameLocals(rq, a[1], a[2]);
                         }
                         break;
+                    case "editvar": EditVar(data); break;
                     case "jump": Jump(data); break;
                     case "openbp": OpenBp(data); break;
                     case "bpremove": RemoveBp(data); break;
@@ -706,9 +715,29 @@ namespace ClarionDebugger.Terminal
             if (w.Found)
                 sb.Append(",\"value\":").Append(Str(w.Value))
                   .Append(",\"typeName\":").Append(Str(w.TypeName))
-                  .Append(",\"threaded\":").Append(w.Threaded ? "true" : "false");
+                  .Append(",\"threaded\":").Append(w.Threaded ? "true" : "false")
+                  // edit-variable-value metadata so the Watch value cell can be written back
+                  .Append(",\"va\":").Append(Str(w.Va))
+                  .Append(",\"typeCode\":").Append(Str(w.TypeCode))
+                  .Append(",\"size\":").Append(w.Size)
+                  .Append(",\"places\":").Append(w.Places);
             sb.Append('}');
             Post(sb.ToString());
+        }
+
+        /// <summary>Edit-variable-value: the page asked to write a new value into a live variable. Data is a
+        /// JSON object {va, typeCode, size, places, value} carried from the row's own metadata. Only valid
+        /// while paused; the service validates va/typeCode as hex and base64-encodes the value. The result
+        /// comes back via <see cref="OnSvcVariableSet"/>.</summary>
+        private void EditVar(string data)
+        {
+            if (string.IsNullOrEmpty(data) || _svc.State != DebugSessionState.Paused) return;
+            string va = JsonVal(data, "va");
+            string typeCode = JsonVal(data, "typeCode");
+            int size; int.TryParse(JsonVal(data, "size") ?? "", out size);
+            int places; int.TryParse(JsonVal(data, "places") ?? "0", out places);
+            string value = JsonVal(data, "value") ?? string.Empty;
+            _svc.SetVariable(va, typeCode, size, places, value);
         }
 
         private void SendBps()
