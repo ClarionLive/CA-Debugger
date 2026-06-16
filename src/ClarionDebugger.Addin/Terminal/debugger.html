@@ -120,6 +120,11 @@
   .vedit-btn { display:none; cursor:pointer; color:var(--blue); opacity:.55; margin:0 5px; font-size:12px; line-height:1; user-select:none; flex:none; }
   .paused .vedit-btn { display:inline; }
   .vedit-btn:hover { opacity:1; }
+  /* DATE/TIME view-as cycle tag — hidden until row hover; always shown when actively re-interpreted */
+  .vas { flex:none; margin:0 4px; font-size:10px; color:var(--muted,#888); cursor:pointer; opacity:0; user-select:none; vertical-align:middle; }
+  .row:hover .vas, .watchrow:hover .vas { opacity:.5; }
+  .vas.active { opacity:.85; color:var(--green); }
+  .vas:hover { opacity:1; color:var(--fg); }
   .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
   .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .pin svg, .dact svg { display:block; }
@@ -700,6 +705,7 @@
       v.textContent=value;
       setEditMeta(v, meta);
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
+      dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -726,7 +732,10 @@
     cell._editing=true;
     const old=cell.textContent;
     const meta={va:cell.dataset.va, typeCode:cell.dataset.tc, size:+cell.dataset.sz||0, places:+cell.dataset.pl||0};
-    const inp=document.createElement('input'); inp.className='vedit'; inp.value=stripEditQuotes(old);
+    // when the cell shows a date/time view, edit the underlying RAW number, not the formatted text
+    const raw=cell.dataset.raw;
+    const inp=document.createElement('input'); inp.className='vedit';
+    inp.value = (raw!=null && /^-?\d+$/.test(raw)) ? raw : stripEditQuotes(old);
     cell.textContent=''; cell.appendChild(inp); inp.focus(); inp.select();
     let finished=false;
     function done(commit){
@@ -752,9 +761,51 @@
   function onVarSet(m){
     if(!m || !m.ok) return;                  // failures are surfaced in the console by the host
     document.querySelectorAll('.vval.editable').forEach(c=>{
-      if(c.dataset.va===m.va){ c.textContent=m.value; c.classList.add('changed'); setTimeout(()=>c.classList.remove('changed'),1600); }
+      if(c.dataset.va===m.va){ c.textContent=m.value; c.classList.add('changed'); setTimeout(()=>c.classList.remove('changed'),1600);
+        dtApply(c, c.dataset.dtname, m.value); }   // re-apply the date/time view to the new raw
     });
   }
+
+  // ---- DATE/TIME view-as: Clarion stores DATE/TIME as a LONG with no type marker, so the user (or a
+  // name heuristic) decides the interpretation. Per-value tag cycles Raw → Date → Time; raw kept in the
+  // tooltip; manual choice persists per name. All client-side arithmetic on the displayed integer. ----
+  const dtModes={};   // name(lower) → 'raw'|'date'|'time' (manual override; survives value refresh)
+  function dtParseInt(s){ s=(s==null?'':(''+s)).trim(); return /^-?\d+$/.test(s) ? parseInt(s,10) : null; }
+  function fieldPart(name){ name=(name||'').toLowerCase(); const i=name.lastIndexOf(':'); return i>=0?name.slice(i+1):name; }
+  // Clarion DATE = days since 28 Dec 1800 (n=4 → 1 Jan 1801). 0/negative = blank.
+  function fmtClarionDate(n){ if(n<=0) return '(blank date)';
+    const d=new Date(Date.UTC(1800,11,28)+n*86400000); if(isNaN(d.getTime())) return String(n);
+    const p=x=>String(x).padStart(2,'0'); return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate()); }
+  // Clarion TIME = hundredths-of-second since midnight + 1 (n=1 → 00:00:00).
+  function fmtClarionTime(n){ if(n<1) return '(blank time)'; let t=n-1; const hund=t%100; const secs=Math.floor(t/100);
+    const ss=secs%60, mm=Math.floor(secs/60)%60, hh=Math.floor(secs/3600); const p=x=>String(x).padStart(2,'0');
+    return p(hh)+':'+p(mm)+':'+p(ss)+(hund?'.'+p(hund):''); }
+  // Smart default: a *DATE/*TIME-named field whose value is in a plausible range auto-formats (the range
+  // guard rejects flags / tick-counts like RUNTIME). Manual cycling overrides regardless of range.
+  function dtDefault(name, n){ const f=fieldPart(name);
+    if(/date$/.test(f) && n>=30000 && n<=110000) return 'date';   // ~1882..~2100 — excludes small flags
+    if(/time$/.test(f) && n>=1 && n<=8640001) return 'time';
+    return 'raw'; }
+  function dtModeFor(name, n){ const k=(name||'').toLowerCase(); return dtModes[k] || dtDefault(name, n); }
+  // (Re)render a value cell for its current date/time mode and attach the cycle tag. rawText = the fresh
+  // raw value string (so we never re-parse an already-formatted cell).
+  function dtApply(cell, name, rawText){
+    if(!cell) return;
+    const n=dtParseInt(rawText!=null?rawText:cell.dataset.raw!=null?cell.dataset.raw:cell.textContent);
+    if(n===null){ if(cell._vas){ cell._vas.remove(); cell._vas=null; } delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode; return; }
+    cell.dataset.raw=String(n); cell.dataset.dtname=name||'';
+    const mode=dtModeFor(name, n); cell.dataset.dtmode=mode;
+    cell.textContent = mode==='date'?fmtClarionDate(n) : mode==='time'?fmtClarionTime(n) : String(n);
+    cell.title = mode==='raw' ? '' : ('raw: '+n);
+    let tag=cell._vas;
+    if(!tag){ tag=document.createElement('span'); tag.className='vas'; cell._vas=tag;
+      tag.onclick=e=>{ e.stopPropagation(); dtCycle(cell); }; cell.insertAdjacentElement('afterend', tag); }
+    tag.textContent=mode; tag.classList.toggle('active', mode!=='raw');
+    tag.title='View as raw / date / time (click to cycle) — raw: '+n;
+  }
+  function dtCycle(cell){ const name=cell.dataset.dtname||''; const order=['raw','date','time'];
+    const next=order[(order.indexOf(cell.dataset.dtmode||'raw')+1)%order.length];
+    dtModes[name.toLowerCase()]=next; dtApply(cell, name, cell.dataset.raw); }
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
   // Sort + filter state for the Variables pane. Default A→Z (Owner request); toggle flips to declaration
@@ -805,6 +856,7 @@
       +'<span class="vtype">'+esc(v.type||'')+'</span>';
     container.appendChild(row);
     wireEdit(row);   // adds the ✎ edit-value pencil when this row carries edit metadata
+    dtApply(row.querySelector('.vval'), v.name, v.value);   // DATE/TIME view-as
 
     let box=null, open=false, loaded=false;
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
