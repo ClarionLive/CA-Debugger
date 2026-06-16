@@ -565,7 +565,7 @@ namespace ClarionDebugger.Terminal
             string module = spec.Substring(0, c);
             int line; if (!int.TryParse(spec.Substring(c + 1), out line)) return;
             string path = ResolvePath(module);
-            if (path != null) TryJump(path, line);
+            if (path != null) NavigateTo(path, line);
             else Console("info", "(can't resolve " + module + " — open the app's solution so the .red is active)");
         }
 
@@ -579,7 +579,7 @@ namespace ClarionDebugger.Terminal
             int line;
             if (!int.TryParse(data.Substring(0, t), out line)) return;
             string path = data.Substring(t + 1);
-            if (!string.IsNullOrEmpty(path) && File.Exists(path)) TryJump(path, line);
+            if (!string.IsNullOrEmpty(path) && File.Exists(path)) NavigateTo(path, line);
             else Console("info", "(can't open " + path + " — file not found)");
         }
 
@@ -797,6 +797,84 @@ namespace ClarionDebugger.Terminal
         private static void TryJump(string path, int line)
         {
             try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
+            catch { }
+        }
+
+        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine.
+        private static MethodInfo _monacoNav;
+
+        /// <summary>Resolve ClarionAssistant's Monaco-aware navigation entry point, if that addin is loaded.
+        /// The Clarion source editor is replaced by ClarionAssistant's Monaco overlay; positioning an
+        /// already-open Monaco editor has no public API, so ClarionAssistant exposes this hook for us.
+        /// We have no compile-time reference to that addin, so we bind by name via reflection and cache it.
+        /// Frozen contract (with CA-Terminal-1-CC):
+        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine(string filePath, int line, int column)
+        ///   line/column 1-based; returns true when it handled the request (covers Monaco overlay ON and OFF,
+        ///   and self-queues if the editor isn't ready yet); false only when it could not (bad/missing path).
+        /// Absent type == ClarionAssistant not loaded (dev not using Monaco) → caller uses the native path.</summary>
+        private static MethodInfo ResolveMonacoNavigator()
+        {
+            if (_monacoNav != null) return _monacoNav;
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type t;
+                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
+                    catch { t = null; }
+                    if (t == null) continue;
+                    var mi = t.GetMethod("NavigateToFileAndLine", BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(string), typeof(int), typeof(int) }, null);
+                    if (mi != null && mi.ReturnType == typeof(bool)) { _monacoNav = mi; break; }
+                }
+            }
+            catch { }
+            return _monacoNav;
+        }
+
+        /// <summary>Open a source file in the Clarion editor and place the caret on <paramref name="line"/>
+        /// (1-based). Used for click-to-navigate from the pane (breakpoint list, call-stack frame). Unlike
+        /// the pause-time <see cref="TryJump"/>, this does NOT paint the yellow current-execution-line marker
+        /// — clicking a breakpoint isn't an execution stop.
+        ///
+        /// Prefer ClarionAssistant's Monaco navigator when present: with the Monaco overlay on, our native
+        /// caret moves land in the hidden editor behind Monaco and are invisible, so only that hook can
+        /// position what the user sees. Its presence is also our Monaco-vs-stock detection — no config flag.
+        ///
+        /// Fallback (ClarionAssistant absent, or it declined) is the stock SharpDevelop editor. Opening a file
+        /// the IDE hasn't loaded yet and positioning the caret in a single call races the editor's async
+        /// document load and lands at the top, so we open first, then position once the view has settled (the
+        /// same BeginInvoke-after-activation pattern <see cref="ReturnFocusToPad"/> relies on).
+        /// FileService.JumpToFilePosition is 0-based (DebuggerService.JumpToCurrentLine internally passes
+        /// line-1), so convert here.</summary>
+        private void NavigateTo(string path, int line)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+
+            // ClarionAssistant Monaco navigator: owns the overlay-ON (reveal Monaco) vs overlay-OFF
+            // (native caret) branch and self-queues if the page isn't ready. 1-based line + column.
+            try
+            {
+                var nav = ResolveMonacoNavigator();
+                if (nav != null)
+                {
+                    object handled = nav.Invoke(null, new object[] { path, line, 1 });
+                    if (handled is bool && (bool)handled) return;
+                }
+            }
+            catch { }
+
+            // Native fallback (stock editor): open, then position on the next pump tick.
+            int target = line > 0 ? line - 1 : 0;
+            try
+            {
+                ICSharpCode.SharpDevelop.FileService.OpenFile(path);
+                BeginInvoke((Action)(() =>
+                {
+                    try { ICSharpCode.SharpDevelop.FileService.JumpToFilePosition(path, target, 0); }
+                    catch { }
+                }));
+            }
             catch { }
         }
 
