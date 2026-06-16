@@ -163,6 +163,13 @@
   .procfilter input { width:100%; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
   .procfilter input:focus { border-color:var(--accent-hi); }
   .procfilter input::placeholder { color:#6f6f6f; }
+  /* per-pane filter + sort-toggle control row (Variables, Call Stack) */
+  .listctl { display:flex; gap:6px; align-items:center; padding:5px 10px 5px 14px; }
+  .listctl input { flex:1; min-width:0; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
+  .listctl input:focus { border-color:var(--accent-hi); }
+  .listctl input::placeholder { color:#6f6f6f; }
+  .sortbtn { flex:none; cursor:pointer; background:var(--btnhover,#2d2d2d); border:1px solid var(--popup-border); color:var(--fg-dim); border-radius:3px; padding:3px 8px; font-size:11px; white-space:nowrap; }
+  .sortbtn:hover { color:var(--fg); }
   .proc { display:flex; align-items:center; gap:8px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .proc:hover { background:var(--hover); }
   .proc .procname { color:var(--name); overflow:hidden; text-overflow:ellipsis; }
@@ -266,7 +273,10 @@
     <div class="sidebar col" id="colLeft">
       <details class="section" open data-sec="variables">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="varTree"><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+        <div class="body">
+          <div class="listctl"><input id="varFilter" placeholder="Filter variables — type a name" autocomplete="off" /><button id="varSort" class="sortbtn" title="Sort variables A→Z / declaration order">A→Z</button></div>
+          <div id="varTree"><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+        </div>
       </details>
       <details class="section" open data-sec="watch">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Watch <span class="count" id="watchCount">0</span><span class="hint">type · ☆ tree · right-click</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -277,7 +287,10 @@
       </details>
       <details class="section" open data-sec="stack">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
-        <div class="body" id="stackList"><div class="empty">Paused frames appear here.</div></div>
+        <div class="body">
+          <div class="listctl"><input id="stackFilter" placeholder="Filter frames — proc or module" autocomplete="off" /><button id="stackSort" class="sortbtn" title="Sort variables A→Z / declaration order (frames stay in call order)">A→Z</button></div>
+          <div id="stackList"><div class="empty">Paused frames appear here.</div></div>
+        </div>
       </details>
       <details class="section" open data-sec="breakpoints">
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Breakpoints <span class="count" id="bpCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
@@ -744,6 +757,19 @@
   }
 
   // ---- Variables tree: split data symbols into Tables (file record buffers) + Global Variables ----
+  // Sort + filter state for the Variables pane. Default A→Z (Owner request); toggle flips to declaration
+  // (original engine) order. The filter matches a top-level entry by its name OR any descendant field name.
+  let varSortAlpha=true, varQ='';
+  function byName(a,b){ return (a.name||'').localeCompare(b.name||''); }
+  // Sort any variable list by name when A→Z is active (applies at EVERY level: top-level entries, nested
+  // group/table fields, module data, and frame locals — so the variables inside a procedure sort too).
+  function sortVars(arr){ return varSortAlpha ? (arr||[]).slice().sort(byName) : (arr||[]); }
+  function symHay(s){ let h=(s.name||'').toLowerCase(); const f=s.fields||[]; for(let i=0;i<f.length;i++) h+=' '+symHay(f[i]); return h; }
+  function varHay(v){ let h=(v.name||'').toLowerCase(); const c=v.children||[]; for(let i=0;i<c.length;i++) h+=' '+varHay(c[i]); return h; }
+  // Re-apply the current filter to every top-level entry in the Variables pane (each editable/filterable
+  // top row carries an _applyVis closure; re-render replaces the closures, so no stale registry).
+  function applyVarFilter(){ const t=$('varTree'); if(!t) return; t.querySelectorAll('.row').forEach(r=>{ if(r._applyVis) r._applyVis(); }); }
+
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
   // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
   // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
@@ -751,14 +777,17 @@
     if(!el) return;
     el.innerHTML='';
     if(!items.length) return;
-    let open=true;
+    const arr = sortVars(items);
     const hdr=document.createElement('div'); hdr.className='row'; hdr.style.cursor='pointer';
     hdr.innerHTML='<span class="ar">▾</span><span class="vname">'+esc(label)+'</span>'
-      +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+items.length+'</span>';
+      +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+arr.length+'</span>';
     el.appendChild(hdr);
-    const tops=items.map(v=>renderVarRow(el, v, 1));
-    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸';
-      tops.forEach(t=>t.setVisible(open)); };
+    const state={open:true};
+    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1); const hay=varHay(v);
+      h.el._applyVis=()=>{ const m=(!varQ||hay.indexOf(varQ)>=0); h.setVisible((state.open||!!varQ) && m); }; return h; });
+    function applyAll(){ tops.forEach(h=>h.el._applyVis()); }
+    hdr.onclick=()=>{ state.open=!state.open; hdr.querySelector('.ar').textContent=state.open?'▾':'▸'; applyAll(); };
+    applyAll();
   }
 
   // Render one variable row into `container`, with its descendants in a child box inserted right after it
@@ -781,7 +810,7 @@
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
       container.insertBefore(box, row.nextSibling); } return box; }
     function renderKids(items){ const b=ensureBox(); b.innerHTML='';
-      (items||[]).forEach(c=>renderVarRow(b, c, depth+1));
+      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1));
       if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
     if(eager && eager.length){ renderKids(eager); loaded=true; }
 
@@ -796,7 +825,7 @@
     }
     if(expandable){ row.style.cursor='pointer'; row.onclick=toggle; }
 
-    return { setVisible(b){ row.style.display=b?'':'none'; if(box) box.style.display=(b&&open)?'':'none'; } };
+    return { el: row, setVisible(b){ row.style.display=b?'':'none'; if(box) box.style.display=(b&&open)?'':'none'; } };
   }
 
   // ---- lazy reference expansion: ask the engine to deref a &GROUP/&QUEUE/&CLASS node and return its members ----
@@ -816,19 +845,29 @@
   }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
-  function buildModuleData(module, items){
-    renderVarGroup($('moduleTree'), 'Module Data', module, items||[]);
-  }
+  // Raw data kept so the sort toggle can re-render without re-fetching.
+  let lastModule='', lastModuleItems=null, lastSymbols=null;
+  function buildModuleData(module, items){ lastModule=module; lastModuleItems=items||[]; renderModuleData(); }
+  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[]); applyVarFilter(); }
 
-  function buildVarTree(symbols){
+  function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
+  function renderVarTree(){
     const tree=$('bufTree'); tree.innerHTML='';
+    const symbols=lastSymbols;
     if(!symbols || !symbols.length){ tree.innerHTML='<div class="empty">No static data symbols.</div>'; return; }
     const isTable=s=> (s.fields && s.fields.length) && /\$.*:record$/i.test(s.name);  // FILE$PREFIX:RECORD
-    const tables=symbols.filter(isTable);
-    const globals=symbols.filter(s=>!isTable(s));
+    let tables=symbols.filter(isTable);
+    let globals=symbols.filter(s=>!isTable(s));
+    if(varSortAlpha){ tables=tables.slice().sort(byName); globals=globals.slice().sort(byName); }
     treeGroup(tree,'Tables',tables,true);
     treeGroup(tree,'Global Variables',globals,false);
+    applyVarFilter();
   }
+  // Flip the variable sort order everywhere (Variables pane + Call Stack locals) and re-render from stored
+  // raw data. Both pane sort buttons drive this one flag, and their labels stay in sync.
+  function setVarSort(alpha){ varSortAlpha=alpha; const lbl=alpha?'A→Z':'Decl';
+    const vb=$('varSort'); if(vb) vb.textContent=lbl; const sb=$('stackSort'); if(sb) sb.textContent=lbl;
+    renderModuleData(); renderVarTree(); renderStack(); }
 
   // One collapsible category. GROUPs expand to their fields (nested groups recurse); scalar leaves are
   // live-watched by name only while visible (section open, and every enclosing group open too).
@@ -837,11 +876,13 @@
     hdr.innerHTML='<span class="ar">'+(openByDefault?'▾':'▸')+'</span><span class="vname">'+esc(label)+'</span>'
       +'<span class="count">'+syms.length+'</span>';
     tree.appendChild(hdr);
-    let open=openByDefault;
-    const tops=syms.map(s=>renderSymRow(tree, s, 1));
-    function applyTop(){ tops.forEach(t=>t.setVisible(open)); }
-    hdr.onclick=()=>{ open=!open; hdr.querySelector('.ar').textContent=open?'▾':'▸'; applyTop(); };
-    applyTop();
+    const state={open:openByDefault};
+    const tops=syms.map(s=>{ const h=renderSymRow(tree, s, 1); const hay=symHay(s);
+      // a top entry is visible when its group is open (or a filter is active) AND it matches the filter
+      h.el._applyVis=()=>{ const m=(!varQ||hay.indexOf(varQ)>=0); h.setVisible((state.open||!!varQ) && m); }; return h; });
+    function applyAll(){ tops.forEach(h=>h.el._applyVis()); }
+    hdr.onclick=()=>{ state.open=!state.open; hdr.querySelector('.ar').textContent=state.open?'▾':'▸'; applyAll(); };
+    applyAll();
   }
 
   // Render a data symbol / field row recursively. GROUPs expand; scalar leaves carry data-name (watched
@@ -865,13 +906,13 @@
 
     const kids=[]; let kidOpen=false;
     if(isGroup){
-      fieldsData.forEach(f=>kids.push(renderSymRow(tree, f, depth+1)));
+      sortVars(fieldsData).forEach(f=>kids.push(renderSymRow(tree, f, depth+1)));
       kids.forEach(k=>k.setVisible(false));
       row.style.cursor='pointer';
       row.onclick=e=>{ if(e.target.closest('.pin')) return; e.stopPropagation();
         kidOpen=!kidOpen; row.querySelector('.ar').textContent=kidOpen?'▾':'▸'; kids.forEach(k=>k.setVisible(kidOpen)); };
     }
-    return { setVisible(b){
+    return { el: row, setVisible(b){
       row.style.display=b?'':'none';
       if(!isGroup){ if(!watched.has(name)) send(b?'watch':'unwatch', name); return; }
       if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
@@ -880,14 +921,23 @@
   }
 
   // ---- call stack ----
-  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. Frame 0 (current)
-  // auto-expands. The twisty toggles locals; clicking the frame name jumps the editor to that frame's line.
-  function buildStack(frames){
-    const list=$('stackList'); list.innerHTML=''; $('stackCount').textContent=frames.length;
+  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. The CURRENT
+  // frame (index 0) auto-expands. Frames always render in CALL ORDER; the sort button sorts the variables
+  // INSIDE a frame (shared varSortAlpha). The filter matches procedure/module. The twisty toggles locals;
+  // clicking the frame name jumps the editor.
+  let stackQ='', lastFrames=null;
+  function buildStack(frames){ lastFrames=frames||[]; renderStack(); }
+  function applyStackFilter(){ const list=$('stackList'); if(!list) return;
+    list.querySelectorAll('.frame').forEach(el=>{ const show=(!stackQ || (el._hay||'').indexOf(stackQ)>=0);
+      el.style.display=show?'':'none'; if(el._box) el._box.style.display=(show && el._open)?'':'none'; }); }
+  function renderStack(){
+    const list=$('stackList'); list.innerHTML=''; const frames=lastFrames||[]; $('stackCount').textContent=frames.length;
     if(!frames.length){ list.innerHTML='<div class="empty">Paused frames appear here.</div>'; return; }
-    frames.forEach((f,i)=>{
+    // Frames stay in CALL ORDER (frame 0 = current → callers); only the variables inside sort.
+    frames.forEach((f,idx)=>{
       const canLoc = !!(f.proc && f.ebp && f.ebp!=='0x0');
-      const el=document.createElement('div'); el.className='frame'+(i===0?' cur':'')+(f.proc?'':' unknown');
+      const el=document.createElement('div'); el.className='frame'+(idx===0?' cur':'')+(f.proc?'':' unknown');
+      el._hay=((f.proc||'')+' '+(f.module||'')).toLowerCase(); el._open=false;
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
       el.innerHTML='<span class="ar">'+(canLoc?'▸':'')+'</span>'
         +'<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc
@@ -895,20 +945,21 @@
       list.appendChild(el);
 
       let box=null, open=false, loaded=false;
-      function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none'; list.insertBefore(box, el.nextSibling); } return box; }
+      function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none'; list.insertBefore(box, el.nextSibling); el._box=box; } return box; }
       function load(){ if(loaded) return; loaded=true; const b=ensureBox();
         b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">…</div>';
         requestFrameLocals(f, items=>{ b.innerHTML='';
           if(!items || !items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
-          else items.forEach(c=>renderVarRow(b, c, 1));
+          else sortVars(items).forEach(c=>renderVarRow(b, c, 1));
           if(box) box.style.display=open?'':'none'; }); }
-      function toggle(){ if(!canLoc) return; open=!open; el.querySelector('.ar').textContent=open?'▾':'▸';
+      function toggle(){ if(!canLoc) return; open=!open; el._open=open; el.querySelector('.ar').textContent=open?'▾':'▸';
         if(open) load(); if(box) box.style.display=open?'':'none'; }
       if(canLoc){ const ar=el.querySelector('.ar'); ar.onclick=(e)=>{ e.stopPropagation(); toggle(); }; }
       if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);   // name click jumps the editor
 
-      if(i===0 && canLoc){ open=true; el.querySelector('.ar').textContent='▾'; load(); }
+      if(idx===0 && canLoc){ open=true; el._open=true; el.querySelector('.ar').textContent='▾'; load(); }
     });
+    applyStackFilter();
   }
 
   // ---- breakpoints ----
@@ -996,6 +1047,12 @@
     q=(q||'').trim().toLowerCase();
     el.querySelectorAll('.proc').forEach(d=>{ d.style.display=(!q || d.dataset.key.indexOf(q)>=0)?'':'none'; });
   }
+  (function(){
+    const vf=$('varFilter'); if(vf) vf.addEventListener('input',()=>{ varQ=vf.value.trim().toLowerCase(); applyVarFilter(); });
+    const vs=$('varSort'); if(vs) vs.addEventListener('click',()=>setVarSort(!varSortAlpha));
+    const sf=$('stackFilter'); if(sf) sf.addEventListener('input',()=>{ stackQ=sf.value.trim().toLowerCase(); applyStackFilter(); });
+    const ss=$('stackSort'); if(ss) ss.addEventListener('click',()=>setVarSort(!varSortAlpha));
+  })();
   (function(){ const f=$('procFilter'); if(f) f.addEventListener('input',()=>filterProcs(f.value));
     const rb=$('procRefresh'); if(rb) rb.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); send('proclist'); }); })();
 
