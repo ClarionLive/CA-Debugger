@@ -157,8 +157,11 @@ namespace ClarionDbg.Cli
             ProcSymbol sym = null;
             bool hasSym = m != null && m.Dbg != null && m.Dbg.ResolveSymbol(rva, out sym);
             // same moduleIdx cross-check as ProcNameAt: don't name cold/init code with the
-            // previous module's last symbol
-            bool symOk = hasSym && (!resolved || sym.ModuleIdx == mi);
+            // previous module's last symbol — but ONLY when the symbol's moduleIdx is a real module-name
+            // index. On binaries where the symbol backref space diverges from the module-name array the
+            // idx is meaningless and would veto every frame (-> "(unknown)" -> no locals), so we trust the
+            // binary-search symbol instead. See TswdDebugInfo.ModuleIdxComparable.
+            bool symOk = hasSym && (!resolved || !m.Dbg.ModuleIdxComparable(sym.ModuleIdx) || sym.ModuleIdx == mi);
             return new StackFrame
             {
                 Rva = rva,
