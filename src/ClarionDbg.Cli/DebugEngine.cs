@@ -333,9 +333,10 @@ namespace ClarionDbg.Cli
                         }
                         else if (_evalActive && tid == _evalTid && exAddr == EVAL_TRAP_VA)
                         {
-                            // the hijacked THR$GetInstance call returned into our unmapped magic
-                            // address — EAX now holds the thread's live instance VA
-                            status = OnEvalComplete(tid);
+                            // a hijacked func-eval call returned into our unmapped magic address. The
+                            // Library-State batch drives many calls in sequence (its own completion handler
+                            // chains the next); a watch is the single THR$GetInstance round-trip.
+                            status = _libstateActive ? OnLibStateEvalComplete(tid) : OnEvalComplete(tid);
                         }
                         else
                         {
@@ -577,6 +578,13 @@ namespace ClarionDbg.Cli
                         // THR$GetInstance, so we must leave the pause loop; the completion
                         // handler re-enters it with the original context restored.
                         if (HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx))
+                            return;
+                        break;
+
+                    case "libstate":
+                        // per-thread RTL "Library State" (ERROR/EVENT/FIELD/…) via a batch of getter
+                        // func-evals on the paused thread; leave the pause loop so the calls can run.
+                        if (HandleLibStateCommand(parts, tid, hThread, ref ctx, haveCtx))
                             return;
                         break;
 
