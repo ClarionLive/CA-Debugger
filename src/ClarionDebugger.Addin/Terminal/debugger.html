@@ -282,7 +282,7 @@
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Variables<span class="hint" id="varsHint">file buffers</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="listctl"><input id="varFilter" placeholder="Filter variables — type a name" autocomplete="off" /><button id="varSort" class="sortbtn" title="Sort variables A→Z / declaration order">A→Z</button></div>
-          <div id="varTree"><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
+          <div id="varTree"><div id="localsTree"></div><div id="moduleTree"></div><div id="bufTree"><div class="empty">Start a session to load file buffers.</div></div></div>
         </div>
       </details>
       <details class="section" open data-sec="watch">
@@ -891,6 +891,22 @@
     wireEdit(row);   // adds the ✎ edit-value pencil when this row carries edit metadata
     dtApply(row.querySelector('.vval'), v.name, v.value);   // DATE/TIME view-as
 
+    // TOP-LEVEL scalar leaf (a local or module-data item): make it watchable by name — pin star + right-click
+    // "Add to Watch", the same affordances a Global gets. Watches resolve against the current frame FIRST (a
+    // local shadows a global), so a local name added here tracks its live stack slot. Gated to depth===1:
+    // NESTED group/queue members (e.g. BRW1::JOB:JOBID inside QUEUE:BROWSE:1) have no standalone resolvable
+    // name — the engine reads them by address while walking the group, but the watch-by-name resolver only
+    // knows top-level local entries and globals, so watching a member would just show "(not found)". They
+    // stay visible with live values (and the edit pencil); they just don't get a misleading watch button.
+    if(!expandable && v.name && depth===1){
+      row.classList.add('selrow');
+      row.dataset.name=v.name;
+      const pin=document.createElement('span'); pin.className='pin'; pin.title='Add to Watch'; pin.innerHTML=STAR;
+      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(v.name); };
+      row.appendChild(pin);
+      wireSel(row);
+    }
+
     let box=null, open=false, loaded=false;
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
       container.insertBefore(box, row.nextSibling); } return box; }
@@ -935,6 +951,14 @@
   function buildModuleData(module, items){ lastModule=module; lastModuleItems=items||[]; renderModuleData(); }
   function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[]); applyVarFilter(); }
 
+  // ---- current-frame locals mirrored into the Variables pane ("Local Variables" section) ----
+  // Same data the Call Stack shows for frame 0, surfaced in the Variables pane so locals sit alongside
+  // Global Variables and get the pin / right-click "Add to Watch" affordances. Refreshed every pause via
+  // buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop.
+  let lastLocals=null, lastLocalsProc='';
+  function buildLocals(proc, items){ lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
+  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[]); applyVarFilter(); }
+
   function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
   function renderVarTree(){
     const tree=$('bufTree'); tree.innerHTML='';
@@ -952,7 +976,7 @@
   // raw data. Both pane sort buttons drive this one flag, and their labels stay in sync.
   function setVarSort(alpha){ varSortAlpha=alpha; const lbl=alpha?'A→Z':'Decl';
     const vb=$('varSort'); if(vb) vb.textContent=lbl; const sb=$('stackSort'); if(sb) sb.textContent=lbl;
-    renderModuleData(); renderVarTree(); renderStack(); }
+    renderModuleData(); renderLocals(); renderVarTree(); renderStack(); }
 
   // One collapsible category. GROUPs expand to their fields (nested groups recurse); scalar leaves are
   // live-watched by name only while visible (section open, and every enclosing group open too).
@@ -1011,7 +1035,12 @@
   // INSIDE a frame (shared varSortAlpha). The filter matches procedure/module. The twisty toggles locals;
   // clicking the frame name jumps the editor.
   let stackQ='', lastFrames=null;
-  function buildStack(frames){ lastFrames=frames||[]; renderStack(); }
+  function buildStack(frames){ lastFrames=frames||[]; renderStack();
+    // Mirror the CURRENT frame's locals into the Variables pane. requestFrameLocals guards a missing/bad
+    // frame and calls back [] (clearing the section). Watch resolves against the top frame, so frame 0 is
+    // the right one to surface here.
+    const f0=lastFrames[0];
+    requestFrameLocals(f0, items=>buildLocals(f0?f0.proc:'', items)); }
   function applyStackFilter(){ const list=$('stackList'); if(!list) return;
     list.querySelectorAll('.frame').forEach(el=>{ const show=(!stackQ || (el._hay||'').indexOf(stackQ)>=0);
       el.style.display=show?'':'none'; if(el._box) el._box.style.display=(show && el._open)?'':'none'; }); }
