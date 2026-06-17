@@ -116,8 +116,9 @@ namespace ClarionDbg.Cli
             else
                 EmitError($"watch {_evalName}: THR$GetInstance eval failed");
 
-            // we are logically still paused at the original location — resume the command loop
-            PausedWait(tid, hThread, ref _evalSavedCtx, true, "watch");
+            // we are logically still paused at the original location — resume the command loop without
+            // re-announcing a `paused` (the watch result already went out; a re-announce is spurious).
+            PausedWait(tid, hThread, ref _evalSavedCtx, true, "watch", emitPaused: false);
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
         }

@@ -174,7 +174,7 @@ namespace ClarionDbg.Cli
             if (_evalHadRearm) { _rearm[tid] = _evalSavedRearm; _evalHadRearm = false; }
             _libstateActive = false; _evalActive = false;
             EmitLibStateRows(_libstateReqId, _libstateRows);
-            PausedWait(tid, hThread, ref _evalSavedCtx, true, "libstate");
+            PausedWait(tid, hThread, ref _evalSavedCtx, true, "libstate", emitPaused: false);
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
         }
