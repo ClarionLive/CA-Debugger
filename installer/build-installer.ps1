@@ -1,4 +1,4 @@
-# Build the CA Debugger installer.
+﻿# Build the CA Debugger installer.
 #
 # Stages a separately-built addin DLL for each Clarion version (the addin links
 # against version-specific IDE assemblies, so one build per version is required),
