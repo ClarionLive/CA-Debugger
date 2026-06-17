@@ -183,7 +183,8 @@ namespace ClarionDbg.Cli
                     string nm = dbg.ModuleNameForIdx(mi2) ?? "?";
                     // symbol bind, cross-checked against the +0x1C moduleIdx (cold/init code below a
                     // module's named entry binds to the previous module's last symbol — say unknown)
-                    string proc = dbg.ResolveSymbol(rva, out ProcSymbol sym) && sym.ModuleIdx == mi2
+                    string proc = dbg.ResolveSymbol(rva, out ProcSymbol sym)
+                        && (!dbg.ModuleIdxComparable(sym.ModuleIdx) || sym.ModuleIdx == mi2)
                         ? $"{sym.Name} [{sym.Kind.ToString().ToLowerInvariant()}]" : null;
                     Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> {nm} (moduleIdx {mi2}) line {l2}{(proc != null ? " in " + proc : "")}  (+0x1C, record RVA 0x{rr2:X})");
                 }
