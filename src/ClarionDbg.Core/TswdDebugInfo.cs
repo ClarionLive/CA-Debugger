@@ -1172,6 +1172,18 @@ namespace ClarionDbg.Core
             return (idx >= 0 && idx < ModuleNames.Count) ? ModuleNames[idx] : null;
         }
 
+        /// <summary>Can a symbol's <see cref="ProcSymbol.ModuleIdx"/> be meaningfully compared against a
+        /// +0x1C line-table moduleIdx? Only when it actually indexes the module-name array. The symbol
+        /// backref index space (+0x28, sized by the +0x24 field) coincides with the module-name array on
+        /// small/reference binaries but DIVERGES on real apps (e.g. a 4-module app whose symbols carry
+        /// backref indices in the hundreds). When it diverges the index is meaningless as a module key —
+        /// so callers must NOT use it to veto an otherwise-valid binary-search symbol match (doing so
+        /// nulls every frame's proc name, which in turn suppresses its locals in the UI).</summary>
+        public bool ModuleIdxComparable(int symModuleIdx)
+        {
+            return symModuleIdx >= 0 && symModuleIdx < ModuleNames.Count;
+        }
+
         /// <summary>The distinct source lines that carry a +0x1C code record for a compiland (moduleIdx) —
         /// the lines a breakpoint binds to exactly. Sorted ascending. Gate user picks to line &lt;= file
         /// length (the +0x1C table can carry cumulative-tail values past EOF).</summary>

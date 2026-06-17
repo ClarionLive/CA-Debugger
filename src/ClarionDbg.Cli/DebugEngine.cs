@@ -798,13 +798,16 @@ namespace ClarionDbg.Cli
         /// Cross-checks the symbol's module against the +0x1C moduleIdx when the caller has one:
         /// code emitted BELOW a module's named entry (init/cold) would otherwise bind to the
         /// previous module's last symbol — better to say "unknown" than name the wrong proc.
+        /// The cross-check only applies when the symbol's moduleIdx is a real module-name index;
+        /// on binaries where the symbol backref space diverges it is skipped (see
+        /// TswdDebugInfo.ModuleIdxComparable) so a valid symbol still names the frame.
         /// </summary>
         private string ProcNameAt(LoadedModule m, uint rva, int moduleIdx)
         {
             if (m == null || m.Dbg == null) return null;
             ProcSymbol sym;
             if (!m.Dbg.ResolveSymbol(rva, out sym)) return null;
-            if (moduleIdx >= 0 && sym.ModuleIdx != moduleIdx) return null;
+            if (moduleIdx >= 0 && m.Dbg.ModuleIdxComparable(sym.ModuleIdx) && sym.ModuleIdx != moduleIdx) return null;
             return sym.Name;
         }
 

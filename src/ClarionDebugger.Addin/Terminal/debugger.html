@@ -1049,7 +1049,9 @@
     if(!frames.length){ list.innerHTML='<div class="empty">Paused frames appear here.</div>'; return; }
     // Frames stay in CALL ORDER (frame 0 = current → callers); only the variables inside sort.
     frames.forEach((f,idx)=>{
-      const canLoc = !!(f.proc && f.ebp && f.ebp!=='0x0');
+      // Locals availability hinges on having a frame base (ebp), NOT on a resolved proc name: a frame may
+      // resolve to real locals even when its symbol name is unknown, so don't hide them behind a name.
+      const canLoc = !!(f.ebp && f.ebp!=='0x0');
       const el=document.createElement('div'); el.className='frame'+(idx===0?' cur':'')+(f.proc?'':' unknown');
       el._hay=((f.proc||'')+' '+(f.module||'')).toLowerCase(); el._open=false;
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
