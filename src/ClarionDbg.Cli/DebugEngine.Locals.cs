@@ -69,6 +69,64 @@ namespace ClarionDbg.Cli
             return best;
         }
 
+        /// <summary>Resolve a named local of the CURRENTLY-EXECUTING frame (frame 0): map the paused EIP to its
+        /// procedure (a ROUTINE shares its host procedure's frame, so route to the enclosing proc), then find a
+        /// local of that name (case-insensitive) in the proc's <see cref="LocalSym"/> set and compute its live
+        /// slot at [EBP + FrameOff]. Locals always live on the stack — never .cwtls — so the read is a direct,
+        /// synchronous one (no THR$GetInstance func-eval). Returns false when not paused-with-context, the owning
+        /// image has no debug info, or this frame declares no local of that name. Used by `watch NAME` so a
+        /// procedure-local shadows a same-named global while we are paused inside its frame.</summary>
+        private bool TryResolveLocalInCurrentFrame(ref Native.CONTEXT_X86 ctx, bool haveCtx, string name,
+            out uint slotVa, out LocalSym found, out LoadedModule owner)
+        {
+            slotVa = 0; found = null; owner = null;
+            if (!haveCtx || ctx.Ebp == 0) return false;
+            var m = ModuleAt(ctx.Eip);
+            if (m == null || m.Dbg == null) return false;
+            ProcSymbol sym;
+            if (!m.Dbg.ResolveSymbol(ctx.Eip - m.LoadBase, out sym)) return false;
+            uint entry = sym.EntryRva;
+            if (sym.Kind == SymbolKind.Routine)
+            {
+                uint pe = EnclosingProcedureEntry(m, ctx.Eip - m.LoadBase);
+                if (pe != 0) entry = pe;
+            }
+            List<LocalSym> locals;
+            if (!m.Dbg.ReadLocals().TryGetValue(entry, out locals) || locals == null) return false;
+            foreach (var l in locals)
+                if (string.Equals(l.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    found = l; owner = m;
+                    slotVa = (uint)((long)ctx.Ebp + l.FrameOff);
+                    return true;
+                }
+            return false;
+        }
+
+        /// <summary>True when <paramref name="name"/> is declared as a local in SOME procedure of any loaded image
+        /// (locals are cached, so this is cheap after first build). Lets a watch miss tell "out of scope right now"
+        /// (a known local of a procedure we are not currently paused in) apart from a genuinely unknown name.</summary>
+        private bool IsKnownLocalName(string name)
+        {
+            if (NameInAnyLocalSet(_exe, name)) return true;
+            foreach (var m in _modules)
+            {
+                if (m == _exe) continue;
+                if (NameInAnyLocalSet(m, name)) return true;
+            }
+            return false;
+        }
+
+        private static bool NameInAnyLocalSet(LoadedModule m, string name)
+        {
+            if (m == null || m.Dbg == null) return false;
+            foreach (var kv in m.Dbg.ReadLocals())
+                foreach (var l in kv.Value)
+                    if (string.Equals(l.Name, name, StringComparison.OrdinalIgnoreCase))
+                        return true;
+            return false;
+        }
+
         /// <summary>The GROUP/QUEUE layout a type describes — directly (a group) or through one reference hop
         /// (a by-ref group/queue/class). Returns null for non-aggregates.</summary>
         private static ClarionType GroupTypeOf(ClarionType t)

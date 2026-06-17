@@ -122,6 +122,7 @@ namespace ClarionDebugger.Services
         public string TypeCode;     // raw Clarion type code as hex (e.g. "0x11") — for edit-variable-value
         public int Size;            // byte width — for edit-variable-value
         public int Places;          // DECIMAL scale (watch reports 0; correct places only for frame locals)
+        public bool OutOfScope;     // a known frame local, but execution is paused outside its procedure
     }
 
     /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
@@ -984,7 +985,7 @@ namespace ClarionDebugger.Services
             try
             {
                 var w = new DebugWatch { Name = GetStr(json, "name"), Found = GetBool(json, "found") };
-                if (!w.Found) return w;
+                if (!w.Found) { w.OutOfScope = GetBool(json, "outOfScope"); return w; }
                 w.Threaded = GetBool(json, "threaded");
                 w.TypeName = GetStr(json, "typeName");
                 w.Va = GetStr(json, "va");

@@ -365,28 +365,40 @@ namespace ClarionDbg.Cli
                  + "}";
         }
 
-        /// <summary>Watch-by-name value: instanceVa is the live (per-thread when threaded) address
-        /// the bytes were read from; va is the link-time template address.</summary>
+        /// <summary>A found watch value: instanceVa is the live (per-thread when threaded, frame slot for a
+        /// local) address the bytes were read from; templateVa is the link-time template address. <paramref
+        /// name="editable"/> gates the edit-variable-value metadata (va + places): the host keys "is this cell
+        /// editable" purely on the presence of "va", so a non-writable type (ref / group / unknown) emits no va
+        /// and therefore shows no edit pencil instead of erroring on commit. A miss goes through
+        /// <see cref="WatchMiss"/>.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
-                                   byte typeCode, string typeName, uint size, string value, byte[] bytes, int read)
+                                   byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable)
         {
-            if (!found)
-                return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false}";
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
               .Append(",\"found\":true")
               .Append(",\"templateVa\":\"0x").Append(templateVa.ToString("X")).Append('"')
-              .Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
               .Append(",\"threaded\":").Append(threaded ? "true" : "false")
               .Append(",\"type\":\"0x").Append(typeCode.ToString("X2")).Append('"')
               .Append(",\"typeName\":").Append(Str(typeName))
               .Append(",\"size\":").Append(size)
               .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
-              .Append(",\"read\":").Append(read)
-              .Append(",\"bytes\":\"");
+              .Append(",\"read\":").Append(read);
+            if (editable)
+                sb.Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
+                  .Append(",\"places\":").Append(places);
+            sb.Append(",\"bytes\":\"");
             for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));
             sb.Append("\"}");
             return sb.ToString();
+        }
+
+        /// <summary>A watch that resolved to no value: either genuinely unknown, or (outOfScope) a known local of
+        /// a procedure we are not currently paused inside. The host renders the latter as "(out of scope)".</summary>
+        public static string WatchMiss(string name, bool outOfScope)
+        {
+            return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false"
+                 + (outOfScope ? ",\"outOfScope\":true" : "") + "}";
         }
 
         public static string Error(string message)

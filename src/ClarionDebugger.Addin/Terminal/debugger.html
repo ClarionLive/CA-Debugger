@@ -733,7 +733,7 @@
     document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
       v.classList.remove('pending');
-      if(!found){ v.textContent='(not found)'; v.classList.add('pending'); return; }
+      if(!found){ v.textContent=(meta&&meta.outOfScope)?'(out of scope)':'(not found)'; v.classList.add('pending'); return; }
       v.textContent=value;
       setEditMeta(v, meta);
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
@@ -781,7 +781,8 @@
   document.addEventListener('dblclick', e=>{ const cell=e.target.closest && e.target.closest('.vval.editable'); if(cell){ e.preventDefault(); beginEdit(cell); } });
   // primary affordance: a ✎ pencil on each editable row (the value cell may carry edit metadata from
   // either the Variables/Call-Stack tree or the Watch panel). Clicking it edits in place; it shows only
-  // while paused (CSS). Locals can't be watched, so this is the only way to edit a Call-Stack local.
+  // while paused (CSS). A frame local can now also be watched (engine resolves the active frame first),
+  // and such a Watch row is editable too — this pencil and the Call-Stack tree are both entry points.
   function wireEdit(row){
     if(!row) return;
     const cell=row.querySelector('.vval'); if(!cell || !cell.dataset.va) return;
@@ -1257,7 +1258,7 @@
       case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places}); break;
+      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope}); break;
       case 'varset': onVarSet(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;

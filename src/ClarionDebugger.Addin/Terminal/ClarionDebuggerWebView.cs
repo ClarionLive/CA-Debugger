@@ -877,6 +877,9 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"typeCode\":").Append(Str(w.TypeCode))
                   .Append(",\"size\":").Append(w.Size)
                   .Append(",\"places\":").Append(w.Places);
+            else
+                // a miss: distinguish a frame local that is merely out of scope from a genuinely unknown name
+                sb.Append(",\"outOfScope\":").Append(w.OutOfScope ? "true" : "false");
             sb.Append('}');
             Post(sb.ToString());
         }

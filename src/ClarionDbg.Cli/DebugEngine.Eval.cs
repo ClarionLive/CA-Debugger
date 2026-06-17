@@ -21,11 +21,26 @@ namespace ClarionDbg.Cli
         {
             if (parts.Length < 2) { EmitError("watch expects: watch NAME"); return false; }
             string name = parts[1];
+
+            // A procedure-local shadows a same-named global while we are paused inside its frame, so resolve the
+            // CURRENT frame's locals FIRST. Locals live on the stack (never .cwtls), so this is a direct read —
+            // no THR$GetInstance func-eval — hence we always return false (stay paused).
+            uint slotVa; LocalSym lsym; LoadedModule lowner;
+            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, name, out slotVa, out lsym, out lowner))
+            {
+                EmitWatchValue(name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places);
+                return false;
+            }
+
             TswdDebugInfo.DataLocation loc; LoadedModule owner;
             if (!ResolveDataAcrossModules(name, out owner, out loc))
             {
-                if (EmitJson) Console.WriteLine("@JSON " + Json.Watch(name, false, 0, 0, false, 0, null, 0, null, null, 0));
-                Console.WriteLine($"  watch {name}: not found");
+                // Not a current-frame local and not a global. If it IS a local of some other procedure, it is
+                // merely out of scope right now (we are paused elsewhere) — flag that so the Watch row reads
+                // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
+                bool outOfScope = haveCtx && IsKnownLocalName(name);
+                if (EmitJson) Console.WriteLine("@JSON " + Json.WatchMiss(name, outOfScope));
+                Console.WriteLine($"  watch {name}: {(outOfScope ? "out of scope" : "not found")}");
                 return false;
             }
             uint templateVa = owner.LoadBase + loc.Rva;
@@ -107,8 +122,11 @@ namespace ClarionDbg.Cli
             return Native.DBG_CONTINUE;
         }
 
-        /// <summary>Read and report a watch value (instanceVa = templateVa for non-threaded data).</summary>
-        private void EmitWatchValue(string name, uint templateVa, uint instanceVa, bool threaded, byte typeCode, uint size)
+        /// <summary>Read and report a watch value (instanceVa = templateVa for non-threaded data). <paramref
+        /// name="target"/>/<paramref name="places"/> carry a frame local's referent-type and DECIMAL scale so
+        /// &amp;STRING locals deref correctly and DECIMAL locals render/edit at the right scale; both default to 0
+        /// for global/static data (whose DataLocation does not carry them) — unchanged from before.</summary>
+        private void EmitWatchValue(string name, uint templateVa, uint instanceVa, bool threaded, byte typeCode, uint size, byte target = 0, int places = 0)
         {
             int len = (int)Math.Min(Math.Max(size, 1), 4096);
             var buf = new byte[len];
@@ -116,10 +134,10 @@ namespace ClarionDbg.Cli
             Native.ReadProcessMemory(_hProcess, (IntPtr)instanceVa, buf, len, out read);
             if (read < 0) read = 0;
             // unified rendering: same engine-side type label + value formatter the Locals panel uses
-            string tn = ClarionTypeLabel(typeCode, 0, size, 0);
-            string value = FormatValueAt(typeCode, 0, size, 0, instanceVa);
+            string tn = ClarionTypeLabel(typeCode, target, size, places);
+            string value = FormatValueAt(typeCode, target, size, places, instanceVa);
             if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, value, buf, read));
+                Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, IsEditableCode(typeCode)));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}");
             for (int row = 0; row < read; row += 16)
             {
