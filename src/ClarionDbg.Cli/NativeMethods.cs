@@ -111,5 +111,11 @@ namespace ClarionDbg.Cli
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr hObject);
+
+        // Resolve a thread's TEB base (ThreadBasicInformation = 0). Returns NTSTATUS (0 = success);
+        // the TEB pointer is at offset +4 of the 28-byte THREAD_BASIC_INFORMATION on 32-bit. Used by
+        // Library State's read-only RTL emulator to read the stopped thread's TLS slots.
+        [DllImport("ntdll.dll")]
+        public static extern int NtQueryInformationThread(IntPtr hThread, int infoClass, byte[] info, int infoLength, out int returnLength);
     }
 }

@@ -115,6 +115,10 @@
   .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
   .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
   .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
+  .lib-grp { color:var(--fg-dim); font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding:5px 10px 2px; border-top:1px solid #ffffff0f; }
+  .lib-grp:first-child { border-top:0; }
+  #libBody .row { display:flex; justify-content:space-between; padding:1px 10px; }
+  #libBody .vname { color:var(--fg); } #libBody .vval { max-width:60%; }
   .vval.editable { cursor:text; border-radius:3px; }
   .paused .vval.editable:hover { background:#ffffff14; outline:1px dotted #ffffff33; }
   .vedit { font:inherit; color:var(--fg); background:var(--titlebar); border:1px solid var(--blue); border-radius:3px; padding:0 3px; min-width:70px; max-width:170px; }
@@ -314,6 +318,10 @@
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Registers<span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body regs mono" id="regs"><div class="empty">Registers appear when paused.</div></div>
       </details>
+      <details class="section" data-sec="libstate">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Library State <span class="hint">per-thread RTL state</span><span class="sec-refresh" id="libRefresh" title="Refresh Library State">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <div class="body mono" id="libBody"><div class="empty">Expand while paused to read the thread's RTL state.</div></div>
+      </details>
     </div>
 
     <div class="splitter" id="splitter"></div>
@@ -469,11 +477,11 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers'];
+  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers','libstate'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
-  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', source:'Source', console:'Debug Console'};
-  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true}; // only collapsible (<details>) panels; matches markup
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', libstate:'Library State', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true, libstate:true}; // only collapsible (<details>) panels; matches markup
   let layoutLoaded=false, dragSec=null;
 
   function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
@@ -945,6 +953,29 @@
     send('framelocals', id+'|'+f.va+'|'+f.ebp);
   }
 
+  // ---- Library State (per-thread RTL state via ClaRUN getter func-evals) ----
+  // Reading runs target code (each getter is called on the paused thread), so we ONLY fetch while the
+  // panel is open (and paused): on pause if open, on expand-while-paused, and on the ↻ button. Values go
+  // stale on resume (cleared), since they reflect the moment they were read.
+  let _libReq=0, lastLibState=null, lastLibError=null;
+  function libIsOpen(){ const el=secEl('libstate'); return !!(el && el.open && !isHidden(el)); }
+  function refreshLibState(){ if(isPaused && libIsOpen()) send('libstate', String(++_libReq)); }
+  function renderLibState(){
+    const box=$('libBody'); if(!box) return;
+    if(lastLibError){ box.innerHTML='<div class="empty">'+esc(lastLibError)+'</div>'; return; }
+    if(!lastLibState){ box.innerHTML='<div class="empty">'+(isPaused?'Reading…':'Pause to read the thread’s RTL state.')+'</div>'; return; }
+    if(!lastLibState.length){ box.innerHTML='<div class="empty">No Library State.</div>'; return; }
+    box.innerHTML=''; let grp=null;
+    lastLibState.forEach(r=>{
+      if(r.group!==grp){ grp=r.group; const h=document.createElement('div'); h.className='lib-grp'; h.textContent=grp; box.appendChild(h); }
+      const d=document.createElement('div'); d.className='row';
+      const val=(r.kind==='str') ? "'"+(r.value||'')+"'" : (r.value||'0');
+      d.innerHTML='<span class="vname">'+esc(r.name)+'</span><span class="vval'+(r.kind==='str'?'':' num')+'">'+esc(val)+'</span>';
+      box.appendChild(d);
+    });
+  }
+  function onLibState(reqId, error, items){ lastLibError=error||null; lastLibState=error?null:(items||[]); renderLibState(); }
+
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
   // Raw data kept so the sort toggle can re-render without re-fetching.
   let lastModule='', lastModuleItems=null, lastSymbols=null;
@@ -1173,6 +1204,9 @@
   })();
   (function(){ const f=$('procFilter'); if(f) f.addEventListener('input',()=>filterProcs(f.value));
     const rb=$('procRefresh'); if(rb) rb.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); send('proclist'); }); })();
+  // Library State: ↻ forces a re-read; expanding the panel while paused fetches on demand.
+  (function(){ const lr=$('libRefresh'); if(lr) lr.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); refreshLibState(); });
+    const lp=secEl('libstate'); if(lp) lp.addEventListener('toggle',()=>refreshLibState()); })();
 
   // ---- registers ----
   function buildRegs(regs){
@@ -1282,11 +1316,12 @@
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
-        buildRegs(m.regs); setPaused(true); break;
-      case 'resumed': setPaused(false); break;
+        buildRegs(m.regs); setPaused(true); refreshLibState(); break;
+      case 'resumed': setPaused(false); lastLibState=null; lastLibError=null; renderLibState(); break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'stack': buildStack(m.frames||[]); break;
       case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
+      case 'libstate': onLibState(m.reqId, m.error, m.items||[]); break;
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope}); break;
@@ -1296,7 +1331,7 @@
       case 'regs': buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;
-      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); break;
+      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); lastLibState=null; lastLibError=null; renderLibState(); break;
     }
   }
   function collectSyms(symbols){ const out=[]; (symbols||[]).forEach(s=>{ out.push({name:s.name,type:s.typeName}); (s.fields||[]).forEach(f=>out.push({name:f.name,type:f.typeName})); }); return out; }

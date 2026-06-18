@@ -69,6 +69,7 @@ namespace ClarionDebugger.Terminal
             _svc.ModuleDataReceived    += OnSvcModuleData;
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
+            _svc.LibStateReceived      += OnSvcLibState;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
@@ -103,6 +104,7 @@ namespace ClarionDebugger.Terminal
             _svc.ModuleDataReceived     -= OnSvcModuleData;
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
+            _svc.LibStateReceived       -= OnSvcLibState;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
@@ -145,6 +147,8 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcFrameLocals(string reqId, string itemsJson) => UI(() =>
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
+        private void OnSvcLibState(string reqId, string error, string itemsJson) => UI(() =>
+            Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
         {
@@ -370,6 +374,10 @@ namespace ClarionDebugger.Terminal
                             if (a.Length == 3 && int.TryParse(a[0], out int rq))
                                 _svc.RequestFrameLocals(rq, a[1], a[2]);
                         }
+                        break;
+                    case "libstate":   // per-thread Library State refresh: data = reqId
+                        if (_svc.State == DebugSessionState.Paused && int.TryParse(data, out int lrq))
+                            _svc.RequestLibState(lrq);
                         break;
                     case "editvar": EditVar(data); break;
                     case "jump": Jump(data); break;

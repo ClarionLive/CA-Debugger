@@ -21,6 +21,7 @@ namespace ClarionDbg.Cli
                     case "runs": return Runs(args);
                     case "lines": return Lines(args);
                     case "symbols": return Symbols(args);
+                    case "exports": return Exports(args);
                     case "globals": return Globals(args);
                     case "locals": return Locals(args);
                     case "break": return Break(args);
@@ -365,6 +366,23 @@ namespace ClarionDbg.Cli
                 else if (mt != null && mt.Kind == TypeKind.Array && mt.ElemType != null && mt.ElemType.Kind == TypeKind.Group)
                     DumpTypeMembers(mt.ElemType, indent + 4);
             }
+        }
+
+        /// <summary>exports &lt;pe&gt; [--name SUBSTR] — list a PE's named exports + RVA (and whether each lands
+        /// in .text, i.e. is callable code). Used to confirm RTL getters (Cla$ERRORCODE, …) resolve in
+        /// ClaRUN.dll for the Library-State func-eval panel.</summary>
+        private static int Exports(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var pe = PeImage.Load(args[1]);
+            var map = pe.BuildExportNameMap();
+            string sub = GetOpt(args, "--name");
+            var rows = map.Where(kv => sub == null || kv.Key.IndexOf(sub, StringComparison.OrdinalIgnoreCase) >= 0)
+                          .OrderBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+            Console.WriteLine($"{map.Count} named export(s) in {System.IO.Path.GetFileName(args[1])}; showing {rows.Count}:");
+            foreach (var kv in rows)
+                Console.WriteLine($"  {kv.Key,-28} RVA 0x{kv.Value:X6}  {(pe.RvaInText(kv.Value) ? "[.text/code]" : "[data]")}");
+            return rows.Count > 0 ? 0 : 3;
         }
 
         private static int Symbols(string[] args)

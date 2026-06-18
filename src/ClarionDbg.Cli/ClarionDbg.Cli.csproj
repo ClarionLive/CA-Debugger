@@ -8,6 +8,9 @@
     <RootNamespace>ClarionDbg.Cli</RootNamespace>
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
+    <!-- The RTL emulator (Library State) uses C# 8 switch expressions; net48 defaults to 7.3.
+         These are compile-time-only features, safe on the .NET Framework runtime. -->
+    <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>

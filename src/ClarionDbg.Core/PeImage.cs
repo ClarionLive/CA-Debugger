@@ -188,6 +188,58 @@ namespace ClarionDbg.Core
             return 0;
         }
 
+        // export directory (data directory index 0) — for resolving an export's RVA by name. At runtime
+        // the function's live VA is loadBase + RVA (used to func-eval RTL getters like Cla$ERRORCODE).
+        private Dictionary<string, uint> _exportRvas;   // export name -> RVA (lazy, cached)
+
+        /// <summary>Map every named export to its RVA (e.g. ClaRUN.dll's Cla$ERRORCODE -> 0xB074).
+        /// Forwarded exports (RVA inside the export directory) are skipped — they re-point to another
+        /// DLL and aren't directly callable here. Built once and cached.</summary>
+        public Dictionary<string, uint> BuildExportNameMap()
+        {
+            if (_exportRvas != null) return _exportRvas;
+            var map = new Dictionary<string, uint>(StringComparer.Ordinal);
+            try
+            {
+                int peOff = BitConverter.ToInt32(Bytes, 0x3C);
+                int optOff = peOff + 24;
+                uint expDirRva = BitConverter.ToUInt32(Bytes, optOff + 96 + 0 * 8);
+                uint expDirSize = BitConverter.ToUInt32(Bytes, optOff + 96 + 0 * 8 + 4);
+                long dirOff = expDirRva != 0 ? RvaToOffset(expDirRva) : -1;
+                if (dirOff >= 0)
+                {
+                    int eo = (int)dirOff;
+                    uint nNames = BitConverter.ToUInt32(Bytes, eo + 24);
+                    long funcsOff = RvaToOffset(BitConverter.ToUInt32(Bytes, eo + 28));
+                    long namesOff = RvaToOffset(BitConverter.ToUInt32(Bytes, eo + 32));
+                    long ordsOff = RvaToOffset(BitConverter.ToUInt32(Bytes, eo + 36));
+                    if (funcsOff >= 0 && namesOff >= 0 && ordsOff >= 0)
+                        for (uint i = 0; i < nNames; i++)
+                        {
+                            uint nameRva = BitConverter.ToUInt32(Bytes, (int)namesOff + (int)i * 4);
+                            long nameOff = RvaToOffset(nameRva);
+                            if (nameOff < 0) continue;
+                            ushort ord = BitConverter.ToUInt16(Bytes, (int)ordsOff + (int)i * 2);
+                            uint funcRva = BitConverter.ToUInt32(Bytes, (int)funcsOff + ord * 4);
+                            // forwarded export (RVA lands inside the export dir) — not a local code address
+                            if (funcRva >= expDirRva && funcRva < expDirRva + expDirSize) continue;
+                            string nm = ReadAsciiZ((int)nameOff);
+                            if (!string.IsNullOrEmpty(nm)) map[nm] = funcRva;
+                        }
+                }
+            }
+            catch { }
+            _exportRvas = map;
+            return map;
+        }
+
+        /// <summary>The RVA of a named export, or 0 if this image doesn't export it.</summary>
+        public uint FindExportRva(string name)
+        {
+            uint rva;
+            return BuildExportNameMap().TryGetValue(name, out rva) ? rva : 0;
+        }
+
         private string ReadAsciiZ(int off)
         {
             int end = off;

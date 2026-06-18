@@ -173,6 +173,7 @@ namespace ClarionDebugger.Services
         public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
+        public event Action<string, string, string> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON)
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
@@ -417,6 +418,11 @@ namespace ClarionDebugger.Services
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
+
+        /// <summary>Request the paused thread's RTL "Library State" (ERROR/EVENT/FIELD/…) — the engine
+        /// func-evals each ClaRUN getter on the paused thread. Result arrives via LibStateReceived keyed
+        /// by <paramref name="reqId"/>. Paused only.</summary>
+        public bool RequestLibState(int reqId) { return SendCommand("libstate " + reqId); }
 
         /// <summary>Lazily expand a reference node: ask the engine to deref <paramref name="addrHex"/> and render
         /// the referent type's members. Result arrives via ExpandedReceived keyed by <paramref name="reqId"/>.
@@ -726,6 +732,10 @@ namespace ClarionDebugger.Services
 
                 case "framelocals":
                     FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
+                    break;
+
+                case "libstate":
+                    LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"));
                     break;
 
                 case "watch":

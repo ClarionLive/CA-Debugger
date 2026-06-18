@@ -333,8 +333,8 @@ namespace ClarionDbg.Cli
                         }
                         else if (_evalActive && tid == _evalTid && exAddr == EVAL_TRAP_VA)
                         {
-                            // the hijacked THR$GetInstance call returned into our unmapped magic
-                            // address — EAX now holds the thread's live instance VA
+                            // a hijacked func-eval call (a `watch` of THREADed data) returned into our
+                            // unmapped magic address — collect its result and restore the pause state.
                             status = OnEvalComplete(tid);
                         }
                         else
@@ -459,7 +459,7 @@ namespace ClarionDbg.Cli
         /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
         /// services stdin commands until a resume-type command arrives.
         /// </summary>
-        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
+        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason, bool emitPaused = true)
         {
             _pauseRequested = false;  // any pause we reach consumes a pending pause request
             _instrStep = false;       // and consumes a pending instruction-step
@@ -476,10 +476,17 @@ namespace ClarionDbg.Cli
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
-            if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
-                    haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
+            // emitPaused is false when we re-enter the loop AFTER a transparent func-eval (a `watch` of
+            // THREADed data): the user is still stopped at the SAME place and the result already went out on
+            // its own event, so re-announcing a `paused` would feed any auto-refreshing panel an infinite
+            // refresh loop. Stay silent and just resume servicing commands.
+            if (emitPaused)
+            {
+                if (EmitJson)
+                    Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
+                        haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
+                Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
+            }
 
             while (true)
             {
@@ -578,6 +585,13 @@ namespace ClarionDbg.Cli
                         // handler re-enters it with the original context restored.
                         if (HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx))
                             return;
+                        break;
+
+                    case "libstate":
+                        // per-thread RTL "Library State" (ERROR/EVENT/FIELD/…). Read by EMULATING each
+                        // ClaRUN getter read-only — synchronous and safe at any stop, so it answers inline
+                        // (no thread hijack, no leaving the pause loop).
+                        HandleLibStateCommand(parts, tid, hThread);
                         break;
 
                     case "quit": case "q": case "kill":
