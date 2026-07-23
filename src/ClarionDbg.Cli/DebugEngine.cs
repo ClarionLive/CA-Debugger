@@ -72,6 +72,8 @@ namespace ClarionDbg.Cli
         public string Kind;        // procedure | method | routine | other, null when unknown
         public string Module;      // .clw name, null when unresolved
         public int Line;
+        public bool Uncertain;     // recovered by ScanStack's raw-memory heuristic, not the EBP chain —
+                                    // may be a stale leftover return address rather than a real caller
     }
 
     /// <summary>One logical user breakpoint: a module:line bound to its code RVAs in the owning image.</summary>
@@ -470,7 +472,7 @@ namespace ClarionDbg.Cli
             bool resolved = haveCtx && m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
             if (!resolved) { line = 0; mi = -1; recRva = 0; }
             string mod = resolved ? m.Dbg.ModuleNameForIdx(mi) : null;
-            string proc = haveCtx ? ProcNameAt(m, rva, resolved ? mi : -1) : null;
+            string proc = haveCtx ? ProcNameAt(m, rva) : null;
             uint gap = resolved ? rva - recRva : 0;
             // SPIKE: when stopped in non-TSWD code (the runtime), name the location from the live IAT
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
@@ -706,10 +708,17 @@ namespace ClarionDbg.Cli
             return c;
         }
 
+        /// <summary>uint VA -> IntPtr without .NET's checked long->int narrowing. On x86 builds, the
+        /// compiler-inserted uint->long widen followed by IntPtr's explicit operator(long) does a CHECKED
+        /// (int) cast internally — any VA >= 0x80000000 (large-address-aware targets routinely hand out
+        /// stack/heap addresses up there) throws OverflowException. ReadProcessMemory/WriteProcessMemory only
+        /// want the raw bit pattern, so reinterpreting unchecked is correct here.</summary>
+        private static IntPtr Ptr(uint va) => (IntPtr)unchecked((int)va);
+
         private void WriteU32(uint va, uint value)
         {
             int wrote;
-            Native.WriteProcessMemory(_hProcess, (IntPtr)va, BitConverter.GetBytes(value), 4, out wrote);
+            Native.WriteProcessMemory(_hProcess, Ptr(va), BitConverter.GetBytes(value), 4, out wrote);
         }
 
         /// <summary>mem 0xADDR LEN — read target memory while paused (for the watch pane).</summary>
@@ -732,7 +741,7 @@ namespace ClarionDbg.Cli
             }
             var buf = new byte[len];
             int read;
-            Native.ReadProcessMemory(_hProcess, (IntPtr)addr, buf, len, out read);
+            Native.ReadProcessMemory(_hProcess, Ptr(addr), buf, len, out read);
             if (read <= 0)
             {
                 EmitError($"mem: read failed at 0x{addr:X}");
@@ -794,20 +803,16 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
-        /// Demangled symbol (proc/method/routine) containing a code RVA, or null when unknown.
-        /// Cross-checks the symbol's module against the +0x1C moduleIdx when the caller has one:
-        /// code emitted BELOW a module's named entry (init/cold) would otherwise bind to the
-        /// previous module's last symbol — better to say "unknown" than name the wrong proc.
-        /// The cross-check only applies when the symbol's moduleIdx is a real module-name index;
-        /// on binaries where the symbol backref space diverges it is skipped (see
-        /// TswdDebugInfo.ModuleIdxComparable) so a valid symbol still names the frame.
+        /// Demangled symbol (proc/method/routine) containing a code RVA, or null when unknown. Uses
+        /// ResolveSymbolVerified — the plain binary search can mislabel cold/init "glue" code (no
+        /// symbol of its own) with an unrelated preceding symbol from a different compiland; verifying
+        /// against the +0x1C line table catches that without the unreliable +0x28 backref moduleIdx.
         /// </summary>
-        private string ProcNameAt(LoadedModule m, uint rva, int moduleIdx)
+        private string ProcNameAt(LoadedModule m, uint rva)
         {
             if (m == null || m.Dbg == null) return null;
             ProcSymbol sym;
-            if (!m.Dbg.ResolveSymbol(rva, out sym)) return null;
-            if (moduleIdx >= 0 && m.Dbg.ModuleIdxComparable(sym.ModuleIdx) && sym.ModuleIdx != moduleIdx) return null;
+            if (!m.Dbg.ResolveSymbolVerified(rva, out sym)) return null;
             return sym.Name;
         }
 
@@ -831,7 +836,7 @@ namespace ClarionDbg.Cli
         {
             var b = new byte[1];
             int read;
-            bool ok = Native.ReadProcessMemory(_hProcess, (IntPtr)va, b, 1, out read) && read == 1;
+            bool ok = Native.ReadProcessMemory(_hProcess, Ptr(va), b, 1, out read) && read == 1;
             value = ok ? b[0] : (byte)0;
             return ok;
         }
@@ -839,8 +844,8 @@ namespace ClarionDbg.Cli
         private void WriteByte(uint va, byte value)
         {
             int wrote;
-            Native.WriteProcessMemory(_hProcess, (IntPtr)va, new[] { value }, 1, out wrote);
-            Native.FlushInstructionCache(_hProcess, (IntPtr)va, (IntPtr)1);
+            Native.WriteProcessMemory(_hProcess, Ptr(va), new[] { value }, 1, out wrote);
+            Native.FlushInstructionCache(_hProcess, Ptr(va), (IntPtr)1);
         }
 
         /// <summary>Write a block of bytes to target memory (data writes — edit-variable-value). Returns
@@ -848,14 +853,14 @@ namespace ClarionDbg.Cli
         private bool WriteBlock(uint va, byte[] buf)
         {
             int wrote;
-            return Native.WriteProcessMemory(_hProcess, (IntPtr)va, buf, buf.Length, out wrote) && wrote == buf.Length;
+            return Native.WriteProcessMemory(_hProcess, Ptr(va), buf, buf.Length, out wrote) && wrote == buf.Length;
         }
 
         private uint ReadU32(uint va)
         {
             var b = new byte[4];
             int read;
-            if (!Native.ReadProcessMemory(_hProcess, (IntPtr)va, b, 4, out read) || read != 4) return 0;
+            if (!Native.ReadProcessMemory(_hProcess, Ptr(va), b, 4, out read) || read != 4) return 0;
             return BitConverter.ToUInt32(b, 0);
         }
 

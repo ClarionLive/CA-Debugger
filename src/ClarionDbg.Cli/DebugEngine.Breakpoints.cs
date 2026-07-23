@@ -323,7 +323,7 @@ namespace ClarionDbg.Cli
             int line = 0, moduleIdx = -1; uint recRva = 0;
             bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out moduleIdx, out recRva);
             string modName = resolved ? m.Dbg.ModuleNameForIdx(moduleIdx) : null;
-            string proc = ProcNameAt(m, rva, resolved ? moduleIdx : -1);
+            string proc = ProcNameAt(m, rva);
             uint gap = resolved ? rva - recRva : 0;
             if (resolved)
             {

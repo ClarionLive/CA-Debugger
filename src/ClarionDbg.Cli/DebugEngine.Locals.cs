@@ -9,52 +9,95 @@ namespace ClarionDbg.Cli
     {
         // ------------------------------------------------------------------ locals (Variables panel)
 
+        // Clarion STRING/CSTRING content is Windows ANSI (cp1252), not 7-bit ASCII — Encoding.ASCII.GetString
+        // replaces every byte >= 0x80 with a literal '?', which silently destroys real (or garbage-tail)
+        // high-byte content and is indistinguishable from an actual '?' character in the source data. cp1252
+        // maps every byte to SOME visible glyph, so what's on screen matches what's really in memory — still
+        // not byte-exact proof for binary content (that needs a raw export), but no longer lossy for display.
+        private static readonly Encoding Cp1252 = Encoding.GetEncoding(1252);
+
         /// <summary>Build the JSON rows for one frame's locals — its proc's entry RVA keys the local set,
         /// each value read live at [frameEbp + frameOffset]. Direct GROUP locals expand inline to nested member
         /// rows; reference locals (incl. by-ref GROUP/QUEUE) are lazy (expanded on demand). Shared by the
         /// method and host-procedure groups. <paramref name="module"/> tags ref rows so the host can request
         /// expansion against the right image's TSWD.</summary>
-        private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
-        {
-            var rows = new List<string>();
-            List<LocalSym> locals;
-            if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
-                foreach (var l in locals)
-                {
-                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
-                }
-            return rows;
-        }
+///        private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
+///        {
+///            var rows = new List<string>();
+///            List<LocalSym> locals;
+///            if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
+///                foreach (var l in locals)
+///                {
+///                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+///                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
+///                }
+///            return rows;
+///        }
+
+
+		private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp, bool suppressSelf)
+		{
+			var rows = new List<string>();
+			List<LocalSym> locals;
+			if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
+				foreach (var l in locals)
+				{
+					if (suppressSelf
+						&& string.Equals(l.Name, "SELF", StringComparison.OrdinalIgnoreCase)
+						&& l.TypeCode == 0x16)
+						continue;
+					uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+					rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places,
+									  slotVa, l.FrameOff, m.Name));
+				}
+			return rows;
+		}
+
+
+
+
 
         /// <summary>framelocals reqId va ebp — the locals of ONE call-stack frame (the Call-Stack-driven
         /// Variables model). Reads the frame's symbol locals at the supplied EBP. A ROUTINE has no frame of
         /// its own (it runs on its procedure's frame via DO), so a routine frame surfaces its enclosing
         /// procedure's locals read at the same EBP; a METHOD's enclosing procedure is a SEPARATE stack frame,
         /// so methods show only their own. Emits a `framelocals` event keyed by reqId. Read-only.</summary>
-        private void HandleFrameLocalsCommand(string[] parts)
-        {
-            if (parts.Length < 4) { EmitError("framelocals expects: framelocals reqId va ebp"); return; }
-            string reqId = parts[1];
-            uint va = ParseHexU(parts[2]);
-            uint ebp = ParseHexU(parts[3]);
-            var rows = new List<string>();
-            var m = ModuleAt(va);
-            ProcSymbol sym;
-            if (m != null && m.Dbg != null && ebp != 0 && m.Dbg.ResolveSymbol(va - m.LoadBase, out sym))
-            {
-                uint entry = sym.EntryRva;
-                if (sym.Kind == SymbolKind.Routine)
-                {
-                    uint pe = EnclosingProcedureEntry(m, va - m.LoadBase);
-                    if (pe != 0) entry = pe;
-                }
-                rows = LocalRowsFor(m, entry, ebp);
-            }
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
-                    + ",\"items\":[" + string.Join(",", rows) + "]}");
-        }
+		private void HandleFrameLocalsCommand(string[] parts)
+		{
+			if (parts.Length < 4) { EmitError("framelocals expects: framelocals reqId va ebp"); return; }
+			string reqId = parts[1];
+			uint va = ParseHexU(parts[2]);
+			uint ebp = ParseHexU(parts[3]);
+			var rows = new List<string>();
+			var m = ModuleAt(va);
+			ProcSymbol sym;
+			if (m != null && m.Dbg != null && ebp != 0 && m.Dbg.ResolveSymbolVerified(va - m.LoadBase, out sym))
+			{
+				uint entry = sym.EntryRva;
+				if (sym.Kind == SymbolKind.Routine)
+				{
+					uint pe = EnclosingProcedureEntry(m, va - m.LoadBase);
+					if (pe != 0) entry = pe;
+				}
+
+				uint queryRva = va - m.LoadBase;
+				uint nextEntry = m.Dbg.NextSymbolEntryRva(sym.EntryRva);
+				bool inGap = sym.Kind == SymbolKind.Method
+							 && nextEntry != 0
+							 && queryRva >= nextEntry;
+				Console.WriteLine("@JSON {\"event\":\"console\",\"level\":\"warn\",\"text\":\"GAP CHECK:"
+					+ " sym=" + sym.Name
+					+ " kind=" + sym.Kind
+					+ " entryRva=0x" + sym.EntryRva.ToString("X")
+					+ " nextEntry=0x" + nextEntry.ToString("X")
+					+ " queryRva=0x" + queryRva.ToString("X")
+					+ " inGap=" + inGap + "\"}");
+				rows = LocalRowsFor(m, entry, ebp, inGap);
+			}
+			if (EmitJson)
+				Console.WriteLine("@JSON {\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
+					+ ",\"items\":[" + string.Join(",", rows) + "]}");
+		}
 
         /// <summary>The entry RVA of the procedure that lexically contains <paramref name="rva"/> — the
         /// greatest Procedure-kind symbol entry at or below it. Used to map a routine frame to its host
@@ -84,7 +127,7 @@ namespace ClarionDbg.Cli
             var m = ModuleAt(ctx.Eip);
             if (m == null || m.Dbg == null) return false;
             ProcSymbol sym;
-            if (!m.Dbg.ResolveSymbol(ctx.Eip - m.LoadBase, out sym)) return false;
+            if (!m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym)) return false;
             uint entry = sym.EntryRva;
             if (sym.Kind == SymbolKind.Routine)
             {
@@ -158,18 +201,19 @@ namespace ClarionDbg.Cli
             if (byRef && g != null)
             {
                 // by-ref group/queue/class: the slot holds a pointer. Mirror the old Clarion debugger —
-                // show the POINTER (no "&GROUP" type noise) and nest one "RECORD" deref node that expands
-                // lazily to the members (pointer -> "RECORD" -> fields). Avoids blindly chasing pointers.
+                // show the POINTER (no "&GROUP" type noise) — and make the row ITSELF the lazy deref node
+                // (ref:true + addr/module/typeRef), so expanding it goes straight to the members. No nested
+                // "RECORD" hop in between: that was an extra, unnecessary click to get from the variable to
+                // its own content. Still avoids blindly chasing pointers — expansion only happens on click.
                 uint ptr = ReadU32(va);
                 sb.Append(",\"type\":\"\"");
                 if (ptr == 0)
                     sb.Append(",\"value\":").Append(Json.Str("(null)"));
                 else
                     sb.Append(",\"value\":").Append(Json.Str("0x" + ptr.ToString("X")))
-                      .Append(",\"children\":[{\"name\":\"RECORD\",\"type\":\"\",\"value\":\"{…}\"")
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(ptr.ToString("X")).Append('"')
                       .Append(",\"module\":").Append(Json.Str(module))
-                      .Append(",\"typeRef\":").Append(g.TypeRef).Append("}]");
+                      .Append(",\"typeRef\":").Append(g.TypeRef);
             }
             else if (g != null)
             {
@@ -187,8 +231,10 @@ namespace ClarionDbg.Cli
             }
             else
             {
-                sb.Append(",\"type\":").Append(Json.Str(ClarionTypeLabel(code, target, size, places)));
-                sb.Append(",\"value\":").Append(Json.Str(FormatValueAt(code, target, size, places, va)));
+                string val = FormatValueAt(code, target, size, places, va);
+                bool isNullRef = code == 0x16 && val == "(null)";
+                sb.Append(",\"type\":").Append(Json.Str(ClarionTypeLabel(code, target, size, places, isNullRef)));
+                sb.Append(",\"value\":").Append(Json.Str(val));
                 // edit-variable-value: carry the live address + type so the UI can write the cell back.
                 // Only editable scalar codes get this; refs/groups/unknowns stay read-only (no metadata).
                 if (IsEditableCode(code))
@@ -207,6 +253,30 @@ namespace ClarionDbg.Cli
         private string GroupChildrenJson(ClarionType g, uint baseVa, string module)
         {
             if (g == null || g.Members == null) return "";
+
+            // A &STRING's own type record can never carry its current length — it's a dynamically-sized
+            // allocation, sized only at runtime, so there's nothing for the compiler to embed statically
+            // (confirmed against StringTheory's private `value` field: its type record's "count" is a
+            // FFFFFFFF/unknown sentinel, not a real length). StringTheory itself tracks the DATA length
+            // (how much of the allocated buffer is actually used — NOT the buffer's allocated capacity) in
+            // a sibling `_DATAEND` int, unique to this one class — verified byte-exact against Clarion's own
+            // native debugger (which showed the pointer's 16-byte content) by reading raw process memory:
+            // _DATAEND held exactly 16 at the offset immediately preceding a cached copy of the same pointer
+            // (VALUEPTR). Read it once per group so the `VALUE` member below can use it. `VALUE` itself is
+            // now resolved by ParseType's own name-recovery (see TswdDebugInfo.cs), not guessed here.
+            uint? dataEndLen = null;
+            foreach (var dm in g.Members)
+            {
+                if (!string.Equals(dm.Name, "_DATAEND", StringComparison.OrdinalIgnoreCase) || dm.Type == null) continue;
+                byte dc, dt; uint dsz; int dpl;
+                CodeForType(dm.Type, out dc, out dt, out dsz, out dpl);
+                if (dc != 0x11 && dc != 0x12) break;   // only trust a plain int/uint sibling
+                string dv = FormatValueAt(dc, dt, dsz, dpl, (uint)((long)baseVa + dm.Offset));
+                int parsed;
+                if (int.TryParse(dv, out parsed) && parsed > 0) dataEndLen = (uint)parsed;
+                break;
+            }
+
             var sb = new StringBuilder();
             bool first = true;
             foreach (var mb in g.Members)
@@ -214,9 +284,38 @@ namespace ClarionDbg.Cli
                 byte mc, mt; uint msz; int mpl;
                 CodeForType(mb.Type, out mc, out mt, out msz, out mpl);
                 uint mva = (uint)((long)baseVa + mb.Offset);
+                // Apply the sibling _DATAEND length ONLY to StringTheory's `value` — other &STRING members
+                // in the same group (e.g. LASTERROR) are separate, independently-allocated buffers and must
+                // keep their own best-effort bounded read.
+                if (mc == 0x16 && mt == 0x18 && msz == 0 && dataEndLen.HasValue
+                    && string.Equals(mb.Name, "VALUE", StringComparison.OrdinalIgnoreCase))
+                {
+                    msz = dataEndLen.Value;
+                }
+                else if (mc == 0x16 && mt == 0x18 && msz == 0)
+                {
+                    // Clarion's native NEW(STRING(n)) allocator (used for ANY plain &STRING, including both
+                    // StringTheory's `value` and its `LASTERROR`) leaves the ALLOCATED BUFFER SIZE in the 4
+                    // bytes immediately following the pointer's OWN slot in this struct — verified for
+                    // LASTERROR against Clarion's native debugger (`SELF.LastError &= NEW STRING(1)` in
+                    // Construct: held 1, content was one space). This is buffer CAPACITY, not necessarily
+                    // the true content length (only StringTheory's own `_DATAEND` tracks that, and only for
+                    // `value`) — it just gives the type label something better than "?" to show. The actual
+                    // on-screen text is capped hard at 32 bytes downstream regardless (FormatValueAt), so an
+                    // over-large capacity here only affects the label, never a garbage-inflated read.
+                    string peek = FormatValueAt(0x11, 0, 4, 0, mva + 4);
+                    int candidate;
+                    if (int.TryParse(peek, out candidate) && candidate > 0 && candidate <= 8192)
+                        msz = (uint)candidate;
+                }
                 if (!first) sb.Append(',');
                 first = false;
-                sb.Append(NodeJson(mb.Name ?? "?", mb.Type, mc, mt, msz, mpl, mva, null, module));
+                // A null name means the compiler itself emitted no name-pool reference for this member AND
+                // ParseType's own pool-based recovery (TswdDebugInfo.cs) couldn't resolve it either — a
+                // genuinely unrecoverable case. Falling back to a bare "?" would make every such member
+                // visually indistinguishable; tag it with its byte offset instead so it stays identifiable.
+                string mName = mb.Name ?? ("(unnamed+" + mb.Offset + ")");
+                sb.Append(NodeJson(mName, mb.Type, mc, mt, msz, mpl, mva, null, module));
             }
             return sb.ToString();
         }
@@ -293,16 +392,42 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Map a resolved member type to the flat (code,target,size,places) the value renderer takes.
-        /// Reference/class-ref tags (0x16/0x26/0x29) render as a pointer; the rest defer to RenderHint.</summary>
+        /// Reference/class-ref tags (0x16/0x26/0x29) render as a pointer, UNLESS the referent is a GROUP (lazy
+        /// expand, target=0x08) or a STRING/CHAR (dereference inline, target=0x18 + the referent's own length —
+        /// mirrors what ReadLocals() already does for a top-level `&STRING` local; without this a by-ref STRING
+        /// group member, e.g. StringTheory's LASTERROR, rendered as a bare pointer instead of its text). Anything
+        /// else defers to RenderHint.</summary>
         private static void CodeForType(ClarionType t, out byte code, out byte target, out uint size, out int places)
         {
             code = 0; target = 0; size = 0; places = 0;
             if (t == null) return;
             if (t.Kind == TypeKind.Reference || t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29)
             {
-                // a reference: pointer leaf, unless it targets a group (then NodeJson makes it lazily expandable)
+                // a reference: pointer leaf, unless it targets a group (lazily expandable) or a string (deref inline)
                 code = 0x16; size = 4;
-                target = (t.Referent != null && t.Referent.Kind == TypeKind.Group) ? (byte)0x08 : (byte)0;
+                if (t.Referent != null && t.Referent.Kind == TypeKind.Group)
+                {
+                    target = 0x08;
+                }
+                else if (t.Referent != null && (t.Referent.Kind == TypeKind.String || t.Referent.Kind == TypeKind.Char))
+                {
+                    target = 0x18;
+                    byte rc; int rp;
+                    t.Referent.RenderHint(out rc, out size, out rp);   // size := the referent STRING's own char count
+                }
+                else if (t.Referent != null && (t.Referent.Tag == 0x29 || t.Referent.Tag == 0x26))
+                {
+                    // ParseType doesn't decode a 0x29/0x26 type record yet (Kind comes back Unknown, size 0) —
+                    // but every observed 0x29/0x26 referent is a class string-property (e.g. StringTheory's
+                    // LASTERROR, ABC control NAME/MENUTEXT/BASENAME). Treat it as string-like and dereference;
+                    // FormatValueAt already falls back to a bounded 256-byte read when size<=0, same as any
+                    // other &STRING of unknown length, so this is a safe best-effort rather than a guess.
+                    // IMPORTANT: reset size to 0 here — it's still 4 from the pointer-slot default above, and
+                    // FormatValueAt's fallback only kicks in when size is NOT a positive number (it otherwise
+                    // reads exactly `size` bytes, which would silently truncate the dereferenced text to 4).
+                    target = 0x18;
+                    size = 0;
+                }
                 return;
             }
             t.RenderHint(out code, out size, out places);
@@ -320,7 +445,7 @@ namespace ClarionDbg.Cli
             {
                 var m = ModuleAt(ctx.Eip);
                 ProcSymbol sym;
-                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbol(ctx.Eip - m.LoadBase, out sym))
+                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym))
                 {
                     int mi = sym.ModuleIdx;
                     module = m.Dbg.ModuleNameForIdx(mi);
@@ -346,7 +471,7 @@ namespace ClarionDbg.Cli
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by
         /// the Locals panel and watch/globals so every scope labels a type the same way.</summary>
-        internal static string ClarionTypeLabel(byte code, byte target, uint size, int places)
+        internal static string ClarionTypeLabel(byte code, byte target, uint size, int places, bool isNullRef = false)
         {
             switch (code)
             {
@@ -357,8 +482,14 @@ namespace ClarionDbg.Cli
                 case 0x23: return "DECIMAL(" + DecimalDigits(size) + "," + places + ")";
                 case 0x24: return "PDECIMAL(" + DecimalDigits(size) + "," + places + ")";
                 case 0x16:
-                    // a by-ref STRING is, to the user, just a STRING(N) — the pointer is an ABI detail
-                    if (target == 0x18) return "STRING(" + size + ")";
+                    // "&" for consistency with &GROUP/&CLASS/&REF below, and because it matters here: N is
+                    // a best-effort capacity hint (StringTheory's _DATAEND, a peek at Clarion's native
+                    // NEW(STRING) buffer-size trailer, or unknown), never a compile-time-exact size the way
+                    // a plain inline STRING(N) local's is — and the on-screen value is always capped at 32
+                    // bytes regardless. The & signals "this is a live guess", not "this is the whole string".
+                    // A NULL reference has no capacity to guess at all — the "(?)" caveat only applies when
+                    // there IS a live string whose length we can't pin down, so a null ref just reads "&STRING".
+                    if (target == 0x18) return isNullRef ? "&STRING" : size > 0 ? "&STRING(" + size + ")" : "&STRING(?)";
                     return target == 0x08 ? "&GROUP" : target == 0x05 ? "&CLASS" : "&REF";
                 case 0x04: return "GROUP";   // class-instance-by-value (e.g. ToolbarClass) — a direct 0x08 group
                 case 0x08: return "GROUP";
@@ -406,7 +537,7 @@ namespace ClarionDbg.Cli
                 {
                     int n = Array.IndexOf(buf, (byte)0, 0, got);
                     if (n < 0) n = got;
-                    return "'" + Encoding.ASCII.GetString(buf, 0, n).TrimEnd(' ') + "'";
+                    return "'" + Cp1252.GetString(buf, 0, n).TrimEnd(' ') + "'";
                 }
                 case 0x23: return FormatBcd(buf, got, places, packed: false);  // DECIMAL (sign-first)
                 case 0x24: return FormatBcd(buf, got, places, packed: true);   // PDECIMAL (sign-last)
@@ -414,15 +545,25 @@ namespace ClarionDbg.Cli
                 {
                     uint ptr = BitConverter.ToUInt32(buf, 0);
                     if (ptr == 0) return "(null)";
-                    if (target == 0x18)   // &STRING — deref and show the fixed N-char buffer (space-padded)
+                    if (target == 0x18)   // &STRING — deref and show a bounded preview (space-padded)
                     {
-                        int sn = size > 0 && size <= 4096 ? (int)size : 256;
+                        // A dynamically-allocated &STRING has no reliable length signal: whatever "size"
+                        // we were given (StringTheory's own _DATAEND data-length property, or a best-effort
+                        // peek at Clarion's native NEW(STRING) buffer-size trailer for a plain &STRING) is at
+                        // best the ALLOCATED capacity, not necessarily the true content length — and there
+                        // is no NUL/length marker inside a Clarion STRING to fall back on either. So always
+                        // cap the on-screen preview at a small, fixed size regardless of source — garbage
+                        // tail included is fine here; byte-exact inspection of the full buffer belongs in a
+                        // raw memory/export view, not this text preview. The type label upstream (which
+                        // still uses the untruncated `size`) tells the user there may be more to see.
+                        const int previewCap = 32;
+                        int sn = size > 0 ? (int)Math.Min(size, previewCap) : previewCap;
                         var sbuf = new byte[sn];
                         int sg = ReadBlock(ptr, sbuf);
                         if (sg <= 0) return "&0x" + ptr.ToString("X") + " <unreadable>";
                         int nz = Array.IndexOf(sbuf, (byte)0, 0, sg);   // CSTRING terminator, if any
                         if (nz < 0) nz = sg;
-                        return "'" + Encoding.ASCII.GetString(sbuf, 0, nz).TrimEnd(' ') + "'";
+                        return "'" + Cp1252.GetString(sbuf, 0, nz).TrimEnd(' ') + "'";
                     }
                     return "&0x" + ptr.ToString("X");
                 }

@@ -12,6 +12,7 @@ namespace ClarionDbg.Core
         public LineRec(int line, uint rva) { Line = line; Rva = rva; }
     }
 
+
     /// <summary>
     /// One record of the TOC +0x1C address table — the CLEAN line table: 8-byte
     /// {u32 codeRVA, u16 line, u16 moduleIdx}, strictly RVA-ascending with NO line resets.
@@ -608,7 +609,14 @@ namespace ClarionDbg.Core
             for (int o = OffSymbolNameArray; o <= end; o++)
             {
                 uint nameRef = U32(o);
-                if (nameRef < 1 || nameRef >= (uint)poolLen) continue;
+                // nameRef 0 is VALID — the pool's first string sits at offset 0, and on PROGRAM images
+                // that first string is `_main` itself (its definition record was silently dropped by a
+                // `nameRef < 1` guard here, leaving _main's whole body a symbol-less hole that stack
+                // frames then mis-bound to the previous module's last method). Zero dwords are common
+                // scan noise, but the remaining filters (entryRva in .text/.data + exact backref match
+                // + pool-string validation) are selective enough: verified live on ML_ScanArc.exe, ONE
+                // window in the whole blob passed them all — the real _main definition.
+                if (nameRef >= (uint)poolLen) continue;
                 uint rva = U32(o + 4);
                 bool inText = rva >= _textLo && rva < _textHi;
                 bool inData = !inText && rva >= 0x1000 && rva < _imageHi;
@@ -635,6 +643,191 @@ namespace ClarionDbg.Core
             Symbols.Sort((a, b) => a.EntryRva.CompareTo(b.EntryRva));
             DataSymbols.Sort((a, b) => a.Rva.CompareTo(b.Rva));
             BuildDataNameIndex();
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): re-run BuildSymbols' scan for any 12-byte window whose
+        /// entryRva field equals <paramref name="targetRva"/>, but report EVERY candidate found —
+        /// including ones the real scan would reject — and exactly which filter rejected it. For
+        /// investigating why a proc known (e.g. from a linker .MAP file) to exist at a given RVA is
+        /// missing from <see cref="Symbols"/>.</summary>
+        public void DumpCandidatesForRva(uint targetRva)
+        {
+            int poolLen = OffSymbolNameArray - OffSymbolPool;
+            var backrefs = new Dictionary<uint, int>();
+            int nBack = ModuleCountField;
+            for (int i = 0; i < nBack; i++)
+            {
+                int o = OffSymbolNameArray + i * 4;
+                if (_base + o + 4 > _b.Length) break;
+                uint v = U32(o);
+                if (!backrefs.ContainsKey(v)) backrefs[v] = i;
+            }
+
+            int end = _b.Length - _base - 12;
+            int found = 0;
+            for (int o = OffSymbolNameArray; o <= end; o++)
+            {
+                uint rva = U32(o + 4);
+                if (rva != targetRva) continue;
+                found++;
+                uint nameRef = U32(o);
+                uint backref = U32(o + 8);
+                bool nameRefOk = nameRef >= 1 && nameRef < (uint)poolLen;
+                bool inText = rva >= _textLo && rva < _textHi;
+                bool inData = !inText && rva >= 0x1000 && rva < _imageHi;
+                bool backrefOk = backrefs.TryGetValue(backref, out int modIdx);
+                string name = nameRefOk ? SymbolNameAt((int)nameRef, poolLen) : null;
+                Console.WriteLine($"  candidate @0x{o:X}: nameRef={nameRef} (ok={nameRefOk}, name='{name}')"
+                    + $" entryRva=0x{rva:X} (inText={inText}, inData={inData})"
+                    + $" backref=0x{backref:X} (ok={backrefOk}, modIdx={(backrefOk ? modIdx.ToString() : "n/a")})");
+            }
+            if (found == 0)
+                Console.WriteLine($"  no 12-byte window with entryRva==0x{targetRva:X} found in [0x{OffSymbolNameArray:X}, blob end 0x{end:X}]");
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): the complement of <see cref="DumpCandidatesForRva"/> —
+        /// search by NAME. Finds every offset in the symbol pool holding <paramref name="name"/> as a
+        /// NUL-terminated string, then scans the blob for 12-byte windows whose nameRef field points at
+        /// any of those offsets, reporting each candidate and which BuildSymbols filter would reject it.
+        /// For investigating a symbol that exists in the pool but is missing from <see cref="Symbols"/>.</summary>
+        public void DumpCandidatesForName(string name)
+        {
+            int poolLen = OffSymbolNameArray - OffSymbolPool;
+            var offsets = new List<int>();
+            int i2 = 0;
+            while (i2 < poolLen)
+            {
+                int s = i2;
+                while (i2 < poolLen && _b[_base + OffSymbolPool + i2] != 0) i2++;
+                int len = i2 - s;
+                if (len == name.Length && Encoding.ASCII.GetString(_b, _base + OffSymbolPool + s, len) == name)
+                    offsets.Add(s);
+                i2++; // past the NUL
+            }
+            Console.WriteLine($"  '{name}' occurs at {offsets.Count} pool offset(s): "
+                + string.Join(", ", offsets.ConvertAll(o => "0x" + o.ToString("X"))));
+
+            var backrefs = new Dictionary<uint, int>();
+            for (int i = 0; i < ModuleCountField; i++)
+            {
+                int o = OffSymbolNameArray + i * 4;
+                if (_base + o + 4 > _b.Length) break;
+                uint v = U32(o);
+                if (!backrefs.ContainsKey(v)) backrefs[v] = i;
+            }
+
+            int end = _b.Length - _base - 12;
+            int found = 0;
+            foreach (int nameOff in offsets)
+                for (int o = OffSymbolNameArray; o <= end; o++)
+                {
+                    if (U32(o) != (uint)nameOff) continue;
+                    found++;
+                    uint rva = U32(o + 4);
+                    uint backref = U32(o + 8);
+                    bool inText = rva >= _textLo && rva < _textHi;
+                    bool inData = !inText && rva >= 0x1000 && rva < _imageHi;
+                    bool backrefOk = backrefs.TryGetValue(backref, out int modIdx);
+                    Console.WriteLine($"  candidate @0x{o:X}: nameRef=0x{nameOff:X}"
+                        + $" entryRva=0x{rva:X} (inText={inText}, inData={inData})"
+                        + $" backref=0x{backref:X} (ok={backrefOk}, modIdx={(backrefOk ? modIdx.ToString() : "n/a")})");
+                }
+            if (found == 0)
+                Console.WriteLine($"  no 12-byte window referencing any of those pool offsets found");
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): dump the raw member-record bytes of a GROUP type (by typeRef),
+        /// bypassing ParseType's name validation — for investigating why a member's name fails to resolve
+        /// (e.g. a NAME('x | y')-decorated field) by inspecting the exact bytes at and around its record.</summary>
+        public void DumpGroupMembersRaw(uint typeRef)
+        {
+            if (!ValidRef(typeRef)) { Console.WriteLine($"  typeRef 0x{typeRef:X} is out of range"); return; }
+            int o = OffTable2C + (int)typeRef;
+            byte tag = SB(o);
+            if (tag == 0x16)   // reference — follow one hop to the referent, same as GroupTypeOf()
+            {
+                uint inner = SU32(o + 1);
+                Console.WriteLine($"  typeRef 0x{typeRef:X} is a REFERENCE -> following to 0x{inner:X}");
+                typeRef = inner;
+                if (!ValidRef(typeRef)) { Console.WriteLine($"  typeRef 0x{typeRef:X} is out of range"); return; }
+                o = OffTable2C + (int)typeRef;
+                tag = SB(o);
+            }
+            if (tag != 0x08) { Console.WriteLine($"  typeRef 0x{typeRef:X} is not a GROUP (tag=0x{tag:X2})"); return; }
+            uint size = SU32(o + 1);
+            uint count = SU32(o + 5);
+            int poolLen = OffSymbolNameArray - OffSymbolPool;
+            Console.WriteLine($"  GROUP @typeRef=0x{typeRef:X}: size={size} count={count} poolLen={poolLen}");
+            int max = (int)Math.Min(count, 1024u);
+            for (int i = 0; i < max; i++)
+            {
+                uint mref = SU32(o + 9 + 4 * i);
+                bool valid = ValidRef(mref);
+                if (!valid) { Console.WriteLine($"  [{i}] mref=0x{mref:X} INVALID"); continue; }
+                int mb = OffTable2C + (int)mref;
+                byte mtag = SB(mb);
+                uint mType = SU32(mb + 1);
+                uint mNameRef = SU32(mb + 5);
+                int mOff = SI32(mb + 9);
+                string name = mNameRef >= 1 && poolLen > 0 && mNameRef < (uint)poolLen
+                    ? SymbolNameAt((int)mNameRef, poolLen) : null;
+                var hex = new StringBuilder();
+                for (int k = -2; k < 24; k++)
+                {
+                    int idx = _base + mb + k;
+                    hex.Append(idx >= 0 && idx < _b.Length ? _b[idx].ToString("X2") : "??").Append(' ');
+                }
+                Console.WriteLine($"  [{i}] mref=0x{mref:X} mb=0x{mb:X} tag=0x{mtag:X2} mType=0x{mType:X}"
+                    + $" mNameRef=0x{mNameRef:X} mOff={mOff} name='{name ?? "(null)"}'  bytes[-2..23]: {hex}");
+            }
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): scan the ENTIRE tag-0x04/0x0C member-record space [OffTable2C,
+        /// OffTable34) for records the compiler left with mNameRef==0 — to find out whether StringTheory's
+        /// `value` is a one-off or part of a broader pattern. A raw byte-position scan (same style as
+        /// ReadLocals' local-record scan), so it can produce false positives on data that merely LOOKS like a
+        /// record; kept honest by requiring a plausible member shape (valid mType typeRef, small non-negative
+        /// mOff) before counting a hit. Reports each hit's offset/type/size plus whatever
+        /// SymbolNameEndingBefore (anchored on the CLOSEST following valid-looking name reference within the
+        /// same run of records) would recover, so we can see how many are fixed by that heuristic already.</summary>
+        public void ScanForMissingMemberNames()
+        {
+            int poolLen = OffSymbolNameArray - OffSymbolPool;
+            int end = OffTable34;
+            if (_base + end > _b.Length) end = _b.Length - _base;
+            int total = 0, recovered = 0;
+            for (int p = OffTable2C; p >= 0 && p + 13 <= end; p++)
+            {
+                byte tag = _b[_base + p];
+                if (tag != 0x04 && tag != 0x0C) continue;
+                uint mType = SU32(p + 1);
+                uint mNameRef = SU32(p + 5);
+                int mOff = SI32(p + 9);
+                if (mNameRef != 0) continue;                      // only interested in the broken case
+                if (!ValidRef(mType)) continue;                   // must point at a real type record
+                if (mOff < 0 || mOff > 8192) continue;             // implausible offset — likely a false-positive byte match
+                byte innerTag = SB(OffTable2C + (int)mType);
+                if (innerTag == 0x00) continue;                   // a genuine member's type is never tag 0
+
+                // best-effort recovery: scan forward a short distance for the nearest OTHER record with a
+                // valid, resolvable mNameRef, then read backward from it — same idea as the GROUP fix, just
+                // without a "same group" boundary (we don't know which group this record belongs to here).
+                string guess = null;
+                for (int q = p + 13; q < end && q < p + 4096; q++)
+                {
+                    byte qtag = _b[_base + q];
+                    if (qtag != 0x04 && qtag != 0x0C) continue;
+                    uint qNameRef = SU32(q + 5);
+                    if (qNameRef < 1 || qNameRef >= (uint)poolLen) continue;
+                    guess = SymbolNameEndingBefore((int)qNameRef, poolLen);
+                    break;
+                }
+                total++;
+                if (guess != null) recovered++;
+                Console.WriteLine($"  #{total} @0x{p:X} (tag=0x{tag:X2}) mType=0x{mType:X} (innerTag=0x{innerTag:X2}) mOff={mOff}"
+                    + $"  recoverable-guess='{guess ?? "(none)"}'");
+            }
+            Console.WriteLine($"\n  {total} record(s) with mNameRef==0 found; {recovered} had a plausible neighbor-recovered name.");
         }
 
         /// <summary>
@@ -821,6 +1014,13 @@ namespace ClarionDbg.Core
         // typeRef -> decoded type record (shared cache; also breaks reference cycles between records).
         private Dictionary<uint, ClarionType> _typeCache;
 
+        /// <summary>DIAGNOSTIC (temporary): one entry per DISTINCT group typeRef (thanks to _typeCache, each
+        /// group is only ever parsed once) that had at least one member with mNameRef==0 — recording whether
+        /// the smallest-anchor pool recovery filled it in. Populated as a side effect of ordinary ParseType
+        /// calls, so a broad, trustworthy survey just needs something to trigger resolution of every group
+        /// reachable from real code (e.g. ReadLocals(), which already resolves every local's aggregate type).</summary>
+        public readonly List<string> MissingMemberLog = new List<string>();
+
         /// <summary>
         /// Follow a record's <c>typeRef</c> (the u32 at tag+1 of a 0x04/0x0C record) to its separate TYPE
         /// record and decode the byte-exact aggregate layout: GROUP size/count/members, array/string
@@ -837,6 +1037,42 @@ namespace ClarionDbg.Core
         {
             if (_typeCache == null) _typeCache = new Dictionary<uint, ClarionType>();
             return ParseType(typeRef, 0);
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): dump the raw bytes of a type record starting at its tag byte —
+        /// for inspecting a tag ParseType doesn't decode yet (e.g. 0x29) to see whether it actually carries a
+        /// length field we're not reading.</summary>
+        public void DumpTypeRaw(uint typeRef, int count)
+        {
+            if (!ValidRef(typeRef)) { Console.WriteLine($"    typeRef 0x{typeRef:X} out of range"); return; }
+            int o = OffTable2C + (int)typeRef;
+            var hex = new StringBuilder();
+            for (int k = 0; k < count; k++)
+            {
+                int idx = _base + o + k;
+                hex.Append(idx >= 0 && idx < _b.Length ? _b[idx].ToString("X2") : "??").Append(' ');
+            }
+            Console.WriteLine($"    raw @typeRef=0x{typeRef:X}: {hex}");
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): print the resolved ClarionType chain for a typeRef (Tag/Kind/Size,
+        /// following .Referent one level at a time) — the exact same data CodeForType() consumes, to verify
+        /// whether a by-ref member's referent actually resolves to Kind==String/Char as expected.</summary>
+        /// <summary>DIAGNOSTIC (temporary): expose SymbolNameEndingBefore for direct testing against a known
+        /// pool-relative offset (e.g. another member's mNameRef).</summary>
+        public string TestSymbolNameEndingBefore(int relStart, int poolLen) => SymbolNameEndingBefore(relStart, poolLen);
+
+        public void DumpTypeChain(uint typeRef)
+        {
+            var t = ResolveType(typeRef);
+            int depth = 0;
+            while (t != null && depth < 8)
+            {
+                Console.WriteLine($"  depth={depth} typeRef=0x{t.TypeRef:X} tag=0x{t.Tag:X2} kind={t.Kind} size={t.Size} length={t.Length}");
+                if (t.Tag != 0x08) DumpTypeRaw(t.TypeRef, 32);   // raw bytes too, except for GROUP (already covered by typemembers)
+                t = t.Referent;
+                depth++;
+            }
         }
 
         // A ref is valid if OffTable2C + ref lands inside the record stream [OffTable2C, OffTable34).
@@ -872,6 +1108,7 @@ namespace ClarionDbg.Core
                     t.Members = new List<TypeMember>();
                     int poolLen = OffSymbolNameArray - OffSymbolPool;
                     int max = (int)Math.Min(count, 1024u);
+                    var rawNameRefs = new List<uint>(max);
                     for (int i = 0; i < max; i++)
                     {
                         uint mref = SU32(o + 9 + 4 * i);
@@ -885,6 +1122,62 @@ namespace ClarionDbg.Core
                         string mName = mNameRef >= 1 && poolLen > 0 && mNameRef < (uint)poolLen
                             ? SymbolNameAt((int)mNameRef, poolLen) : null;
                         t.Members.Add(new TypeMember { Name = mName, Offset = mOff, Type = ParseType(mType, depth + 1) });
+                        rawNameRefs.Add(mNameRef);   // kept parallel to t.Members for the recovery pass below
+                    }
+                    // The compiler can write mNameRef==0 for a member — confirmed byte-exact on StringTheory's
+                    // PRIVATE `value` field (StringTheory.inc:366): its record is byte-identical in shape to
+                    // its working neighbor `streamFileName`'s, except this one field. The STRING itself is
+                    // still written to the pool correctly (found via a plain linear scan) — only the pointer
+                    // TO it is missing. The pool packs many DIFFERENT classes'/contexts' identifiers together
+                    // (confirmed: StreamFileName's own neighbor chain in the pool runs ...VALUE, STREAMFILENAME,
+                    // LINES, LINE, EMPTY, QUOTED, _DATAEND, VALUEPTR... — "LINE"/"EMPTY"/"QUOTED" belong to some
+                    // OTHER, unrelated struct entirely), so trying every other member as a backward-scan anchor
+                    // is unsafe: `_DATAEND`'s own immediate predecessor is "QUOTED", not a StringTheory field at
+                    // all. The one anchor that IS trustworthy is the member with the SMALLEST known mNameRef
+                    // (i.e. earliest in the pool among this group's OWN members) — a missing member's true
+                    // position can only be even earlier than that, so it's the only gap where "whatever sits
+                    // immediately before" is still plausibly one of THIS class's own fields. Verified:
+                    // streamFileName's mNameRef (6) is the smallest of all 22 resolved ST members, and reading
+                    // backward from it gives exactly "VALUE" (6 bytes: V-A-L-U-E-NUL). Still reject a result
+                    // that duplicates an already-named member, in case even this anchor turns out to be wrong.
+                    //
+                    // ONLY for mNameRef exactly 0 — a DIFFERENT, out-of-range sentinel like 0xFFFFFFFF also
+                    // renders as an unnamed member but means something else entirely: confirmed on an
+                    // ML_RestErrorClass GROUP overlay, where TWO members legitimately share one offset (a
+                    // scalar view alongside the overlay's own container, e.g. `ErrorG`) and BOTH carry
+                    // mNameRef==0xFFFFFFFF — that's the compiler saying "no single field name applies here",
+                    // not "the name was lost". Recovering a name for those produced a false duplicate.
+                    for (int i = 0; i < t.Members.Count; i++)
+                    {
+                        if (t.Members[i].Name != null || rawNameRefs[i] != 0) continue;
+                        int offForLog = t.Members[i].Offset;
+                        int anchor = -1;
+                        for (int j = 0; j < t.Members.Count; j++)
+                        {
+                            if (j == i || rawNameRefs[j] < 1) continue;
+                            if (anchor < 0 || rawNameRefs[j] < rawNameRefs[anchor]) anchor = j;
+                        }
+                        string candidate = anchor >= 0 ? SymbolNameEndingBefore((int)rawNameRefs[anchor], poolLen) : null;
+                        // Reject anything that isn't a plausible Clarion FIELD identifier: '@'/'$' only ever
+                        // show up in the compiler's own mangled PROCEDURE/ROUTINE names (e.g. "NAME@F",
+                        // "R$NAME") — confirmed false-positive on "TEST_XCEEDZIPPING@F", a plain PROCEDURE
+                        // declared in ML2apiDev799_Functions with no relation to this group at all.
+                        if (candidate != null && (candidate.IndexOf('@') >= 0 || candidate.IndexOf('$') >= 0))
+                            candidate = null;
+                        bool isDuplicate = false;
+                        if (candidate != null)
+                            foreach (var other in t.Members)
+                                if (string.Equals(other.Name, candidate, StringComparison.OrdinalIgnoreCase)) { isDuplicate = true; break; }
+                        if (candidate != null && !isDuplicate)
+                        {
+                            t.Members[i].Name = candidate;
+                            MissingMemberLog.Add($"typeRef=0x{typeRef:X} offset=+{offForLog}: recovered '{candidate}'");
+                        }
+                        else
+                        {
+                            MissingMemberLog.Add($"typeRef=0x{typeRef:X} offset=+{offForLog}: UNRECOVERED"
+                                + (candidate != null ? $" (candidate '{candidate}' rejected as duplicate)" : ""));
+                        }
                     }
                     break;
                 }
@@ -1027,12 +1320,40 @@ namespace ClarionDbg.Core
         {
             int s = _base + OffSymbolPool + rel;
             if (s <= 0 || s >= _b.Length) return null;
-            if (_b[s - 1] != 0) return null;
+            // NUL-preceded guard proves rel points at a string START, not into one's tail — but the
+            // pool's FIRST string (rel 0, `_main` on PROGRAM images) has no preceding byte to test.
+            if (rel != 0 && _b[s - 1] != 0) return null;
             if (_b[s] < 0x21 || _b[s] >= 0x7F) return null;
             int e = s;
             while (e < _b.Length && _b[e] >= 0x20 && _b[e] < 0x7F) e++;
             if (e >= _b.Length || _b[e] != 0) return null;
             return Encoding.ASCII.GetString(_b, s, e - s);
+        }
+
+        /// <summary>The mirror of <see cref="SymbolNameAt"/>: recover the NUL-terminated string that ends
+        /// immediately before pool-relative offset <paramref name="relStart"/> (i.e. the string physically
+        /// preceding another, already-resolved one) — used when a member's own mNameRef is 0/missing but its
+        /// neighbor's resolves fine, so the missing name can be read straight out of the pool instead of
+        /// guessed. Strict: returns null unless byte relStart-1 is a genuine NUL and everything back to the
+        /// PRIOR NUL (or pool start) is printable — a malformed/absent predecessor yields null, never garbage.</summary>
+        private string SymbolNameEndingBefore(int relStart, int poolLen)
+        {
+            if (relStart <= 0 || relStart > poolLen) return null;
+            int nulPos = _base + OffSymbolPool + (relStart - 1);
+            if (nulPos < 0 || nulPos >= _b.Length || _b[nulPos] != 0) return null;
+            int e = relStart - 1;   // pool-relative, exclusive end (the NUL position)
+            int s = e;
+            while (s > 0)
+            {
+                int prev = _base + OffSymbolPool + (s - 1);
+                if (prev < 0 || prev >= _b.Length) return null;
+                byte c = _b[prev];
+                if (c == 0) break;                          // hit the PRIOR string's own terminator — done
+                if (c < 0x20 || c >= 0x7F) return null;      // not printable — this isn't a clean string, bail
+                s--;
+            }
+            if (s >= e) return null;
+            return Encoding.ASCII.GetString(_b, _base + OffSymbolPool + s, e - s);
         }
 
         /// <summary>
@@ -1079,9 +1400,12 @@ namespace ClarionDbg.Core
         /// Bind a code RVA to the symbol whose entry it falls under: the greatest EntryRva &lt;=
         /// the target (binary search over the sorted table). Because routines/methods are symbols
         /// too, this names stack frames at sub-procedure granularity. Returns false if no symbol
-        /// precedes the address. NOTE: a proc can emit code BELOW its named entry (init/cold), so
-        /// the floor of a module's +0x1C region may bind to the previous module's last symbol —
-        /// callers that have a moduleIdx should cross-check it against <see cref="ProcSymbol.ModuleIdx"/>.
+        /// precedes the address. NOTE: a proc can emit code BELOW its named entry (init/cold — e.g.
+        /// compiler-generated global-object Construct() calls ahead of a PROGRAM's own CODE), so the
+        /// match can fall through to an unrelated PRECEDING symbol from a different compiland entirely.
+        /// <see cref="ResolveSymbolVerified"/> guards against exactly that; prefer it when naming a
+        /// frame/pause location for the user. Use this plain version only when raw nearest-symbol
+        /// lookup is genuinely what's wanted (e.g. resolving a routine's enclosing procedure).
         /// </summary>
         public bool ResolveSymbol(uint rva, out ProcSymbol sym)
         {
@@ -1102,6 +1426,86 @@ namespace ClarionDbg.Core
             sym = Symbols[ans];
             return true;
         }
+
+        /// <summary>
+        /// <see cref="ResolveSymbol"/>, but verified against the +0x1C line table so cold/init "glue"
+        /// code (unnamed at the symbol level) doesn't get mislabeled with an unrelated PRECEDING symbol
+        /// from a different compiland. <see cref="ProcSymbol.ModuleIdx"/> can't be used for this
+        /// cross-check — it's a +0x28 backref-array position, a different, non-linearly-related index
+        /// space from the +0x1C table's moduleIdx (confirmed live: comparing them vetoed 100% of frames
+        /// on a 134-module binary). The verification rule: the FIRST +0x1C record in the candidate's own
+        /// span up to the query — i.e. in [candidate.EntryRva, rva] — must belong to the same compiland
+        /// the query resolved to. Both module indices then come from the one reliable, self-consistent
+        /// table. Note this deliberately does NOT resolve the candidate's EntryRva itself: a proc's
+        /// entry (prologue) can precede its own first line record, so nearest-below resolution at the
+        /// entry inherits the PREVIOUS module's tail record (verified live: _main@0x86EAC vs its first
+        /// record at 0x86EE0 — entry-resolution misattributed it and vetoed the correct name). On a
+        /// mismatch, walks backward through the EntryRva-sorted symbol table; no distance bound — the
+        /// first-record rule rejects distant coincidences naturally (any intervening module's records
+        /// break the match; a 518KB-away CRT handler that fooled entry-resolution fails here), while a
+        /// byte bound wrongly stripped names from legitimately large procedures (TEST_WEBSERVICES,
+        /// 0x4188 bytes of code, lost its name to a 0x4000 cap). Returns false when no symbol verifies —
+        /// safer than a confident wrong name.
+        /// </summary>
+        public bool ResolveSymbolVerified(uint rva, out ProcSymbol sym)
+        {
+            sym = null;
+            if (Symbols == null || Symbols.Count == 0) return false;
+            if (_textHi != uint.MaxValue && (rva < _textLo || rva >= _textHi)) return false;
+
+            int line; int mi; uint recRva;
+            if (!ResolveAddr(rva, out line, out mi, out recRva))
+                return ResolveSymbol(rva, out sym);   // no line-table data to cross-check against — trust it
+
+            int lo = 0, hi = Symbols.Count - 1, ans = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                if (Symbols[mid].EntryRva <= rva) { ans = mid; lo = mid + 1; }
+                else hi = mid - 1;
+            }
+            for (int i = ans; i >= 0; i--)
+            {
+                int symMi;
+                if (FirstRecordModuleIn(Symbols[i].EntryRva, rva, out symMi) && symMi == mi)
+                {
+                    sym = Symbols[i];
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>The compiland (moduleIdx) of the FIRST +0x1C record with Rva in [lo, hi] — the
+        /// earliest line record a symbol starting at <paramref name="lo"/> emits at or before a query
+        /// at <paramref name="hi"/>. False when no record falls in the range.</summary>
+        private bool FirstRecordModuleIn(uint lo, uint hi, out int moduleIdx)
+        {
+            moduleIdx = -1;
+            if (AddrTable == null || AddrTable.Count == 0) return false;
+            int a = 0, b = AddrTable.Count - 1, ans = -1;
+            while (a <= b)
+            {
+                int mid = (a + b) / 2;
+                if (AddrTable[mid].Rva >= lo) { ans = mid; b = mid - 1; }
+                else a = mid + 1;
+            }
+            if (ans < 0 || AddrTable[ans].Rva > hi) return false;
+            moduleIdx = AddrTable[ans].ModuleIdx;
+            return true;
+        }
+
+		/// <summary>Entry RVA of the first symbol strictly after <paramref name="afterRva"/>,
+		/// or 0 if none. Used to detect whether a query RVA falls in an inter-symbol gap.</summary>
+		public uint NextSymbolEntryRva(uint afterRva)
+		{
+			if (Symbols == null) return 0;
+			foreach (var s in Symbols)
+				if (s.EntryRva > afterRva)
+					return s.EntryRva;
+			return 0;
+		}
+
 
         /// <summary>Commit a run if it carries enough records to be real (drops stray fragments).</summary>
         private void CloseRun(ref LineRun r)
@@ -1170,18 +1574,6 @@ namespace ClarionDbg.Core
         public string ModuleNameForIdx(int idx)
         {
             return (idx >= 0 && idx < ModuleNames.Count) ? ModuleNames[idx] : null;
-        }
-
-        /// <summary>Can a symbol's <see cref="ProcSymbol.ModuleIdx"/> be meaningfully compared against a
-        /// +0x1C line-table moduleIdx? Only when it actually indexes the module-name array. The symbol
-        /// backref index space (+0x28, sized by the +0x24 field) coincides with the module-name array on
-        /// small/reference binaries but DIVERGES on real apps (e.g. a 4-module app whose symbols carry
-        /// backref indices in the hundreds). When it diverges the index is meaningless as a module key —
-        /// so callers must NOT use it to veto an otherwise-valid binary-search symbol match (doing so
-        /// nulls every frame's proc name, which in turn suppresses its locals in the UI).</summary>
-        public bool ModuleIdxComparable(int symModuleIdx)
-        {
-            return symModuleIdx >= 0 && symModuleIdx < ModuleNames.Count;
         }
 
         /// <summary>The distinct source lines that carry a +0x1C code record for a compiland (moduleIdx) —

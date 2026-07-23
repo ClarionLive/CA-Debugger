@@ -269,6 +269,7 @@ namespace ClarionDbg.Cli
                   .Append(",\"va\":\"0x").Append(f.Va.ToString("X")).Append('"')
                   .Append(",\"ebp\":\"0x").Append(f.Ebp.ToString("X")).Append('"')
                   .Append(",\"stackAddr\":\"0x").Append(f.StackAddr.ToString("X")).Append('"')
+                  .Append(",\"uncertain\":").Append(f.Uncertain ? "true" : "false")
                   .Append('}');
             }
             sb.Append("]}");

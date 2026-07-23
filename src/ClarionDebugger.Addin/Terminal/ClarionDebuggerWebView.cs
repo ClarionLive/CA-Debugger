@@ -858,7 +858,8 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"module\":").Append(Str(f.Module))
                   .Append(",\"line\":").Append(f.Line)
                   .Append(",\"va\":").Append(Str(f.Va))
-                  .Append(",\"ebp\":").Append(Str(f.Ebp)).Append('}');
+                  .Append(",\"ebp\":").Append(Str(f.Ebp))
+                  .Append(",\"uncertain\":").Append(f.Uncertain ? "true" : "false").Append('}');
             }
             sb.Append("]}");
             Post(sb.ToString());

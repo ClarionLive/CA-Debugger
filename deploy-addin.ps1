@@ -22,11 +22,27 @@ $EngineProj = Join-Path $RepoRoot "src\ClarionDbg.Cli\ClarionDbg.Cli.csproj"
 $EngineOut  = Join-Path $RepoRoot "src\ClarionDbg.Cli\bin\Debug\net48"
 
 function Resolve-MSBuild {
+    # -latest picks the highest-VERSION-NUMBER install, not the most complete one — a newer VS
+    # (Preview/Insider, or one missing the ".NET desktop development" workload) can win over an
+    # older, fully-functional one and lack MSBuild's .NET SDK resolver entirely. Building an
+    # SDK-style project (<Project Sdk="Microsoft.NET.Sdk">) with that MSBuild fails with
+    # "Could not resolve SDK Microsoft.NET.Sdk" even though the project itself is fine. So: check
+    # every installed instance (newest first) and skip any whose MSBuild lacks the resolver DLL,
+    # instead of trusting -latest blindly.
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path $vswhere) {
-        $found = & $vswhere -latest -requires Microsoft.Component.MSBuild `
-                            -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-        if ($found -and (Test-Path $found)) { return $found }
+        $candidates = & $vswhere -all -prerelease -requires Microsoft.Component.MSBuild `
+                            -find "MSBuild\**\Bin\MSBuild.exe" -sort
+        foreach ($msbuild in $candidates) {
+            if (-not (Test-Path $msbuild)) { continue }
+            $resolverDir = Join-Path (Split-Path $msbuild -Parent) "SdkResolvers\Microsoft.DotNet.MSBuildSdkResolver"
+            if (Test-Path $resolverDir) { return $msbuild }
+        }
+        if ($candidates) {
+            $msg = "Found MSBuild.exe (e.g. $($candidates[0])) but none have the .NET SDK resolver. "
+            $msg += "Install the '.NET desktop development' workload for that Visual Studio, or install an older one alongside it."
+            throw $msg
+        }
     }
     throw "MSBuild.exe not found. Install Visual Studio with the MSBuild component."
 }
@@ -34,9 +50,9 @@ $MSBuild = Resolve-MSBuild
 
 # Clarion install roots per version (first existing root wins).
 $Versions = @{
-    "12" = @("C:\Clarion12")
-    "11" = @("d:\Clarion11.1EE", "C:\Clarion11-13372")
-    "10" = @("C:\Clarion10", "C:\Clarion10v8")
+    "12" = @("d:\Clarion12", "d:\_dev\C111")
+    "11" = @("d:\Clarion11.1EE", "d:\_dev\C111")
+    "10" = @("d:\Clarion10", "C:\Clarion10v8")
 }
 $TargetVersions = if ($Version -eq "all") { @("12","11","10") } else { @($Version) }
 

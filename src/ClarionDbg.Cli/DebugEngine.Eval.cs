@@ -131,11 +131,12 @@ namespace ClarionDbg.Cli
             int len = (int)Math.Min(Math.Max(size, 1), 4096);
             var buf = new byte[len];
             int read;
-            Native.ReadProcessMemory(_hProcess, (IntPtr)instanceVa, buf, len, out read);
+            Native.ReadProcessMemory(_hProcess, Ptr(instanceVa), buf, len, out read);
             if (read < 0) read = 0;
             // unified rendering: same engine-side type label + value formatter the Locals panel uses
-            string tn = ClarionTypeLabel(typeCode, target, size, places);
             string value = FormatValueAt(typeCode, target, size, places, instanceVa);
+            bool isNullRef = typeCode == 0x16 && value == "(null)";
+            string tn = ClarionTypeLabel(typeCode, target, size, places, isNullRef);
             if (EmitJson)
                 Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, IsEditableCode(typeCode)));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}");
