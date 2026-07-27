@@ -30,12 +30,35 @@ namespace ClarionDbg.Cli
             if (_mode != StepMode.None && tid == _stepTid && !_skipRunning && haveCtx)
                 StepMachine(tid, hThread, ref ctx);
 
-            // 3) instruction step (stepi): we asked for exactly one TF step — pause here at the new EIP
+            // 3) instruction step (stepi): we asked for exactly one TF step — pause here at the new EIP.
+            // If that lands exactly on an armed user breakpoint's byte (e.g. a breakpoint set on a
+            // procedure's own entry line, then stepping INTO that call), restore-and-reschedule the
+            // same way StopStepAndPause does — otherwise the still-planted 0xCC fires as a genuine
+            // EXCEPTION_BREAKPOINT on the very next resume, reporting reason "breakpoint" instead of
+            // "stepi" and spuriously jumping the host UI to source.
             else if (_instrStep && tid == _instrStepTid && haveCtx)
+            {
+                RestoreIfArmed(tid, ctx.Eip);
                 PausedWait(tid, hThread, ref ctx, haveCtx, "stepi"); // PausedWait clears _instrStep
+            }
 
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
+        }
+
+        /// <summary>If <paramref name="va"/> carries an armed user breakpoint's byte, restore the
+        /// original instruction so it executes correctly on resume, and schedule a re-plant after the
+        /// thread takes one more step off it. Shared by every landing path (mode-driven step-stop and
+        /// the raw single-instruction step) so none of them leave a stale 0xCC sitting where the debuggee
+        /// is about to resume execution.</summary>
+        private void RestoreIfArmed(uint tid, uint va)
+        {
+            byte orig;
+            if (_armed.TryGetValue(va, out orig))
+            {
+                WriteByte(va, orig);
+                _rearm[tid] = new Rearm { Va = va, IsTemp = false };
+            }
         }
 
         private void StepMachine(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx)
@@ -117,9 +140,12 @@ namespace ClarionDbg.Cli
             // Instruction-granular step-over (disassembly view): purely address-based, independent of any
             // source mapping — stop as soon as EIP has left the starting instruction (the call-skip brings
             // us back at the return address). Checked before the source-resolution guard below so it stops
-            // even in runtime/library code with no .clw record.
+            // even in runtime/library code with no .clw record. Same prologue-window bypass as StepMode.Over:
+            // a procedure's entry instruction can itself be a single ENTER opcode that both pushes ebp AND
+            // reserves the whole local frame (sub esp,N folded in) — that alone can blow past ESP_SLACK in
+            // one instruction, so gating on it here would skip stopping right after the entry instruction.
             if (_mode == StepMode.OverInstr)
-                return va != _stepStartVa && esp + ESP_SLACK >= _startEsp;
+                return va != _stepStartVa && (_startAtProcEntry || esp + ESP_SLACK >= _startEsp);
             var m = ModuleAt(va);
             uint rva = m != null ? va - m.LoadBase : va;
             int line = 0, mi = -1; uint recRva = 0;
@@ -130,8 +156,21 @@ namespace ClarionDbg.Cli
             switch (_mode)
             {
                 case StepMode.Into: return newStatement;
-                case StepMode.Over: return newStatement && esp + ESP_SLACK >= _startEsp;
-                case StepMode.Out:  return esp > _startEsp && gap <= OUT_GAP_MAX;
+                case StepMode.Over:
+                    // Started inside the callee's own prologue window (landed there via a prior Step
+                    // Into, before `push ebp/mov ebp,esp/sub esp,N` ran): reserving the local frame
+                    // legitimately drops ESP well past ESP_SLACK, but that's this procedure claiming
+                    // its own frame, not a nested call — the call-skip logic above already peels off
+                    // any real nested calls before we get here. Skip the ESP gate for this first hop.
+                    return newStatement && (_startAtProcEntry || esp + ESP_SLACK >= _startEsp);
+                case StepMode.Out:
+                    // esp > _startEsp alone can trip mid-epilogue: a Clarion procedure's frame teardown
+                    // (mov esp,ebp / pop ebp / ret) is several instructions all mapped to the SAME
+                    // RETURN-statement record, and the first of them already grows esp past the start
+                    // value before the actual `ret` has run. Require newStatement too (leaving the
+                    // starting record), same guard Into/Over already use, so Out doesn't stop again on
+                    // its own epilogue — only once execution has genuinely reached the caller.
+                    return esp > _startEsp && gap <= OUT_GAP_MAX && newStatement;
             }
             return false;
         }
@@ -139,15 +178,7 @@ namespace ClarionDbg.Cli
         private void StopStepAndPause(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, string reason)
         {
             CancelStep();
-            uint va = ctx.Eip;
-            byte orig;
-            if (_armed.TryGetValue(va, out orig))
-            {
-                // landed exactly on a user breakpoint byte — restore it so the instruction can
-                // execute on resume, and re-plant after one single-step
-                WriteByte(va, orig);
-                _rearm[tid] = new Rearm { Va = va, IsTemp = false };
-            }
+            RestoreIfArmed(tid, ctx.Eip);
             PausedWait(tid, hThread, ref ctx, true, reason);
         }
 
@@ -175,6 +206,12 @@ namespace ClarionDbg.Cli
             _stepStartVa = _prevVa;
             _stepCount = 0;
             _skipRunning = false;
+
+            ProcSymbol sym;
+            uint rva = (haveCtx && m != null) ? ctx.Eip - m.LoadBase : 0;
+            _startAtProcEntry = haveCtx && m != null && m.Dbg != null
+                && m.Dbg.ResolveSymbol(rva, out sym)
+                && rva >= sym.EntryRva && rva - sym.EntryRva <= PROLOGUE_WINDOW;
         }
     }
 }
