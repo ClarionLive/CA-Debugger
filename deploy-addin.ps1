@@ -50,9 +50,9 @@ $MSBuild = Resolve-MSBuild
 
 # Clarion install roots per version (first existing root wins).
 $Versions = @{
-    "12" = @("d:\Clarion12", "d:\_dev\C111")
-    "11" = @("d:\Clarion11.1EE", "d:\_dev\C111")
-    "10" = @("d:\Clarion10", "C:\Clarion10v8")
+    "12" = @("C:\Clarion12", "d:\Clarion12", "d:\_dev\C111")
+    "11" = @("d:\Clarion11.1EE", "C:\Clarion11-13372", "d:\_dev\C111")
+    "10" = @("C:\Clarion10", "d:\Clarion10", "C:\Clarion10v8")
 }
 $TargetVersions = if ($Version -eq "all") { @("12","11","10") } else { @($Version) }
 
