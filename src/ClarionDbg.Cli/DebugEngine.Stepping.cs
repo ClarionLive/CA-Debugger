@@ -131,7 +131,14 @@ namespace ClarionDbg.Cli
             {
                 case StepMode.Into: return newStatement;
                 case StepMode.Over: return newStatement && esp + ESP_SLACK >= _startEsp;
-                case StepMode.Out:  return esp > _startEsp && gap <= OUT_GAP_MAX;
+                case StepMode.Out:
+                    // esp > _startEsp alone can trip mid-epilogue: a Clarion procedure's frame teardown
+                    // (mov esp,ebp / pop ebp / ret) is several instructions all mapped to the SAME
+                    // RETURN-statement record, and the first of them already grows esp past the start
+                    // value before the actual `ret` has run. Require newStatement too (leaving the
+                    // starting record), same guard Into/Over already use, so Out doesn't stop again on
+                    // its own epilogue — only once execution has genuinely reached the caller.
+                    return esp > _startEsp && gap <= OUT_GAP_MAX && newStatement;
             }
             return false;
         }
