@@ -1008,8 +1008,12 @@ namespace ClarionDebugger.Terminal
 
         private void OnGutterBpRemoved(string module, int line)
         {
+            // Keep _pending in sync regardless of run state — it's what StartSession() resends wholesale
+            // on the NEXT session, so a removal that only reached the live engine (running-session branch)
+            // would otherwise resurrect the "removed" breakpoint on the next start.
+            _pending.RemoveAll(b => SameBp(b, module, line));
             if (_svc.IsRunning) _svc.RemoveBreakpoint(module, line);
-            else { _pending.RemoveAll(b => SameBp(b, module, line)); SendBps(); }
+            else SendBps();
         }
 
         private static bool SameBp(DebugBreakpoint b, string module, int line)
