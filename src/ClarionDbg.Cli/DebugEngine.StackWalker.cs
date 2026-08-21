@@ -34,7 +34,8 @@ namespace ClarionDbg.Cli
                 var f = frames[i];
                 string name = f.Proc ?? "(unknown)";
                 string loc = f.Module != null ? $"  {f.Module}:{f.Line}" : "";
-                Console.WriteLine($"    #{i,-2} {name}{loc}  RVA 0x{f.Rva:X}{(f.Kind != null ? "  [" + f.Kind + "]" : "")}");
+                string unc = f.Uncertain ? "  (usikker — mulig foreldet stackrest)" : "";
+                Console.WriteLine($"    #{i,-2} {name}{loc}  RVA 0x{f.Rva:X}{(f.Kind != null ? "  [" + f.Kind + "]" : "")}{unc}");
             }
         }
 
@@ -145,7 +146,9 @@ namespace ClarionDbg.Cli
                 if (rva - recRva > FRAME_GAP_MAX) continue;     // not Clarion-mapped code
                 if (!CallPrecedes(cand)) continue;              // not a return address
 
-                frames.Add(FrameAt(cm, cand, esp + (uint)off));
+                var f = FrameAt(cm, cand, esp + (uint)off);
+                f.Uncertain = true;   // a plausible-looking dword, not a chain-verified caller
+                frames.Add(f);
             }
         }
 
@@ -155,20 +158,20 @@ namespace ClarionDbg.Cli
             int line = 0, mi = -1; uint recRva = 0;
             bool resolved = m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
             ProcSymbol sym = null;
-            bool hasSym = m != null && m.Dbg != null && m.Dbg.ResolveSymbol(rva, out sym);
-            // same moduleIdx cross-check as ProcNameAt: don't name cold/init code with the
-            // previous module's last symbol — but ONLY when the symbol's moduleIdx is a real module-name
-            // index. On binaries where the symbol backref space diverges from the module-name array the
-            // idx is meaningless and would veto every frame (-> "(unknown)" -> no locals), so we trust the
-            // binary-search symbol instead. See TswdDebugInfo.ModuleIdxComparable.
-            bool symOk = hasSym && (!resolved || !m.Dbg.ModuleIdxComparable(sym.ModuleIdx) || sym.ModuleIdx == mi);
+            // ResolveSymbolVerified (not the plain binary search): cold/init "glue" code with no symbol
+            // of its own (e.g. a PROGRAM's compiler-generated global-object Construct() calls ahead of
+            // its own CODE) would otherwise mislabel the frame with an unrelated PRECEDING symbol from a
+            // different compiland — confirmed live (ML_ScanArc.exe line 99, _main's first statement,
+            // resolved to ML_ProcessClass.Construct). Verified against the +0x1C line table instead of
+            // the unreliable +0x28 backref moduleIdx (see TswdDebugInfo.ResolveSymbolVerified).
+            bool hasSym = m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(rva, out sym);
             return new StackFrame
             {
                 Rva = rva,
                 Va = va,
                 StackAddr = stackAddr,
-                Proc = symOk ? sym.Name : null,
-                Kind = symOk ? sym.Kind.ToString().ToLowerInvariant() : null,
+                Proc = hasSym ? sym.Name : null,
+                Kind = hasSym ? sym.Kind.ToString().ToLowerInvariant() : null,
                 Module = resolved ? m.Dbg.ModuleNameForIdx(mi) : null,
                 Line = resolved ? line : 0
             };
@@ -185,7 +188,7 @@ namespace ClarionDbg.Cli
             if (va < 8) return false;
             var b = new byte[8];                      // b[i] = byte at va-8+i, so byte at va-k is b[8-k]
             int read;
-            if (!Native.ReadProcessMemory(_hProcess, (IntPtr)(va - 8), b, 8, out read) || read != 8)
+            if (!Native.ReadProcessMemory(_hProcess, Ptr(va - 8), b, 8, out read) || read != 8)
                 return false;
             if (b[3] == 0xE8) return true;                                  // call rel32
             if (b[6] == 0xFF && (b[7] & 0x38) == 0x10) return true;         // call reg / [reg]
@@ -206,7 +209,7 @@ namespace ClarionDbg.Cli
                 int chunk = Math.Min(0x1000 - (int)((va + (uint)total) & 0xFFF), buf.Length - total);
                 var page = new byte[chunk];
                 int read;
-                if (!Native.ReadProcessMemory(_hProcess, (IntPtr)(va + (uint)total), page, chunk, out read) || read <= 0)
+                if (!Native.ReadProcessMemory(_hProcess, Ptr(va + (uint)total), page, chunk, out read) || read <= 0)
                     break;
                 Array.Copy(page, 0, buf, total, read);
                 total += read;

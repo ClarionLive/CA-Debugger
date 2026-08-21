@@ -24,6 +24,13 @@ namespace ClarionDbg.Cli
                     case "globals": return Globals(args);
                     case "locals": return Locals(args);
                     case "break": return Break(args);
+                    case "scanrva": return ScanRva(args);
+                    case "scanname": return ScanName(args);
+                    case "typemembers": return TypeMembers(args);
+                    case "typechain": return TypeChain(args);
+                    case "poolback": return PoolBack(args);
+                    case "scanmissingnames": return ScanMissingNames(args);
+                    case "surveymissingnames": return SurveyMissingNames(args);
                     default: Usage(); return 1;
                 }
             }
@@ -84,6 +91,91 @@ namespace ClarionDbg.Cli
             var pe = PeImage.Load(exe);
             var dbg = TswdDebugInfo.FromPe(pe);
             return (pe, dbg);
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): scanrva &lt;exe&gt; &lt;rva&gt; — dump every raw symbol-table
+        /// candidate whose entryRva matches, including rejected ones and why. See
+        /// TswdDebugInfo.DumpCandidatesForRva.</summary>
+        private static int ScanRva(string[] args)
+        {
+            if (args.Length < 3) { Usage(); return 1; }
+            var (pe, dbg) = LoadDebug(args[1]);
+            uint rva = ParseNum(args[2]);
+            if (rva >= pe.ImageBase) rva -= pe.ImageBase; // accept VA or RVA
+            Console.WriteLine($"Scanning for entryRva == 0x{rva:X}:");
+            dbg.DumpCandidatesForRva(rva);
+            return 0;
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): scanname &lt;exe&gt; &lt;name&gt; — dump every raw symbol-table
+        /// candidate whose nameRef points at the given pool string, including rejected ones and why.</summary>
+        private static int ScanName(string[] args)
+        {
+            if (args.Length < 3) { Usage(); return 1; }
+            var (_, dbg) = LoadDebug(args[1]);
+            Console.WriteLine($"Scanning for nameRef -> '{args[2]}':");
+            dbg.DumpCandidatesForName(args[2]);
+            return 0;
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): typemembers &lt;exe&gt; &lt;typeRefHex&gt; — dump the raw member
+        /// records of a GROUP type, bypassing name validation, to inspect why a member's name fails to resolve.</summary>
+        private static int TypeMembers(string[] args)
+        {
+            if (args.Length < 3) { Usage(); return 1; }
+            var (_, dbg) = LoadDebug(args[1]);
+            uint typeRef = Convert.ToUInt32(args[2], 16);
+            dbg.DumpGroupMembersRaw(typeRef);
+            return 0;
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): typechain &lt;exe&gt; &lt;typeRefHex&gt; — print the resolved
+        /// ClarionType chain (Tag/Kind/Size, following .Referent), the same data CodeForType() consumes.</summary>
+        private static int TypeChain(string[] args)
+        {
+            if (args.Length < 3) { Usage(); return 1; }
+            var (_, dbg) = LoadDebug(args[1]);
+            uint typeRef = Convert.ToUInt32(args[2], 16);
+            dbg.DumpTypeChain(typeRef);
+            return 0;
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): poolback &lt;exe&gt; &lt;relOffsetDec&gt; — test SymbolNameEndingBefore
+        /// directly against a known pool-relative offset (e.g. another member's mNameRef).</summary>
+        private static int PoolBack(string[] args)
+        {
+            if (args.Length < 3) { Usage(); return 1; }
+            var (_, dbg) = LoadDebug(args[1]);
+            int rel = int.Parse(args[2]);
+            int poolLen = dbg.OffSymbolNameArray - dbg.OffSymbolPool;
+            string r = dbg.TestSymbolNameEndingBefore(rel, poolLen);
+            Console.WriteLine($"  poolLen={poolLen} SymbolNameEndingBefore({rel}) = '{r ?? "(null)"}'");
+            return 0;
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): scanmissingnames &lt;exe&gt; — scan the whole TSWD member-record
+        /// space for records with mNameRef==0, to see how common StringTheory's `value` case really is.</summary>
+        private static int ScanMissingNames(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (_, dbg) = LoadDebug(args[1]);
+            dbg.ScanForMissingMemberNames();
+            return 0;
+        }
+
+        /// <summary>DIAGNOSTIC (temporary): survey EVERY group reachable from real code (every local's
+        /// aggregate type, resolved once each thanks to the type cache) for members the compiler left
+        /// unnamed — a trustworthy count (no raw-byte false positives) of how common StringTheory's `value`
+        /// case really is across the whole application.</summary>
+        private static int SurveyMissingNames(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (_, dbg) = LoadDebug(args[1]);
+            dbg.ReadLocals();   // resolves every local's aggregate type as a side effect — populates MissingMemberLog
+            foreach (var line in dbg.MissingMemberLog) Console.WriteLine("  " + line);
+            int recovered = dbg.MissingMemberLog.FindAll(l => l.Contains(": recovered")).Count;
+            Console.WriteLine($"\n  {dbg.MissingMemberLog.Count} distinct group(s) had an unnamed member; {recovered} recovered, {dbg.MissingMemberLog.Count - recovered} still unrecovered.");
+            return 0;
         }
 
         private static int Dump(string[] args)
@@ -181,10 +273,10 @@ namespace ClarionDbg.Cli
                 if (dbg.ResolveAddr(rva, out int l2, out int mi2, out uint rr2))
                 {
                     string nm = dbg.ModuleNameForIdx(mi2) ?? "?";
-                    // symbol bind, cross-checked against the +0x1C moduleIdx (cold/init code below a
-                    // module's named entry binds to the previous module's last symbol — say unknown)
-                    string proc = dbg.ResolveSymbol(rva, out ProcSymbol sym)
-                        && (!dbg.ModuleIdxComparable(sym.ModuleIdx) || sym.ModuleIdx == mi2)
+                    // ResolveSymbolVerified: cross-checks the candidate symbol's own EntryRva against
+                    // the same +0x1C line table (not the unreliable +0x28 backref moduleIdx), catching
+                    // cold/init glue code that would otherwise mislabel with an unrelated preceding symbol.
+                    string proc = dbg.ResolveSymbolVerified(rva, out ProcSymbol sym)
                         ? $"{sym.Name} [{sym.Kind.ToString().ToLowerInvariant()}]" : null;
                     Console.WriteLine($"RVA 0x{rva:X} (VA 0x{pe.ImageBase + rva:X}) -> {nm} (moduleIdx {mi2}) line {l2}{(proc != null ? " in " + proc : "")}  (+0x1C, record RVA 0x{rr2:X})");
                 }

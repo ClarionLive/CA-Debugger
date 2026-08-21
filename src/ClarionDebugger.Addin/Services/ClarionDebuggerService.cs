@@ -94,6 +94,7 @@ namespace ClarionDebugger.Services
         public string Va;           // frame instruction VA (for per-frame locals resolution)
         public string Ebp;          // frame base pointer (for reading the frame's locals); "0x0" = unknown
         public string ResolvedPath; // generated .clw path via the active .red (or null)
+        public bool Uncertain;      // recovered by the raw-stack-scan fallback, not the EBP chain — may be stale
     }
 
     /// <summary>One decoded x86 instruction (EXPERIMENT: disassembly view).</summary>
@@ -168,7 +169,6 @@ namespace ClarionDebugger.Services
         public event Action<string, int, string> BreakpointError;  // module, line, error
         public event Action<string, int, string, int> Traced;      // tracepoint fired: module, line, interpolated message, hit count
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
-        public event Action<uint, int, byte[]> MemoryReceived;     // addr, requested len, bytes
         public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
         public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
@@ -405,12 +405,6 @@ namespace ClarionDebugger.Services
         }
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
-
-        /// <summary>Read target memory while paused; result arrives via MemoryReceived.</summary>
-        public bool ReadMemory(uint address, int length)
-        {
-            return SendCommand("mem 0x" + address.ToString("X") + " " + length);
-        }
 
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
         public bool RequestStack() { return SendCommand("stack"); }
@@ -688,13 +682,6 @@ namespace ClarionDebugger.Services
                     BreakpointListReceived?.Invoke(list);
                     break;
 
-                case "mem":
-                    uint addr = ParseHexU32(GetStr(json, "addr"));
-                    int memLen = GetInt(json, "len");
-                    byte[] bytes = ParseHexBytes(GetStr(json, "bytes"));
-                    if (bytes != null) MemoryReceived?.Invoke(addr, memLen, bytes);
-                    break;
-
                 case "disasm":
                     var dlist = ParseDisasm(json);
                     // Resolve each instruction's .clw to a real path (once per distinct module) so the
@@ -919,6 +906,7 @@ namespace ClarionDebugger.Services
                         Rva = GetStr(f, "rva"),
                         Va = GetStr(f, "va"),
                         Ebp = GetStr(f, "ebp"),
+                        Uncertain = GetBool(f, "uncertain"),
                     });
                 }
             }
@@ -1174,27 +1162,6 @@ namespace ClarionDebugger.Services
             if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s.Substring(2);
             uint v;
             return uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v) ? v : 0;
-        }
-
-        private static byte[] ParseHexBytes(string hex)
-        {
-            if (string.IsNullOrEmpty(hex) || hex.Length % 2 != 0) return null;
-            var bytes = new byte[hex.Length / 2];
-            for (int i = 0; i < bytes.Length; i++)
-            {
-                int hi = HexVal(hex[i * 2]), lo = HexVal(hex[i * 2 + 1]);
-                if (hi < 0 || lo < 0) return null;
-                bytes[i] = (byte)((hi << 4) | lo);
-            }
-            return bytes;
-        }
-
-        private static int HexVal(char c)
-        {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            return -1;
         }
 
         private static string GetStr(string json, string key)
