@@ -186,6 +186,10 @@ namespace ClarionDbg.Cli
         private uint _prevVa;         // EIP at the previous single-step trap (for call-entry detection)
         private uint _stepStartVa;    // EIP when the step began (OverInstr stops once EIP leaves it)
         private int _stepCount;
+        private bool _startAtProcEntry; // step began inside the callee's prologue window (PROLOGUE_WINDOW
+                                         // of its symbol entry) — Over must not gate on ESP for its first
+                                         // hop, since the prologue's own `sub esp,N` legitimately drops ESP
+                                         // before any nested call happens
         private bool _skipRunning;    // running full-speed to a call-skip temp BP; TF off
         private uint _skipEntryEsp;   // ESP at the callee's entry instruction (return depth = this + 4)
 
