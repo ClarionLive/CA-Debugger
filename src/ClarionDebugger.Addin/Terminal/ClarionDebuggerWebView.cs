@@ -163,6 +163,8 @@ namespace ClarionDebugger.Terminal
             if (_pendingRtcKey != null && bp != null && bp.Module != null
                 && (bp.RequestedLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
             {
+                Console("info", "rtc: confirmed armed at " + bp.Module + ":" + bp.Line
+                    + " (requested " + bp.RequestedLine + ") -> resuming");
                 _transientBps.Remove(_pendingRtcKey);
                 _pendingRtcKey = null;
                 _transientBps.Add(TransientKey(bp.Module, bp.RequestedLine));   // engine-confirmed identity
@@ -377,6 +379,7 @@ namespace ClarionDebugger.Terminal
                     case "bpremove": RemoveBp(data); break;
                     case "bpprops": SetBpProps(data); break;
                     case "runtocursor": CmdRunToCursor(data); break;   // transient one-shot bp at module:line, then resume
+                    case "runtocursormonaco": CmdRunToCursorMonaco(); break;   // SPIKE: same, but module:line comes from the live Monaco cursor
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
@@ -443,7 +446,12 @@ namespace ClarionDebugger.Terminal
         /// rather than planting a clobbering duplicate. We only resume if the transient actually armed.</summary>
         public void CmdRunToCursor(string spec)
         {
-            if (CurrentState != DebugSessionState.Paused || string.IsNullOrEmpty(spec)) return;
+            Console("info", "rtc: CmdRunToCursor spec=" + spec + " state=" + CurrentState);
+            if (CurrentState != DebugSessionState.Paused || string.IsNullOrEmpty(spec))
+            {
+                Console("info", "rtc: rejected (not paused, or empty spec)");
+                return;
+            }
             int c = spec.LastIndexOf(':');
             if (c <= 0) return;
             string module = spec.Substring(0, c);
@@ -491,10 +499,89 @@ namespace ClarionDebugger.Terminal
             _transientBps.Add(rtcKey);
             _pendingRtcKey = rtcKey;    // resume happens in OnSvcBreakpointSet once the engine confirms this bp
             _pendingRtcLine = line;     // match the engine echo by line (module spelling is re-adopted from it)
-            Console("info", "run to cursor: " + module + ":" + line);
+            Console("info", "run to cursor: " + module + ":" + line + " (pending engine confirmation)");
         }
 
         private static string TransientKey(string module, int line) { return (module ?? "") + ":" + line; }
+
+        // ── Run to cursor FROM the real Monaco editor (spike) ──────────────────────────────────────
+        // Pulls "wherever the developer's cursor actually is right now" from ClarionAssistant's live
+        // Monaco cursor tracking (MonacoSourceNavigator.TryGetActiveCursor), instead of the pad's own
+        // mini source view (which CmdRunToCursor above still serves via module:line from a DOM click).
+        // TEMPORARY: every step logs to the pad's own Debug Console (Console("info", "rtc: ...")) so the
+        // whole chain can be traced without a separate log file. Triggered by a temporary toolbar button
+        // ("runtocursormonaco" web message) until a real Monaco-side context menu/gutter exists.
+
+        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor.
+        private static MethodInfo _monacoCursor;
+
+        /// <summary>Resolve ClarionAssistant's live-cursor query, if that addin is loaded. Same reflection
+        /// pattern as ResolveMonacoNavigator (no compile-time reference between the two addins). Frozen
+        /// contract: bool ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor(out string filePath, out int line, out int column)</summary>
+        private static MethodInfo ResolveMonacoCursorGetter()
+        {
+            if (_monacoCursor != null) return _monacoCursor;
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type t;
+                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
+                    catch { t = null; }
+                    if (t == null) continue;
+                    var mi = t.GetMethod("TryGetActiveCursor", BindingFlags.Public | BindingFlags.Static);
+                    if (mi != null) { _monacoCursor = mi; break; }
+                }
+            }
+            catch { }
+            return _monacoCursor;
+        }
+
+        /// <summary>Run to cursor using the ACTIVE Monaco editor's live cursor position instead of an
+        /// explicit module:line spec. Resolves module from the file path (a generated-source file name IS
+        /// the module name, same assumption EditorBreakpointService makes) and delegates to the existing,
+        /// well-tested CmdRunToCursor(spec) for the actual transient-breakpoint plumbing.</summary>
+        public void CmdRunToCursorMonaco()
+        {
+            Console("info", "rtc: CmdRunToCursorMonaco invoked, state=" + CurrentState);
+            if (CurrentState != DebugSessionState.Paused)
+            {
+                Console("info", "rtc: not paused, ignoring");
+                return;
+            }
+
+            var mi = ResolveMonacoCursorGetter();
+            if (mi == null)
+            {
+                Console("err", "run to cursor (Monaco): ClarionAssistant not loaded — can't read the active editor's cursor.");
+                return;
+            }
+
+            object[] args = new object[] { null, 0, 0 };
+            bool ok;
+            try { ok = (bool)mi.Invoke(null, args); }
+            catch (Exception ex)
+            {
+                Console("err", "run to cursor (Monaco): " + ex.Message);
+                return;
+            }
+
+            string path = args[0] as string;
+            int line = args[1] is int ? (int)args[1] : 0;
+            int column = args[2] is int ? (int)args[2] : 0;
+            Console("info", "rtc: TryGetActiveCursor -> ok=" + ok + " path=" + path + " line=" + line + " column=" + column);
+
+            if (!ok || string.IsNullOrEmpty(path) || line <= 0)
+            {
+                Console("info", "run to cursor (Monaco): no active Monaco cursor to read (open a source file and click a line first).");
+                return;
+            }
+
+            string module = Path.GetFileName(path);
+            string spec = module + ":" + line;
+            Console("info", "rtc: resolved module=" + module + " -> delegating to CmdRunToCursor(\"" + spec + "\")");
+            CmdRunToCursor(spec);
+        }
 
         /// <summary>Break on procedure entry: plant a normal (persistent) breakpoint at a procedure's
         /// definition line, surfaced from a right-click on a Procedures-pane row. Data is a JSON object
@@ -799,6 +886,8 @@ namespace ClarionDebugger.Terminal
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
                 if (_transientBps.Count > 0)
                 {
+                    Console("info", "rtc: clearing " + _transientBps.Count + " transient bp(s) — stopped at "
+                        + p.Module + ":" + p.Line + " (reason=" + p.Reason + ")");
                     foreach (var key in new List<string>(_transientBps))
                     {
                         int ci = key.LastIndexOf(':');
