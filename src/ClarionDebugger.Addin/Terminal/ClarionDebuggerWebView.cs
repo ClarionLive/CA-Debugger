@@ -163,8 +163,6 @@ namespace ClarionDebugger.Terminal
             if (_pendingRtcKey != null && bp != null && bp.Module != null
                 && (bp.RequestedLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
             {
-                Console("info", "rtc: confirmed armed at " + bp.Module + ":" + bp.Line
-                    + " (requested " + bp.RequestedLine + ") -> resuming");
                 _transientBps.Remove(_pendingRtcKey);
                 _pendingRtcKey = null;
                 _transientBps.Add(TransientKey(bp.Module, bp.RequestedLine));   // engine-confirmed identity
@@ -379,7 +377,6 @@ namespace ClarionDebugger.Terminal
                     case "bpremove": RemoveBp(data); break;
                     case "bpprops": SetBpProps(data); break;
                     case "runtocursor": CmdRunToCursor(data); break;   // transient one-shot bp at module:line, then resume
-                    case "runtocursormonaco": CmdRunToCursorMonaco(); break;   // SPIKE: same, but module:line comes from the live Monaco cursor
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
@@ -440,17 +437,21 @@ namespace ClarionDebugger.Terminal
         /// tracked in <see cref="_transientBps"/> (NOT _pending / the gutter), filtered out of the Breakpoints
         /// pane by <see cref="SendBps"/>, and removed on the next pause (<see cref="OnPaused"/>) — so it fires
         /// once and is cancelled whether the cursor line or another breakpoint is hit first. Only valid while
-        /// paused (the Source view, and hence a cursor, exists only then). Data is "module:line". Behaviour when
+        /// paused (the Source view, and hence a cursor, exists only then). Data is "module:line", or EMPTY to mean
+        /// "wherever my caret actually is" — resolved from the active Monaco editor's live cursor. Behaviour when
         /// a breakpoint already sits on the SAME REQUESTED line: an unconditional one will stop anyway (just
         /// continue); a conditional/hit-count/tracepoint one may NOT stop, so we defer to it with a warning
         /// rather than planting a clobbering duplicate. We only resume if the transient actually armed.</summary>
         public void CmdRunToCursor(string spec)
         {
-            Console("info", "rtc: CmdRunToCursor spec=" + spec + " state=" + CurrentState);
-            if (CurrentState != DebugSessionState.Paused || string.IsNullOrEmpty(spec))
+            if (CurrentState != DebugSessionState.Paused) return;
+            // No explicit spec = "wherever my caret actually is": resolve the ACTIVE Monaco editor's live
+            // cursor. The pad's own mini-source-view right-click still passes an explicit module:line, and
+            // pointing at a specific line is the more specific intent, so it wins whenever it's present.
+            if (string.IsNullOrEmpty(spec))
             {
-                Console("info", "rtc: rejected (not paused, or empty spec)");
-                return;
+                spec = ResolveMonacoCursorSpec();
+                if (spec == null) return;   // ResolveMonacoCursorSpec already reported why to the console
             }
             int c = spec.LastIndexOf(':');
             if (c <= 0) return;
@@ -504,13 +505,12 @@ namespace ClarionDebugger.Terminal
 
         private static string TransientKey(string module, int line) { return (module ?? "") + ":" + line; }
 
-        // ── Run to cursor FROM the real Monaco editor (spike) ──────────────────────────────────────
-        // Pulls "wherever the developer's cursor actually is right now" from ClarionAssistant's live
-        // Monaco cursor tracking (MonacoSourceNavigator.TryGetActiveCursor), instead of the pad's own
-        // mini source view (which CmdRunToCursor above still serves via module:line from a DOM click).
-        // TEMPORARY: every step logs to the pad's own Debug Console (Console("info", "rtc: ...")) so the
-        // whole chain can be traced without a separate log file. Triggered by a temporary toolbar button
-        // ("runtocursormonaco" web message) until a real Monaco-side context menu/gutter exists.
+        // ── Run to cursor sourced from the real Monaco editor ─────────────────────────────────────
+        // "Wherever the developer's caret actually is right now", pulled from ClarionAssistant's live Monaco
+        // cursor tracking (MonacoSourceNavigator.TryGetActiveCursor). This is the no-spec branch of
+        // CmdRunToCursor, NOT a second command: one "run to cursor" concept, two ways to say where. The
+        // eventual Monaco-side trigger (context menu / gutter click) needs no new plumbing here — it sends
+        // the same "runtocursor" web message with no data.
 
         // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor.
         private static MethodInfo _monacoCursor;
@@ -537,50 +537,40 @@ namespace ClarionDebugger.Terminal
             return _monacoCursor;
         }
 
-        /// <summary>Run to cursor using the ACTIVE Monaco editor's live cursor position instead of an
-        /// explicit module:line spec. Resolves module from the file path (a generated-source file name IS
-        /// the module name, same assumption EditorBreakpointService makes) and delegates to the existing,
-        /// well-tested CmdRunToCursor(spec) for the actual transient-breakpoint plumbing.</summary>
-        public void CmdRunToCursorMonaco()
+        /// <summary>Resolve "module:line" from the ACTIVE Monaco editor's live cursor, or null if there is no
+        /// usable cursor — reporting WHY to the Debug Console in that case, since every failure here is
+        /// something the user can act on (install/enable ClarionAssistant, open a source file, click a line).
+        /// Deliberately does NOT fall back to the pad's mini source view: silently running to a line the user
+        /// wasn't looking at is worse than an error. Module comes from the file name (a generated-source file
+        /// name IS the module name — the same assumption EditorBreakpointService makes).</summary>
+        private string ResolveMonacoCursorSpec()
         {
-            Console("info", "rtc: CmdRunToCursorMonaco invoked, state=" + CurrentState);
-            if (CurrentState != DebugSessionState.Paused)
-            {
-                Console("info", "rtc: not paused, ignoring");
-                return;
-            }
-
             var mi = ResolveMonacoCursorGetter();
             if (mi == null)
             {
-                Console("err", "run to cursor (Monaco): ClarionAssistant not loaded — can't read the active editor's cursor.");
-                return;
+                Console("err", "run to cursor: ClarionAssistant isn't loaded — can't read the active editor's cursor.");
+                return null;
             }
 
-            object[] args = new object[] { null, 0, 0 };
+            object[] args = new object[] { null, 0, 0 };   // out filePath, out line, out column
             bool ok;
             try { ok = (bool)mi.Invoke(null, args); }
             catch (Exception ex)
             {
-                Console("err", "run to cursor (Monaco): " + ex.Message);
-                return;
+                Console("err", "run to cursor: couldn't read the Monaco cursor — " + ex.Message);
+                return null;
             }
 
             string path = args[0] as string;
             int line = args[1] is int ? (int)args[1] : 0;
-            int column = args[2] is int ? (int)args[2] : 0;
-            Console("info", "rtc: TryGetActiveCursor -> ok=" + ok + " path=" + path + " line=" + line + " column=" + column);
-
             if (!ok || string.IsNullOrEmpty(path) || line <= 0)
             {
-                Console("info", "run to cursor (Monaco): no active Monaco cursor to read (open a source file and click a line first).");
-                return;
+                // Upstream returns false when the active workbench window isn't a Monaco-hosted Clarion source
+                // editor, or the overlay just attached and hasn't reported a cursor yet. Both are actionable.
+                Console("err", "run to cursor: no active Monaco editor cursor — open a source file and click a line first.");
+                return null;
             }
-
-            string module = Path.GetFileName(path);
-            string spec = module + ":" + line;
-            Console("info", "rtc: resolved module=" + module + " -> delegating to CmdRunToCursor(\"" + spec + "\")");
-            CmdRunToCursor(spec);
+            return Path.GetFileName(path) + ":" + line;
         }
 
         /// <summary>Break on procedure entry: plant a normal (persistent) breakpoint at a procedure's
@@ -886,8 +876,6 @@ namespace ClarionDebugger.Terminal
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
                 if (_transientBps.Count > 0)
                 {
-                    Console("info", "rtc: clearing " + _transientBps.Count + " transient bp(s) — stopped at "
-                        + p.Module + ":" + p.Line + " (reason=" + p.Reason + ")");
                     foreach (var key in new List<string>(_transientBps))
                     {
                         int ci = key.LastIndexOf(':');
