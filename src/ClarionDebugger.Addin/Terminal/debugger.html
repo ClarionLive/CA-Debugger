@@ -251,6 +251,22 @@
   .modal-x { cursor:pointer; color:var(--fg-dim); font-size:14px; width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center; border-radius:4px; }
   .modal-x:hover { background:var(--btnhover); color:var(--fg-bright); }
   .modal-body { padding:4px 16px 16px; }
+
+  /* About panel. Cards mirror the Clarion Assistant About layout so the two addins read as a set.
+     The version line is intentionally allowed to wrap rather than clip — Clarion Assistant's
+     equivalent truncates to two components, which is the bug this one must not reproduce. */
+  .ab-card { background:var(--btnhover); border:1px solid var(--popup-border); border-radius:6px; padding:14px 16px; margin-top:12px; }
+  .ab-ver { color:var(--accent-hi); font-size:20px; font-weight:700; line-height:1.25; overflow-wrap:anywhere; }
+  .ab-tag { color:var(--fg-dim); font-size:12px; margin-top:4px; }
+  .ab-tbl { width:100%; border-collapse:collapse; }
+  .ab-tbl th { text-align:left; font-weight:400; color:var(--fg-dim); font-size:12px; padding:7px 12px 7px 0; vertical-align:top; white-space:nowrap; width:34%; }
+  .ab-tbl td { text-align:left; color:var(--fg); font-size:12px; padding:7px 0; vertical-align:top; overflow-wrap:anywhere; }
+  .ab-tbl tr + tr th, .ab-tbl tr + tr td { border-top:1px solid var(--popup-border); }
+  .ab-tbl a { color:var(--accent-hi); }
+  .ab-head { color:var(--accent-hi); font-size:12px; font-weight:700; margin-bottom:2px; }
+  .ab-foot { color:var(--fg-dim); font-size:11px; margin-top:14px; }
+  .hdr-title.clickable { cursor:pointer; }
+  .hdr-title.clickable:hover { color:var(--fg-bright); }
   .set-section { margin-top:12px; }
   .set-h { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); margin-bottom:4px; }
   .set-note { font-size:11.5px; line-height:1.5; color:var(--fg-dim); margin-bottom:10px; }
@@ -270,7 +286,8 @@
   <!-- Slim header: the 7 debug controls now live on the main IDE toolbar. This keeps only the
        run-state indicator plus the gear (keyboard shortcuts) and theme toggles. -->
   <div class="toolbar">
-    <span class="hdr-title">CA Debugger</span>
+    <!-- Version is appended by the host's "about" push (see setAbout). Click opens About. -->
+    <span class="hdr-title clickable" id="hdrTitle" title="About CA Debugger">CA Debugger</span>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
@@ -357,6 +374,13 @@
     </div>
   </div>
 
+  <div class="modal-backdrop" id="aboutBackdrop">
+    <div class="modal" role="dialog" aria-label="About CA Debugger">
+      <div class="modal-head"><span>About CA Debugger</span><span class="modal-x" id="aboutClose" title="Close">✕</span></div>
+      <div class="modal-body" id="aboutBody"></div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
 <script>
@@ -437,6 +461,58 @@
   $('settingsClose').onclick=closeSettings;
   $('settingsBackdrop').addEventListener('click',e=>{ if(e.target===$('settingsBackdrop')) closeSettings(); });
 
+  // ---- About -------------------------------------------------------------------------------
+  // Populated by the host's "about" push on ready. Everything is written with textContent rather
+  // than innerHTML: most fields are host constants, but the WebView2 runtime string comes from the
+  // installed browser and the same class of bug (DOM XSS via an attacker-influenced string) has
+  // already been found once in this codebase's sibling list rendering.
+  var aboutInfo=null;
+  function aboutOpen(){ return $('aboutBackdrop').classList.contains('show'); }
+  function closeAbout(){ $('aboutBackdrop').classList.remove('show'); }
+  function openAbout(){ if(aboutInfo) $('aboutBackdrop').classList.add('show'); }
+
+  function setAbout(m){
+    aboutInfo=m;
+    // Header caption picks up the version too — this is the in-panel title; the docked pad tab
+    // caption is stamped into the addin manifest at build time (StampAddinManifest).
+    if(m.version) $('hdrTitle').textContent=m.product+' v'+m.version;
+
+    var body=$('aboutBody');
+    body.textContent='';
+
+    var hero=document.createElement('div'); hero.className='ab-card';
+    var v=document.createElement('div'); v.className='ab-ver'; v.textContent='Version '+(m.version||'unknown');
+    var t=document.createElement('div'); t.className='ab-tag'; t.textContent=m.tagline||'';
+    hero.appendChild(v); hero.appendChild(t); body.appendChild(hero);
+
+    var rows=[['Publisher',m.publisher,null],['Website',m.website,m.website],
+              ['Debug engine',m.engine,null],['Runtime',m.runtime,null]];
+    var card=document.createElement('div'); card.className='ab-card';
+    var tbl=document.createElement('table'); tbl.className='ab-tbl';
+    rows.forEach(function(r){
+      if(!r[1]) return;
+      var tr=document.createElement('tr');
+      var th=document.createElement('th'); th.textContent=r[0];
+      var td=document.createElement('td');
+      // Only ever build a link for an http(s) URL; anything else renders as plain text so a
+      // javascript:/data: string can never become a clickable target.
+      if(r[2] && /^https?:\/\//i.test(r[2])){
+        var a=document.createElement('a'); a.href=r[2]; a.target='_blank'; a.rel='noopener noreferrer';
+        a.textContent=r[1]; td.appendChild(a);
+      } else td.textContent=r[1];
+      tr.appendChild(th); tr.appendChild(td); tbl.appendChild(tr);
+    });
+    card.appendChild(tbl); body.appendChild(card);
+
+    var foot=document.createElement('div'); foot.className='ab-foot';
+    foot.textContent='© '+(m.year||'')+' '+(m.publisher||'')+'. Released under the MIT licence.';
+    body.appendChild(foot);
+  }
+
+  $('hdrTitle').onclick=openAbout;
+  $('aboutClose').onclick=closeAbout;
+  $('aboutBackdrop').addEventListener('click',e=>{ if(e.target===$('aboutBackdrop')) closeAbout(); });
+
   document.addEventListener('keydown',e=>{
     // 1) capture mode — record the next combo for the command being rebound
     if(capturing){
@@ -450,6 +526,8 @@
     }
     // 2) while Settings is open, Esc closes it and debug keys stay inert
     if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
+    // 2b) same for About — a modal must swallow debug shortcuts, not just look modal
+    if(aboutOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAbout(); } return; }
     // 3) normal dispatch — send the command bound to this combo straight to the host. The IDE toolbar's
     // condition evaluator is the source of truth for whether a command is valid in the current state; the
     // host side no-ops a command that doesn't apply, so the pad shortcut just forwards unconditionally.
@@ -1305,6 +1383,7 @@
   function onMessage(data){
     let m; try{ m=JSON.parse(data); }catch(e){ return; }
     switch(m.type){
+      case 'about': setAbout(m); break;
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';

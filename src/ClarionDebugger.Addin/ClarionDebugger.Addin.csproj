@@ -18,7 +18,13 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <!--
+      THE released version, and the only thing AddinFinder compares against the git tag.
+      Three parts, no build number — see CheckAddinVersion below. AssemblyVersion is pinned to it
+      deliberately so the build number never reaches an assembly-binding identity.
+    -->
     <Version>1.1.1</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <ClarionRoot Condition="'$(ClarionRoot)' == ''">C:\Clarion12</ClarionRoot>
@@ -52,11 +58,12 @@
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3800.47" />
   </ItemGroup>
 
-  <!-- Addin manifest + the debugger panel HTML are deployed alongside the DLL. -->
+  <!--
+    The debugger panel HTML is deployed alongside the DLL. ClarionDebugger.addin is deliberately
+    NOT copied here — StampAddinManifest below emits the output copy, with the pad title stamped.
+  -->
   <ItemGroup>
-    <None Include="ClarionDebugger.addin">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    <None Include="ClarionDebugger.addin" />
     <None Include="Terminal\debugger.html">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
@@ -92,6 +99,74 @@
     XmlPeek rather than a regex: the manifest's own quotes and angle brackets would have to be
     expanded into MSBuild property syntax for a Regex property function, which breaks on this file.
   -->
+  <!--
+    Build number = git commit count. Chosen over an auto-incrementing counter file because it
+    stores no state, never rewrites a tracked file, is monotonic, and maps back to an exact
+    commit. (The counter-file approach on the sibling ClarionAssistant repo rewrites its props
+    file mid-build, which is what forced its version guard to be scoped to
+    BuildingInsideVisualStudio.)
+
+    The build number goes into FileVersion / InformationalVersion ONLY — never into $(Version),
+    $(AssemblyVersion), or the manifest's <Identity version>. AddinFinder compares Identity
+    against the release tag, so a build number there would put every install back on the
+    permanent "Update available" that v1.1.1 exists to fix.
+
+    Degrades safely: no git, no repo, or a build from an exported tarball all yield build 0 and a
+    warning rather than a failed build.
+  -->
+  <Target Name="ComputeBuildNumber" BeforeTargets="GetAssemblyAttributes;CheckAddinVersion;StampAddinManifest">
+    <Exec Command="git rev-list --count HEAD"
+          WorkingDirectory="$(MSBuildProjectDirectory)"
+          ConsoleToMSBuild="true"
+          StandardOutputImportance="low"
+          ContinueOnError="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitCommitCount" />
+      <Output TaskParameter="ExitCode" PropertyName="_GitExitCode" />
+    </Exec>
+
+    <PropertyGroup>
+      <BuildNumber Condition="'$(_GitExitCode)' == '0' and '$(_GitCommitCount)' != ''">$(_GitCommitCount.Trim())</BuildNumber>
+      <BuildNumber Condition="'$(BuildNumber)' == ''">0</BuildNumber>
+      <FullVersion>$(Version).$(BuildNumber)</FullVersion>
+      <FileVersion>$(FullVersion)</FileVersion>
+      <InformationalVersion>$(FullVersion)</InformationalVersion>
+    </PropertyGroup>
+
+    <Warning Condition="'$(BuildNumber)' == '0'"
+             Text="ComputeBuildNumber: could not read a git commit count (git missing, or not a repo). Falling back to build 0 — this build's displayed version will be $(FullVersion)." />
+  </Target>
+
+  <!--
+    Emit the output manifest with the pad title stamped to the full version, so the docked pad
+    caption reads "CA Debugger v1.1.1.847". PadDescriptor.Title is read-only at runtime, so the
+    caption has to be baked into the manifest at build time.
+
+    Only the pad's title attribute is rewritten. <Identity version> is copied through untouched,
+    which is why the checked-in ClarionDebugger.addin stays the authoritative, standalone-valid
+    source of truth and CheckAddinVersion still guards it directly. Do NOT switch this to a
+    template-with-tokens scheme: that would leave the repo without a valid checked-in manifest
+    and put a generated file on the path AddinFinder reads.
+  -->
+  <Target Name="StampAddinManifest"
+          AfterTargets="CheckAddinVersion"
+          BeforeTargets="Build"
+          Inputs="$(MSBuildProjectDirectory)\ClarionDebugger.addin;$(MSBuildProjectFullPath)"
+          Outputs="$(IntermediateOutputPath)ClarionDebugger.addin">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\ClarionDebugger.addin"
+          DestinationFiles="$(IntermediateOutputPath)ClarionDebugger.addin" />
+    <XmlPoke XmlInputPath="$(IntermediateOutputPath)ClarionDebugger.addin"
+             Query="/AddIn/Path[@name='/SharpDevelop/Workbench/Pads']/Pad/@title"
+             Value="CA Debugger v$(FullVersion)" />
+    <Message Importance="normal" Text="StampAddinManifest: pad caption -> 'CA Debugger v$(FullVersion)' (Identity version stays $(Version))" />
+  </Target>
+
+  <Target Name="CopyStampedAddinManifest" AfterTargets="Build" DependsOnTargets="StampAddinManifest">
+    <Copy SourceFiles="$(IntermediateOutputPath)ClarionDebugger.addin"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
   <Target Name="CheckAddinVersion" BeforeTargets="Build">
     <PropertyGroup>
       <_AddinManifest>$(MSBuildProjectDirectory)\ClarionDebugger.addin</_AddinManifest>

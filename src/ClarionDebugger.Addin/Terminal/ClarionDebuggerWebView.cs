@@ -341,6 +341,7 @@ namespace ClarionDebugger.Terminal
                 {
                     case "ready":
                         Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
+                        PushAbout();
                         if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
                         if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
                         break;
@@ -1288,6 +1289,73 @@ namespace ClarionDebugger.Terminal
         {
             try { if (_ready && _webView.CoreWebView2 != null) _webView.CoreWebView2.PostWebMessageAsString(json); }
             catch { }
+        }
+
+        /// <summary>
+        /// Pushes the data behind the About panel. Sent once on "ready" rather than on demand so the
+        /// panel opens instantly and still works if the engine is unreachable.
+        /// </summary>
+        /// <remarks>
+        /// The displayed version is the assembly's InformationalVersion, which the build stamps as
+        /// Major.Minor.Patch.BuildNumber (build number = git commit count). Deliberately NOT read from
+        /// the addin manifest's &lt;Identity version&gt;: that string is what AddinFinder compares against
+        /// the release tag, it is bare Major.Minor.Patch by design, and display code must never become a
+        /// reason to change it. Show the whole string — do not truncate to two components.
+        /// </remarks>
+        private void PushAbout()
+        {
+            string version, runtime = "not detected";
+            try
+            {
+                var asm = Assembly.GetExecutingAssembly();
+                var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+                version = info != null && !string.IsNullOrEmpty(info.InformationalVersion)
+                    ? info.InformationalVersion
+                    : asm.GetName().Version.ToString();
+            }
+            catch { version = "unknown"; }
+
+            try
+            {
+                if (_webView != null && _webView.CoreWebView2 != null)
+                    runtime = _webView.CoreWebView2.Environment.BrowserVersionString;
+            }
+            catch { }
+
+            var sb = new StringBuilder();
+            sb.Append("{\"type\":\"about\"")
+              .Append(",\"product\":\"CA Debugger\"")
+              .Append(",\"version\":\"").Append(JsonStr(version)).Append('"')
+              .Append(",\"tagline\":\"Source-level debugger for the Clarion IDE\"")
+              .Append(",\"publisher\":\"ClarionLive\"")
+              .Append(",\"website\":\"https://github.com/ClarionLive/CA-Debugger\"")
+              .Append(",\"engine\":\"ClarionDbg (32-bit, TSWD debug info)\"")
+              .Append(",\"runtime\":\"Microsoft Edge WebView2 ").Append(JsonStr(runtime)).Append('"')
+              .Append(",\"year\":\"2026\"}");
+            Post(sb.ToString());
+        }
+
+        /// <summary>Minimal JSON string-body escaper for the About payload (no dependency on a JSON lib).</summary>
+        private static string JsonStr(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"':  sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n");  break;
+                    case '\r': sb.Append("\\r");  break;
+                    case '\t': sb.Append("\\t");  break;
+                    default:
+                        if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         private void UI(Action a)
