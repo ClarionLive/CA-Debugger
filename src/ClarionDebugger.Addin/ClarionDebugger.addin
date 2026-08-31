@@ -1,6 +1,6 @@
 <AddIn name="CA Debugger" author="John Hickey" description="Standalone Clarion debugger for the Clarion IDE: native gutter breakpoints, stepping, call stack with procedure names, and watch-by-name over the TSWD debug engine. Installs independently — no Clarion Assistant required.">
   <Manifest>
-    <Identity name="ClarionDebugger" version="1.0.0"/>
+    <Identity name="ClarionDebugger" version="1.1.1"/>
   </Manifest>
   <Runtime>
     <Import assembly="ClarionDebugger.dll">

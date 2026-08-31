@@ -43,6 +43,21 @@ $StageDir     = Join-Path $InstallerDir "staging"
 $OutputDir    = Join-Path $InstallerDir "output"
 $IssFile      = Join-Path $InstallerDir "CA-Debugger.iss"
 
+# --- The one place the shipped version comes from ---
+# CA-Debugger.iss holds no version literal; it is passed to ISCC below as /DMyAppVersion. The
+# single source of truth is <Version> in the addin csproj, which the csproj's own
+# CheckAddinVersion target already forces to equal ClarionDebugger.addin's <Identity version>.
+# That matters because AddinFinder compares the installed manifest's <Identity version> against
+# the GitHub release tag minus 'v' — so the csproj version, the manifest, the installer filename
+# and the git tag all have to be the same number.
+function Get-ProductVersion {
+    [xml]$proj = Get-Content $AddinProj -Raw
+    $v = @($proj.Project.PropertyGroup.Version) | Where-Object { $_ } | Select-Object -First 1
+    if (-not $v) { throw "Could not read <Version> from $AddinProj — the installer has no version to stamp." }
+    return "$v".Trim()
+}
+$ProductVersion = Get-ProductVersion
+
 # Clarion install roots per version (first existing root wins) — mirrors deploy-addin.ps1.
 $VersionRoots = @{
     12 = @("C:\Clarion12", "C:\Clarion12d")
@@ -116,6 +131,7 @@ Write-Host "=== CA Debugger Installer Build ===" -ForegroundColor Cyan
 Write-Host "MSBuild:    $MSBuild"
 Write-Host "Inno Setup: $ISCC"
 Write-Host "Versions:   $(( $Build | ForEach-Object { $_.Ver }) -join ', ')"
+Write-Host "Product:    $ProductVersion (from csproj <Version>; tag the release v$ProductVersion)"
 Write-Host ""
 
 # Clean staging.
@@ -169,6 +185,30 @@ foreach ($b in $Build) {
     Write-Host "  staged Clarion $($b.Ver) addin ($dest)" -ForegroundColor Green
 }
 
+# --- Staged-manifest version gate ---
+# Check the ARTIFACT, not the source. The csproj guard proves csproj-vs-manifest agree in the
+# tree; this proves the manifest that actually reached staging — and therefore the installer —
+# declares the version we are about to tag.
+#
+# This is the gate v1.1.0 did not have. That release shipped with staging carrying a manifest
+# still declaring 1.0.0 while the .iss said 1.1.0, so every v1.1.0 install reads "Update
+# available" in AddinFinder forever and reinstalling cannot clear it. A stale staged copy is
+# invisible in the build log without a check like this one, and -NoBuild is exactly the mode
+# where it happens.
+Write-Host "`nVerifying staged manifests declare $ProductVersion..." -ForegroundColor Yellow
+foreach ($b in $Build) {
+    $manifest = Join-Path (Join-Path $StageDir "C$($b.Ver)") "ClarionDebugger.addin"
+    if (-not (Test-Path $manifest)) { throw "Staged manifest missing for Clarion $($b.Ver): $manifest" }
+    [xml]$mx = Get-Content $manifest -Raw
+    $staged = "$($mx.AddIn.Manifest.Identity.version)".Trim()
+    if ($staged -ne $ProductVersion) {
+        throw ("Staged Clarion $($b.Ver) manifest declares <Identity version=`"$staged`"> but this build is $ProductVersion. " +
+               "Shipping this would leave every install stuck on 'Update available' in AddinFinder. " +
+               "Rebuild without -NoBuild so the manifest is re-copied from source.")
+    }
+    Write-Host "  C$($b.Ver): $staged OK" -ForegroundColor Green
+}
+
 # --- Sign staged binaries (before they are compressed into the installer) ---
 if ($Sign) {
     Write-Host "`nSigning staged binaries..." -ForegroundColor Yellow
@@ -182,7 +222,7 @@ if ($Sign) {
 # --- Compile installer ---
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 Write-Host "`nCompiling installer..." -ForegroundColor Yellow
-& $ISCC $IssFile
+& $ISCC "/DMyAppVersion=$ProductVersion" $IssFile
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed." }
 
 $exe = Get-ChildItem $OutputDir -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1

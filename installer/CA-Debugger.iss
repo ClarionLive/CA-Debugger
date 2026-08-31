@@ -7,7 +7,22 @@
 ; the staging\ folders have already been populated.
 
 #define MyAppName "CA Debugger"
-#define MyAppVersion "1.1.0"
+
+; MyAppVersion is deliberately NOT defined here. It is passed in on the ISCC command line
+; (/DMyAppVersion=...) by build-installer.ps1, which reads it from the single source of truth:
+; <Version> in src\ClarionDebugger.Addin\ClarionDebugger.Addin.csproj.
+;
+; This file used to hold its own literal, and it drifted — it said 1.1.0 while the addin manifest
+; still said 1.0.0, so v1.1.0 shipped an installer whose manifest declared 1.0.0. AddinFinder reads
+; the manifest, so every one of those installs shows "Update available" permanently. Holding no
+; version at all removes that copy by construction instead of guarding it.
+;
+; Do not re-add a "#define MyAppVersion" here. The csproj's CheckAddinVersion target does NOT
+; cover this file.
+#ifndef MyAppVersion
+  #error MyAppVersion is not defined. Build via installer\build-installer.ps1 (it passes /DMyAppVersion from the csproj). Do not run ISCC directly on this script.
+#endif
+
 #define MyAppPublisher "ClarionLive"
 #define MyAppURL "https://github.com/ClarionLive/CA-Debugger"
 

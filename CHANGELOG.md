@@ -3,6 +3,51 @@
 All notable changes to CA Debugger are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## v1.1.1 — 2026-08-28
+
+A patch release: stepping and breakpoint fixes contributed by the community, plus
+a versioning fix that matters for anyone installing through AddinFinder.
+
+### Fixed
+
+- **"Update available" showed forever in AddinFinder.** The addin manifest shipped
+  in v1.1.0 still declared version `1.0.0` while the release was tagged `v1.1.0`.
+  AddinFinder compares the installed manifest's version against the release tag,
+  so every v1.1.0 install reported an update that reinstalling could never clear.
+  All version numbers now come from one source and are checked at build time, so
+  the release tag and the shipped manifest cannot drift apart again.
+- **Step Out** no longer stops mid-epilogue on a procedure's own `RETURN` record.
+  Thanks to [@geircodes](https://github.com/geircodes) (#22).
+- **Step Over** no longer runs past a procedure's own prologue.
+  Thanks to [@geircodes](https://github.com/geircodes) (#25).
+- **Removing a breakpoint while the target is running** no longer resurrects it on
+  the next debug session. Thanks to [@geircodes](https://github.com/geircodes) (#23).
+- **Unnamed `GROUP` members and the `_main` symbol** are now recovered from TSWD
+  debug info, so they resolve by name instead of appearing blank.
+  Thanks to [@geircodes](https://github.com/geircodes) (issues #19, #21).
+- **Locals and frame names** resolve correctly when a symbol's `moduleIdx` space
+  diverges from the module table. Thanks to
+  [@msarson](https://github.com/msarson) (#17).
+
+### Changed
+
+- **Run to cursor** now reads the live cursor position from the active Monaco
+  editor rather than the debugger's own Source panel, so it follows where you are
+  actually looking. Based on a spike by
+  [@geircodes](https://github.com/geircodes) (#24).
+- `deploy-addin.ps1` again finds Clarion installs on `C:` alongside `D:` paths.
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.1.1-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
 ## v1.1.0 — 2026-06-16
 
 A large feature release focused on the debugging experience — richer breakpoints,

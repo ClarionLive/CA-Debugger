@@ -18,7 +18,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>1.0.0</Version>
+    <Version>1.1.1</Version>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <ClarionRoot Condition="'$(ClarionRoot)' == ''">C:\Clarion12</ClarionRoot>
@@ -65,6 +65,50 @@
   <Target Name="ValidateClarionRoot" BeforeTargets="ResolveReferences">
     <Error Condition="!Exists('$(ClarionRoot)\bin\ICSharpCode.Core.dll')"
            Text="Missing Clarion IDE assemblies at $(ClarionRoot)\bin. Set ClarionRoot to your Clarion install (e.g. /p:ClarionRoot=C:\Clarion12)." />
+  </Target>
+
+  <!--
+    Version guard — keeps <Version> above and the addin manifest's <Identity version> equal.
+
+    Why this matters: AddinFinder (msarson/ClarionAddinFinder) decides "Update available" by
+    comparing the manifest's <Identity version> on disk against the GitHub release tag minus its
+    leading 'v', component-wise (InstalledAddinStore.CompareDotted). If they differ by any
+    component the IDE shows "Update available" permanently — and reinstalling cannot clear it,
+    because the freshly-installed manifest keeps reasserting the same wrong number. v1.1.0 shipped
+    exactly that way: the installer carried a manifest still declaring 1.0.0.
+
+    Two deliberate choices, both learned the hard way on the sibling ClarionAssistant repo:
+
+      * NOT gated on Configuration == Release. We ship Debug builds (build-installer.ps1 passes
+        /p:Configuration=Debug), so a Release-only guard — which is what the reference
+        implementation does — would never once run.
+
+      * The .iss needs no arm here: it holds no version literal at all any more.
+        build-installer.ps1 passes it via /DMyAppVersion from this same $(Version), and a bare
+        ISCC run stops at an #error. Do NOT re-add a hardcoded "#define MyAppVersion" to the .iss
+        thinking this target covers it — it does not, and that copy is the one that has drifted
+        before.
+
+    XmlPeek rather than a regex: the manifest's own quotes and angle brackets would have to be
+    expanded into MSBuild property syntax for a Regex property function, which breaks on this file.
+  -->
+  <Target Name="CheckAddinVersion" BeforeTargets="Build">
+    <PropertyGroup>
+      <_AddinManifest>$(MSBuildProjectDirectory)\ClarionDebugger.addin</_AddinManifest>
+    </PropertyGroup>
+
+    <Error Condition="!Exists('$(_AddinManifest)')"
+           Text="CheckAddinVersion: addin manifest not found at $(_AddinManifest)." />
+
+    <XmlPeek XmlInputPath="$(_AddinManifest)" Query="/AddIn/Manifest/Identity/@version">
+      <Output TaskParameter="Result" PropertyName="_AddinIdentityVersion" />
+    </XmlPeek>
+
+    <Error Condition="'$(_AddinIdentityVersion)' == ''"
+           Text="CheckAddinVersion: could not read /AddIn/Manifest/Identity/@version from $(_AddinManifest). The manifest shape changed — fix this target, do not delete it." />
+
+    <Error Condition="'$(_AddinIdentityVersion)' != '$(Version)'"
+           Text="CheckAddinVersion: version drift. ClarionDebugger.Addin.csproj &lt;Version&gt; is '$(Version)' but ClarionDebugger.addin &lt;Identity version&gt; is '$(_AddinIdentityVersion)'. These must be identical — AddinFinder compares the manifest version against the release tag and will show 'Update available' forever if they disagree. Update both, and tag the release v$(Version)." />
   </Target>
 
 </Project>
