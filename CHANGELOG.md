@@ -3,7 +3,7 @@
 All notable changes to CA Debugger are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## v1.1.1 — 2026-08-28
+## v1.1.1 — 2026-08-31
 
 A patch release: stepping and breakpoint fixes contributed by the community, plus
 a versioning fix that matters for anyone installing through AddinFinder.
