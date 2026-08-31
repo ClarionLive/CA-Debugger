@@ -339,6 +339,10 @@ namespace ClarionDebugger.Terminal
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
+                    // The page asks for About data when the panel is opened. This is the path that
+                    // actually delivers it: the push below on "ready" is made before
+                    // NavigationCompleted has fired, so _ready is still false and Post() drops it.
+                    case "about": PushAbout(); break;
                     case "ready":
                         Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
                         PushAbout();
