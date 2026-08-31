@@ -147,11 +147,16 @@
     template-with-tokens scheme: that would leave the repo without a valid checked-in manifest
     and put a generated file on the path AddinFinder reads.
   -->
+  <!--
+    Deliberately NOT incremental. An Inputs/Outputs pair here can only name files, and the value
+    being stamped ($(BuildNumber), a git commit count) is not one — so the target would skip
+    whenever only the commit count had moved and happily ship a caption a build behind the DLL.
+    That was observed: FileVersion 1.1.1.132 against a caption reading v1.1.1.131. A copy plus one
+    XmlPoke is far too cheap to be worth re-introducing that risk.
+  -->
   <Target Name="StampAddinManifest"
           AfterTargets="CheckAddinVersion"
-          BeforeTargets="Build"
-          Inputs="$(MSBuildProjectDirectory)\ClarionDebugger.addin;$(MSBuildProjectFullPath)"
-          Outputs="$(IntermediateOutputPath)ClarionDebugger.addin">
+          BeforeTargets="Build">
     <MakeDir Directories="$(IntermediateOutputPath)" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\ClarionDebugger.addin"
           DestinationFiles="$(IntermediateOutputPath)ClarionDebugger.addin" />

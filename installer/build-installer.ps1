@@ -206,7 +206,21 @@ foreach ($b in $Build) {
                "Shipping this would leave every install stuck on 'Update available' in AddinFinder. " +
                "Rebuild without -NoBuild so the manifest is re-copied from source.")
     }
-    Write-Host "  C$($b.Ver): $staged OK" -ForegroundColor Green
+    # The pad caption is stamped separately from <Identity version> and carries the build number,
+    # so it can drift on its own axis: a skipped restamp ships a caption a build behind the DLL.
+    # That actually happened during development (FileVersion 1.1.1.132 vs caption v1.1.1.131), and
+    # nothing else would have caught it — Identity was correct the whole time.
+    $padTitle = "$($mx.AddIn.Path | Where-Object { $_.name -eq '/SharpDevelop/Workbench/Pads' } |
+                   ForEach-Object { $_.Pad.title })".Trim()
+    $dll = Join-Path (Join-Path $StageDir "C$($b.Ver)") "ClarionDebugger.dll"
+    $fileVer = (Get-Item $dll).VersionInfo.FileVersion.Trim()
+    $expectedTitle = "CA Debugger v$fileVer"
+    if ($padTitle -ne $expectedTitle) {
+        throw ("Staged Clarion $($b.Ver) pad caption is '$padTitle' but the staged DLL is FileVersion " +
+               "$fileVer (expected caption '$expectedTitle'). The manifest was not restamped for this " +
+               "build — the shipped caption would show the wrong build number.")
+    }
+    Write-Host "  C$($b.Ver): identity $staged, caption '$padTitle' OK" -ForegroundColor Green
 }
 
 # --- Sign staged binaries (before they are compressed into the installer) ---
