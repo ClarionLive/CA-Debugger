@@ -479,11 +479,10 @@
   // which is indistinguishable from a dead button — if the data is missing, say so in the panel
   // rather than doing nothing.
   function openAbout(){
-    // Ask the host for the data every time rather than relying on the push it makes while handling
-    // our 'ready' message. That push happens before WebView2 raises NavigationCompleted, so the
-    // host's _ready flag is still false and its Post() silently drops the message. By the time a
-    // user can click this, _ready is long since true — so this request always lands. The panel
-    // repaints when the reply arrives.
+    // Ask the host afresh each time so the panel reflects live state rather than a value captured
+    // once at startup. The host's push on 'ready' now survives too (it buffers messages until the
+    // WebView is ready), but this request is what makes About independent of initialization
+    // ordering. The panel repaints when the reply arrives.
     send('about');
     if(!aboutInfo) setAbout({product:'CA Debugger',version:'',tagline:'Version information unavailable — the debugger panel did not receive it from the IDE host.',publisher:'ClarionLive',website:'https://github.com/ClarionLive/CA-Debugger',year:'2026'});
     $('aboutBackdrop').classList.add('show');

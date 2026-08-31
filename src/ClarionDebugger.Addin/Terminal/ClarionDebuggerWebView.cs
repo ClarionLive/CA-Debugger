@@ -28,6 +28,25 @@ namespace ClarionDebugger.Terminal
         private bool _initializing;
         private volatile bool _startQueued; // a toolbar Start arrived before the WebView was ready; fire it on NavigationCompleted
 
+        // Messages posted before the WebView is ready, held until NavigationCompleted rather than
+        // discarded. The page's inline script calls send('ready') while the document is still
+        // parsing, but WebView2 raises NavigationCompleted only after the load event — so the whole
+        // "ready" handler runs in a window where _ready is false. Without this buffer every message
+        // it produces is thrown away, silently: the initial runstate, the About payload, and the
+        // "auto-detected target" console line. (PushProcedures escaped it only by accident, because
+        // it posts via UI(), i.e. a later message-loop turn.)
+        //
+        // Bounded: if navigation never completes, this must not grow without limit. On overflow the
+        // OLDEST is dropped — for state pushes the newest message is the truthful one.
+        //
+        // _postLock guards both the queue and the enqueue-vs-flush decision. It is not enough for
+        // _ready to be volatile: without the lock, Post() can observe _ready == false, be preempted
+        // by the flush, and then enqueue into a queue nobody will drain again.
+        private const int MaxPendingPosts = 64;
+        private readonly object _postLock = new object();
+        private readonly Queue<string> _pendingPosts = new Queue<string>();
+        private bool _pendingOverflowed;
+
         private readonly ClarionDebuggerService _svc = new ClarionDebuggerService();
         private readonly EditorBreakpointService _gutter = new EditorBreakpointService();
         private readonly List<DebugBreakpoint> _pending = new List<DebugBreakpoint>(); // breakpoints while idle
@@ -265,6 +284,11 @@ namespace ClarionDebugger.Terminal
             if (ok)
             {
                 _ready = true; _initializing = false;
+                // Deliver anything the page missed while it was still loading — in particular
+                // everything the "ready" handler produced, which runs strictly before this event.
+                // Flush FIRST so the page receives startup state in generation order, and before any
+                // queued Start starts producing newer messages on top of it.
+                FlushPendingPosts();
                 // Run a queued Start now that the page is live — but re-check idempotency (StartSession only
                 // when still Idle) so the queued path is guarded identically to CmdStart.
                 if (_startQueued)
@@ -279,6 +303,10 @@ namespace ClarionDebugger.Terminal
             {
                 _ready = false; _initializing = false;
                 _startQueued = false; // don't strand a queued Start on a failed navigation
+                // Same reasoning for buffered messages: the page never came up, so there is nothing
+                // to replay them into. Holding them would also keep them alive across the reopen
+                // that is the documented recovery, delivering stale startup state to a fresh page.
+                DiscardPendingPosts("navigation failed: " + (reason ?? "unknown"));
                 // Don't promise a Start-retry: OnHandleCreated is one-shot and won't re-run. Recovery is
                 // reopening the pad (which constructs a fresh WebView + re-runs init).
                 UI(() => Console("err", "debugger view failed to initialize: " + (reason ?? "unknown") + " — reopen the CA Debugger pad to retry."));
@@ -339,9 +367,11 @@ namespace ClarionDebugger.Terminal
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
-                    // The page asks for About data when the panel is opened. This is the path that
-                    // actually delivers it: the push below on "ready" is made before
-                    // NavigationCompleted has fired, so _ready is still false and Post() drops it.
+                    // The page also asks for About data whenever the panel is opened, so it reflects
+                    // live state rather than a value captured once at startup. The push on "ready"
+                    // below now survives too (Post buffers until NavigationCompleted), but this
+                    // request path is kept deliberately: it is the one that cannot be broken by a
+                    // future change to initialization ordering.
                     case "about": PushAbout(); break;
                     case "ready":
                         Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
@@ -1289,10 +1319,70 @@ namespace ClarionDebugger.Terminal
             }
         }
 
+        /// <summary>
+        /// Sends a message to the page, or buffers it if the WebView is not ready yet (see
+        /// _pendingPosts). Callers never have to ask whether the page is up — that question is the
+        /// trap this fix exists to remove, because getting it wrong failed silently.
+        /// </summary>
         private void Post(string json)
         {
-            try { if (_ready && _webView.CoreWebView2 != null) _webView.CoreWebView2.PostWebMessageAsString(json); }
+            lock (_postLock)
+            {
+                if (!_ready || _webView.CoreWebView2 == null)
+                {
+                    if (_pendingPosts.Count >= MaxPendingPosts)
+                    {
+                        _pendingPosts.Dequeue();   // drop oldest — newest state wins
+                        if (!_pendingOverflowed)
+                        {
+                            _pendingOverflowed = true;
+                            System.Diagnostics.Debug.WriteLine(
+                                "[CADebuggerWeb] pre-ready post buffer hit " + MaxPendingPosts +
+                                "; dropping oldest. The page may never have finished navigating.");
+                        }
+                    }
+                    _pendingPosts.Enqueue(json);
+                    return;
+                }
+            }
+            try { _webView.CoreWebView2.PostWebMessageAsString(json); }
             catch { }
+        }
+
+        /// <summary>
+        /// Delivers everything buffered before the page was ready, in the order it was produced.
+        /// Called from OnNavigationCompleted once _ready is set.
+        /// </summary>
+        private void FlushPendingPosts()
+        {
+            string[] queued;
+            lock (_postLock)
+            {
+                if (_pendingPosts.Count == 0) return;
+                queued = _pendingPosts.ToArray();
+                _pendingPosts.Clear();
+                _pendingOverflowed = false;
+            }
+            foreach (var json in queued)
+            {
+                try { if (_webView.CoreWebView2 != null) _webView.CoreWebView2.PostWebMessageAsString(json); }
+                catch { }
+            }
+        }
+
+        /// <summary>Discards buffered messages — navigation failed or the view is going away.</summary>
+        private void DiscardPendingPosts(string why)
+        {
+            int n;
+            lock (_postLock)
+            {
+                n = _pendingPosts.Count;
+                _pendingPosts.Clear();
+                _pendingOverflowed = false;
+            }
+            if (n > 0)
+                System.Diagnostics.Debug.WriteLine(
+                    "[CADebuggerWeb] discarded " + n + " buffered message(s): " + why);
         }
 
         /// <summary>
@@ -1329,37 +1419,14 @@ namespace ClarionDebugger.Terminal
             var sb = new StringBuilder();
             sb.Append("{\"type\":\"about\"")
               .Append(",\"product\":\"CA Debugger\"")
-              .Append(",\"version\":\"").Append(JsonStr(version)).Append('"')
+              .Append(",\"version\":").Append(Str(version))
               .Append(",\"tagline\":\"Source-level debugger for the Clarion IDE\"")
               .Append(",\"publisher\":\"ClarionLive\"")
               .Append(",\"website\":\"https://github.com/ClarionLive/CA-Debugger\"")
               .Append(",\"engine\":\"ClarionDbg (32-bit, TSWD debug info)\"")
-              .Append(",\"runtime\":\"Microsoft Edge WebView2 ").Append(JsonStr(runtime)).Append('"')
+              .Append(",\"runtime\":").Append(Str("Microsoft Edge WebView2 " + runtime))
               .Append(",\"year\":\"2026\"}");
             Post(sb.ToString());
-        }
-
-        /// <summary>Minimal JSON string-body escaper for the About payload (no dependency on a JSON lib).</summary>
-        private static string JsonStr(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return string.Empty;
-            var sb = new StringBuilder(s.Length + 8);
-            foreach (char c in s)
-            {
-                switch (c)
-                {
-                    case '"':  sb.Append("\\\""); break;
-                    case '\\': sb.Append("\\\\"); break;
-                    case '\n': sb.Append("\\n");  break;
-                    case '\r': sb.Append("\\r");  break;
-                    case '\t': sb.Append("\\t");  break;
-                    default:
-                        if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
-                        else sb.Append(c);
-                        break;
-                }
-            }
-            return sb.ToString();
         }
 
         private void UI(Action a)
@@ -1431,6 +1498,9 @@ namespace ClarionDebugger.Terminal
                 // teardown-completion signal goes to the STATIC controller (safe post-dispose), not the WebView.
                 _ready = false;
                 _startQueued = false;
+                // Late off-thread callbacks can still call Post() during teardown; with _ready false
+                // those would buffer into a queue that will never be flushed. Drop them.
+                try { DiscardPendingPosts("pad disposing"); } catch { }
                 try { DetachServiceEvents(); } catch { }
                 if (_coreForEvents != null)
                 {
