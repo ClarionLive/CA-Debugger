@@ -171,13 +171,20 @@ namespace ClarionDebugger.Terminal
         /// ClarionAssistant work. A solution opened mid-session is ignored here on purpose; the next
         /// Start re-resolves from scratch via ResolveTargetForStart().
         /// </remarks>
-        private void RefreshForIdeContext(string why)
+        /// <param name="sessionEnded">
+        /// True when called from the state-change handler because the session just ended. The caller
+        /// already knows the session is over, so the idle check is skipped: _svc.State is not
+        /// guaranteed to read Idle yet at the moment the StateChanged callback runs, and re-deriving
+        /// it here would make this depend on an ordering assumption. Getting exactly that wrong is
+        /// what caused the two preceding bugs in this file.
+        /// </param>
+        private void RefreshForIdeContext(string why, bool sessionEnded = false)
         {
             UI(() =>
             {
                 try
                 {
-                    if (CurrentState != DebugSessionState.Idle) return;
+                    if (!sessionEnded && CurrentState != DebugSessionState.Idle) return;
                     // TryAutoResolveExe already announces a changed target and pushes it to the
                     // target bar; a second line here just said the same thing twice.
                     TryAutoResolveExe();
@@ -250,6 +257,15 @@ namespace ClarionDebugger.Terminal
             // Fires off-thread (OutputDataReceived/Exited); the Post is marshalled to the UI thread.
             DebugSessionController.SetState(this, ToControllerState(s));
             UI(() => Post("{\"type\":\"runstate\",\"state\":\"" + StateName(s) + "\"}"));
+
+            // Catch up with the IDE now the session is over. RefreshForIdeContext deliberately
+            // ignores solution/project events while a session is live, because re-priming the .red
+            // resolver mid-session would repoint it away from the binary being debugged. But
+            // suppressing those events left nothing to reconcile afterwards: open a different
+            // solution while paused, Stop, and the pad went on showing the OLD target indefinitely —
+            // it only corrected itself on the next IDE event, which might be the solution closing
+            // minutes later. Observed exactly that way during the v1.2.0 session test.
+            if (s == DebugSessionState.Idle) RefreshForIdeContext("session ended", sessionEnded: true);
         }
 
         private void OnSvcResumed(string mode) => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });

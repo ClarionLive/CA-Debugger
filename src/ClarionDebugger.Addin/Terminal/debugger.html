@@ -777,7 +777,14 @@
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
+    // Every state must write the status line. Only 'idle' used to, so once a session started the
+    // bar kept the idle text — the app was visibly running while the bar still read "Not running —
+    // press Start on the IDE toolbar." The paused text is written by the pause handler, which has
+    // the procedure/module/line to name; the states below have nothing to add, so they say what is
+    // true and no more.
     if(state==='idle'){ $('locbar').textContent='Not running — press Start on the IDE toolbar.'; clearSrc(); }
+    else if(state==='launching'){ $('locbar').textContent='Launching…'; }
+    else if(state==='running'){ $('locbar').textContent='Running — use the target, or Pause to break in.'; }
   }
 
   // ---- add a watch (from any of the 4 mechanisms) ----
