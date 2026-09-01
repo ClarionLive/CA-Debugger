@@ -62,6 +62,34 @@ each pass. Under `-NoBuild` nothing rebuilds, so all three staging folders recei
 DLL happens to be there — C10 and C11 would ship a C12-linked DLL, silently. **The version gates
 cannot catch this**: every copy carries the correct version and only the binding differs.
 
+## The build number, and the third gate
+
+Since v1.1.1 the pad caption carries a build number — the pad reads **"CA Debugger v1.1.1.136"**:
+`Major.Minor.Patch` plus a git commit count. The same value appears in `FileVersion` and
+`InformationalVersion`.
+
+**It is derived, not authored.** Nobody bumps it; `ComputeBuildNumber` reads
+`git rev-list --count HEAD`. Do not hand-edit it, and **never promote it into `<Identity version>`
+or the release tag** — a build number in the compared version is exactly the shape that made v1.1.0
+unfixable.
+
+It is also monotonic only along a *linear* history: a feature branch can carry a higher count than
+main, and a squash-merge can land main on a lower count than a dev build already produced. That is
+harmless where the number lives, and would not be if it ever reached a compared version.
+
+**A third gate can fail your release build, and its message is unlike the other two.**
+`build-installer.ps1` compares each staged pad caption against that staged DLL's `FileVersion` and
+throws when they disagree. It means the manifest was not restamped for this build. The fix is a
+clean rebuild — never editing the caption by hand.
+
+It guards a **different axis** from the version gates: `<Identity version>` can be perfectly correct
+while the caption is a build behind. That was observed during development — `FileVersion 1.1.1.132`
+against a caption reading `v1.1.1.131`, with Identity right the whole time.
+
+**It does not catch a `-NoBuild` build.** Under `-NoBuild` the staged manifest and the staged DLL
+both come from the same stale `bin\Debug`, so the caption and `FileVersion` agree and the gate
+passes. Point 4 above stands exactly as written: `-NoBuild` is caught by nothing.
+
 ## The sequence
 
 ```powershell
