@@ -3,6 +3,38 @@
 All notable changes to CA Debugger are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## v1.2.1 — 2026-09-01
+
+Two fixes to the panel's status display, both found by running a full debug
+session against v1.2.0.
+
+### Fixed
+
+- **The target bar could show the previous project's EXE after a debug session.**
+  While a session is running the panel deliberately ignores solution changes —
+  re-pointing the debug engine mid-session would aim it at the wrong binary — but
+  it then had no way to catch up once the session ended. If you opened a
+  different solution while debugging, the target bar kept showing the old target
+  after you stopped, until some later action happened to refresh it. It now
+  re-syncs as soon as the session ends. (This only ever affected what was
+  *displayed*: starting a session always re-resolves the target, so the wrong
+  program could not be launched.)
+- **The status line read "Not running" while the program was running.** It only
+  ever updated when the session went idle or paused, so during a run it
+  contradicted the run-state indicator next to it. It now reports launching and
+  running as well.
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.2.1-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
 ## v1.2.0 — 2026-09-01
 
 The debugger panel now tells you what it's pointed at and keeps up with the IDE

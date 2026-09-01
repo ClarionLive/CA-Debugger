@@ -23,7 +23,7 @@
       Three parts, no build number — see CheckAddinVersion below. AssemblyVersion is pinned to it
       deliberately so the build number never reaches an assembly-binding identity.
     -->
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
     <AssemblyVersion>$(Version)</AssemblyVersion>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
