@@ -25,9 +25,21 @@ removed. Addin Finder compares them component-wise and reads a *missing* compone
 and `1.2.0` are equal — and nothing else is.
 
 Get this wrong and the pad reads **"Update available" forever**. Reinstalling cannot clear it, because
-the freshly-installed manifest keeps reasserting the same wrong number. This is not hypothetical:
-**v1.1.0 shipped exactly that way**, with a manifest still declaring `1.0.0`, and every install of it
-was stuck until v1.1.1.
+the freshly-installed manifest keeps reasserting the same wrong number.
+
+This is not hypothetical, and it was not a one-off slip. **Every release before v1.1.1 shipped a
+manifest that disagreed with its tag** — the drift goes back to the earliest tag in the repository,
+not just to v1.1.0:
+
+| Tag | Shipped manifest | |
+|-----|------------------|---|
+| `v1.0.1` | `1.0.0` | drift |
+| `v1.1.0` | `1.0.0` | drift |
+| `v1.1.1` | `1.1.1` | first release whose manifest matched its tag |
+| `v1.2.0` | `1.2.0` | ✓ |
+
+So the guards below are not protecting a working process from one mistake. They are the reason the
+process works at all — it never did before them.
 
 Two guards enforce it, and neither should be removed:
 
