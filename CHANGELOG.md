@@ -3,6 +3,57 @@
 All notable changes to CA Debugger are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## v1.2.0 — 2026-09-01
+
+The debugger panel now tells you what it's pointed at and keeps up with the IDE
+on its own, instead of waiting to be refreshed.
+
+### Added
+
+- **Target bar.** The resolved target EXE is shown in the panel, full path,
+  always visible — click it to reveal the file in Explorer. It previously
+  appeared only in the Debug Console, which is a section you can hide, so with it
+  collapsed there was no way to see what was about to be launched.
+- **Live solution tracking.** Open a project and the target and Procedures list
+  populate on their own; close the solution and they clear. Previously the panel
+  resolved these only when it first opened or when you pressed ↻, so a solution
+  opened afterwards left it looking empty indefinitely.
+- **About panel**, on the ⓘ button — version, publisher, debug engine and
+  WebView2 runtime.
+- **Documentation button**, opening the user guide (the installed copy if you
+  have it, otherwise the published one).
+- **Version in the pad caption** — the docked tab reads `CA Debugger v1.2.0.<build>`,
+  where the build number is the commit the build came from.
+
+### Fixed
+
+- **Messages sent to the panel as it started up were silently discarded.** The
+  page announces itself while it is still loading, but the host treated it as not
+  yet ready and dropped everything it sent back — the initial run state, the
+  About details, and the auto-detected target message. They are now held and
+  delivered once the panel is live.
+- **Duplicate console lines** when a project opened: the target was announced on
+  every IDE event, whether or not it had changed.
+- The panel's initialization-failure message advised reopening the pad, which
+  could never have worked — closing a pad only hides it, so reopening reuses the
+  same instance. It now says to restart the IDE.
+
+### Changed
+
+- The panel header shows the product name larger and in colour, without
+  repeating the version already in the tab caption.
+
+### Requirements
+
+- Clarion 10, 11, or 12 (32-bit).
+- Microsoft Edge WebView2 Runtime (for the debugger pad UI).
+- The target application must be compiled with **Full** debug information.
+
+### Install
+
+Download `CA-Debugger-1.2.0-Setup.exe` from the release assets and run it (close
+the Clarion IDE first). See the [User Guide](https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html) for usage.
+
 ## v1.1.1 — 2026-08-31
 
 A patch release: stepping and breakpoint fixes contributed by the community, plus
