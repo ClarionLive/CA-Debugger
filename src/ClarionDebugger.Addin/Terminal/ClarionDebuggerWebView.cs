@@ -178,14 +178,10 @@ namespace ClarionDebugger.Terminal
                 try
                 {
                     if (CurrentState != DebugSessionState.Idle) return;
-                    string before = _exe;
+                    // TryAutoResolveExe already announces a changed target and pushes it to the
+                    // target bar; a second line here just said the same thing twice.
                     TryAutoResolveExe();
-                    if (!string.IsNullOrEmpty(_exe))
-                    {
-                        if (!string.Equals(before, _exe, StringComparison.OrdinalIgnoreCase))
-                            Console("info", why + " — target: " + Path.GetFileName(_exe));
-                        PushProcedures(_exe);
-                    }
+                    if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
                 }
                 catch (Exception ex)
                 {
@@ -206,6 +202,7 @@ namespace ClarionDebugger.Terminal
                     _exe = null; _exeAuto = false; _exeManualKey = null;
                     _procGen++;                       // invalidate any in-flight procedure parse
                     Post("{\"type\":\"procedures\",\"procs\":[]}");
+                    PushTarget();                     // blanks the target bar
                     Console("info", "solution closed — target cleared");
                 }
                 catch (Exception ex)
@@ -481,9 +478,12 @@ namespace ClarionDebugger.Terminal
                     // request path is kept deliberately: it is the one that cannot be broken by a
                     // future change to initialization ordering.
                     case "about": PushAbout(); break;
+                    case "revealexe": RevealExe(); break;
+                    case "opendocs": OpenDocs(); break;
                     case "ready":
                         Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
                         PushAbout();
+                        PushTarget();
                         if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
                         if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
                         break;
@@ -898,13 +898,75 @@ namespace ClarionDebugger.Terminal
                 string result = ProjectTargetService.ResolveTargetExe();
                 if (!string.IsNullOrEmpty(result))
                 {
+                    // Log only on an actual change. This runs on every IDE context event, and
+                    // re-announcing the same unchanged target each time was pure console noise.
+                    bool changed = !string.Equals(_exe, result, StringComparison.OrdinalIgnoreCase);
                     _exe = result;
                     _exeAuto = true;
                     _exeManualKey = null;
-                    Console("info", "auto-detected target: " + Path.GetFileName(_exe));
+                    if (changed) Console("info", "auto-detected target: " + Path.GetFileName(_exe));
+                    PushTarget();
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Sends the resolved target to the page's target bar. The target belongs on-screen, not in
+        /// the Debug Console: the console is a hideable section, so anyone with it collapsed had no
+        /// way to see what the debugger was about to launch.
+        /// </summary>
+        private void PushTarget()
+        {
+            string path = _exe ?? string.Empty;
+            bool exists = false;
+            try { exists = path.Length > 0 && File.Exists(path); } catch { }
+            Post("{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false") + "}");
+        }
+
+        /// <summary>Shows the target EXE in File Explorer, with the file selected.</summary>
+        private void RevealExe()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_exe)) { Console("info", "no target resolved yet."); return; }
+                if (!File.Exists(_exe)) { Console("err", "target does not exist on disk: " + _exe + " — build the app."); return; }
+                // A Windows path cannot contain a double quote, so quoting is sufficient here and
+                // there is no argument-injection surface. UseShellExecute so this works without a
+                // console subsystem attached.
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "explorer.exe", "/select,\"" + _exe + "\"") { UseShellExecute = true });
+            }
+            catch (Exception ex) { Console("err", "could not open Explorer: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// Opens the user guide — the copy the installer laid down if present, otherwise the
+        /// published one. The installer's docs component is OPTIONAL, so a local copy cannot be
+        /// assumed, and the guide does not live beside the addin DLL (it goes to the app dir, while
+        /// the addin goes under the Clarion install's accessory\addins).
+        /// </summary>
+        private void OpenDocs()
+        {
+            const string online = "https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html";
+            string target = online;
+            try
+            {
+                foreach (var root in new[]
+                {
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)
+                })
+                {
+                    if (string.IsNullOrEmpty(root)) continue;
+                    string candidate = Path.Combine(root, "CA Debugger", "user-guide.html");
+                    if (File.Exists(candidate)) { target = candidate; break; }
+                }
+            }
+            catch { }
+
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(target) { UseShellExecute = true }); }
+            catch (Exception ex) { Console("err", "could not open the user guide: " + ex.Message); }
         }
 
         /// <summary>Prompt for a Target EXE. Returns true if the user picked one. A manual choice clears
