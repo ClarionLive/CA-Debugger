@@ -101,8 +101,14 @@
   -->
   <!--
     Build number = git commit count. Chosen over an auto-incrementing counter file because it
-    stores no state, never rewrites a tracked file, is monotonic, and maps back to an exact
-    commit. (The counter-file approach on the sibling ClarionAssistant repo rewrites its props
+    stores no state, never rewrites a tracked file, and maps back to an exact commit.
+
+    It is NOT a safe version component in its own right, and must not be treated as one: the count
+    rises along a single linear history, but a feature branch can carry a higher count than main,
+    and a squash-merge can put main on a LOWER count than a dev build you already produced. So the
+    number can go backwards between builds. That is harmless only because it never reaches
+    <Identity version>, which AddinFinder compares forward-only — the worst it can do is show a
+    caption that looks like it went back a build. Do not promote it into a compared version. (The counter-file approach on the sibling ClarionAssistant repo rewrites its props
     file mid-build, which is what forced its version guard to be scoped to
     BuildingInsideVisualStudio.)
 
