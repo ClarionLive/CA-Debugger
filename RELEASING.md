@@ -67,12 +67,21 @@ The registry entry's `id` is **`ClarionDebugger`** — the folder the installer 
 the registry entry must change with it, or the addin silently never shows as installed and never
 reports a version.
 
-### 4. The build is not a `-NoBuild` build
+### 4. Every Clarion version is actually rebuilt
 
 `build-installer.ps1` builds once per Clarion version into the *same* `bin\Debug` and stages after
-each pass. Under `-NoBuild` nothing rebuilds, so all three staging folders receive whichever single
-DLL happens to be there — C10 and C11 would ship a C12-linked DLL, silently. **The version gates
-cannot catch this**: every copy carries the correct version and only the binding differs.
+each pass. If the builds are skipped, all three staging folders receive whichever single DLL happens
+to be there — C10 and C11 would ship a C12-linked DLL, silently. **No gate can catch this**: every
+copy carries the correct version and only the binding differs, and versions, sizes and hashes are
+all blind to binding.
+
+**This is now enforced rather than remembered.** `build-installer.ps1` used to take a `-NoBuild`
+switch that did exactly this, and for a while this section existed to tell you not to use it. The
+switch has been removed: it had no safe use — the `.iss` references all three staging folders
+unconditionally, so a partial build cannot produce a working installer anyway — and a rule that
+lives only in a document is one unread document away from being violated. Do not re-add it, or any
+`-SkipBuild` equivalent. The script carries a comment saying the same thing at the point where
+someone would be tempted.
 
 ## The build number, and the third gate
 
@@ -98,9 +107,10 @@ It guards a **different axis** from the version gates: `<Identity version>` can 
 while the caption is a build behind. That was observed during development — `FileVersion 1.1.1.132`
 against a caption reading `v1.1.1.131`, with Identity right the whole time.
 
-**It does not catch a `-NoBuild` build.** Under `-NoBuild` the staged manifest and the staged DLL
-both come from the same stale `bin\Debug`, so the caption and `FileVersion` agree and the gate
-passes. Point 4 above stands exactly as written: `-NoBuild` is caught by nothing.
+**It would not have caught a skipped build.** With everything restaged from the same stale
+`bin\Debug`, the caption and `FileVersion` agree and this gate passes clean — which is why the
+`-NoBuild` switch was removed outright rather than guarded. Worth keeping straight when adding
+gates: all three of these compare **versions**, and a wrong-binding DLL is not a version problem.
 
 ## The sequence
 
@@ -112,7 +122,7 @@ passes. Point 4 above stands exactly as written: `-NoBuild` is caught by nothing
 
 # 2. Write the CHANGELOG entry, crediting contributors by handle.
 
-# 3. Build + sign. NOT -NoBuild.
+# 3. Build + sign.
 cd installer
 .\build-installer.ps1 -Sign
 

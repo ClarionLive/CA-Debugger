@@ -5,10 +5,9 @@
 # stages the version-independent ClarionDbg engine once, then compiles the Inno
 # Setup script into installer\output\.
 #
-# Usage: .\build-installer.ps1 [-Versions 12,11,10] [-NoBuild] [-Sign]
+# Usage: .\build-installer.ps1 [-Versions 12,11,10] [-Sign]
 #
 #   -Versions   Which Clarion versions to include (default: all that are installed).
-#   -NoBuild    Skip MSBuild; (re)stage from existing build output and compile only.
 #   -Sign       Authenticode-sign the staged binaries and the finished installer
 #               with the Sectigo EV cert (Kennewick Computer Company). Requires the
 #               EV dongle plugged in.
@@ -17,9 +16,20 @@
 # root for every version being built (its \bin\ICSharpCode.*.dll are referenced
 # at compile time). For -Sign: Windows SDK signtool + the EV dongle.
 
+# There is deliberately no -NoBuild / -SkipBuild switch. The addin is built once per Clarion
+# version into the SAME bin\Debug and staged after each pass, so skipping the builds staged
+# whichever single DLL happened to be there into all three folders — C10 and C11 would ship a
+# C12-linked DLL. Nothing could catch it: every gate here compares VERSIONS, and all three copies
+# carried the correct version; only the linked IDE assembly references differed, and versions,
+# sizes and hashes are all blind to binding. Re-adding the switch re-opens that hole.
+#
+# [CmdletBinding()] is load-bearing here, not decoration. Without it PowerShell does not bind
+# strictly: an unknown named argument is silently collected into $args and ignored. Someone typing
+# -NoBuild out of muscle memory would get no complaint and would reasonably believe the builds had
+# been skipped. With it, the flag is a hard error that names itself.
+[CmdletBinding()]
 param(
     [int[]]$Versions,
-    [switch]$NoBuild,
     [switch]$Sign
 )
 
@@ -139,11 +149,9 @@ if (Test-Path $StageDir) { Remove-Item $StageDir -Recurse -Force }
 New-Item -ItemType Directory -Path $StageDir | Out-Null
 
 # --- Engine (version-independent) ---
-if (-not $NoBuild) {
-    Write-Host "Building ClarionDbg engine..." -ForegroundColor Yellow
-    & $MSBuild $EngineProj /t:Build /restore /p:Configuration=Debug /v:minimal /nologo
-    if ($LASTEXITCODE -ne 0) { throw "Engine build failed." }
-}
+Write-Host "Building ClarionDbg engine..." -ForegroundColor Yellow
+& $MSBuild $EngineProj /t:Build /restore /p:Configuration=Debug /v:minimal /nologo
+if ($LASTEXITCODE -ne 0) { throw "Engine build failed." }
 $EngineStage = Join-Path $StageDir "engine"
 New-Item -ItemType Directory -Path $EngineStage | Out-Null
 # Iced.dll is the x86 disassembler the engine hard-references for the disassembly view — stage it
@@ -175,11 +183,9 @@ function Stage-Addin([string]$dest) {
 }
 
 foreach ($b in $Build) {
-    if (-not $NoBuild) {
-        Write-Host "Building addin for Clarion $($b.Ver) ($($b.Root))..." -ForegroundColor Yellow
-        & $MSBuild $AddinProj /t:Rebuild /restore /p:Configuration=Debug /p:ClarionRoot=$($b.Root) /v:minimal /nologo
-        if ($LASTEXITCODE -ne 0) { throw "Addin build failed for Clarion $($b.Ver)." }
-    }
+    Write-Host "Building addin for Clarion $($b.Ver) ($($b.Root))..." -ForegroundColor Yellow
+    & $MSBuild $AddinProj /t:Rebuild /restore /p:Configuration=Debug /p:ClarionRoot=$($b.Root) /v:minimal /nologo
+    if ($LASTEXITCODE -ne 0) { throw "Addin build failed for Clarion $($b.Ver)." }
     $dest = Join-Path $StageDir "C$($b.Ver)"
     Stage-Addin $dest
     Write-Host "  staged Clarion $($b.Ver) addin ($dest)" -ForegroundColor Green
@@ -193,8 +199,7 @@ foreach ($b in $Build) {
 # This is the gate v1.1.0 did not have. That release shipped with staging carrying a manifest
 # still declaring 1.0.0 while the .iss said 1.1.0, so every v1.1.0 install reads "Update
 # available" in AddinFinder forever and reinstalling cannot clear it. A stale staged copy is
-# invisible in the build log without a check like this one, and -NoBuild is exactly the mode
-# where it happens.
+# invisible in the build log without a check like this one.
 Write-Host "`nVerifying staged manifests declare $ProductVersion..." -ForegroundColor Yellow
 foreach ($b in $Build) {
     $manifest = Join-Path (Join-Path $StageDir "C$($b.Ver)") "ClarionDebugger.addin"
@@ -204,7 +209,7 @@ foreach ($b in $Build) {
     if ($staged -ne $ProductVersion) {
         throw ("Staged Clarion $($b.Ver) manifest declares <Identity version=`"$staged`"> but this build is $ProductVersion. " +
                "Shipping this would leave every install stuck on 'Update available' in AddinFinder. " +
-               "Rebuild without -NoBuild so the manifest is re-copied from source.")
+               "Rebuild so the manifest is re-copied from source.")
     }
     # The pad caption is stamped separately from <Identity version> and carries the build number,
     # so it can drift on its own axis: a skipped restamp ships a caption a build behind the DLL.
