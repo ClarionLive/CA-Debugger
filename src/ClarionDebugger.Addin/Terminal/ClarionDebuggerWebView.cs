@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
+using ICSharpCode.SharpDevelop.Project;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -106,8 +107,112 @@ namespace ClarionDebugger.Terminal
 
             HandleCreated += OnHandleCreated;
 
+            AttachProjectEvents();
+
             // Become the live target for the IDE debug toolbar. The latest pad instance wins.
             DebugSessionController.Register(this);
+        }
+
+        /// <summary>
+        /// Track the IDE's solution/project so the pad reflects what is open without being told to.
+        /// Previously the target and Procedures were resolved only on the page's "ready" message —
+        /// once, when the WebView first navigates — or when the user pressed the refresh button.
+        /// Opening a solution afterwards left the pad showing "No procedures yet" indefinitely, and
+        /// there was no user action that plausibly fixed it: closing the pad only HIDES it, so
+        /// reopening does not re-run initialization.
+        /// </summary>
+        /// <remarks>
+        /// Subscribed directly rather than through reflection: ProjectService exposes these three
+        /// events with identical signatures on Clarion 10, 11 and 12 (verified against each install's
+        /// ICSharpCode.SharpDevelop.dll), and the addin is compiled once per version anyway.
+        /// ProjectTargetService reflects for a different reason — it walks solution/project shapes
+        /// that do differ.
+        /// </remarks>
+        private void AttachProjectEvents()
+        {
+            try
+            {
+                ProjectService.SolutionLoaded        += OnIdeSolutionLoaded;
+                ProjectService.SolutionClosed        += OnIdeSolutionClosed;
+                ProjectService.CurrentProjectChanged += OnIdeCurrentProjectChanged;
+            }
+            catch (Exception ex)
+            {
+                // Never let a host-API difference stop the pad from loading — the refresh button and
+                // Start both still re-resolve, so this degrades to the old behaviour rather than failing.
+                System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] could not subscribe to ProjectService events: " + ex.Message);
+            }
+        }
+
+        private void DetachProjectEvents()
+        {
+            try
+            {
+                ProjectService.SolutionLoaded        -= OnIdeSolutionLoaded;
+                ProjectService.SolutionClosed        -= OnIdeSolutionClosed;
+                ProjectService.CurrentProjectChanged -= OnIdeCurrentProjectChanged;
+            }
+            catch { }
+        }
+
+        private void OnIdeSolutionLoaded(object sender, SolutionEventArgs e) => RefreshForIdeContext("solution opened");
+        private void OnIdeSolutionClosed(object sender, EventArgs e) => ClearForClosedSolution();
+        private void OnIdeCurrentProjectChanged(object sender, ProjectEventArgs e) => RefreshForIdeContext("project changed");
+
+        /// <summary>
+        /// Re-resolve the target and re-list procedures for whatever the IDE now has open — the same
+        /// work the refresh button does, just triggered by the IDE instead of by the user.
+        /// </summary>
+        /// <remarks>
+        /// Idle-guarded, and that guard is load-bearing rather than defensive: PushProcedures calls
+        /// _svc.PrimeTarget(), which re-anchors the .red resolver at a new EXE. Doing that while a
+        /// session is live repoints the resolver away from the binary actually being debugged — the
+        /// "live-session resolver poisoning" failure already fixed once on the sibling
+        /// ClarionAssistant work. A solution opened mid-session is ignored here on purpose; the next
+        /// Start re-resolves from scratch via ResolveTargetForStart().
+        /// </remarks>
+        private void RefreshForIdeContext(string why)
+        {
+            UI(() =>
+            {
+                try
+                {
+                    if (CurrentState != DebugSessionState.Idle) return;
+                    string before = _exe;
+                    TryAutoResolveExe();
+                    if (!string.IsNullOrEmpty(_exe))
+                    {
+                        if (!string.Equals(before, _exe, StringComparison.OrdinalIgnoreCase))
+                            Console("info", why + " — target: " + Path.GetFileName(_exe));
+                        PushProcedures(_exe);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] IDE context refresh failed: " + ex.Message);
+                }
+            });
+        }
+
+        /// <summary>Drop target/procedure state when the solution closes, so the pad never shows a list
+        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.</summary>
+        private void ClearForClosedSolution()
+        {
+            UI(() =>
+            {
+                try
+                {
+                    if (CurrentState != DebugSessionState.Idle) return;
+                    _exe = null; _exeAuto = false; _exeManualKey = null;
+                    _procGen++;                       // invalidate any in-flight procedure parse
+                    Post("{\"type\":\"procedures\",\"procs\":[]}");
+                    Console("info", "solution closed — target cleared");
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] solution-closed cleanup failed: " + ex.Message);
+                }
+            });
         }
 
         /// <summary>Detach every engine/gutter event handler. Called from Dispose BEFORE _svc.Stop() so a
@@ -307,9 +412,12 @@ namespace ClarionDebugger.Terminal
                 // to replay them into. Holding them would also keep them alive across the reopen
                 // that is the documented recovery, delivering stale startup state to a fresh page.
                 DiscardPendingPosts("navigation failed: " + (reason ?? "unknown"));
-                // Don't promise a Start-retry: OnHandleCreated is one-shot and won't re-run. Recovery is
-                // reopening the pad (which constructs a fresh WebView + re-runs init).
-                UI(() => Console("err", "debugger view failed to initialize: " + (reason ?? "unknown") + " — reopen the CA Debugger pad to retry."));
+                // Don't promise a Start-retry: OnHandleCreated is one-shot and won't re-run.
+                //
+                // This used to tell the user to reopen the pad, which cannot work: the IDE only HIDES
+                // a closed pad, it does not dispose it, so reopening reuses this same instance and
+                // re-runs nothing. Restarting the IDE is the honest recovery.
+                UI(() => Console("err", "debugger view failed to initialize: " + (reason ?? "unknown") + " — restart the Clarion IDE to retry (closing the pad only hides it)."));
             }
         }
 
@@ -1501,6 +1609,7 @@ namespace ClarionDebugger.Terminal
                 // Late off-thread callbacks can still call Post() during teardown; with _ready false
                 // those would buffer into a queue that will never be flushed. Drop them.
                 try { DiscardPendingPosts("pad disposing"); } catch { }
+                try { DetachProjectEvents(); } catch { }
                 try { DetachServiceEvents(); } catch { }
                 if (_coreForEvents != null)
                 {
