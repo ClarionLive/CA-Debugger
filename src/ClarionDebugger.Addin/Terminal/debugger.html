@@ -12,6 +12,9 @@
     --purple:#c586c0; --red:#f48771; --num:#b5cea8; --section:#bbbbbb;
     --input:#3c3c3c; --cur:#3a3d1f; --popup:#252526; --popup-border:#454545; --btnhover:#ffffff14;
     --name:#9cdcfe;
+    /* Panel title. Its own token because neither --blue nor --accent-hi reads well on the
+       titlebar in BOTH themes: --accent-hi is muddy on dark, --blue is near-navy on light. */
+    --hdr:#6cb6f0;
   }
   body.light {
     --bg:#ffffff; --panel:#f3f3f3; --titlebar:#e9e9ec; --border:#d3d3d6;
@@ -21,6 +24,7 @@
     --purple:#9b2393; --red:#cd3131; --num:#0a7a3a; --section:#555a60;
     --input:#ffffff; --cur:#fff6c8; --popup:#ffffff; --popup-border:#c4c4c8; --btnhover:#0000000d;
     --name:#0b5cad;
+    --hdr:#1668c9;
   }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; }
@@ -29,7 +33,9 @@
   .mono { font-family:"Cascadia Code",Consolas,"Courier New",monospace; }
 
   .toolbar { display:flex; align-items:center; gap:2px; padding:5px 8px; background:var(--titlebar); border-bottom:1px solid var(--border); flex:none; }
-  .hdr-title { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); padding:0 4px; }
+  /* Product name, styled to stand out the way Clarion Assistant's does: larger, blue, and mixed
+     case rather than small uppercase. Not interactive — About is the (i) button. */
+  .hdr-title { font-size:14px; font-weight:700; letter-spacing:.2px; color:var(--hdr); padding:0 4px; }
   .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; border:none; border-radius:4px; background:transparent; color:var(--fg); font-size:12px; cursor:pointer; white-space:nowrap; }
   .tbtn:hover { background:var(--btnhover); }
   /* Run to Cursor only means anything while paused — gate it on body.paused (set by setPaused),
@@ -277,8 +283,6 @@
   .ab-tbl a { color:var(--accent-hi); }
   .ab-head { color:var(--accent-hi); font-size:12px; font-weight:700; margin-bottom:2px; }
   .ab-foot { color:var(--fg-dim); font-size:11px; margin-top:14px; }
-  .hdr-title.clickable { cursor:pointer; }
-  .hdr-title.clickable:hover { color:var(--fg-bright); }
   .set-section { margin-top:12px; }
   .set-h { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); margin-bottom:4px; }
   .set-note { font-size:11.5px; line-height:1.5; color:var(--fg-dim); margin-bottom:10px; }
@@ -298,8 +302,7 @@
   <!-- Slim header: the 7 debug controls now live on the main IDE toolbar. This keeps only the
        run-state indicator plus the gear (keyboard shortcuts) and theme toggles. -->
   <div class="toolbar">
-    <!-- Version is appended by the host's "about" push (see setAbout). Click opens About. -->
-    <span class="hdr-title clickable" id="hdrTitle" title="About CA Debugger">CA Debugger</span>
+    <span class="hdr-title" id="hdrTitle">CA Debugger</span>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
@@ -567,7 +570,6 @@
 
   $('btnDocs').onclick=function(){ send('opendocs'); };
   $('btnAbout').onclick=openAbout;
-  $('hdrTitle').onclick=openAbout;
   $('aboutClose').onclick=closeAbout;
   $('aboutBackdrop').addEventListener('click',e=>{ if(e.target===$('aboutBackdrop')) closeAbout(); });
 
