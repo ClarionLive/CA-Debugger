@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
+using ICSharpCode.SharpDevelop.Project;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -27,6 +28,25 @@ namespace ClarionDebugger.Terminal
         private volatile bool _ready;
         private bool _initializing;
         private volatile bool _startQueued; // a toolbar Start arrived before the WebView was ready; fire it on NavigationCompleted
+
+        // Messages posted before the WebView is ready, held until NavigationCompleted rather than
+        // discarded. The page's inline script calls send('ready') while the document is still
+        // parsing, but WebView2 raises NavigationCompleted only after the load event — so the whole
+        // "ready" handler runs in a window where _ready is false. Without this buffer every message
+        // it produces is thrown away, silently: the initial runstate, the About payload, and the
+        // "auto-detected target" console line. (PushProcedures escaped it only by accident, because
+        // it posts via UI(), i.e. a later message-loop turn.)
+        //
+        // Bounded: if navigation never completes, this must not grow without limit. On overflow the
+        // OLDEST is dropped — for state pushes the newest message is the truthful one.
+        //
+        // _postLock guards both the queue and the enqueue-vs-flush decision. It is not enough for
+        // _ready to be volatile: without the lock, Post() can observe _ready == false, be preempted
+        // by the flush, and then enqueue into a queue nobody will drain again.
+        private const int MaxPendingPosts = 64;
+        private readonly object _postLock = new object();
+        private readonly Queue<string> _pendingPosts = new Queue<string>();
+        private bool _pendingOverflowed;
 
         private readonly ClarionDebuggerService _svc = new ClarionDebuggerService();
         private readonly EditorBreakpointService _gutter = new EditorBreakpointService();
@@ -87,8 +107,109 @@ namespace ClarionDebugger.Terminal
 
             HandleCreated += OnHandleCreated;
 
+            AttachProjectEvents();
+
             // Become the live target for the IDE debug toolbar. The latest pad instance wins.
             DebugSessionController.Register(this);
+        }
+
+        /// <summary>
+        /// Track the IDE's solution/project so the pad reflects what is open without being told to.
+        /// Previously the target and Procedures were resolved only on the page's "ready" message —
+        /// once, when the WebView first navigates — or when the user pressed the refresh button.
+        /// Opening a solution afterwards left the pad showing "No procedures yet" indefinitely, and
+        /// there was no user action that plausibly fixed it: closing the pad only HIDES it, so
+        /// reopening does not re-run initialization.
+        /// </summary>
+        /// <remarks>
+        /// Subscribed directly rather than through reflection: ProjectService exposes these three
+        /// events with identical signatures on Clarion 10, 11 and 12 (verified against each install's
+        /// ICSharpCode.SharpDevelop.dll), and the addin is compiled once per version anyway.
+        /// ProjectTargetService reflects for a different reason — it walks solution/project shapes
+        /// that do differ.
+        /// </remarks>
+        private void AttachProjectEvents()
+        {
+            try
+            {
+                ProjectService.SolutionLoaded        += OnIdeSolutionLoaded;
+                ProjectService.SolutionClosed        += OnIdeSolutionClosed;
+                ProjectService.CurrentProjectChanged += OnIdeCurrentProjectChanged;
+            }
+            catch (Exception ex)
+            {
+                // Never let a host-API difference stop the pad from loading — the refresh button and
+                // Start both still re-resolve, so this degrades to the old behaviour rather than failing.
+                System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] could not subscribe to ProjectService events: " + ex.Message);
+            }
+        }
+
+        private void DetachProjectEvents()
+        {
+            try
+            {
+                ProjectService.SolutionLoaded        -= OnIdeSolutionLoaded;
+                ProjectService.SolutionClosed        -= OnIdeSolutionClosed;
+                ProjectService.CurrentProjectChanged -= OnIdeCurrentProjectChanged;
+            }
+            catch { }
+        }
+
+        private void OnIdeSolutionLoaded(object sender, SolutionEventArgs e) => RefreshForIdeContext("solution opened");
+        private void OnIdeSolutionClosed(object sender, EventArgs e) => ClearForClosedSolution();
+        private void OnIdeCurrentProjectChanged(object sender, ProjectEventArgs e) => RefreshForIdeContext("project changed");
+
+        /// <summary>
+        /// Re-resolve the target and re-list procedures for whatever the IDE now has open — the same
+        /// work the refresh button does, just triggered by the IDE instead of by the user.
+        /// </summary>
+        /// <remarks>
+        /// Idle-guarded, and that guard is load-bearing rather than defensive: PushProcedures calls
+        /// _svc.PrimeTarget(), which re-anchors the .red resolver at a new EXE. Doing that while a
+        /// session is live repoints the resolver away from the binary actually being debugged — the
+        /// "live-session resolver poisoning" failure already fixed once on the sibling
+        /// ClarionAssistant work. A solution opened mid-session is ignored here on purpose; the next
+        /// Start re-resolves from scratch via ResolveTargetForStart().
+        /// </remarks>
+        private void RefreshForIdeContext(string why)
+        {
+            UI(() =>
+            {
+                try
+                {
+                    if (CurrentState != DebugSessionState.Idle) return;
+                    // TryAutoResolveExe already announces a changed target and pushes it to the
+                    // target bar; a second line here just said the same thing twice.
+                    TryAutoResolveExe();
+                    if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] IDE context refresh failed: " + ex.Message);
+                }
+            });
+        }
+
+        /// <summary>Drop target/procedure state when the solution closes, so the pad never shows a list
+        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.</summary>
+        private void ClearForClosedSolution()
+        {
+            UI(() =>
+            {
+                try
+                {
+                    if (CurrentState != DebugSessionState.Idle) return;
+                    _exe = null; _exeAuto = false; _exeManualKey = null;
+                    _procGen++;                       // invalidate any in-flight procedure parse
+                    Post("{\"type\":\"procedures\",\"procs\":[]}");
+                    PushTarget();                     // blanks the target bar
+                    Console("info", "solution closed — target cleared");
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] solution-closed cleanup failed: " + ex.Message);
+                }
+            });
         }
 
         /// <summary>Detach every engine/gutter event handler. Called from Dispose BEFORE _svc.Stop() so a
@@ -265,6 +386,11 @@ namespace ClarionDebugger.Terminal
             if (ok)
             {
                 _ready = true; _initializing = false;
+                // Deliver anything the page missed while it was still loading — in particular
+                // everything the "ready" handler produced, which runs strictly before this event.
+                // Flush FIRST so the page receives startup state in generation order, and before any
+                // queued Start starts producing newer messages on top of it.
+                FlushPendingPosts();
                 // Run a queued Start now that the page is live — but re-check idempotency (StartSession only
                 // when still Idle) so the queued path is guarded identically to CmdStart.
                 if (_startQueued)
@@ -279,9 +405,16 @@ namespace ClarionDebugger.Terminal
             {
                 _ready = false; _initializing = false;
                 _startQueued = false; // don't strand a queued Start on a failed navigation
-                // Don't promise a Start-retry: OnHandleCreated is one-shot and won't re-run. Recovery is
-                // reopening the pad (which constructs a fresh WebView + re-runs init).
-                UI(() => Console("err", "debugger view failed to initialize: " + (reason ?? "unknown") + " — reopen the CA Debugger pad to retry."));
+                // Same reasoning for buffered messages: the page never came up, so there is nothing
+                // to replay them into. Holding them would also keep them alive across the reopen
+                // that is the documented recovery, delivering stale startup state to a fresh page.
+                DiscardPendingPosts("navigation failed: " + (reason ?? "unknown"));
+                // Don't promise a Start-retry: OnHandleCreated is one-shot and won't re-run.
+                //
+                // This used to tell the user to reopen the pad, which cannot work: the IDE only HIDES
+                // a closed pad, it does not dispose it, so reopening reuses this same instance and
+                // re-runs nothing. Restarting the IDE is the honest recovery.
+                UI(() => Console("err", "debugger view failed to initialize: " + (reason ?? "unknown") + " — restart the Clarion IDE to retry (closing the pad only hides it)."));
             }
         }
 
@@ -339,8 +472,18 @@ namespace ClarionDebugger.Terminal
                 string data = JsonVal(json, "data");
                 switch (action)
                 {
+                    // The page also asks for About data whenever the panel is opened, so it reflects
+                    // live state rather than a value captured once at startup. The push on "ready"
+                    // below now survives too (Post buffers until NavigationCompleted), but this
+                    // request path is kept deliberately: it is the one that cannot be broken by a
+                    // future change to initialization ordering.
+                    case "about": PushAbout(); break;
+                    case "revealexe": RevealExe(); break;
+                    case "opendocs": OpenDocs(); break;
                     case "ready":
                         Post("{\"type\":\"runstate\",\"state\":\"idle\"}");
+                        PushAbout();
+                        PushTarget();
                         if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
                         if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
                         break;
@@ -755,13 +898,75 @@ namespace ClarionDebugger.Terminal
                 string result = ProjectTargetService.ResolveTargetExe();
                 if (!string.IsNullOrEmpty(result))
                 {
+                    // Log only on an actual change. This runs on every IDE context event, and
+                    // re-announcing the same unchanged target each time was pure console noise.
+                    bool changed = !string.Equals(_exe, result, StringComparison.OrdinalIgnoreCase);
                     _exe = result;
                     _exeAuto = true;
                     _exeManualKey = null;
-                    Console("info", "auto-detected target: " + Path.GetFileName(_exe));
+                    if (changed) Console("info", "auto-detected target: " + Path.GetFileName(_exe));
+                    PushTarget();
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Sends the resolved target to the page's target bar. The target belongs on-screen, not in
+        /// the Debug Console: the console is a hideable section, so anyone with it collapsed had no
+        /// way to see what the debugger was about to launch.
+        /// </summary>
+        private void PushTarget()
+        {
+            string path = _exe ?? string.Empty;
+            bool exists = false;
+            try { exists = path.Length > 0 && File.Exists(path); } catch { }
+            Post("{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false") + "}");
+        }
+
+        /// <summary>Shows the target EXE in File Explorer, with the file selected.</summary>
+        private void RevealExe()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(_exe)) { Console("info", "no target resolved yet."); return; }
+                if (!File.Exists(_exe)) { Console("err", "target does not exist on disk: " + _exe + " — build the app."); return; }
+                // A Windows path cannot contain a double quote, so quoting is sufficient here and
+                // there is no argument-injection surface. UseShellExecute so this works without a
+                // console subsystem attached.
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "explorer.exe", "/select,\"" + _exe + "\"") { UseShellExecute = true });
+            }
+            catch (Exception ex) { Console("err", "could not open Explorer: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// Opens the user guide — the copy the installer laid down if present, otherwise the
+        /// published one. The installer's docs component is OPTIONAL, so a local copy cannot be
+        /// assumed, and the guide does not live beside the addin DLL (it goes to the app dir, while
+        /// the addin goes under the Clarion install's accessory\addins).
+        /// </summary>
+        private void OpenDocs()
+        {
+            const string online = "https://htmlpreview.github.io/?https://github.com/ClarionLive/CA-Debugger/blob/main/docs/user-guide.html";
+            string target = online;
+            try
+            {
+                foreach (var root in new[]
+                {
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)
+                })
+                {
+                    if (string.IsNullOrEmpty(root)) continue;
+                    string candidate = Path.Combine(root, "CA Debugger", "user-guide.html");
+                    if (File.Exists(candidate)) { target = candidate; break; }
+                }
+            }
+            catch { }
+
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(target) { UseShellExecute = true }); }
+            catch (Exception ex) { Console("err", "could not open the user guide: " + ex.Message); }
         }
 
         /// <summary>Prompt for a Target EXE. Returns true if the user picked one. A manual choice clears
@@ -1284,10 +1489,114 @@ namespace ClarionDebugger.Terminal
             }
         }
 
+        /// <summary>
+        /// Sends a message to the page, or buffers it if the WebView is not ready yet (see
+        /// _pendingPosts). Callers never have to ask whether the page is up — that question is the
+        /// trap this fix exists to remove, because getting it wrong failed silently.
+        /// </summary>
         private void Post(string json)
         {
-            try { if (_ready && _webView.CoreWebView2 != null) _webView.CoreWebView2.PostWebMessageAsString(json); }
+            lock (_postLock)
+            {
+                if (!_ready || _webView.CoreWebView2 == null)
+                {
+                    if (_pendingPosts.Count >= MaxPendingPosts)
+                    {
+                        _pendingPosts.Dequeue();   // drop oldest — newest state wins
+                        if (!_pendingOverflowed)
+                        {
+                            _pendingOverflowed = true;
+                            System.Diagnostics.Debug.WriteLine(
+                                "[CADebuggerWeb] pre-ready post buffer hit " + MaxPendingPosts +
+                                "; dropping oldest. The page may never have finished navigating.");
+                        }
+                    }
+                    _pendingPosts.Enqueue(json);
+                    return;
+                }
+            }
+            try { _webView.CoreWebView2.PostWebMessageAsString(json); }
             catch { }
+        }
+
+        /// <summary>
+        /// Delivers everything buffered before the page was ready, in the order it was produced.
+        /// Called from OnNavigationCompleted once _ready is set.
+        /// </summary>
+        private void FlushPendingPosts()
+        {
+            string[] queued;
+            lock (_postLock)
+            {
+                if (_pendingPosts.Count == 0) return;
+                queued = _pendingPosts.ToArray();
+                _pendingPosts.Clear();
+                _pendingOverflowed = false;
+            }
+            foreach (var json in queued)
+            {
+                try { if (_webView.CoreWebView2 != null) _webView.CoreWebView2.PostWebMessageAsString(json); }
+                catch { }
+            }
+        }
+
+        /// <summary>Discards buffered messages — navigation failed or the view is going away.</summary>
+        private void DiscardPendingPosts(string why)
+        {
+            int n;
+            lock (_postLock)
+            {
+                n = _pendingPosts.Count;
+                _pendingPosts.Clear();
+                _pendingOverflowed = false;
+            }
+            if (n > 0)
+                System.Diagnostics.Debug.WriteLine(
+                    "[CADebuggerWeb] discarded " + n + " buffered message(s): " + why);
+        }
+
+        /// <summary>
+        /// Pushes the data behind the About panel. Sent once on "ready" rather than on demand so the
+        /// panel opens instantly and still works if the engine is unreachable.
+        /// </summary>
+        /// <remarks>
+        /// The displayed version is the assembly's InformationalVersion, which the build stamps as
+        /// Major.Minor.Patch.BuildNumber (build number = git commit count). Deliberately NOT read from
+        /// the addin manifest's &lt;Identity version&gt;: that string is what AddinFinder compares against
+        /// the release tag, it is bare Major.Minor.Patch by design, and display code must never become a
+        /// reason to change it. Show the whole string — do not truncate to two components.
+        /// </remarks>
+        private void PushAbout()
+        {
+            string version, runtime = "not detected";
+            try
+            {
+                var asm = Assembly.GetExecutingAssembly();
+                var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
+                version = info != null && !string.IsNullOrEmpty(info.InformationalVersion)
+                    ? info.InformationalVersion
+                    : asm.GetName().Version.ToString();
+            }
+            catch { version = "unknown"; }
+
+            try
+            {
+                if (_webView != null && _webView.CoreWebView2 != null)
+                    runtime = _webView.CoreWebView2.Environment.BrowserVersionString;
+            }
+            catch { }
+
+            var sb = new StringBuilder();
+            sb.Append("{\"type\":\"about\"")
+              .Append(",\"product\":\"CA Debugger\"")
+              .Append(",\"version\":").Append(Str(version))
+              .Append(",\"tagline\":\"Source-level debugger for the Clarion IDE\"")
+              .Append(",\"publisher\":\"ClarionLive\"")
+              .Append(",\"website\":\"https://github.com/ClarionLive/CA-Debugger\"")
+              .Append(",\"engine\":\"ClarionDbg (32-bit, TSWD debug info)\"")
+              .Append(",\"runtime\":").Append(Str("Microsoft Edge WebView2 " + runtime))
+              .Append(",\"year\":\"2026\"}");
+            Post(sb.ToString());
         }
 
         private void UI(Action a)
@@ -1359,6 +1668,10 @@ namespace ClarionDebugger.Terminal
                 // teardown-completion signal goes to the STATIC controller (safe post-dispose), not the WebView.
                 _ready = false;
                 _startQueued = false;
+                // Late off-thread callbacks can still call Post() during teardown; with _ready false
+                // those would buffer into a queue that will never be flushed. Drop them.
+                try { DiscardPendingPosts("pad disposing"); } catch { }
+                try { DetachProjectEvents(); } catch { }
                 try { DetachServiceEvents(); } catch { }
                 if (_coreForEvents != null)
                 {

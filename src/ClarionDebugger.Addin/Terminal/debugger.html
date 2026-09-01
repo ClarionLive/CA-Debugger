@@ -12,6 +12,9 @@
     --purple:#c586c0; --red:#f48771; --num:#b5cea8; --section:#bbbbbb;
     --input:#3c3c3c; --cur:#3a3d1f; --popup:#252526; --popup-border:#454545; --btnhover:#ffffff14;
     --name:#9cdcfe;
+    /* Panel title. Its own token because neither --blue nor --accent-hi reads well on the
+       titlebar in BOTH themes: --accent-hi is muddy on dark, --blue is near-navy on light. */
+    --hdr:#6cb6f0;
   }
   body.light {
     --bg:#ffffff; --panel:#f3f3f3; --titlebar:#e9e9ec; --border:#d3d3d6;
@@ -21,6 +24,7 @@
     --purple:#9b2393; --red:#cd3131; --num:#0a7a3a; --section:#555a60;
     --input:#ffffff; --cur:#fff6c8; --popup:#ffffff; --popup-border:#c4c4c8; --btnhover:#0000000d;
     --name:#0b5cad;
+    --hdr:#1668c9;
   }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; }
@@ -29,7 +33,9 @@
   .mono { font-family:"Cascadia Code",Consolas,"Courier New",monospace; }
 
   .toolbar { display:flex; align-items:center; gap:2px; padding:5px 8px; background:var(--titlebar); border-bottom:1px solid var(--border); flex:none; }
-  .hdr-title { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); padding:0 4px; }
+  /* Product name, styled to stand out the way Clarion Assistant's does: larger, blue, and mixed
+     case rather than small uppercase. Not interactive — About is the (i) button. */
+  .hdr-title { font-size:14px; font-weight:700; letter-spacing:.2px; color:var(--hdr); padding:0 4px; }
   .tbtn { display:inline-flex; align-items:center; gap:6px; height:28px; padding:0 9px; border:none; border-radius:4px; background:transparent; color:var(--fg); font-size:12px; cursor:pointer; white-space:nowrap; }
   .tbtn:hover { background:var(--btnhover); }
   /* Run to Cursor only means anything while paused — gate it on body.paused (set by setPaused),
@@ -44,6 +50,18 @@
 
   .locbar { flex:none; padding:5px 12px; background:var(--titlebar); border-bottom:1px solid var(--border); font-size:12px; color:var(--fg-dim); }
   .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
+
+  /* Target bar — the resolved EXE, always on screen. This used to be announced only in the Debug
+     Console, which is a hideable section, so with it collapsed there was no way to see what was
+     about to be launched. Full path, not just the filename: which build you are attached to is the
+     question this answers. Click reveals it in File Explorer. */
+  .exebar { flex:none; display:flex; align-items:baseline; gap:8px; padding:4px 12px 5px;
+            background:var(--titlebar); border-bottom:1px solid var(--border); font-size:11px; }
+  .exebar .lbl { color:var(--fg-dim); text-transform:uppercase; letter-spacing:.5px; font-weight:700; flex:none; }
+  .exebar .path { color:var(--blue); overflow-wrap:anywhere; cursor:pointer; }
+  .exebar .path:hover { color:var(--accent-hi); text-decoration:underline; }
+  .exebar .path.none { color:var(--fg-dim); cursor:default; text-decoration:none; font-style:italic; }
+  .exebar .path.missing { color:var(--red); }
 
   .main { flex:1; display:flex; min-height:0; }
   .sidebar { width:360px; min-width:180px; background:var(--panel); display:flex; flex-direction:column; overflow-y:auto; flex:none; }
@@ -251,6 +269,20 @@
   .modal-x { cursor:pointer; color:var(--fg-dim); font-size:14px; width:24px; height:24px; display:inline-flex; align-items:center; justify-content:center; border-radius:4px; }
   .modal-x:hover { background:var(--btnhover); color:var(--fg-bright); }
   .modal-body { padding:4px 16px 16px; }
+
+  /* About panel. Cards mirror the Clarion Assistant About layout so the two addins read as a set.
+     The version line is intentionally allowed to wrap rather than clip — Clarion Assistant's
+     equivalent truncates to two components, which is the bug this one must not reproduce. */
+  .ab-card { background:var(--btnhover); border:1px solid var(--popup-border); border-radius:6px; padding:14px 16px; margin-top:12px; }
+  .ab-ver { color:var(--accent-hi); font-size:20px; font-weight:700; line-height:1.25; overflow-wrap:anywhere; }
+  .ab-tag { color:var(--fg-dim); font-size:12px; margin-top:4px; }
+  .ab-tbl { width:100%; border-collapse:collapse; }
+  .ab-tbl th { text-align:left; font-weight:400; color:var(--fg-dim); font-size:12px; padding:7px 12px 7px 0; vertical-align:top; white-space:nowrap; width:34%; }
+  .ab-tbl td { text-align:left; color:var(--fg); font-size:12px; padding:7px 0; vertical-align:top; overflow-wrap:anywhere; }
+  .ab-tbl tr + tr th, .ab-tbl tr + tr td { border-top:1px solid var(--popup-border); }
+  .ab-tbl a { color:var(--accent-hi); }
+  .ab-head { color:var(--accent-hi); font-size:12px; font-weight:700; margin-bottom:2px; }
+  .ab-foot { color:var(--fg-dim); font-size:11px; margin-top:14px; }
   .set-section { margin-top:12px; }
   .set-h { font-size:11px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; color:var(--section); margin-bottom:4px; }
   .set-note { font-size:11.5px; line-height:1.5; color:var(--fg-dim); margin-bottom:10px; }
@@ -270,7 +302,7 @@
   <!-- Slim header: the 7 debug controls now live on the main IDE toolbar. This keeps only the
        run-state indicator plus the gear (keyboard shortcuts) and theme toggles. -->
   <div class="toolbar">
-    <span class="hdr-title">CA Debugger</span>
+    <span class="hdr-title" id="hdrTitle">CA Debugger</span>
     <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
@@ -279,12 +311,26 @@
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
+    <!-- Explicit About entry point. The in-panel title is also clickable, but it renders small,
+         dim and uppercase, so it is not discoverable on its own — and the mixed-case caption users
+         actually see is the IDE's pad tab, which is chrome we cannot attach a handler to. -->
+    <button class="tbtn" id="btnDocs" title="User guide — open the CA Debugger documentation" style="margin-left:2px;padding:0 8px">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+    </button>
+    <button class="tbtn" id="btnAbout" title="About CA Debugger" style="margin-left:2px;padding:0 8px">
+      <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 16v-5"/><path d="M12 8h.01"/></svg>
+    </button>
     <button class="tbtn" id="btnTheme" title="Toggle light / dark" style="margin-left:2px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
     </button>
   </div>
 
   <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
+
+  <div class="exebar">
+    <span class="lbl">Target</span>
+    <span class="path none" id="exePath" title="">No target resolved — open a project, or build the app.</span>
+  </div>
 
   <div class="main">
     <div class="sidebar col" id="colLeft">
@@ -354,6 +400,13 @@
     <div class="modal" role="dialog" aria-label="Settings">
       <div class="modal-head"><span>Settings</span><span class="modal-x" id="settingsClose" title="Close">✕</span></div>
       <div class="modal-body" id="settingsBody"></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="aboutBackdrop">
+    <div class="modal" role="dialog" aria-label="About CA Debugger">
+      <div class="modal-head"><span>About CA Debugger</span><span class="modal-x" id="aboutClose" title="Close">✕</span></div>
+      <div class="modal-body" id="aboutBody"></div>
     </div>
   </div>
 
@@ -437,6 +490,89 @@
   $('settingsClose').onclick=closeSettings;
   $('settingsBackdrop').addEventListener('click',e=>{ if(e.target===$('settingsBackdrop')) closeSettings(); });
 
+  // ---- About -------------------------------------------------------------------------------
+  // Populated by the host's "about" push on ready. Everything is written with textContent rather
+  // than innerHTML: most fields are host constants, but the WebView2 runtime string comes from the
+  // installed browser and the same class of bug (DOM XSS via an attacker-influenced string) has
+  // already been found once in this codebase's sibling list rendering.
+  var aboutInfo=null;
+  function aboutOpen(){ return $('aboutBackdrop').classList.contains('show'); }
+  function closeAbout(){ $('aboutBackdrop').classList.remove('show'); }
+  // Always opens. An earlier version returned silently when the host push had not arrived yet,
+  // which is indistinguishable from a dead button — if the data is missing, say so in the panel
+  // rather than doing nothing.
+  function openAbout(){
+    // Ask the host afresh each time so the panel reflects live state rather than a value captured
+    // once at startup. The host's push on 'ready' now survives too (it buffers messages until the
+    // WebView is ready), but this request is what makes About independent of initialization
+    // ordering. The panel repaints when the reply arrives.
+    send('about');
+    if(!aboutInfo) setAbout({product:'CA Debugger',version:'',tagline:'Version information unavailable — the debugger panel did not receive it from the IDE host.',publisher:'ClarionLive',website:'https://github.com/ClarionLive/CA-Debugger',year:'2026'});
+    $('aboutBackdrop').classList.add('show');
+  }
+
+  function setAbout(m){
+    aboutInfo=m;
+    // The in-panel title deliberately stays "CA Debugger" with no version. The pad's own tab
+    // caption already carries it (stamped into the addin manifest at build time by
+    // StampAddinManifest), and repeating it two rows apart was just noise. The version lives in
+    // the About panel, reachable from the (i) button.
+    var body=$('aboutBody');
+    body.textContent='';
+
+    var hero=document.createElement('div'); hero.className='ab-card';
+    var v=document.createElement('div'); v.className='ab-ver'; v.textContent='Version '+(m.version||'unknown');
+    var t=document.createElement('div'); t.className='ab-tag'; t.textContent=m.tagline||'';
+    hero.appendChild(v); hero.appendChild(t); body.appendChild(hero);
+
+    var rows=[['Publisher',m.publisher,null],['Website',m.website,m.website],
+              ['Debug engine',m.engine,null],['Runtime',m.runtime,null]];
+    var card=document.createElement('div'); card.className='ab-card';
+    var tbl=document.createElement('table'); tbl.className='ab-tbl';
+    rows.forEach(function(r){
+      if(!r[1]) return;
+      var tr=document.createElement('tr');
+      var th=document.createElement('th'); th.textContent=r[0];
+      var td=document.createElement('td');
+      // Only ever build a link for an http(s) URL; anything else renders as plain text so a
+      // javascript:/data: string can never become a clickable target.
+      if(r[2] && /^https?:\/\//i.test(r[2])){
+        var a=document.createElement('a'); a.href=r[2]; a.target='_blank'; a.rel='noopener noreferrer';
+        a.textContent=r[1]; td.appendChild(a);
+      } else td.textContent=r[1];
+      tr.appendChild(th); tr.appendChild(td); tbl.appendChild(tr);
+    });
+    card.appendChild(tbl); body.appendChild(card);
+
+    var foot=document.createElement('div'); foot.className='ab-foot';
+    foot.textContent='© '+(m.year||'')+' '+(m.publisher||'')+'. Released under the MIT licence.';
+    body.appendChild(foot);
+  }
+
+  // ---- Target bar --------------------------------------------------------------------------
+  // textContent throughout: the path comes from the host, but it is a filesystem string we do not
+  // control the contents of, and this file has had a DOM-XSS bug of exactly that shape before.
+  var targetPath=null;
+  function setTarget(m){
+    var el=$('exePath');
+    targetPath = m && m.path ? m.path : null;
+    if(!targetPath){
+      el.className='path none';
+      el.textContent='No target resolved — open a project, or build the app.';
+      el.title='';
+      return;
+    }
+    el.className = m.exists ? 'path' : 'path missing';
+    el.textContent = targetPath;
+    el.title = m.exists ? 'Click to show in File Explorer' : 'Not on disk yet — build the app. Click to show its folder.';
+  }
+  $('exePath').onclick=function(){ if(targetPath) send('revealexe'); };
+
+  $('btnDocs').onclick=function(){ send('opendocs'); };
+  $('btnAbout').onclick=openAbout;
+  $('aboutClose').onclick=closeAbout;
+  $('aboutBackdrop').addEventListener('click',e=>{ if(e.target===$('aboutBackdrop')) closeAbout(); });
+
   document.addEventListener('keydown',e=>{
     // 1) capture mode — record the next combo for the command being rebound
     if(capturing){
@@ -450,6 +586,8 @@
     }
     // 2) while Settings is open, Esc closes it and debug keys stay inert
     if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
+    // 2b) same for About — a modal must swallow debug shortcuts, not just look modal
+    if(aboutOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAbout(); } return; }
     // 3) normal dispatch — send the command bound to this combo straight to the host. The IDE toolbar's
     // condition evaluator is the source of truth for whether a command is valid in the current state; the
     // host side no-ops a command that doesn't apply, so the pad shortcut just forwards unconditionally.
@@ -1305,6 +1443,8 @@
   function onMessage(data){
     let m; try{ m=JSON.parse(data); }catch(e){ return; }
     switch(m.type){
+      case 'about': setAbout(m); break;
+      case 'target': setTarget(m); break;
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
