@@ -369,8 +369,8 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>exports &lt;pe&gt; [--name SUBSTR] — list a PE's named exports + RVA (and whether each lands
-        /// in .text, i.e. is callable code). Used to confirm RTL getters (Cla$ERRORCODE, …) resolve in
-        /// ClaRUN.dll for the Library-State func-eval panel.</summary>
+        /// in .text, i.e. is real code). Used to confirm the RTL getters (Cla$ERRORCODE, …) resolve in
+        /// ClaRUN.dll, and that their bodies are code the Library State panel's emulator can run.</summary>
         private static int Exports(string[] args)
         {
             if (args.Length < 2) { Usage(); return 1; }
@@ -382,7 +382,9 @@ namespace ClarionDbg.Cli
             Console.WriteLine($"{map.Count} named export(s) in {System.IO.Path.GetFileName(args[1])}; showing {rows.Count}:");
             foreach (var kv in rows)
                 Console.WriteLine($"  {kv.Key,-28} RVA 0x{kv.Value:X6}  {(pe.RvaInText(kv.Value) ? "[.text/code]" : "[data]")}");
-            return rows.Count > 0 ? 0 : 3;
+            // exit 3 only when the image has no export table to read; a --name that simply matches nothing
+            // is a successful query with an empty result, not a failure.
+            return map.Count > 0 ? 0 : 3;
         }
 
         private static int Symbols(string[] args)

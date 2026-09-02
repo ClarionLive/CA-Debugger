@@ -420,8 +420,9 @@ namespace ClarionDebugger.Services
         public bool RequestModuleData() { return SendCommand("moduledata"); }
 
         /// <summary>Request the paused thread's RTL "Library State" (ERROR/EVENT/FIELD/…) — the engine
-        /// func-evals each ClaRUN getter on the paused thread. Result arrives via LibStateReceived keyed
-        /// by <paramref name="reqId"/>. Paused only.</summary>
+        /// EMULATES each ClaRUN getter read-only (no code runs in the debuggee, so this is safe at any
+        /// stop, including inside TakeEvent). Result arrives via LibStateReceived keyed by
+        /// <paramref name="reqId"/>. Paused only.</summary>
         public bool RequestLibState(int reqId) { return SendCommand("libstate " + reqId); }
 
         /// <summary>Lazily expand a reference node: ask the engine to deref <paramref name="addrHex"/> and render

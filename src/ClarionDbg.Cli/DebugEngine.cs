@@ -477,9 +477,10 @@ namespace ClarionDbg.Cli
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
             // emitPaused is false when we re-enter the loop AFTER a transparent func-eval (a `watch` of
-            // THREADed data): the user is still stopped at the SAME place and the result already went out on
-            // its own event, so re-announcing a `paused` would feed any auto-refreshing panel an infinite
-            // refresh loop. Stay silent and just resume servicing commands.
+            // THREADed data — the one path that still hijacks the thread; Library State no longer does).
+            // The user never left the original stop and the watch result already went out on its own event,
+            // so a second `paused` for the same location isn't new information: the host would take it for a
+            // fresh stop and re-drive everything that keys off one. Stay silent and resume servicing commands.
             if (emitPaused)
             {
                 if (EmitJson)

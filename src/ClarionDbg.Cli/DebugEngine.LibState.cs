@@ -122,10 +122,16 @@ namespace ClarionDbg.Cli
                         }
                     }
                 }
-                catch (RtlEmulator.NotSupported)
+                // Per-row isolation. NotSupported is the emulator's designed refusal, but ANY failure here
+                // must degrade to <unavailable> for this one value rather than escape into the command
+                // dispatcher and take the whole panel — and with it the pause loop — down with it.
+                catch (Exception ex)
                 {
                     value = "<unavailable>"; ok = false;
-                    if (!EmitJson) Console.WriteLine($"  libstate: {g.Name} ({g.Export}) not emulatable on this runtime — skipped");
+                    if (!EmitJson)
+                        Console.WriteLine(ex is RtlEmulator.NotSupported
+                            ? $"  libstate: {g.Name} ({g.Export}) not emulatable on this runtime — skipped ({ex.Message})"
+                            : $"  libstate: {g.Name} ({g.Export}) failed — {ex.GetType().Name}: {ex.Message}");
                 }
                 rows.Add(LibStateRow(g.Group, g.Name, value, kind, ok));
             }

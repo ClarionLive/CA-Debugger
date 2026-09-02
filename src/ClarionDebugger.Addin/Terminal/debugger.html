@@ -953,10 +953,12 @@
     send('framelocals', id+'|'+f.va+'|'+f.ebp);
   }
 
-  // ---- Library State (per-thread RTL state via ClaRUN getter func-evals) ----
-  // Reading runs target code (each getter is called on the paused thread), so we ONLY fetch while the
-  // panel is open (and paused): on pause if open, on expand-while-paused, and on the ↻ button. Values go
-  // stale on resume (cleared), since they reflect the moment they were read.
+  // ---- Library State (per-thread RTL state, read by emulating the ClaRUN getters) ----
+  // Reading runs NO target code — the engine emulates each getter read-only over the debuggee's memory —
+  // so this is safe at any stop. We still only fetch while the panel is open (and paused): on pause if
+  // open, on expand-while-paused, and on the ↻ button, since each read is a burst of memory reads and
+  // there's nothing to show for a collapsed panel. Values are cleared on resume: they reflect the moment
+  // they were read.
   let _libReq=0, lastLibState=null, lastLibError=null;
   function libIsOpen(){ const el=secEl('libstate'); return !!(el && el.open && !isHidden(el)); }
   function refreshLibState(){ if(isPaused && libIsOpen()) send('libstate', String(++_libReq)); }
@@ -974,7 +976,12 @@
       box.appendChild(d);
     });
   }
-  function onLibState(reqId, error, items){ lastLibError=error||null; lastLibState=error?null:(items||[]); renderLibState(); }
+  // Drop a reply that isn't for the newest request: a pause followed quickly by a ↻ (or another pause)
+  // leaves an earlier read in flight, and letting it land would overwrite fresher values with stale ones.
+  function onLibState(reqId, error, items){
+    if(+reqId!==_libReq) return;
+    lastLibError=error||null; lastLibState=error?null:(items||[]); renderLibState();
+  }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
   // Raw data kept so the sort toggle can re-render without re-fetching.
