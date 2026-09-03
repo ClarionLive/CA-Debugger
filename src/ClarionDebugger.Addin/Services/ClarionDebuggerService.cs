@@ -133,6 +133,10 @@ namespace ClarionDebugger.Services
         public string Name;     // demangled, e.g. SELECTJOBS, INICLASS.UPDATE
         public string Module;   // owning .clw basename, e.g. clbrws011.clw
         public int Line;        // 1-based definition line
+        /// <summary>"procedure", "method" or "routine". ROUTINEs are carried so a breakpoint can name the
+        /// ROUTINE it sits in and the procedure that encloses it; the Procedures PANEL filters them back out
+        /// (a routine is not independently navigable the way a procedure is).</summary>
+        public string Kind;
     }
 
     /// <summary>
@@ -1090,10 +1094,15 @@ namespace ClarionDebugger.Services
                     if (list.Count >= MaxProcedures) break;
                     string obj = m.Value;
                     string kind = GetStr(obj, "kind");
-                    if (kind != "procedure" && kind != "method") continue;
+                    // Routines come through as well as procedures/methods: they are what lets a breakpoint
+                    // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
+                    // them together with their parent by definition line, so containment falls out of the
+                    // line order — no extra symbol work. The Procedures panel filters routines back out on
+                    // the client, so this does not change what that list shows.
+                    if (kind != "procedure" && kind != "method" && kind != "routine") continue;
                     int line = GetInt(obj, "line");
                     if (line <= 0) continue;
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line });
+                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind });
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }

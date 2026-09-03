@@ -193,6 +193,12 @@
   .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
   .bp .bplink { color:var(--blue); cursor:pointer; text-decoration:underline; }
   .bp .bplink:hover { filter:brightness(1.25); }
+  /* owning procedure (+ routine crumb) — subordinate to module:line. The outsized flex-shrink is what
+     makes it yield room before module:line does: flex distributes shrink in proportion to each item's
+     base size, so a plain "0 1 auto" would shorten the location alongside it. min-width:0 is what lets a
+     flex child shrink below its content at all, and is required for the ellipsis to appear. */
+  .bp .bpproc { color:var(--yellow); font-size:11px; opacity:.85; flex:0 999 auto; min-width:0;
+                overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:help; }
 
   .procfilter { padding:5px 10px 5px 14px; }
   .procfilter input { width:100%; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
@@ -1299,6 +1305,19 @@
       d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
       const lk=d.querySelector('.bplink');
       if(lk) lk.onclick=()=>{ if(b.path) send('openbp', b.line+'\t'+b.path); else if(b.module) send('jump', b.module+':'+b.line); };
+      // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
+      // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
+      // be an injection sink, since esc() doesn't escape quotes. Absent before symbols load: the row then
+      // stays exactly as it was, rather than showing "unknown".
+      const own=bpOwner(b.module, b.line);
+      if(own){
+        const pc=document.createElement('span'); pc.className='bpproc';
+        pc.textContent=own.routine ? (own.proc ? own.proc+' › '+own.routine : own.routine) : own.proc;
+        pc.title=own.routine
+          ? (own.proc ? 'In ROUTINE '+own.routine+' of '+own.proc : 'In ROUTINE '+own.routine)
+          : 'In '+own.proc;
+        d.appendChild(pc);
+      }
       // type styling on the dot + per-type indicator badges (titles via property = injection-safe)
       const isTrace=!!b.trace, isAdv=!!b.condition||!!b.hitMode;
       if(isAdv) d.classList.add('has-adv');
@@ -1345,18 +1364,27 @@
   }
 
   // ---- procedures (static list from the target EXE; click a file link to open the .clw at the definition) ----
-  let allProcs=[];
+  // allProcs holds EVERY symbol the host sends, ROUTINEs included — they're what lets a breakpoint name the
+  // routine it sits in. The PANEL below shows only procedures/methods: a routine isn't independently
+  // navigable the way a procedure is, and listing them would bury the procedure list they belong to.
+  let allProcs=[], procIndex=null;
+  const isProcKind = p => (p.kind||'procedure')!=='routine';
   function buildProcs(procs){
     allProcs=procs||[];
+    procIndex=null;                       // symbols changed — drop the per-module line index
+    const listed=allProcs.filter(isProcKind);
+    // Breakpoint rows carry procedure names resolved from this list, and breakpoints usually exist before
+    // it arrives (they're restored from the gutter at startup). Re-render them now that names can resolve.
+    if(bps.length) buildBps(bps);
     const el=$('procList'); if(!el) return;
-    $('procCount').textContent=allProcs.length;
-    if(!allProcs.length){ el.innerHTML='<div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div>'; return; }
+    $('procCount').textContent=listed.length;
+    if(!listed.length){ el.innerHTML='<div class="empty">No procedures yet — build the app, then click ↻ to list them (or press Start).</div>'; return; }
     el.innerHTML='';
     const frag=document.createDocumentFragment();
     // Build rows with DOM APIs (textContent + .title), never innerHTML — name/module come from the
     // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE (esc() doesn't escape quotes,
     // so interpolating them into an HTML attribute would be an injection sink).
-    allProcs.forEach(p=>{ const module=p.module||'', name=p.name||'';
+    listed.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
       // module/line/name for the right-click "Break on entry" action (dataset assignment is injection-safe)
       d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
@@ -1368,6 +1396,48 @@
       frag.appendChild(d); });
     el.appendChild(frag);
     filterProcs($('procFilter') ? $('procFilter').value : '');
+  }
+
+  // ---- breakpoint -> owning procedure (issue #27) ----
+  // The host sends symbols sorted by NAME; ownership needs them per module in LINE order, so index once and
+  // reuse. Rebuilt whenever a `procedures` message replaces allProcs (declared with allProcs above).
+  function ensureProcIndex(){
+    if(procIndex) return procIndex;
+    procIndex={};
+    allProcs.forEach(p=>{
+      const m=(p.module||'').toLowerCase(), ln=+p.line;
+      if(!m || !(ln>0)) return;
+      (procIndex[m]||(procIndex[m]=[])).push({name:p.name||'', line:ln, rtn:(p.kind||'')==='routine'});
+    });
+    // Line order, and on a tie the routine sorts AFTER its procedure so the innermost symbol is the one a
+    // "last entry at or before this line" search lands on.
+    Object.keys(procIndex).forEach(m=>procIndex[m].sort((a,b)=>(a.line-b.line)||((a.rtn?1:0)-(b.rtn?1:0))));
+    return procIndex;
+  }
+  /// Resolve which procedure (and routine) a breakpoint sits in — {proc, routine} or null when we can't say.
+  function bpOwner(module, line){
+    const arr=ensureProcIndex()[(module||'').toLowerCase()];
+    const ln=+line;
+    if(!arr || !arr.length || !(ln>0)) return null;
+    // Binary search for the last symbol defined at or before this line. Symbols carry a definition line but
+    // no END line, so containment is "the nearest definition above you" — which is exactly right between two
+    // procedures, and for the last one in a module is right too because a Clarion procedure runs to the end
+    // of its file. The case that WOULD be a guess is a breakpoint ABOVE the first symbol (in the MAP or
+    // global data); that lands on i<0 below and we say nothing rather than reaching for the nearest name.
+    let i=-1, lo=0, hi=arr.length-1;
+    while(lo<=hi){ const mid=(lo+hi)>>1; if(arr[mid].line<=ln){ i=mid; lo=mid+1; } else hi=mid-1; }
+    if(i<0) return null;
+    const sym=arr[i];
+    if(!sym.rtn) return {proc:sym.name, routine:null};
+    // A routine decodes to "PARENT::NAME" (Clarion mangles it R$PARENT::NAME), so its own name is the part
+    // after the separator — without this the crumb would read "SelectJobs › SelectJobs::ClearFilter".
+    const sep=sym.name.lastIndexOf('::');
+    const rtn=sep>0 ? sym.name.slice(sep+2) : sym.name;         // bare R$NAME form carries no parent
+    // Prefer the enclosing symbol for the parent over the name's own prefix: the prefix is the RAW proc
+    // name, so for a routine inside a class method it would show the mangling (UPDATE@F8INICLASS) where
+    // the symbol above it is properly demangled (INICLASS.UPDATE).
+    for(let j=i-1;j>=0;j--) if(!arr[j].rtn) return {proc:arr[j].name, routine:rtn};
+    return {proc:(sep>0 ? sym.name.slice(0,sep) : null), routine:rtn};   // nothing above it — fall back to the prefix
   }
   function filterProcs(q){
     const el=$('procList'); if(!el) return;

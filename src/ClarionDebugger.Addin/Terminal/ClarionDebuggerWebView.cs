@@ -846,6 +846,7 @@ namespace ClarionDebugger.Terminal
                         sb.Append("{\"name\":").Append(Str(p.Name))
                           .Append(",\"module\":").Append(Str(p.Module))
                           .Append(",\"line\":").Append(p.Line)
+                          .Append(",\"kind\":").Append(Str(p.Kind))
                           .Append('}');
                     }
                     sb.Append("]}");
