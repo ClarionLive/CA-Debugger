@@ -26,13 +26,20 @@ namespace ClarionDbg.Cli
         public readonly List<string> Trace = new List<string>();   // diagnostics
 
         // modeled stack: a private window; accesses inside it hit this buffer, everything else is a
-        // read-only debuggee fetch. Based high so it won't collide with real heap/module addresses.
-        const uint StackBase = 0x60000000;
-        const int StackSize = 0x10000;
+        // read-only debuggee fetch. The base is NOT fixed — the caller picks one from a region the target
+        // has genuinely free (see EmulatorStackWindow.Pick). A hardcoded base is a silent wrong
+        // answer waiting to happen: if a real module or heap block lives there, every read of a genuine
+        // address inside the window gets served from this buffer instead, and the panel shows a plausible
+        // number that isn't the RTL's. Refusing beats guessing, and not colliding beats both.
+        public const int StackSize = 0x10000;
         // …and a band either side of it. An access that lands here is the emulation having run off the
         // modeled stack (ESP walked past an end after a bad pop / a huge `sub esp`), not a genuine
         // debuggee address — refusing it stops a runaway before it spins out to the step limit.
-        const uint StackGuard = 0x00100000;
+        public const uint StackGuard = 0x00100000;
+        /// <summary>Bytes of free address space the caller must find: the modeled stack plus both guards.
+        /// The base handed to the constructor is the region's start + <see cref="StackGuard"/>.</summary>
+        public const uint WindowBytes = StackGuard + StackSize + StackGuard;
+        readonly uint _stackBase;
         readonly byte[] _stack = new byte[StackSize];
 
         readonly Func<uint, int, byte[]> _readMem;     // debuggee read (addr, len)
@@ -47,10 +54,14 @@ namespace ClarionDbg.Cli
         const uint RetSentinel = 0xDEAD0000;           // top-level return address; ret here = done
 
         public RtlEmulator(Func<uint, int, byte[]> readMem, Func<uint, uint> tlsGetValue, uint curThreadId,
-                           uint teb, Func<uint, string> importAtSlot, Func<uint, bool> isCode)
+                           uint teb, Func<uint, string> importAtSlot, Func<uint, bool> isCode, uint stackBase)
         {
             _readMem = readMem; _tlsGetValue = tlsGetValue; _curThreadId = curThreadId; _teb = teb;
             _importAtSlot = importAtSlot; _isCode = isCode;
+            // the low guard is computed as _stackBase - StackGuard, so a base below that would wrap.
+            if (stackBase < StackGuard || stackBase > uint.MaxValue - (StackSize + StackGuard))
+                throw new NotSupported($"modeled stack base 0x{stackBase:X} leaves no room for its guard bands");
+            _stackBase = stackBase;
         }
 
         /// <summary>Run the function at <paramref name="va"/> (zero args) and return EAX. Optionally seed EAX
@@ -62,7 +73,7 @@ namespace ClarionDbg.Cli
                                              Register.ESI, Register.EDI, Register.EBP })
                 _r[reg] = 0;
             _r[Register.EAX] = eaxSeed;
-            _r[Register.ESP] = StackBase + StackSize - 0x100;
+            _r[Register.ESP] = _stackBase + StackSize - 0x100;
             _zf = _cf = _sf = _of = _df = false;
             Push(RetSentinel);
             Run(va);
@@ -386,16 +397,16 @@ namespace ClarionDbg.Cli
         /// (a debuggee access). A span that straddles an edge — or lands in the guard band either side — is
         /// the emulation having gone off the rails, so it throws instead of half-reading the stack buffer
         /// (which used to index past <see cref="_stack"/> and escape as IndexOutOfRangeException) or quietly
-        /// reading an unrelated debuggee address just below <see cref="StackBase"/>.</summary>
+        /// reading an unrelated debuggee address just below the modeled stack.</summary>
         bool InStack(uint addr, int n)
         {
             uint lo = addr, hi = addr + (uint)(n - 1);
             if (hi < lo) throw new NotSupported($"address wraps at 0x{addr:X}+{n}");
-            bool loIn = lo >= StackBase && lo < StackBase + StackSize;
-            bool hiIn = hi >= StackBase && hi < StackBase + StackSize;
+            bool loIn = lo >= _stackBase && lo < _stackBase + StackSize;
+            bool hiIn = hi >= _stackBase && hi < _stackBase + StackSize;
             if (loIn && hiIn) return true;
             if (loIn != hiIn) throw new NotSupported($"access 0x{addr:X}+{n} straddles the modeled stack");
-            if (hi >= StackBase - StackGuard && lo < StackBase + StackSize + StackGuard)
+            if (hi >= _stackBase - StackGuard && lo < _stackBase + StackSize + StackGuard)
                 throw new NotSupported($"stack under/overflow at 0x{addr:X}");
             return false;
         }
@@ -406,7 +417,7 @@ namespace ClarionDbg.Cli
 
         uint ReadN(uint addr, int n)
         {
-            if (InStack(addr, n)) { uint v = 0; for (int i = 0; i < n; i++) v |= (uint)_stack[addr - StackBase + i] << (8 * i); return v; }
+            if (InStack(addr, n)) { uint v = 0; for (int i = 0; i < n; i++) v |= (uint)_stack[addr - _stackBase + i] << (8 * i); return v; }
             var b = _readMem(addr, n);
             if (b.Length < n) throw new NotSupported($"read 0x{addr:X}");
             if (_shadow.Count > 0) for (int i = 0; i < n; i++) if (_shadow.TryGetValue(addr + (uint)i, out var sb)) b[i] = sb;
@@ -416,7 +427,7 @@ namespace ClarionDbg.Cli
         void WriteMem(uint addr, uint v, MemorySize sz) => WriteN(addr, v, MemSize(sz));
         void WriteN(uint addr, uint v, int n)
         {
-            if (InStack(addr, n)) { for (int i = 0; i < n; i++) _stack[addr - StackBase + i] = (byte)(v >> (8 * i)); return; }
+            if (InStack(addr, n)) { for (int i = 0; i < n; i++) _stack[addr - _stackBase + i] = (byte)(v >> (8 * i)); return; }
             for (int i = 0; i < n; i++) _shadow[addr + (uint)i] = (byte)(v >> (8 * i));   // shadow, not the debuggee
         }
 

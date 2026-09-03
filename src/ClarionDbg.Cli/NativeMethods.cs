@@ -117,5 +117,28 @@ namespace ClarionDbg.Cli
         // Library State's read-only RTL emulator to read the stopped thread's TLS slots.
         [DllImport("ntdll.dll")]
         public static extern int NtQueryInformationThread(IntPtr hThread, int infoClass, byte[] info, int infoLength, out int returnLength);
+
+        // --- address-space query (VirtualQueryEx) ---
+        // Library State's emulator models a private stack in a window of the debuggee's address space.
+        // That window has to be genuinely unmapped in the target, or a read of a REAL address inside it
+        // would be served from the modeled stack instead — a plausible-looking wrong number, which is the
+        // one outcome the emulator is built to avoid. We walk the target's regions to find a free one.
+        public const uint MEM_FREE = 0x10000;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MEMORY_BASIC_INFORMATION
+        {
+            public IntPtr BaseAddress;
+            public IntPtr AllocationBase;
+            public uint AllocationProtect;
+            public IntPtr RegionSize;
+            public uint State;
+            public uint Protect;
+            public uint Type;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress,
+            out MEMORY_BASIC_INFORMATION lpBuffer, IntPtr dwLength);
     }
 }

@@ -152,13 +152,20 @@ namespace ClarionDbg.Cli
                 int bang = fn.IndexOf('!');
                 imports[rt.LoadBase + kv.Key] = bang >= 0 ? fn.Substring(bang + 1) : fn;
             }
+            uint stackBase = EmulatorStackWindow.Pick(_hProcess);
+            if (stackBase == 0)
+                throw new InvalidOperationException(
+                    "no free address-space window for the emulator's modeled stack — refusing rather than "
+                    + "risking a window that overlaps live memory");
+
             return new RtlEmulator(
                 readMem: (addr, n) => ReadBytesExact(addr, n),
                 tlsGetValue: idx => ReadTlsSlot(teb, idx),
                 curThreadId: tid,
                 teb: teb,
                 importAtSlot: slot => imports.TryGetValue(slot, out var nm) ? nm : null,
-                isCode: va => ModuleAt(va) != null);
+                isCode: va => ModuleAt(va) != null,
+                stackBase: stackBase);
         }
 
         /// <summary>Read exactly <paramref name="n"/> bytes from the debuggee, or fewer at a guard page /
