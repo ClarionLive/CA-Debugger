@@ -727,11 +727,17 @@ namespace ClarionDbg.Cli
             return c;
         }
 
-        /// <summary>uint VA -> IntPtr without .NET's checked long->int narrowing. On x86 builds, the
+        /// <summary>uint -> IntPtr without .NET's checked long->int narrowing. On x86 builds, the
         /// compiler-inserted uint->long widen followed by IntPtr's explicit operator(long) does a CHECKED
-        /// (int) cast internally — any VA >= 0x80000000 (large-address-aware targets routinely hand out
-        /// stack/heap addresses up there) throws OverflowException. ReadProcessMemory/WriteProcessMemory only
-        /// want the raw bit pattern, so reinterpreting unchecked is correct here.</summary>
+        /// (int) cast internally — any value >= 0x80000000 (large-address-aware targets routinely hand out
+        /// stack/heap addresses up there) throws OverflowException. The Win32 callee only wants the raw bit
+        /// pattern, so reinterpreting unchecked is correct here.
+        ///
+        /// Use this for EVERY uint->IntPtr conversion, not just addresses: the trap is in the conversion,
+        /// not in what the number means. Debug-event HANDLE values go through it too — Windows keeps handles
+        /// small in practice, so the overflow is latent there rather than observed, but a bare (IntPtr)uint
+        /// anywhere in this file is the bug from issue #20 waiting to be reintroduced. There should be no
+        /// remaining uint-sourced (IntPtr) casts, so the pattern can be grepped for as a rule.</summary>
         private static IntPtr Ptr(uint va) => (IntPtr)unchecked((int)va);
 
         private void WriteU32(uint va, uint value)
@@ -913,7 +919,7 @@ namespace ClarionDbg.Cli
         {
             if (hFile == 0) return null;
             var sb = new System.Text.StringBuilder(520);
-            uint n = GetFinalPathNameByHandle((IntPtr)hFile, sb, (uint)sb.Capacity, 0);
+            uint n = GetFinalPathNameByHandle(Ptr(hFile), sb, (uint)sb.Capacity, 0);
             if (n == 0) return null;
             string p = sb.ToString();
             if (p.StartsWith(@"\\?\UNC\")) p = @"\\" + p.Substring(8);
@@ -924,7 +930,7 @@ namespace ClarionDbg.Cli
         /// <summary>Close a raw debug-event handle (the LOAD_DLL hFile) so we don't leak it.</summary>
         private static void CloseHandleValue(uint handle)
         {
-            if (handle != 0) Native.CloseHandle((IntPtr)handle);
+            if (handle != 0) Native.CloseHandle(Ptr(handle));
         }
 
         // --- DEBUG_EVENT header accessors (first 12 bytes) ---

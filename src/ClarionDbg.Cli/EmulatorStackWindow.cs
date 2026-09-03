@@ -28,7 +28,7 @@ namespace ClarionDbg.Cli
             ulong addr = 0x10000;                                   // skip the reserved low 64 KB
             while (addr < UserSpaceEnd)
             {
-                if (Native.VirtualQueryEx(hProcess, (IntPtr)(long)addr, out var mbi, (IntPtr)mbiSize) == IntPtr.Zero)
+                if (Native.VirtualQueryEx(hProcess, Ptr(addr), out var mbi, (IntPtr)mbiSize) == IntPtr.Zero)
                     break;                                          // walked off the end (or the query failed)
                 ulong regionBase = (ulong)mbi.BaseAddress.ToInt64();
                 ulong regionSize = (ulong)mbi.RegionSize.ToInt64();
@@ -50,5 +50,11 @@ namespace ClarionDbg.Cli
             }
             return 0;
         }
+
+        /// <summary>Address -> IntPtr by raw bit pattern. Same trap as DebugEngine.Ptr: on x86 the
+        /// (IntPtr)(long) route is a CHECKED narrowing that throws for anything >= 0x80000000. The walk
+        /// below stops at UserSpaceEnd so it can't reach that today, but the cast is the footgun from
+        /// issue #20 and shouldn't be left lying around waiting for the bound to move.</summary>
+        private static IntPtr Ptr(ulong addr) => (IntPtr)unchecked((int)(uint)addr);
     }
 }
