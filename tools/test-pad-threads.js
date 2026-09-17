@@ -109,9 +109,12 @@ const THREADS_EVENT = {
     { tid: BROWSE_TID, clarionThread: 2, proc: 'BrowsePublishers', module: 'clbrws011.clw', line: 142, state: 'syscall', clarionFrames: 9, stopped: false, selected: false },
   ],
 };
-function freshThreadsEvent(sel) {
+// `stopped` defaults to the frame thread, which is the case the Owner hit; pass it when the scenario
+// stops somewhere else, so the inventory and the pause event agree the way a real engine's would.
+function freshThreadsEvent(sel, stopped) {
   const e = JSON.parse(JSON.stringify(THREADS_EVENT));
-  e.selected = sel; e.threads.forEach(t => { t.selected = t.tid === sel; });
+  e.selected = sel; e.stopped = stopped || STOP_TID;
+  e.threads.forEach(t => { t.selected = t.tid === sel; t.stopped = t.tid === e.stopped; });
   return e;
 }
 // a Watch/Variables row, in a container, attached to the document so querySelectorAll can find it
@@ -340,6 +343,32 @@ console.log('\n8) a new stop starts from the stopped thread, whatever was select
   onThreads(freshThreadsEvent(STOP_TID));
   check('the inventory re-points the pad at the stopped thread', selTid === STOP_TID && stopTid === STOP_TID);
   check('and the chip names it again', $('thSelText').textContent === 'Thread 1 · MAIN', $('thSelText').textContent);
+}
+
+console.log('\n8b) the pause event may name its own thread (additive) — the marker is right before the list arrives');
+{
+  resetAll();
+  onThreads(THREADS_EVENT);
+  onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  // new stop, and this time the engine names the thread it stopped on
+  onMessage(JSON.stringify({ type: 'paused', proc: 'BROWSEPUBLISHERS', module: 'clbrws011.clw', line: 142,
+                             regs: null, tid: BROWSE_TID }));
+  check('the stopped thread is known from the stop itself', stopTid === BROWSE_TID && selTid === BROWSE_TID);
+  check('so nothing claims we are off the stopped thread', !doc.body.classList.contains('viewing-other'));
+  check('a reply for the stopped thread lands', tidAccepted({ tid: BROWSE_TID }));
+  check('a reply for any OTHER thread is already gated', !tidAccepted({ tid: STOP_TID }));
+  check('the chip names it even with no inventory yet',
+        $('thSelText').textContent === 'tid ' + BROWSE_TID, $('thSelText').textContent);
+  // the inventory refines the label; it agrees with the stop about which thread that was
+  onThreads(freshThreadsEvent(BROWSE_TID, BROWSE_TID));
+  check('the inventory adds the readable name', $('thSelText').textContent === 'Thread 2 · BrowsePublishers',
+        $('thSelText').textContent);
+  check('and agrees about the stopped thread', stopTid === BROWSE_TID && !doc.body.classList.contains('viewing-other'));
+
+  // an engine that does NOT name it behaves exactly as before
+  onMessage(JSON.stringify({ type: 'paused', proc: 'MAIN', module: 'clbrws.clw', line: 84, regs: null }));
+  check('an unstamped pause leaves the pad unscoped, as before', stopTid === null && selTid === null);
+  check('…so it accepts whatever the stop pushes', tidAccepted({ tid: STOP_TID }) && tidAccepted({ tid: BROWSE_TID }));
 }
 
 console.log('\n9) a refused selection leaves the pad on the thread it actually has');

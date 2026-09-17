@@ -1569,9 +1569,16 @@
   // Every thread identity belongs to ONE stop. Clearing them at a resume (and again at the next pause)
   // is what stops a stale selection from gating the new stop's replies: the engine picks the stopped
   // thread again, and a leftover selTid pointing at last stop's thread would drop every reply it sends.
-  function resetThreadState(){
+  //
+  // `stoppedTid` is the new stop's own thread when the pause event names it (an additive field — an
+  // engine that omits it leaves the pad exactly as it was, learning the stopped thread from the `threads`
+  // reply instead). Taking it here means the stopped-thread marker is right from the first moment of the
+  // stop, even if the inventory request that follows fails or is overtaken; the inventory only ever adds
+  // to it (the Clarion thread number, the procedure), never contradicts it.
+  function resetThreadState(stoppedTid){
     threadRows=[]; stopTid=null; selTid=null; threadSwitching=false; stackPendingTid=null;
     switchGen++;                 // invalidates any armed sweep
+    if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
     closeThreadPicker(); renderThreadUi();
   }
 
@@ -1929,8 +1936,9 @@
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
         // A new stop is a new thread world: the engine has re-picked the stopped thread and dropped any
         // selection. Forget last stop's tids FIRST — a leftover selTid would drop every reply this stop
-        // is about to push. The host asks for the inventory, which fills the picker back in.
-        resetThreadState();
+        // is about to push — then adopt the thread this stop is ON, when the event names it. The host
+        // asks for the inventory too, which fills in the picker and the readable labels.
+        resetThreadState(m.tid);
         buildRegs(m.regs); setPaused(true); refreshLibState(); break;
       case 'resumed': setPaused(false); resetThreadState(); lastLibState=null; lastLibError=null; renderLibState(); break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;

@@ -1168,7 +1168,7 @@ namespace ClarionDebugger.Terminal
                 sb.Append("{\"type\":\"paused\",\"module\":").Append(Str(p.Module))
                   .Append(",\"proc\":").Append(Str(p.Proc))
                   .Append(",\"line\":").Append(p.Line)
-                  .Append(",\"regs\":").Append(RegsJson(p.Regs)).Append('}');
+                  .Append(",\"regs\":").Append(RegsJson(p.Regs)).Append(TidJson(p.Tid)).Append('}');
                 Post(sb.ToString());
                 Console("pause", "paused [" + p.Reason + "]  " + (p.Resolved ? p.Module + " line " + p.Line + (p.Proc != null ? " in " + p.Proc : "") : "(unresolved)"));
 

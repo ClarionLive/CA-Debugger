@@ -48,6 +48,10 @@ namespace ClarionDebugger.Services
         public string Sym;
         /// <summary>x86 registers as hex strings keyed by name (eax..eflags), or null.</summary>
         public Dictionary<string, string> Regs;
+        /// <summary>The thread the engine stopped on, or null from an engine that doesn't name it. Lets the
+        /// pad mark the stopped thread from the stop itself, rather than only from the 'threads' reply that
+        /// follows it — which can fail or be overtaken.</summary>
+        public int? Tid;
         /// <summary>Full path to the source module, resolved via the active .red redirection (or null).</summary>
         public string ResolvedPath;
     }
@@ -951,6 +955,7 @@ namespace ClarionDebugger.Services
                     Gap = GetInt(json, "gap"),
                     Exact = GetBool(json, "exact"),
                     Sym = GetStr(json, "sym"),
+                    Tid = GetIntOrNull(json, "tid"),
                 };
                 p.Regs = ParseRegs(json);
                 return p;
