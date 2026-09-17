@@ -46,7 +46,7 @@ let lastLibState = null, lastLibError = null;
 let _flSeq = 0; const _flCbs = {};
 let _expandSeq = 0; const _expandCbs = {};
 const STAR = '*';
-const beginEdit = () => { };
+let activeEdit = null;                 // the page's in-place editor handle (real beginEdit is under test)
 // The real page waits PENDING_SWEEP_MS before giving up on a row still showing "…". Shortened here so the
 // test doesn't sleep for four seconds; the assertion below keeps the page's own constant honest.
 const PENDING_SWEEP_MS = 30;
@@ -70,12 +70,13 @@ function buildSource() { } function clearSrc() { } function onVarSet() { } funct
 function refreshWatchClipping() { }
 
 // ---- the page's own code ---------------------------------------------------------------------------
-const FNS = ['esc', 'send', 'snapToStoppedThread', 'resetThreadState',
+const FNS = ['esc', 'send', 'resetThreadState',
   'dtParseInt', 'fieldPart', 'fmtClarionDate', 'fmtClarionTime', 'dtDefault', 'dtModeFor', 'dtApply', 'dtCycle',
   'clearEditMeta', 'setEditMeta', 'wireEdit', 'applyValue', 'showTipFor',
+  'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
-  'onThreads', 'onThreadSelected', 'beginThreadSwitch', 'invalidateThreadScopedState',
+  'onThreads', 'onThreadSelected', 'onEngineError', 'beginThreadSwitch', 'invalidateThreadScopedState',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
   'buildStack', 'renderStack', 'onMessage'];
 const missing = [];
@@ -83,10 +84,20 @@ const src = FNS.map(n => {
   try { return pad.extract(html, n); }
   catch (e) { missing.push(n); return 'function ' + n + '(){}'; }
 }).join('\n');
-let resumeTable = 'const RESUME_ACTIONS={};';
-try { resumeTable = pad.extractConst(html, 'RESUME_ACTIONS'); } catch (e) { missing.push('RESUME_ACTIONS'); }
 if (missing.length) console.log('   (note: absent from this page — pre-fix? ' + missing.join(', ') + ')');
-eval(resumeTable + '\n' + src);
+eval(src);
+
+// ---- reaching into the page's in-place editor from a test ----
+function activeEditCell() { return activeEdit ? activeEdit.cell : null; }
+// Type into the open editor and press Enter, through the page's own keydown handler — the commit path a
+// user actually takes, rather than calling an internal the page does not expose.
+function commitActiveEdit(text) {
+  const cell = activeEditCell(); if (!cell) return false;
+  const inp = cell.children.find(c => c.classList.contains('vedit')); if (!inp) return false;
+  inp.value = text;
+  inp.onkeydown({ key: 'Enter', preventDefault() { } });
+  return true;
+}
 
 // the page's own thread state (declared with `let` in the page, so the tests own the bindings here)
 let threadRows = [], stopTid = null, selTid = null, threadSwitching = false, switchGen = 0, stackPendingTid = null;
@@ -150,9 +161,9 @@ check('both lazy loaders handle a cancelled (null) reply',
       (html.match(/items===null/g) || []).length + ' site(s)');
 check('no page function was missing', missing.length === 0, missing.join(',') || 'all present');
 if (missing.length) {
-  // Pointed at a page that predates the thread picker: say so once instead of throwing halfway through a
+  // Pointed at a page that predates part of this work: say so once instead of throwing halfway through a
   // scenario, which reads like a broken test rather than the before/after proof it is.
-  console.log('\nThis page has no thread selection — ' + missing.length + ' piece(s) absent. ' + failures + ' FAILURE(S)');
+  console.log('\nThis page predates ' + missing.length + ' piece(s) these checks cover. ' + failures + ' FAILURE(S)');
   process.exit(1);
 }
 
@@ -309,26 +320,96 @@ console.log('\n6) a watch row re-resolves into 50414e39\'s per-thread states, no
         && s.title === 'not yet used on this thread — initial value' && !s.pencil);
 }
 
-console.log('\n7) stepping or continuing snaps the view back to the stopped thread');
+console.log('\n7) stepping snaps the view back — on the engine\'s REPLY, never on the command being sent');
 {
   resetAll();
   onThreads(THREADS_EVENT);
   onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  const row = makeRow('PUB:PUB_NAME');
+  onMessage(JSON.stringify({ type: 'watch', name: 'PUB:PUB_NAME', found: true, value: "'Algodata'",
+                             typeName: 'STRING(41)', threaded: true, tid: BROWSE_TID }));
   toggleThreadPicker();
-  check('(setup) viewing the browse thread, picker open', selTid === BROWSE_TID && doc.body.classList.contains('viewing-other'));
+  check('(setup) viewing the browse thread, showing its value', selTid === BROWSE_TID
+        && doc.body.classList.contains('viewing-other') && state(row).text === "'Algodata'");
 
   clearSent();
   send('stepover');
-  check('the selection snaps back as the command leaves the pad', selTid === STOP_TID);
+  check('the step goes out', sentActions().includes('stepover'));
+  // The host's Cmd* handlers are self-guarding: Run to Cursor returns without resuming when the editor's
+  // cursor cannot be resolved, Pause/Start no-op in the wrong state. Relabelling here would put the
+  // BROWSE thread's values on screen under the STOPPED thread's name for a command that never ran.
+  check('the labelling does NOT move on dispatch', selTid === BROWSE_TID);
+  check('…so the panels and their banner still agree with the values on screen',
+        doc.body.classList.contains('viewing-other') && state(row).text === "'Algodata'");
+
+  // a command the host dropped: no reply ever comes, and the pad must be exactly as it was
+  clearSent();
+  send('runtocursor');
+  check('a dropped command leaves the view untouched', selTid === BROWSE_TID
+        && doc.body.classList.contains('viewing-other') && state(row).text === "'Algodata'");
+  check('and leaves no row stranded on "…"', state(row).text !== '…');
+
+  // the engine's own resume echo is what actually snaps it back
+  onMessage(JSON.stringify({ type: 'resumed', mode: 'stepover' }));
+  check('the resume reply snaps the view back', selTid === null && stopTid === null && !threadRows.length);
   check('the banner is gone', !$('thWarn').classList.contains('show') && !doc.body.classList.contains('viewing-other'));
   check('the picker is closed', !threadPickerOpen());
-  check('the step itself still went out', sentActions().includes('stepover'));
+  check('…and the next stop\'s replies are not gated by a stale selection', tidAccepted({ tid: 99999 }) === true);
+}
 
-  // and the engine's own resume echo clears the stop entirely
-  onMessage(JSON.stringify({ type: 'resumed', mode: 'stepover' }));
-  check('a resume forgets the stop\'s thread identities', selTid === null && stopTid === null && !threadRows.length);
-  check('…so the next stop\'s replies are not gated by a stale selection',
-        tidAccepted({ tid: 99999 }) === true);
+console.log('\n7b) an edit committed during a switch never writes the old thread\'s address');
+{
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const row = makeRow('PUB:PUB_NAME', { watch: true });
+  applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  check('(setup) the row is editable, bound to the stopped thread\'s instance', state(row).va === A_INSTANCE.va);
+
+  // the user opens the editor, then picks another thread before committing
+  beginEdit(cell(row));
+  check('(setup) an editor is open', !!activeEditCell());
+  clearSent();
+  selectThread(BROWSE_TID);
+  check('the open editor is cancelled by the request itself', !activeEditCell());
+  check('the stale instance address is dropped BEFORE the request goes out',
+        state(row).va === undefined && !state(row).pencil);
+  check('only the selection request was sent', sentActions().join(',') === 'selectthread', sentActions().join(','));
+
+  // and a fresh edit attempt in the gap cannot start one either
+  beginEdit(cell(row));
+  check('a new edit cannot be started against the old address', !activeEditCell());
+  check('no write was sent in the gap', !sentActions().includes('editvar'), sentActions().join(','));
+}
+
+console.log('\n7c) a write names the thread its address was read on');
+{
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const row = makeRow('PUB:PUB_NAME', { watch: true });
+  applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  clearSent();
+  beginEdit(cell(row));
+  commitActiveEdit('New Moon Books');
+  const wrote = SENT.find(s => s.action === 'editvar');
+  console.log('   ' + (wrote ? wrote.data : '(nothing sent)'));
+  check('the write carries the selected thread', !!wrote && JSON.parse(wrote.data).tid === STOP_TID);
+  // the host reads the FIRST "key": it finds anywhere in the text, and `value` is the one field the user
+  // typed — a value containing its own "tid" must not be the one that gets read
+  check('tid appears before the user-typed value', !!wrote && wrote.data.indexOf('"tid"') < wrote.data.indexOf('"value"'));
+}
+
+console.log('\n7d) an engine error answers a switch that is in flight');
+{
+  resetAll();
+  onThreads(THREADS_EVENT);
+  selectThread(BROWSE_TID);
+  check('(setup) the chip says a switch is in flight', $('thSelText').textContent === 'switching…');
+  clearSent();
+  onMessage(JSON.stringify({ type: 'engineerror', message: 'thread 5140 is not readable' }));
+  check('the chip stops claiming a request is in flight', $('thSelText').textContent !== 'switching…',
+        $('thSelText').textContent);
+  check('the selection stays where the engine has it', selTid === STOP_TID);
+  check('the pad resyncs from the engine', sentActions().includes('threads'));
 }
 
 console.log('\n8) a new stop starts from the stopped thread, whatever was selected before');
@@ -423,6 +504,36 @@ console.log('\n11) the sweep never fires over a newer switch or a resumed target
   await sleep(PENDING_SWEEP_MS + 40);
   check('the first switch\'s sweep does not overwrite the second switch\'s value',
         state(row).text === "'Algodata'", state(row).text);
+}
+
+console.log('\n11b) a thread id near the top of the DWORD range is a normal id, not "unknown"');
+{
+  // Win32 thread ids are DWORDs. An id above Int32.MaxValue used to parse as null on the way through the
+  // add-in, and null means UNSCOPED — so a reply the engine HAD stamped would be accepted as if it were
+  // for whatever thread is on screen. That is the absent-means-unknown rule broken from the other side,
+  // and it would hit roughly one thread id in two. (The parse itself is covered by tools/test-addin-json.ps1;
+  // this is the consequence on the page.)
+  const HIGH = 4294967295, HIGH2 = 3221225472;
+  resetAll();
+  onThreads({ type: 'threads', stopped: HIGH, selected: HIGH, threads: [
+    { tid: HIGH, clarionThread: 1, proc: 'MAIN', module: 'clbrws.clw', line: 84, state: 'syscall', clarionFrames: 6, stopped: true, selected: true },
+    { tid: HIGH2, clarionThread: 2, proc: 'BrowsePublishers', module: 'clbrws011.clw', line: 142, state: 'syscall', clarionFrames: 9, stopped: false, selected: false },
+  ] });
+  check('a high id is listed and marked as the stopped thread', stopTid === HIGH && selTid === HIGH
+        && $('thList').children[0].children.some(c => c.textContent === 'Thread 1'));
+  check('its own reply lands', tidAccepted({ tid: HIGH }));
+  check('the OTHER high id is still gated out', !tidAccepted({ tid: HIGH2 }),
+        'a stamped reply must never be mistaken for an unscoped one');
+
+  const row = makeRow('PUB:PUB_NAME');
+  onMessage(JSON.stringify({ type: 'watch', name: 'PUB:PUB_NAME', found: true, value: "'wrong thread'",
+                             typeName: 'STRING(41)', threaded: true, tid: HIGH2 }));
+  check('a value from the other high-id thread never paints', state(row).text === '…', state(row).text);
+  onMessage(JSON.stringify({ type: 'watch', name: 'PUB:PUB_NAME', found: true, value: "'Algodata'",
+                             typeName: 'STRING(41)', threaded: true, tid: HIGH }));
+  check('the selected high-id thread\'s value does paint', state(row).text === "'Algodata'");
+  check('selecting one sends the id unmangled',
+        (clearSent(), selectThread(HIGH2), SENT[0] && SENT[0].data === String(HIGH2)), SENT[0] && SENT[0].data);
 }
 
 console.log('\n12) replies keyed by request id are cancelled, not left hanging');

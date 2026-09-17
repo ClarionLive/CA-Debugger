@@ -286,24 +286,24 @@ namespace ClarionDebugger.Terminal
         // emit 'resumed', so they leave the marker alone.
         private void OnSvcResumed(string mode) => UI(() => { ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
-        private void OnSvcStack(List<DebugStackFrame> frames, int? tid) => UI(() => OnStack(frames, tid));
+        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid) => UI(() => OnStack(frames, tid));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
         // fields); forward its array bodies verbatim so the structure survives intact.
 
-        private void OnSvcModuleData(string module, string itemsJson, int? tid) => UI(() =>
+        private void OnSvcModuleData(string module, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
             Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
 
-        private void OnSvcFrameLocals(string reqId, string itemsJson, int? tid) => UI(() =>
+        private void OnSvcFrameLocals(string reqId, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
-        private void OnSvcLibState(string reqId, string error, string itemsJson, int? tid) => UI(() =>
+        private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
-        private void OnSvcRegs(Dictionary<string, string> regs, int? tid) => UI(() =>
+        private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
-        private void OnSvcThreadSelected(int tid, bool ok, string error) => UI(() =>
+        private void OnSvcThreadSelected(uint tid, bool ok, string error) => UI(() =>
         {
             Post("{\"type\":\"threadselected\",\"tid\":" + tid + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
@@ -354,7 +354,14 @@ namespace ClarionDebugger.Terminal
             Console("err", "breakpoint " + m + ":" + l + " — " + err);
         });
         private void OnSvcTraced(string m, int l, string msg, int hits) => UI(() => Console("trace", m + ":" + l + "  " + msg + "  (#" + hits + ")"));
-        private void OnSvcEngineError(string msg) => UI(() => Console("err", "engine: " + msg));
+        // Also pushed to the page as a typed message, not only to the console: the page can have a request
+        // in flight (a thread switch) that this error is the answer to, and a console line is text it
+        // cannot act on. Nothing else in the page reads it today.
+        private void OnSvcEngineError(string msg) => UI(() =>
+        {
+            Console("err", "engine: " + msg);
+            Post("{\"type\":\"engineerror\",\"message\":" + Str(msg) + "}");
+        });
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
         private void OnSvcLog(string s) => UI(() => Console("info", s));
@@ -567,7 +574,7 @@ namespace ClarionDebugger.Terminal
                     // on screen. Each of these is paused-only; the engine refuses them otherwise anyway.
                     case "threads": if (_svc.State == DebugSessionState.Paused) _svc.RequestThreads(); break;
                     case "selectthread":
-                        if (_svc.State == DebugSessionState.Paused && int.TryParse(data, out int seltid))
+                        if (_svc.State == DebugSessionState.Paused && uint.TryParse(data, out uint seltid))
                             _svc.SelectThread(seltid);
                         break;
                     case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
@@ -1235,7 +1242,7 @@ namespace ClarionDebugger.Terminal
         /// ABSENT IS NOT ZERO: the page treats a reply without a tid as unscoped and accepts it (so the pad
         /// still works against an engine that predates the stamp), while a tid that names another thread is
         /// dropped. Emitting 0 for "unknown" would make every such reply look like a different thread's.</summary>
-        private static string TidJson(int? tid)
+        private static string TidJson(uint? tid)
         {
             return tid.HasValue ? ",\"tid\":" + tid.Value.ToString(CultureInfo.InvariantCulture) : string.Empty;
         }
@@ -1266,7 +1273,7 @@ namespace ClarionDebugger.Terminal
             Post(sb.ToString());
         }
 
-        private void OnStack(List<DebugStackFrame> frames, int? tid)
+        private void OnStack(List<DebugStackFrame> frames, uint? tid)
         {
             var sb = new StringBuilder("{\"type\":\"stack\",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
@@ -1322,8 +1329,13 @@ namespace ClarionDebugger.Terminal
             string typeCode = JsonVal(data, "typeCode");
             int size; int.TryParse(JsonVal(data, "size") ?? "", out size);
             int places; int.TryParse(JsonVal(data, "places") ?? "0", out places);
+            // The thread the address was read on. The page puts it AHEAD of "value" for JsonVal's benefit
+            // (it takes the first "key": in the text, and value is user-typed). Passed on so the engine can
+            // refuse a write whose thread is no longer the selected one rather than writing another
+            // thread's memory; absent when the page has no thread selection to name.
+            uint tid; bool haveTid = uint.TryParse(JsonVal(data, "tid") ?? "", out tid);
             string value = JsonVal(data, "value") ?? string.Empty;
-            _svc.SetVariable(va, typeCode, size, places, value);
+            _svc.SetVariable(va, typeCode, size, places, value, haveTid ? (uint?)tid : null);
         }
 
         private void SendBps()
