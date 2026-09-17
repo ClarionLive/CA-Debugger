@@ -39,7 +39,10 @@ class ClassList {
 }
 class El {
   constructor(tag){ this.tag = tag; this.classList = new ClassList(); this.dataset = {}; this.children = [];
-    this.parentElement = null; this.textContent = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100; }
+    this.parentElement = null; this.textContent = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100;
+    this.style = {}; }
+  getBoundingClientRect(){ return { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }; }
+  addEventListener(){}
   querySelector(sel){
     const want = sel.replace('.', '');
     for (const c of this.children) { if (c.classList.contains(want)) return c;
@@ -65,11 +68,22 @@ class El {
 }
 
 let ROW = null;
+let DETAIL = null;          // an OPEN Watch detail panel, when a scenario registers one
 const document = {
   createElement: t => new El(t),
   querySelectorAll: sel => (sel.startsWith('[data-name=') && ROW) ? [ROW] : [],
-  querySelector: () => null,
+  querySelector: sel => {
+    const m = /^\.wdetail\[data-detail="(.*)"\]$/.exec(sel);
+    if (m && DETAIL && DETAIL.dataset.detail === m[1]) return DETAIL;
+    return null;
+  },
 };
+// the hover data-tip's own elements ($('dtName') / $('dtType') / $('dtVal')) and the tip container
+const TIP_ELS = {};
+const $ = id => (TIP_ELS[id] = TIP_ELS[id] || new El('span'));
+const tip = new El('div');
+const window = { innerWidth: 1200, innerHeight: 800 };
+let tipTarget = null, tipTimer = null;
 // deps applyValue touches that are not under test
 const values = new Map();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
@@ -82,7 +96,7 @@ const dtModes = {};
 
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
 const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','wireEdit','applyValue'].map(n => {
+             'clearEditMeta','setEditMeta','wireEdit','applyValue','showTipFor'].map(n => {
   try { return extract(n); }
   catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
 }).join('\n');
@@ -171,6 +185,56 @@ numericScenario('5) LONG row (dtApply inserts .vas between the cell and the penc
                 'JOB:JOBID', '4711', 'LONG', { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 }, '');
 numericScenario('6) DATE row (same ordering, value rendered as a date, raw kept in the tooltip)',
                 'TIT:PUBDATE', '80000', 'ULONG', { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 }, 'raw: 80000');
+
+// ---- the `values` cache behind the hover data-tip and the Watch detail panel ----
+// It is read by BOTH of those long after the reply that filled it, so it has to carry the caveat with the
+// value and be evicted when a reply resolves to nothing. Otherwise a qualified value (shared template /
+// not yet used on this thread) reads as an ordinary live value, and a name the engine could not read keeps
+// quoting the previous stop's value.
+console.log('7) hover data-tip reflects a qualified value, and forgets an unreadable one');
+{
+  const name = 'TIT:PUBDATE';
+  const row = makeRow(name);
+  const tEl = new El('span'); tEl.classList.add('vtype'); tEl.textContent = 'ULONG'; row.append(tEl);
+
+  applyValue(name, true, '80000', 'ULONG', true, { note: 'no thread instance — shared template value' });
+  showTipFor(row);
+  console.log('   tip after a template-value reply: ' + JSON.stringify($('dtVal').textContent));
+  check('tip carries the caveat', $('dtVal').textContent.includes('no thread instance'));
+
+  applyValue(name, false, null, null, false, { error: 'could not resolve the thread\'s TEB' });
+  showTipFor(row);
+  console.log('   tip after a failed read:          ' + JSON.stringify($('dtVal').textContent));
+  check('tip drops the stale value', !$('dtVal').textContent.includes('2020-01-09') && !$('dtVal').textContent.includes('80000'),
+        'tip=' + JSON.stringify($('dtVal').textContent));
+  check('tip shows the unavailable state', $('dtVal').textContent.includes('(unavailable)'));
+
+  // The tip a SOURCE identifier raises has no row behind it, so it reads the cache directly — this is the
+  // path where a stale entry is actually visible, and the one the eviction exists for.
+  const token = new El('span'); token.dataset.name = name;   // no .vval child
+  showTipFor(token);
+  console.log('   tip over a source identifier:     ' + JSON.stringify($('dtVal').textContent));
+  check('source tip quotes no stale value', !$('dtVal').textContent.includes('2020-01-09') && !$('dtVal').textContent.includes('80000'),
+        'tip=' + JSON.stringify($('dtVal').textContent));
+}
+
+console.log('8) an OPEN Watch detail panel follows the row when the read fails');
+{
+  const name = 'AUT:AU_LNAME';
+  const row = makeRow(name); row.classList.add('watchrow');
+  DETAIL = new El('div'); DETAIL.classList.add('wdetail'); DETAIL.dataset.detail = name; DETAIL.style.display = '';
+
+  applyValue(name, true, "'Del Castillo'", 'STRING(41)', true, { va: '0x847A76', typeCode: '0x18', size: 41, places: 0 });
+  console.log('   detail after a resolved reply: ' + JSON.stringify(DETAIL.textContent));
+  check('detail shows the value', DETAIL.textContent === "'Del Castillo'");
+
+  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  console.log('   detail after a failed read:    ' + JSON.stringify(DETAIL.textContent));
+  check('open detail no longer shows the stale value', DETAIL.textContent !== "'Del Castillo'",
+        'detail=' + JSON.stringify(DETAIL.textContent));
+  check('detail shows the unavailable state', DETAIL.textContent === '(unavailable)');
+  DETAIL = null;
+}
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

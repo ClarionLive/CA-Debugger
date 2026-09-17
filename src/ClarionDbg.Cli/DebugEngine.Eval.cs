@@ -32,6 +32,7 @@ namespace ClarionDbg.Cli
         private enum ThreadedResolve
         {
             Ok,            // instanceVa is this thread's live instance
+            Template,      // this thread has no instance of its own: the template itself is what it reads
             Unallocated,   // this thread has not touched the data yet; no instance exists to read
             Failed,        // could not resolve (no import, no TEB, emulator refusal, unreadable result)
         }
@@ -111,17 +112,25 @@ namespace ClarionDbg.Cli
             if (result == 0) { reason = "THR$GetInstance returned no instance"; return ThreadedResolve.Failed; }
 
             // A thread that is not a Clarion thread (or an image whose data isn't really threaded) legitimately
-            // gets the template back — that IS what code on that thread reads. Anything else must be readable.
-            if (result != templateVa)
+            // gets the TEMPLATE back — that IS what code on that thread reads, so the value is real and worth
+            // showing. But it is shared, not this thread's own: writing it would change what every future
+            // thread starts from, the same reason the Unallocated branch refuses to write. So it gets its own
+            // outcome rather than passing for an instance, and it is never cached — the cache maps a whole
+            // image's block for a thread that HAS one.
+            if (result == templateVa)
             {
-                var probe = new byte[1];
-                if (ReadBlock(result, probe) < 1)
-                {
-                    reason = $"THR$GetInstance returned an unreadable instance (0x{result:X})";
-                    return ThreadedResolve.Failed;
-                }
-                _tlsBaseCache[TlsCacheKey(tid, owner.LoadBase)] = result - (templateVa - cwtlsBase);
+                instanceVa = templateVa;
+                reason = "no thread instance — shared template value";
+                return ThreadedResolve.Template;
             }
+
+            var probe = new byte[1];
+            if (ReadBlock(result, probe) < 1)
+            {
+                reason = $"THR$GetInstance returned an unreadable instance (0x{result:X})";
+                return ThreadedResolve.Failed;
+            }
+            _tlsBaseCache[TlsCacheKey(tid, owner.LoadBase)] = result - (templateVa - cwtlsBase);
 
             instanceVa = result;
             return ThreadedResolve.Ok;
@@ -182,6 +191,14 @@ namespace ClarionDbg.Cli
                     // template would change what EVERY future thread starts from.
                     EmitWatchValue(name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
                                    note: "not yet used on this thread — initial value", editable: false);
+                    break;
+
+                case ThreadedResolve.Template:
+                    // Not a Clarion thread (e.g. a pause that landed on a worker or the injected break thread):
+                    // the template IS what code here reads, so show it — but it is shared data, not this
+                    // thread's own, and writing it would change what every future thread starts from.
+                    EmitWatchValue(name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                                   note: reason, editable: false);
                     break;
 
                 default:

@@ -915,7 +915,12 @@
 
   // apply a watch value to any matching row (Watch list + Variables tree)
   function applyValue(name, found, value, typeName, threaded, meta){
-    if(found) values.set(name,{value:value,type:typeName,threaded:threaded});
+    // The cache behind the source data-tip and the Watch detail panel. It must carry the caveat with the
+    // value — a "not yet used on this thread" template value would otherwise resurface in a tip as an
+    // ordinary live value — and a reply that resolved to NOTHING must evict it, or the tip keeps quoting a
+    // previous stop's value for a name the engine just said it cannot read.
+    if(found) values.set(name,{value:value,type:typeName,threaded:threaded,note:(meta&&meta.note)||null});
+    else values.delete(name);
     document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
       v.classList.remove('pending','unavail','noted'); v.removeAttribute('title');
@@ -932,6 +937,10 @@
         v.textContent = err ? '(unavailable)' : (meta&&meta.outOfScope) ? '(out of scope)' : '(not found)';
         v.classList.add(err?'unavail':'pending');
         if(err) v.title=err;
+        // An OPEN detail panel is showing the previous stop's value; it has to follow the row, or the Watch
+        // panel keeps displaying a value for a name the engine just reported it could not read.
+        const det0=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'"]');
+        if(det0 && det0.style.display!=='none') det0.textContent=v.textContent;
         return;
       }
       v.textContent=value;
@@ -1560,7 +1569,11 @@
     let val=(vEl&&vEl.textContent.trim()) || (known&&known.value) || '';
     if(!val || val==='…') val = known&&known.value ? known.value : '(not watched — ☆ to add)';
     tipTarget={name,type,val};
-    $('dtName').textContent=name; $('dtType').textContent=type; $('dtVal').textContent=val;
+    $('dtName').textContent=name; $('dtType').textContent=type;
+    // carry the caveat into the tip: without it a shared-template or not-yet-used value reads as this
+    // thread's own live value, which is the misreading the row's own marker exists to prevent
+    const note=known&&known.note;
+    $('dtVal').textContent = note ? (val+'  ('+note+')') : val;
     // Anchor OVER the row (same Y) so the cursor reaches the tip/icons by moving right —
     // not down across the next row (which would steal the hover).
     const r=el.getBoundingClientRect();
