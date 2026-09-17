@@ -893,6 +893,16 @@
   // edit-variable-value: build the inline data-attrs for an editable scalar cell (engine-controlled
   // hex/number metadata — safe in attributes); empty string for non-editable rows.
   function editAttrs(v){ return v.va ? (' data-va="'+v.va+'" data-tc="'+v.typeCode+'" data-sz="'+(v.size||0)+'" data-pl="'+(v.places||0)+'"') : ''; }
+  // Drop a cell's edit affordance and the instance address it was bound to. The pencil is a SIBLING of the
+  // cell (wireEdit inserts it after), so it has to go too — a live pencil over a cleared va is exactly the
+  // stale-write hazard this prevents. setEditMeta/wireEdit re-add both when the new reply carries a va.
+  function clearEditMeta(cell){
+    if(!cell) return;
+    cell.classList.remove('editable');
+    delete cell.dataset.va; delete cell.dataset.tc; delete cell.dataset.sz; delete cell.dataset.pl;
+    const next=cell.nextElementSibling;   // wireEdit inserts the pencil immediately after the cell
+    if(next && next.classList.contains('vedit-btn')) next.remove();
+  }
   function setEditMeta(cell, meta){
     if(!cell || !meta || !meta.va) return;
     cell.classList.add('editable');
@@ -905,6 +915,12 @@
     document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
       v.classList.remove('pending','unavail','noted'); v.removeAttribute('title');
+      // Rows are REUSED across stops, so every reply must first strip the previous one's edit metadata.
+      // setEditMeta only ever ADDS (it early-returns when this reply carries no va), and wireEdit keeps an
+      // existing pencil — so without this a row that resolved to thread A's instance would keep A's va and
+      // its pencil when a later stop reports the value unreadable or not-yet-allocated, and committing an
+      // edit would write ANOTHER thread's memory while the row shows the template value.
+      clearEditMeta(v);
       if(!found){
         // Three distinct misses, and every one of them RESOLVES the row — a value that can't be read must
         // never leave "…" sitting there looking like it's still loading.

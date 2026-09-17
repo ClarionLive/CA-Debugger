@@ -642,9 +642,7 @@ namespace ClarionDebugger.Services
                     if (pause != null)
                     {
                         pause.ResolvedPath = ResolveModulePath(pause.Module);
-                        // a 'watch' pause is a transient func-eval round-trip — don't record its trap VA
-                        if (!string.Equals(pause.Reason, "watch", StringComparison.OrdinalIgnoreCase))
-                            CurrentVa = pause.Va;
+                        CurrentVa = pause.Va;
                         SetState(DebugSessionState.Paused);
                         Paused?.Invoke(pause);
                     }

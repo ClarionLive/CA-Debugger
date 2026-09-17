@@ -1105,9 +1105,6 @@ namespace ClarionDebugger.Terminal
         {
             UI(() =>
             {
-                // a 'watch' pause is the func-eval round-trip completing — NOT a fresh stop; don't cascade
-                if (string.Equals(p.Reason, "watch", StringComparison.OrdinalIgnoreCase)) return;
-
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
