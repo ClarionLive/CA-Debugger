@@ -136,6 +136,9 @@
   .veq { color:var(--fg-dim); margin:0 5px; }
   .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
   .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
+  /* a read that failed (never leave a row on "…"); and a real value that carries a caveat */
+  .vval.unavail { color:#c98a8a; font-style:italic; }
+  .vval.noted { border-bottom:1px dotted #8a8a5a; }
   .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
   .lib-grp { color:var(--fg-dim); font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding:5px 10px 2px; border-top:1px solid #ffffff0f; }
   .lib-grp:first-child { border-top:0; }
@@ -901,9 +904,19 @@
     if(found) values.set(name,{value:value,type:typeName,threaded:threaded});
     document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
-      v.classList.remove('pending');
-      if(!found){ v.textContent=(meta&&meta.outOfScope)?'(out of scope)':'(not found)'; v.classList.add('pending'); return; }
+      v.classList.remove('pending','unavail','noted'); v.removeAttribute('title');
+      if(!found){
+        // Three distinct misses, and every one of them RESOLVES the row — a value that can't be read must
+        // never leave "…" sitting there looking like it's still loading.
+        const err=meta&&meta.error;
+        v.textContent = err ? '(unavailable)' : (meta&&meta.outOfScope) ? '(out of scope)' : '(not found)';
+        v.classList.add(err?'unavail':'pending');
+        if(err) v.title=err;
+        return;
+      }
       v.textContent=value;
+      // a real value with a caveat (e.g. a THREADed variable this thread hasn't used yet)
+      if(meta && meta.note){ v.classList.add('noted'); v.title=meta.note; }
       setEditMeta(v, meta);
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
@@ -1574,7 +1587,7 @@
       case 'libstate': onLibState(m.reqId, m.error, m.items||[]); break;
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope}); break;
+      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
       case 'varset': onVarSet(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;

@@ -373,7 +373,8 @@ namespace ClarionDbg.Cli
         /// and therefore shows no edit pencil instead of erroring on commit. A miss goes through
         /// <see cref="WatchMiss"/>.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
-                                   byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable)
+                                   byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable,
+                                   string note = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
@@ -385,6 +386,7 @@ namespace ClarionDbg.Cli
               .Append(",\"size\":").Append(size)
               .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read);
+            if (note != null) sb.Append(",\"note\":").Append(Str(note));
             if (editable)
                 sb.Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
                   .Append(",\"places\":").Append(places);
@@ -400,6 +402,15 @@ namespace ClarionDbg.Cli
         {
             return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false"
                  + (outOfScope ? ",\"outOfScope\":true" : "") + "}";
+        }
+
+        /// <summary>A watch that RESOLVED to a name but could not be read (e.g. a THREADed instance the
+        /// runtime wouldn't yield). Carried on the watch event against the name so the host resolves that
+        /// row's pending state instead of leaving it on "…" forever.</summary>
+        public static string WatchError(string name, string error)
+        {
+            return "{\"event\":\"watch\",\"name\":" + Str(name) + ",\"found\":false"
+                 + ",\"error\":" + Str(error) + "}";
         }
 
         public static string Error(string message)

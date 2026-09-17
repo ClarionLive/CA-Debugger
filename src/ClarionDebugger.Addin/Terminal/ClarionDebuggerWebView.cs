@@ -1227,10 +1227,14 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"va\":").Append(Str(w.Va))
                   .Append(",\"typeCode\":").Append(Str(w.TypeCode))
                   .Append(",\"size\":").Append(w.Size)
-                  .Append(",\"places\":").Append(w.Places);
+                  .Append(",\"places\":").Append(w.Places)
+                  // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
+                  .Append(",\"note\":").Append(Str(w.Note));
             else
-                // a miss: distinguish a frame local that is merely out of scope from a genuinely unknown name
-                sb.Append(",\"outOfScope\":").Append(w.OutOfScope ? "true" : "false");
+                // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and
+                // a name that resolved but could not be read (error) — all three must clear the row's pending state
+                sb.Append(",\"outOfScope\":").Append(w.OutOfScope ? "true" : "false")
+                  .Append(",\"error\":").Append(Str(w.Error));
             sb.Append('}');
             Post(sb.ToString());
         }

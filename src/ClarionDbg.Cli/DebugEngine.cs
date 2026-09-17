@@ -160,21 +160,10 @@ namespace ClarionDbg.Cli
         private struct Rearm { public uint Va; public bool IsTemp; }
         private readonly Dictionary<uint, Rearm> _rearm = new Dictionary<uint, Rearm>();
 
-        // ---- threaded-data func-eval (watch NAME on THREADed .cwtls data) ----
-        // While paused, hijack the CURRENT thread to call ClaRUN!THR$GetInstance(EAX=templateVA,
-        // EBX=.cwtls base) and trap the return at an unmapped magic address. The paused thread IS
-        // the thread whose instance the user wants — per-thread data resolves correctly by design.
-        private const uint EVAL_TRAP_VA = 0x7FFF1000;   // never valid in 32-bit user space
-        private bool _evalActive;
-        private uint _evalTid;
-        private Native.CONTEXT_X86 _evalSavedCtx;
-        private bool _evalHadRearm;
-        private Rearm _evalSavedRearm;
-        private string _evalName;                       // pending watch: symbol + size to read
-        private uint _evalSize;
-        private string _evalTypeName;
-        private byte _evalTypeCode;
-        private uint _evalTemplateVa;
+        // ---- threaded data (watch NAME on THREADed .cwtls data) ----
+        // Resolved by emulating ClaRUN!THR$GetInstance READ-ONLY on the paused thread's TLS — no hijack, no
+        // func-eval, no resume. See DebugEngine.Eval.cs (TryResolveThreadedInstance) for why the old
+        // thread-hijack had to go.
 
         // source-level stepping state
         private StepMode _mode = StepMode.None;
@@ -306,6 +295,7 @@ namespace ClarionDbg.Cli
 
                     case Native.EXIT_THREAD_DEBUG_EVENT:
                         _threads.Remove(tid);
+                        ClearThreadedCache(tid);   // a reused tid must never inherit this thread's .cwtls block
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -336,12 +326,6 @@ namespace ClarionDbg.Cli
                         else if (exCode == Native.EXCEPTION_SINGLE_STEP)
                         {
                             status = OnSingleStep(tid);
-                        }
-                        else if (_evalActive && tid == _evalTid && exAddr == EVAL_TRAP_VA)
-                        {
-                            // a hijacked func-eval call (a `watch` of THREADed data) returned into our
-                            // unmapped magic address — collect its result and restore the pause state.
-                            status = OnEvalComplete(tid);
                         }
                         else
                         {
@@ -465,10 +449,11 @@ namespace ClarionDbg.Cli
         /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
         /// services stdin commands until a resume-type command arrives.
         /// </summary>
-        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason, bool emitPaused = true)
+        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
         {
             _pauseRequested = false;  // any pause we reach consumes a pending pause request
             _instrStep = false;       // and consumes a pending instruction-step
+            ClearThreadedCache();     // a fresh stop: re-resolve .cwtls instances rather than trust the last one
             uint va = haveCtx ? ctx.Eip : 0;
             var m = haveCtx ? ModuleAt(va) : null;
             uint rva = m != null ? va - m.LoadBase : va;
@@ -482,18 +467,10 @@ namespace ClarionDbg.Cli
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
-            // emitPaused is false when we re-enter the loop AFTER a transparent func-eval (a `watch` of
-            // THREADed data — the one path that still hijacks the thread; Library State no longer does).
-            // The user never left the original stop and the watch result already went out on its own event,
-            // so a second `paused` for the same location isn't new information: the host would take it for a
-            // fresh stop and re-drive everything that keys off one. Stay silent and resume servicing commands.
-            if (emitPaused)
-            {
-                if (EmitJson)
-                    Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
-                        haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-                Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
-            }
+            if (EmitJson)
+                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
+                    haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
 
             while (true)
             {
@@ -586,12 +563,10 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "watch":
-                        // resolve + read a data symbol's CURRENT-THREAD value. THREADed (.cwtls)
-                        // names need a func-eval: the target resumes briefly to run
-                        // THR$GetInstance, so we must leave the pause loop; the completion
-                        // handler re-enters it with the original context restored.
-                        if (HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx))
-                            return;
+                        // resolve + read a data symbol's CURRENT-THREAD value. THREADed (.cwtls) names
+                        // resolve by emulating THR$GetInstance read-only, so this answers inline like every
+                        // other read — no resume, no leaving the pause loop.
+                        HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx);
                         break;
 
                     case "libstate":
@@ -717,14 +692,6 @@ namespace ClarionDbg.Cli
             string tn = TswdDebugInfo.TypeCodeName(loc.TypeCode);
             if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, true, loc.Rva, va, loc.TypeCode, tn, loc.Size, loc.Container));
             Console.WriteLine($"  sym {name}: VA 0x{va:X} (RVA 0x{loc.Rva:X}) {(tn ?? $"type 0x{loc.TypeCode:X2}")} size {loc.Size}{(loc.Container != null ? " in " + loc.Container : "")}");
-        }
-
-        private static Native.CONTEXT_X86 CloneContext(ref Native.CONTEXT_X86 src)
-        {
-            var c = src;   // struct copy — but the two byte[] fields still REFERENCE src's arrays
-            c.FltRegisterArea = (byte[])src.FltRegisterArea.Clone();
-            c.ExtendedRegisters = (byte[])src.ExtendedRegisters.Clone();
-            return c;
         }
 
         /// <summary>uint -> IntPtr without .NET's checked long->int narrowing. On x86 builds, the
