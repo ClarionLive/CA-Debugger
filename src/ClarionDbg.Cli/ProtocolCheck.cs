@@ -187,6 +187,21 @@ namespace ClarionDbg.Cli
                                  + " was refused — " + why);
             }
 
+            // THE CASE WHOSE ABSENCE LET A HOLE THROUGH: an image with a real .cwtls section whose
+            // THR$GetInstance import did not resolve (locally linked runtime, renamed DLL, import by
+            // ordinal). Its rows are vetoed by the row-level checks, which gate on the section alone, so the
+            // write guard must refuse the same template — it needs no import to do it. The existing template
+            // case above runs against a module where the import DOES resolve, which is exactly why it could
+            // not see this.
+            var noImport = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            noImport.RegisterThreadedModuleForTest("static.exe", 0x400000, 0xC8000, 0xCC000, 0);
+            if (noImport.ThreadedWriteAllowedForTest(0x4CAF60, tid, out why))
+                failures.Add("threaded-write: the shared template was writable on an image whose "
+                             + "THR$GetInstance import did not resolve — an unrecoverable guard must not "
+                             + "depend on an optional capability");
+            if (!noImport.ThreadedWriteAllowedForTest(0x401000, tid, out why))
+                failures.Add("threaded-write control: an ordinary address was refused on a no-import image — " + why);
+
             // An engine with no threaded image must not refuse anything.
             var plain = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
             if (!plain.ThreadedWriteAllowedForTest(0x4CAF60, tid, out why))
