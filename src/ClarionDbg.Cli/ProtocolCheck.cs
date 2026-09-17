@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
@@ -67,15 +68,86 @@ namespace ClarionDbg.Cli
             if (DebugEngine.WithTidForTest("{}", 42) != "{\"tid\":42}")
                 failures.Add("empty object: stamping produced malformed JSON");
 
+            CheckEditVeto(failures);
+
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
             {
-                Console.WriteLine($"protocolcheck: {shapes.Length} event shapes OK — a known tid is stamped, "
-                                  + "an unknown tid is absent (never 0 or -1).");
+                Console.WriteLine($"protocolcheck: {shapes.Length} event shapes OK - a known tid is stamped, "
+                                  + "an unknown tid is absent (never 0 or -1); and a vetoed row offers no "
+                                  + "editable descendant.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
             return 1;
+        }
+
+        /// <summary>
+        /// A row that is NOT this thread's own must not be editable — and neither must anything INSIDE it.
+        ///
+        /// `moduledata` falls back to the shared .cwtls template when the selected thread has no instance of
+        /// a THREADed symbol, and vetoes the edit pencil because writing a template changes the initial value
+        /// every future Clarion thread starts from. The setval thread guard cannot catch a write that slips
+        /// through here: the tid on such a row is perfectly honest, the ADDRESS just belongs to no thread.
+        ///
+        /// So the veto has to reach the descendants, and that is what this asserts — against the real
+        /// NodeJson, including the group and array child builders it delegates to. A live harness cannot
+        /// cover it: reaching the template fallback needs a stop whose EIP resolves to a module carrying
+        /// THREADed module-scope data while a thread with no instance of it is selected, which the debuggee
+        /// does not readily produce.
+        /// </summary>
+        private static void CheckEditVeto(List<string> failures)
+        {
+            // A DebugEngine with no target: rows still build, the values just read as nothing.
+            var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+
+            var lng = new ClarionType { Kind = TypeKind.Int, Size = 4 };
+            var grp = new ClarionType
+            {
+                Kind = TypeKind.Group,
+                Size = 8,
+                Members = new List<TypeMember>
+                {
+                    new TypeMember { Name = "FIRST",  Offset = 0, Type = lng },
+                    new TypeMember { Name = "SECOND", Offset = 4, Type = lng },
+                },
+            };
+            var arr = new ClarionType { Kind = TypeKind.Array, Size = 8, Length = 2, LoBound = 1, ElemSize = 4, ElemType = lng };
+
+            // Control: without a veto these DO carry edit metadata. Without this, a builder that never
+            // emitted `va` at all would pass the real checks for the wrong reason.
+            string groupOk = eng.NodeJsonForTest("G", grp, 0x08, 0, 8, 0, 0x400000, "m.clw", null, true);
+            if (CountVa(groupOk) == 0) failures.Add("edit-veto control: an un-vetoed GROUP produced no editable member at all");
+            string arrayOk = eng.NodeJsonForTest("A", arr, 0x18, 0, 8, 0, 0x400000, "m.clw", null, true);
+            if (CountVa(arrayOk) == 0) failures.Add("edit-veto control: an un-vetoed ARRAY produced no editable element at all");
+
+            // THE RULE: a vetoed row carries no edit metadata anywhere beneath it either.
+            string groupVetoed = eng.NodeJsonForTest("G", grp, 0x08, 0, 8, 0, 0x400000, "m.clw",
+                                                     "no thread instance - shared template value", false);
+            int n = CountVa(groupVetoed);
+            if (n != 0)
+                failures.Add("edit-veto: a vetoed GROUP still offered " + n + " editable descendant row(s) — "
+                             + "a commit would rewrite the shared template");
+
+            string arrayVetoed = eng.NodeJsonForTest("A", arr, 0x18, 0, 8, 0, 0x400000, "m.clw",
+                                                     "no thread instance - shared template value", false);
+            n = CountVa(arrayVetoed);
+            if (n != 0)
+                failures.Add("edit-veto: a vetoed ARRAY still offered " + n + " editable element row(s)");
+
+            // A vetoed scalar is the case that already worked; assert it so a refactor cannot lose it.
+            string scalarVetoed = eng.NodeJsonForTest("S", null, 0x11, 0, 4, 0, 0x400000, "m.clw", "shared", false);
+            if (CountVa(scalarVetoed) != 0) failures.Add("edit-veto: a vetoed scalar row still carried edit metadata");
+            if (scalarVetoed.IndexOf("\"note\":", StringComparison.Ordinal) < 0)
+                failures.Add("edit-veto: a vetoed row dropped its explanation");
+        }
+
+        /// <summary>How many rows in this JSON carry edit metadata (a `"va":` member).</summary>
+        private static int CountVa(string json)
+        {
+            int n = 0, i = 0;
+            while ((i = json.IndexOf("\"va\":", i, StringComparison.Ordinal)) >= 0) { n++; i += 5; }
+            return n;
         }
 
         /// <summary>The value of the top-level "event" member, so a check can prove stamping did not

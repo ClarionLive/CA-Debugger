@@ -185,6 +185,15 @@ namespace ClarionDbg.Cli
         ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
         ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
         /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
+        /// <summary>Test seam for `protocolcheck`: build a row through the REAL <see cref="NodeJson"/>, so
+        /// the edit-metadata veto is asserted against the shipped builder rather than a copy of its rules.
+        /// Needs no live process — whether a row carries a `va` never depends on the value read.</summary>
+        internal string NodeJsonForTest(string name, ClarionType type, byte code, byte target, uint size, int places,
+                                        uint va, string module, string note, bool editable)
+        {
+            return NodeJson(name, type, code, target, size, places, va, null, module, note, editable);
+        }
+
         private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module,
                                 string note = null, bool editable = true)
         {
@@ -219,14 +228,19 @@ namespace ClarionDbg.Cli
             {
                 // direct GROUP/QUEUE instance: inline members, no "GROUP" type label (the {…}/fields convey it).
                 sb.Append(",\"type\":\"\",\"value\":").Append(Json.Str("{…}"));
-                sb.Append(",\"children\":[").Append(GroupChildrenJson(g, va, module)).Append(']');
+                // The veto and its explanation MUST travel to the members. A vetoed row's address is the
+                // shared .cwtls template, so every member address is template+offset — editable descendants
+                // under a read-only parent would let a commit rewrite the value every future Clarion thread
+                // starts from, and the setval thread guard cannot catch it (the tid is honest; the ADDRESS
+                // belongs to no thread).
+                sb.Append(",\"children\":[").Append(GroupChildrenJson(g, va, module, editable, note)).Append(']');
             }
             else if (type != null && type.Kind == TypeKind.Array)
             {
                 int hi = type.LoBound + type.Length - 1;
                 sb.Append(",\"type\":").Append(Json.Str(type.Length > 0 ? "ARRAY[" + type.LoBound + ".." + hi + "]" : "ARRAY"));
                 sb.Append(",\"value\":").Append(Json.Str("[…]"));
-                string kids = ArrayChildrenJson(type, va, module);
+                string kids = ArrayChildrenJson(type, va, module, editable, note);
                 if (kids.Length > 0) sb.Append(",\"children\":[").Append(kids).Append(']');
             }
             else
@@ -253,7 +267,12 @@ namespace ClarionDbg.Cli
 
         /// <summary>Render a group's members as a JSON row array, each read at <paramref name="baseVa"/> + its
         /// byte offset. Shared by inline direct-group expansion and the on-demand <c>expand</c> handler.</summary>
-        private string GroupChildrenJson(ClarionType g, uint baseVa, string module)
+        /// <param name="editable">false when the PARENT row is not this thread's own (a shared .cwtls
+        /// template). Members of such a row are at template+offset and must not be editable either.</param>
+        /// <param name="note">the parent's explanation, repeated on each member so a row read on its own —
+        /// the tree can be scrolled anywhere — still says why it cannot be edited.</param>
+        private string GroupChildrenJson(ClarionType g, uint baseVa, string module,
+                                         bool editable = true, string note = null)
         {
             if (g == null || g.Members == null) return "";
 
@@ -318,7 +337,7 @@ namespace ClarionDbg.Cli
                 // genuinely unrecoverable case. Falling back to a bare "?" would make every such member
                 // visually indistinguishable; tag it with its byte offset instead so it stays identifiable.
                 string mName = mb.Name ?? ("(unnamed+" + mb.Offset + ")");
-                sb.Append(NodeJson(mName, mb.Type, mc, mt, msz, mpl, mva, null, module));
+                sb.Append(NodeJson(mName, mb.Type, mc, mt, msz, mpl, mva, null, module, note, editable));
             }
             return sb.ToString();
         }
@@ -328,7 +347,11 @@ namespace ClarionDbg.Cli
         /// reuse the on-demand <c>expand</c> path — so an array-of-group doesn't explode into members until a
         /// row is opened, and the expand handler reads members at the element's address directly (no deref).
         /// Capped to keep the DOM bounded on very large DIMs.</summary>
-        private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module)
+        /// <param name="editable">false when the PARENT row is not this thread's own; elements sit at
+        /// baseVa + k*stride inside that same shared block and inherit the veto.</param>
+        /// <param name="note">the parent's explanation, carried onto each element row.</param>
+        private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module,
+                                         bool editable = true, string note = null)
         {
             if (arr == null || arr.Length <= 0 || arr.ElemSize == 0) return "";
             const int cap = 1000;
@@ -346,13 +369,17 @@ namespace ClarionDbg.Cli
                       .Append(",\"type\":\"GROUP\",\"value\":").Append(Json.Str("{…}"))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(eva.ToString("X")).Append('"')
                       .Append(",\"module\":").Append(Json.Str(module))
-                      .Append(",\"typeRef\":").Append(elem.TypeRef).Append('}');
+                      .Append(",\"typeRef\":").Append(elem.TypeRef);
+                    // Carries no `va`, so it is not editable regardless — but it should still say why it is
+                    // not this thread's data, and see the expand caveat on HandleExpandCommand.
+                    if (note != null) sb.Append(",\"note\":").Append(Json.Str(note));
+                    sb.Append('}');
                 }
                 else
                 {
                     byte ec, et; uint esz; int epl;
                     CodeForType(elem, out ec, out et, out esz, out epl);
-                    sb.Append(NodeJson(idx, elem, ec, et, esz, epl, eva, null, module));
+                    sb.Append(NodeJson(idx, elem, ec, et, esz, epl, eva, null, module, note, editable));
                 }
             }
             if (arr.Length > cap)
@@ -363,7 +390,13 @@ namespace ClarionDbg.Cli
 
         /// <summary>On-demand expansion of a reference node: re-resolve its referent type in the owning image's
         /// TSWD and render that group's members read live at the dereferenced address. Emits an `expanded`
-        /// event keyed by the host's reqId. Read-only — no target code runs.</summary>
+        /// event keyed by the host's reqId. Read-only — no target code runs.
+        ///
+        /// KNOWN GAP, deliberately not guessed at: the command carries only reqId/module/typeRef/addr, so the
+        /// engine cannot tell whether that address came from a row whose edit pencil was vetoed (a shared
+        /// .cwtls template). Expanding such a row therefore still yields editable members. Closing it needs
+        /// the HOST to pass the flag it already has, which is a protocol change rather than an engine fix —
+        /// raised with the PM rather than decided here. The inline paths above, which DO know, are fixed.</summary>
         private void HandleExpandCommand(string[] parts)
         {
             // expand <reqId> <module> <typeRef(dec)> <addr(hex)>
