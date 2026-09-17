@@ -62,21 +62,27 @@ namespace ClarionDbg.Cli
             if (!int.TryParse(parts[3], out size) || size <= 0 || size > 4096) { EmitVarSetError(va, "bad size"); return; }
             if (!int.TryParse(parts[4], out places)) places = 0;
 
-            // The ADDRESS guard. The tid check above catches a stale SELECTION — the host telling us which
-            // thread it meant. This catches a stale ADDRESS, and it needs no cooperation from anyone: a VA
-            // that names THREADed data which is not the selected thread's own is refused however it got
-            // here, including from a row the host built before a switch, an expanded node whose veto we
-            // cannot see, or a hand-typed CLI setval. Enforcing at the WRITE covers every path into it
-            // rather than every row that might produce one.
-            string threadedWhy;
-            if (!ThreadedWriteAllowed(va, selectedTid, out threadedWhy)) { EmitVarSetError(va, threadedWhy); return; }
-
             string value;
             try { value = Encoding.UTF8.GetString(Convert.FromBase64String(parts[5])); }
             catch { EmitVarSetError(va, "bad value encoding"); return; }
 
             byte[] bytes; string err;
             if (!EncodeValue(code, (uint)size, places, value, out bytes, out err)) { EmitVarSetError(va, err); return; }
+
+            // The ADDRESS guard. The tid check above catches a stale SELECTION — the host telling us which
+            // thread it meant. This catches a stale ADDRESS, and it needs no cooperation from anyone: a
+            // write that touches THREADed data which is not the selected thread's own is refused however it
+            // got here, including from a row the host built before a switch, an expanded node whose veto we
+            // cannot see, or a hand-typed CLI setval. Enforcing at the WRITE covers every path into it
+            // rather than every row that might produce one.
+            //
+            // Deliberately placed HERE, immediately before WriteBlock and after EncodeValue, because it
+            // needs the LENGTH: a write is an interval, and bytes.Length is the interval this call will
+            // actually put on the target.
+            string threadedWhy;
+            if (!ThreadedWriteAllowed(va, bytes.Length, selectedTid, out threadedWhy))
+            { EmitVarSetError(va, threadedWhy); return; }
+
             if (!WriteBlock(va, bytes)) { EmitVarSetError(va, "memory write failed at 0x" + va.ToString("X")); return; }
 
             // re-read at the same location so the UI shows the engine's canonical rendering of what landed
@@ -86,7 +92,14 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
-        /// May a write land at <paramref name="va"/> for the selected thread?
+        /// May a write of <paramref name="len"/> bytes at <paramref name="va"/> land, for the selected thread?
+        ///
+        /// A WRITE IS AN INTERVAL, not an address. This tested only the start address until the claims
+        /// audit caught it: WriteBlock puts `len` bytes down (up to 4096), so a write beginning just below
+        /// a protected block and running into it was allowed, and landed on it. Worse, the test that was
+        /// supposed to prove the guard asserted the byte immediately below the template MUST BE ALLOWED —
+        /// true of a single byte, false as a general claim, and the control case was itself the hole. Every
+        /// comparison below is therefore an overlap of [va, va+len) with the protected range.
         ///
         /// Two refusals, both about THREADed (.cwtls) data:
         ///  • the VA is inside an image's .cwtls TEMPLATE range — the shared block every Clarion thread's
@@ -111,9 +124,14 @@ namespace ClarionDbg.Cli
         /// value, and refusing those to catch a rarer case would break editing for everyone. The template
         /// test, which is the one that cannot be recovered from, fails CLOSED and needs no resolution at all.
         /// </summary>
-        private bool ThreadedWriteAllowed(uint va, uint selectedTid, out string reason)
+        private bool ThreadedWriteAllowed(uint va, int len, uint selectedTid, out string reason)
         {
             reason = null;
+            if (len < 1) len = 1;
+            // 64-bit so a write near the top of the address space cannot wrap the end past the start and
+            // silently turn an overlap into a miss.
+            ulong wLo = va, wHi = (ulong)va + (ulong)len;
+
             foreach (var m in _modules)
             {
                 // Gated on the SECTION, not on HasThreadedData: the template refusal below needs no import.
@@ -123,13 +141,14 @@ namespace ClarionDbg.Cli
                 uint tmplLo = m.LoadBase + m.CwtlsLo;
 
                 // 1. the shared template — unconditional, needs nothing resolved
-                if (va >= tmplLo && va < tmplLo + tmplSpan)
+                if (Overlaps(wLo, wHi, tmplLo, tmplSpan))
                 {
                     uint ownBase;
-                    string where = m.HasThreadedData && TryInstanceBase(m, selectedTid, out ownBase)
+                    string where = m.HasThreadedData && va >= tmplLo && va < tmplLo + tmplSpan
+                                   && TryInstanceBase(m, selectedTid, out ownBase)
                         ? " — thread " + selectedTid + "'s own copy is at 0x" + (va - tmplLo + ownBase).ToString("X")
                         : " and thread " + selectedTid + " has no instance of it";
-                    reason = "not written: 0x" + va.ToString("X") + " is the shared " + m.Name
+                    reason = "not written: " + Range(va, len) + " touches the shared " + m.Name
                            + " template, not one thread's data" + where;
                     return false;
                 }
@@ -144,24 +163,37 @@ namespace ClarionDbg.Cli
                 // a valid write breaks editing, which is worse than the case it would catch.
                 uint blockSpan = m.CwtlsDataSize != 0 ? m.CwtlsDataSize : tmplSpan;
 
-                // 2. this thread's own instance block — the ordinary, correct case
-                uint selBase;
-                if (TryInstanceBase(m, selectedTid, out selBase) && va >= selBase && va < selBase + blockSpan)
-                    return true;
-
-                // 3. somebody else's instance block
+                // 2. somebody else's instance block. There is deliberately no early "it is inside MY block,
+                //    allow" shortcut any more: with intervals a write can touch two adjacent blocks at once,
+                //    and returning early on the first would skip the refusal the second one earns. Being
+                //    inside the selected thread's own block is simply the absence of any refusal.
                 foreach (uint t in _threads)
                 {
                     if (t == selectedTid) continue;
                     uint otherBase;
                     if (!TryInstanceBase(m, t, out otherBase)) continue;
-                    if (va < otherBase || va >= otherBase + blockSpan) continue;
-                    reason = "not written: 0x" + va.ToString("X") + " is thread " + t + "'s copy of the "
+                    if (!Overlaps(wLo, wHi, otherBase, blockSpan)) continue;
+                    reason = "not written: " + Range(va, len) + " touches thread " + t + "'s copy of the "
                            + m.Name + " data, but thread " + selectedTid + " is selected";
                     return false;
                 }
             }
             return true;
+        }
+
+        /// <summary>Do the half-open intervals [wLo,wHi) and [bLo, bLo+bLen) share a byte?</summary>
+        private static bool Overlaps(ulong wLo, ulong wHi, uint bLo, uint bLen)
+        {
+            ulong lo = bLo, hi = (ulong)bLo + bLen;
+            return wLo < hi && wHi > lo;
+        }
+
+        /// <summary>An address range for a refusal message — a single byte reads as just its address.</summary>
+        private static string Range(uint va, int len)
+        {
+            return len <= 1 ? "0x" + va.ToString("X")
+                            : len + " bytes at 0x" + va.ToString("X")
+                              + " (through 0x" + ((uint)(va + len - 1)).ToString("X") + ")";
         }
 
         /// <summary>The base of one thread's .cwtls instance block for an image, via the same read-only
@@ -186,9 +218,9 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Test seam for `protocolcheck`: assert the shipped write guard, not a copy of its rules.</summary>
-        internal bool ThreadedWriteAllowedForTest(uint va, uint tid, out string reason)
+        internal bool ThreadedWriteAllowedForTest(uint va, int len, uint tid, out string reason)
         {
-            return ThreadedWriteAllowed(va, tid, out reason);
+            return ThreadedWriteAllowed(va, len, tid, out reason);
         }
 
         /// <summary>Test seam: register a mapped image with a known .cwtls range, so the template-range
