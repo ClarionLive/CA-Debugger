@@ -36,6 +36,10 @@ namespace ClarionDebugger
         void CmdStepInto();
         void CmdStepOut();
         void CmdStop();
+
+        /// <summary>Run to cursor. <paramref name="spec"/> is "module:line", or null/empty for the active
+        /// Monaco editor's live cursor.</summary>
+        void CmdRunToCursor(string spec);
     }
 
     /// <summary>
@@ -179,6 +183,11 @@ namespace ClarionDebugger
         public static void StepOver() { Invoke(t => t.CmdStepOver(), allowed: IsPaused); }
         public static void StepInto() { Invoke(t => t.CmdStepInto(), allowed: IsPaused); }
         public static void StepOut()  { Invoke(t => t.CmdStepOut(),  allowed: IsPaused); }
+
+        /// <summary>Run to the active Monaco editor's cursor line. Entry point for ClarionAssistant's editor
+        /// context menu, reached by reflection. Frozen contract: public static void RunToCursor(), a silent
+        /// no-op unless Paused with a ready pad. A null spec makes the pad resolve the live Monaco cursor.</summary>
+        public static void RunToCursor() { Invoke(t => t.CmdRunToCursor(null), allowed: IsPaused); }
 
         public static void Pause()
         {

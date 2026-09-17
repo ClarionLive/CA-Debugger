@@ -268,9 +268,16 @@ namespace ClarionDebugger.Terminal
             // it only corrected itself on the next IDE event, which might be the solution closing
             // minutes later. Observed exactly that way during the v1.2.0 session test.
             if (s == DebugSessionState.Idle) RefreshForIdeContext("session ended", sessionEnded: true);
+
+            // Session over by any route (exit, terminate, detach, engine crash): drop the execution-line
+            // marker. Exited/CmdStop/Dispose clear too; this also catches an engine that dies without them.
+            if (s == DebugSessionState.Idle) UI(ClearExecutionLineIfHooked);
         }
 
-        private void OnSvcResumed(string mode) => UI(() => { Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
+        // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
+        // emit 'resumed', so they leave the marker alone.
+        private void OnSvcResumed(string mode) => UI(() => { ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames) => UI(() => OnStack(frames));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
@@ -335,7 +342,7 @@ namespace ClarionDebugger.Terminal
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
         private void OnSvcLog(string s) => UI(() => Console("info", s));
-        private void OnSvcExited(int code) => UI(() => { _transientBps.Clear(); _pendingRtcKey = null; ClearCurrentLineMarker(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+        private void OnSvcExited(int code) => UI(() => { _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
@@ -774,8 +781,8 @@ namespace ClarionDebugger.Terminal
         public void CmdStop()
         {
             if (CurrentState == DebugSessionState.Idle) return;   // nothing to stop
-            // Clear the editor's yellow current-line marker on the UI thread (it's a UI operation).
-            ClearCurrentLineMarker();
+            // Clear the execution-line marker (Monaco + native) on the UI thread (it's a UI operation).
+            ClearExecutionLine();
             // _svc.Stop() blocks (WaitForExit(1500) + Kill); run it off the UI thread so the IDE doesn't
             // freeze. Results come back via the existing Exited/StateChanged -> UI() path.
             var svc = _svc;
@@ -1141,8 +1148,15 @@ namespace ClarionDebugger.Terminal
                 // panel refresh above, but DON'T jump the editor to the .clw — that activates the source
                 // tab and steals focus away from the disassembly view on every instruction step.
                 bool instrStep = string.Equals(p.Reason, "stepi", StringComparison.OrdinalIgnoreCase);
-                if (!instrStep && !string.IsNullOrEmpty(p.ResolvedPath))
+                var execLine = ResolveMonacoExecutionLine();
+                if (execLine != null)
                 {
+                    // ClarionAssistant can paint the execution line itself (issue #26).
+                    MarkExecutionLine(execLine, p.ResolvedPath, p.Line, instrStep);
+                }
+                else if (!instrStep && !string.IsNullOrEmpty(p.ResolvedPath))
+                {
+                    // No SetExecutionLine hook (ClarionAssistant absent or an older build): unchanged path.
                     TryJump(p.ResolvedPath, p.Line);
                     // JumpToCurrentLine activates the Clarion editor and grabs keyboard focus, so the
                     // next configured debug shortcut would be handled by the editor instead of this
@@ -1150,6 +1164,35 @@ namespace ClarionDebugger.Terminal
                     ReturnFocusToPad();
                 }
             });
+        }
+
+        /// <summary>Pause-time execution-line marker when ClarionAssistant exposes SetExecutionLine.
+        /// Navigation still goes through <see cref="TryJump"/> (skipped for a 'stepi' instruction step so
+        /// the Disassembly view keeps focus); the marker itself is Monaco's when it reports it painted one.
+        /// When it returns false (overlay OFF) or throws, the stock editor's native marker is painted
+        /// instead, which also fixes the pre-#26 overlay-off case where no marker appeared at all. An
+        /// unresolved pause (no source path) clears the marker.</summary>
+        private void MarkExecutionLine(MethodInfo setter, string path, int line, bool instrStep)
+        {
+            if (string.IsNullOrEmpty(path)) { ClearExecutionLine(); return; }
+
+            bool nativeJumped = false;
+            if (!instrStep) nativeJumped = TryJump(path, line);
+
+            bool painted = InvokeExecutionLine(setter, path, line);
+            if (painted)
+            {
+                // Monaco owns the marker. If the navigator declined and TryJump fell back to the stock
+                // editor, drop the native arrow it painted so there is only ever one marker.
+                if (nativeJumped) ClearCurrentLineMarker();
+            }
+            else if (!instrStep && !nativeJumped)
+            {
+                try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
+                catch { }
+            }
+
+            if (!instrStep) ReturnFocusToPad();
         }
 
         private void OnStack(List<DebugStackFrame> frames)
@@ -1355,22 +1398,83 @@ namespace ClarionDebugger.Terminal
         /// on, the stock editor sits hidden behind Monaco, so JumpToCurrentLine moves an invisible caret and
         /// the visible Monaco editor never scrolls. Prefer the Monaco navigator (its frozen contract covers
         /// overlay ON and OFF and self-queues if the page isn't ready); only fall back to the stock editor's
-        /// current-line jump — which also paints the execution-line marker — when ClarionAssistant is absent.</summary>
-        private static void TryJump(string path, int line)
+        /// current-line jump — which also paints the execution-line marker — when ClarionAssistant is absent.
+        /// Returns true when it took that native path (so the native marker is now painted).</summary>
+        private static bool TryJump(string path, int line)
         {
-            if (string.IsNullOrEmpty(path)) return;
+            if (string.IsNullOrEmpty(path)) return false;
             try
             {
                 var nav = ResolveMonacoNavigator();
                 if (nav != null)
                 {
                     object handled = nav.Invoke(null, new object[] { path, line, 1 });
-                    if (handled is bool && (bool)handled) return;
+                    if (handled is bool && (bool)handled) return false;
                 }
             }
             catch { }
             try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
             catch { }
+            return true;
+        }
+
+        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.SetExecutionLine.
+        private static MethodInfo _monacoExecLine;
+
+        /// <summary>Resolve ClarionAssistant's execution-line marker hook, if that addin is loaded and new
+        /// enough to have it. Same reflection pattern as <see cref="ResolveMonacoNavigator"/>.
+        /// Frozen contract (issue #26, with ClarionAssistant ticket #26a):
+        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.SetExecutionLine(string filePath, int line)
+        ///   set: path + line &gt;= 1 paints one global marker, with no navigation or focus change. Returns
+        ///   true when Monaco painted it, false when the overlay is OFF (caller paints the native marker).
+        ///   clear: null/empty path or line &lt;= 0. Always returns true; idempotent.
+        /// Null == method missing (ClarionAssistant absent or an older build) → callers keep the pre-#26
+        /// behaviour exactly and make no new calls.</summary>
+        private static MethodInfo ResolveMonacoExecutionLine()
+        {
+            if (_monacoExecLine != null) return _monacoExecLine;
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type t;
+                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
+                    catch { t = null; }
+                    if (t == null) continue;
+                    var mi = t.GetMethod("SetExecutionLine", BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(string), typeof(int) }, null);
+                    if (mi != null && mi.ReturnType == typeof(bool)) { _monacoExecLine = mi; break; }
+                }
+            }
+            catch { }
+            return _monacoExecLine;
+        }
+
+        /// <summary>Call SetExecutionLine; a throw counts as "not painted" so stepping never breaks.</summary>
+        private static bool InvokeExecutionLine(MethodInfo setter, string path, int line)
+        {
+            try
+            {
+                object r = setter.Invoke(null, new object[] { path, line });
+                return r is bool && (bool)r;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Clear the execution-line marker everywhere: Monaco's (when the hook is bound) and the
+        /// stock editor's native arrow. Without the hook this is exactly <see cref="ClearCurrentLineMarker"/>.</summary>
+        private static void ClearExecutionLine()
+        {
+            var setter = ResolveMonacoExecutionLine();
+            if (setter != null) InvokeExecutionLine(setter, null, 0);
+            ClearCurrentLineMarker();
+        }
+
+        /// <summary>The target left the paused state (resumed or session over). Only acts when the
+        /// SetExecutionLine hook is bound; without it no clear happened here before #26, so none happens now.</summary>
+        private static void ClearExecutionLineIfHooked()
+        {
+            if (ResolveMonacoExecutionLine() != null) ClearExecutionLine();
         }
 
         // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine.
@@ -1705,7 +1809,7 @@ namespace ClarionDebugger.Terminal
                     _coreForEvents = null;
                 }
 
-                try { ClearCurrentLineMarker(); } catch { }
+                try { ClearExecutionLine(); } catch { }
 
                 var svc = _svc;
                 if (wasLive)
