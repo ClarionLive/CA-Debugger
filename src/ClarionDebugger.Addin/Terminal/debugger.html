@@ -476,15 +476,14 @@
   const STAR='<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg>';
   const $=id=>document.getElementById(id);
   const wv=window.chrome && window.chrome.webview;
-  // Commands that resume the target (or end the session). They ALWAYS act on the thread the engine
-  // stopped on, never on whatever thread the panels are currently being read against, and the engine
-  // resets its own selection before running them — so the pad snaps its view back at the same moment,
-  // rather than stepping under a "viewing thread N" banner that stopped being true.
-  const RESUME_ACTIONS={continue:1,stepover:1,stepinto:1,stepout:1,stepi:1,nexti:1,runtocursor:1,pause:1,stop:1,start:1};
-  function send(action,data){
-    if(RESUME_ACTIONS[action]) snapToStoppedThread();
-    if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data}));
-  }
+  // SENDING A COMMAND IS NOT THE COMMAND HAPPENING. The host's Cmd* handlers are self-guarding and
+  // several of them legitimately no-op — Run to Cursor returns without resuming when the editor's cursor
+  // can't be resolved or the line won't parse, Pause and Start do nothing when the state doesn't allow
+  // them — so nothing reaches the engine at all. Pad state that names WHICH THREAD THE PIXELS BELONG TO
+  // therefore changes only on an engine REPLY (onThreads / onThreadSelected / resumed / paused), never
+  // here. Relabelling the panels on dispatch left them holding one thread's values under another
+  // thread's name whenever a command was dropped, which is the exact failure this ticket exists to stop.
+  function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
   function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
@@ -1024,6 +1023,11 @@
   let isPaused=false;
   function setPaused(p){ isPaused=p; document.body.classList.toggle('paused', p); }
   function stripEditQuotes(s){ s=s==null?'':(''+s); return (s.length>=2 && s[0]==="'" && s[s.length-1]==="'") ? s.slice(1,-1) : s; }
+  // The cell currently being edited in place, and how to abandon it. An open editor CAPTURES the
+  // instance address when it opens, so clearing the cell's metadata underneath it is not enough to stop
+  // it committing — the editor itself has to be cancelled. See cancelActiveEdit.
+  let activeEdit=null;
+  function cancelActiveEdit(){ const a=activeEdit; activeEdit=null; if(a){ try{ a.cancel(); }catch(e){} } }
   function beginEdit(cell){
     if(!cell || cell._editing || !isPaused || !cell.dataset.va) return;
     cell._editing=true;
@@ -1037,9 +1041,16 @@
     let finished=false;
     function done(commit){
       if(finished) return; finished=true; cell._editing=false;
+      if(activeEdit && activeEdit.cell===cell) activeEdit=null;
       cell.textContent=old;                 // restore now; a successful write repaints via the 'varset' reply
-      if(commit) send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size, places:meta.places, value:inp.value}));
+      // tid BEFORE value: the host's minimal JSON reader takes the FIRST "key": it finds anywhere in the
+      // text, and `value` is the one field here the user typed — it could otherwise carry its own "tid".
+      // The tid names the thread this address was read on, so the engine can refuse a write whose thread
+      // is no longer the selected one instead of writing another thread's memory.
+      if(commit) send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size,
+                                                 places:meta.places, tid:(selTid==null?null:selTid), value:inp.value}));
     }
+    activeEdit={cell:cell, cancel:function(){ done(false); }};
     inp.onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); done(true); } else if(e.key==='Escape'){ e.preventDefault(); done(false); } };
     inp.onblur=()=>done(false);
   }
@@ -1457,6 +1468,13 @@
     closeThreadPicker();
     if(tid==null || !isPaused) return;
     if(tid===selTid){ return; }                 // already showing it — a re-read would only flicker
+    // CLOSE THE WRITE PATH BEFORE THE REQUEST GOES OUT, not when the reply comes back. Between the two
+    // the engine moves to the new thread, but the rows on screen still carry the OLD thread's instance
+    // addresses — and the command queue preserves order, so an edit committed in that gap arrives AFTER
+    // the switch and writes the old thread's memory in the user's own program. The engine gets the tid on
+    // the write too and refuses a mismatch; this is the half that stops the write ever being sent.
+    cancelActiveEdit();                         // an OPEN editor captured its address when it opened
+    document.querySelectorAll('.vval.editable').forEach(clearEditMeta);
     threadSwitching=true; renderThreadUi();
     send('selectthread', String(tid));
   }
@@ -1470,6 +1488,16 @@
     if(sel!=null) selTid=sel; else if(selTid==null) selTid=stopTid;
     threadSwitching=false;
     renderThreadUi();
+  }
+
+  // An engine error can BE the answer to a switch we are waiting on (the engine refuses some paths with a
+  // plain error rather than a threadselected reply). Without this the chip sits on "switching…" for the
+  // rest of the stop, claiming a request is still in flight when nothing is coming.
+  function onEngineError(){
+    if(!threadSwitching) return;
+    threadSwitching=false;
+    renderThreadUi();
+    requestThreads();     // resync: the engine's selection is whatever it says it is
   }
 
   function onThreadSelected(m){
@@ -1554,16 +1582,6 @@
       if(stackPendingTid===tid){ stackPendingTid=null; renderStack(); }
       if(n) logLine('err','thread '+tid+': '+n+' value(s) got no reply');
     }, PENDING_SWEEP_MS);
-  }
-
-  // Stepping or continuing always acts on the STOPPED thread and resets the engine's selection, so the
-  // view has to snap back visibly the moment such a command leaves the pad — not one round trip later,
-  // and not at the next stop under a banner that is no longer true.
-  function snapToStoppedThread(){
-    closeThreadPicker();
-    threadSwitching=false;
-    if(stopTid!=null && selTid!==stopTid) selTid=stopTid;
-    renderThreadUi();
   }
 
   // Every thread identity belongs to ONE stop. Clearing them at a resume (and again at the next pause)
@@ -1940,10 +1958,14 @@
         // asks for the inventory too, which fills in the picker and the readable labels.
         resetThreadState(m.tid);
         buildRegs(m.regs); setPaused(true); refreshLibState(); break;
+      // The target really is running again — THIS is where a step or a continue snaps the view back to
+      // the stopped thread, because it is the engine saying the command took effect. Doing it when the
+      // command was merely sent would relabel the panels for a command the host dropped (see send()).
       case 'resumed': setPaused(false); resetThreadState(); lastLibState=null; lastLibError=null; renderLibState(); break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'threads': onThreads(m); break;
       case 'threadselected': onThreadSelected(m); break;
+      case 'engineerror': onEngineError(m); break;
       // Thread-scoped replies: a reply for a thread we are no longer showing is dropped before it can
       // repaint anything (tidAccepted also lets through an engine that doesn't stamp its replies).
       case 'stack': if(tidAccepted(m)) buildStack(m.frames||[]); break;

@@ -68,6 +68,8 @@ class El {
   }
   getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }; }
   addEventListener() { }
+  focus() { }      // the in-place value editor focuses and selects itself when it opens
+  select() { }
   matches(sel) {
     const p = parseSel(sel);
     if (!p.classes.every(c => this.classList.contains(c))) return false;
