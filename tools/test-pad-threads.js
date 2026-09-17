@@ -76,7 +76,7 @@ const FNS = ['esc', 'send', 'resetThreadState',
   'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
-  'onThreads', 'onThreadSelected', 'onEngineError', 'beginThreadSwitch', 'invalidateThreadScopedState',
+  'onThreads', 'onThreadSelected', 'onEngineError', 'rearmCurrentThread', 'beginThreadSwitch', 'invalidateThreadScopedState',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
   'buildStack', 'renderStack', 'onMessage'];
 const missing = [];
@@ -461,8 +461,11 @@ console.log('\n9) a refused selection leaves the pad on the thread it actually h
   onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: false, error: 'thread 5140 has exited' });
   check('the selection does not move', selTid === STOP_TID, 'selTid=' + selTid);
   check('the reason is surfaced', TOASTS.some(t => t.includes('has exited')), TOASTS.join('|'));
-  check('no panel is re-read against a thread we did not get',
-        !sentActions().includes('stack') && !sentActions().includes('rewatch'), sentActions().join(','));
+  // The panels ARE re-read (9d: the refusal has to give the rows their editing back) — what matters is
+  // that the re-read is for the thread we still have, and that nothing from the thread we did not get can
+  // paint. A "no re-read at all" check used to stand here; it was guarding the second half by accident.
+  check('the re-read is for the thread we still have', selTid === STOP_TID && tidAccepted({ tid: STOP_TID }));
+  check('and a reply from the thread we did not get still cannot land', !tidAccepted({ tid: BROWSE_TID }));
   check('the pad resyncs from the engine', sentActions().includes('threads'));
   check('the chip is not left saying "switching…"', $('thSelText').textContent !== 'switching…', $('thSelText').textContent);
 }
@@ -498,6 +501,44 @@ console.log('\n9b) a refusal names the thread that was ASKED FOR — it is never
   onMessage(JSON.stringify({ type: 'threadselected', ok: true }));
   check('an ok with no tid is not taken as a selection', selTid === STOP_TID, 'selTid=' + selTid);
   check('…it asks the engine what is actually selected', sentActions().includes('threads'), sentActions().join(','));
+}
+
+console.log('\n9d) a switch that was REFUSED gives the rows their editing back');
+{
+  // The TOCTOU guard strips every editable row at REQUEST time, before anyone knows the answer. When the
+  // answer is "no", the selection never moved and the values on screen are still right — but nothing has
+  // re-armed them, so editing would stay dead for the rest of the stop. The user asked to look elsewhere,
+  // was told no, and quietly lost the ability to edit the thread they are still on.
+  const REPLY = { type: 'watch', name: 'PUB:PUB_NAME', found: true, value: "'Algodata'", typeName: 'STRING(41)',
+                  threaded: true, va: A_INSTANCE.va, typeCode: '0x18', size: 41, tid: STOP_TID };
+  function refusalScenario(label, deliverRefusal) {
+    console.log('   ' + label);
+    resetAll();
+    onThreads(THREADS_EVENT);
+    const row = makeRow('PUB:PUB_NAME', { watch: true });
+    applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+    selectThread(BROWSE_TID);
+    check('   (setup) the request stripped the row, as the TOCTOU fix requires',
+          state(row).va === undefined && !state(row).pencil);
+    clearSent();
+    deliverRefusal();
+    const acts = sentActions();
+    check('   the still-current thread is re-read', acts.includes('rewatch') && acts.includes('moduledata')
+          && acts.includes('stack'), acts.join(','));
+    check('   the values on screen were NOT blanked to "…" to do it', state(row).text === "'Algodata'",
+          state(row).text);
+    // and the reply that re-read produces puts the editing back
+    onMessage(JSON.stringify(REPLY));
+    check('   editing is alive again on the thread we never left',
+          state(row).va === A_INSTANCE.va && state(row).pencil);
+    check('   the selection still never moved', selTid === STOP_TID);
+  }
+  refusalScenario('the engine refuses the switch:', () =>
+    onMessage(JSON.stringify({ type: 'threadselected', tid: BROWSE_TID, ok: false, error: 'unknown or exited thread' })));
+  refusalScenario('an engine error answers it instead:', () =>
+    onMessage(JSON.stringify({ type: 'engineerror', message: 'thread is not readable' })));
+  refusalScenario('an ok that names no thread:', () =>
+    onMessage(JSON.stringify({ type: 'threadselected', ok: true })));
 }
 
 console.log('\n9c) a module-data row says the same thing about a thread as a Watch row does');

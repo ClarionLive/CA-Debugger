@@ -1508,7 +1508,23 @@
     if(!threadSwitching) return;
     threadSwitching=false;
     renderThreadUi();
-    requestThreads();     // resync: the engine's selection is whatever it says it is
+    requestThreads();        // resync: the engine's selection is whatever it says it is
+    rearmCurrentThread();    // identical hole to a refusal — the rows were stripped for a switch that failed
+  }
+
+  // A switch that did NOT happen still stripped every editable row: the TOCTOU guard in selectThread runs
+  // at REQUEST time, before anyone knows the answer. The selection never moved, so the values on screen
+  // are still this thread's and still correct — but nothing has re-armed their edit metadata, and editing
+  // stays dead for the rest of the stop. The user asked to look elsewhere, was told no, and quietly lost
+  // the ability to edit the thread they are still on.
+  //
+  // Re-read rather than routing through beginThreadSwitch: that would blank every row to "…" and re-fetch
+  // values we already have and know to be right, which is a worse answer than the bug. These replies carry
+  // the unchanged selection, so they land, and they re-arm the metadata on the way in — the watch replies
+  // through setEditMeta/wireEdit, the module-data and stack replies by rebuilding their rows.
+  function rearmCurrentThread(){
+    if(!isPaused) return;
+    send('rewatch'); send('moduledata'); send('stack');
   }
 
   function onThreadSelected(m){
@@ -1519,10 +1535,11 @@
       // only set the switching flag) and re-asks `threads` for the engine's authoritative answer.
       // A malformed request carries no tid at all: don't invent one in the message.
       toast(((m && m.tid!=null) ? 'Thread '+m.tid+': ' : '') + ((m && m.error) || 'could not select that thread'));
-      requestThreads(); renderThreadUi(); return;
+      requestThreads(); rearmCurrentThread(); renderThreadUi(); return;
     }
-    // ok with no tid would leave us not knowing what we are looking at — ask, rather than assume.
-    if(m.tid==null){ requestThreads(); renderThreadUi(); return; }
+    // ok with no tid would leave us not knowing what we are looking at — ask, rather than assume. The rows
+    // were stripped for a switch that we cannot confirm happened, so put them back for the thread we have.
+    if(m.tid==null){ requestThreads(); rearmCurrentThread(); renderThreadUi(); return; }
     selTid=m.tid;
     beginThreadSwitch(m.tid);
   }
