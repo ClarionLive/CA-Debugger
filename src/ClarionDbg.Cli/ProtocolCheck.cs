@@ -34,6 +34,7 @@ namespace ClarionDbg.Cli
                 "{\"event\":\"framelocals\",\"reqId\":\"9\",\"items\":[]}",
                 "{\"event\":\"watch\",\"name\":\"PUB:PUB_NAME\",\"found\":true,\"value\":\"'New Moon Books'\"}",
                 "{\"event\":\"libstate\",\"reqId\":\"7\",\"items\":[]}",
+                "{\"event\":\"disasm\",\"addr\":\"0x4754EB\",\"tag\":\"\",\"instrs\":[{\"va\":\"0x4754EB\"}]}",
             };
 
             foreach (var shape in shapes)

@@ -185,7 +185,8 @@ namespace ClarionDbg.Cli
         ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
         ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
         /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
-        private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module)
+        private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module,
+                                string note = null, bool editable = true)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
@@ -236,12 +237,15 @@ namespace ClarionDbg.Cli
                 sb.Append(",\"value\":").Append(Json.Str(val));
                 // edit-variable-value: carry the live address + type so the UI can write the cell back.
                 // Only editable scalar codes get this; refs/groups/unknowns stay read-only (no metadata).
-                if (IsEditableCode(code))
+                // `editable:false` vetoes the pencil for a value that is real but NOT this thread's own —
+                // writing a shared template would change what every future thread starts from.
+                if (editable && IsEditableCode(code))
                     sb.Append(",\"va\":\"0x").Append(va.ToString("X")).Append('"')
                       .Append(",\"typeCode\":\"0x").Append(code.ToString("X2")).Append('"')
                       .Append(",\"size\":").Append(size)
                       .Append(",\"places\":").Append(places);
             }
+            if (note != null) sb.Append(",\"note\":").Append(Json.Str(note));
             if (frameOff.HasValue) sb.Append(",\"frameOff\":").Append(frameOff.Value);
             sb.Append('}');
             return sb.ToString();
@@ -435,7 +439,8 @@ namespace ClarionDbg.Cli
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
         /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
         /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
-        private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
+        private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
+                                             IntPtr hThread)
         {
             var rows = new List<string>();
             string module = null;
@@ -454,9 +459,34 @@ namespace ClarionDbg.Cli
                         if (ds.ModuleIdx != mi) continue;
                         if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
                             continue;   // file record buffer — belongs to the file-buffer tree, not module data
-                        uint va = m.LoadBase + ds.Rva;
+                        // A ,THREAD module symbol lives in .cwtls and has one instance PER THREAD, exactly
+                        // like the record buffers `watch` resolves. Reading the link-time template here would
+                        // show every thread the same shared value — and, now that this panel is re-read on a
+                        // thread switch, it would contradict the Watch row for the SAME name at the SAME stop.
+                        // One variable showing two values is worse than either value alone, so this mirrors
+                        // the watch path: same resolution, same vocabulary, same refusal to offer an edit on
+                        // a value that is not this thread's own.
+                        uint templateVa = m.LoadBase + ds.Rva;
+                        uint va = templateVa;
+                        string note = null; bool editable = true;
+                        if (m.CwtlsHi != 0 && ds.Rva >= m.CwtlsLo && ds.Rva < m.CwtlsHi)
+                        {
+                            uint instanceVa; string reason;
+                            switch (TryResolveThreadedInstance(m, templateVa, tid, hThread, out instanceVa, out reason))
+                            {
+                                case ThreadedResolve.Ok:
+                                    va = instanceVa;
+                                    break;
+                                case ThreadedResolve.Unallocated:
+                                    note = "not yet used on this thread — initial value"; editable = false;
+                                    break;
+                                default:   // Template, or a resolution we could not complete
+                                    note = reason ?? "no thread instance — shared template value"; editable = false;
+                                    break;
+                            }
+                        }
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
-                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name));
+                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name, note, editable));
                     }
                 }
             }

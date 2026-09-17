@@ -424,6 +424,11 @@ namespace ClarionDbg.Cli
         private void HandleThreadsCommand(uint stoppedTid)
         {
             var probes = ProbeAllThreads(stoppedTid);
+            // Never offer the thread DebugBreakProcess injected to cause this stop. It is a real live
+            // thread, so it would list and select like any other, but it belongs to the debugger, carries
+            // no Clarion work, and exits the instant the target resumes. `threadscan` still shows it — that
+            // is a diagnostic and the break thread is part of what it is diagnosing.
+            if (_breakTid != 0) probes.RemoveAll(p => p.Tid == _breakTid);
             probes.Sort((x, y) =>
             {
                 if (x.IsStopped != y.IsStopped) return x.IsStopped ? -1 : 1;   // stopped thread first
@@ -473,16 +478,23 @@ namespace ClarionDbg.Cli
         /// An unknown or exited tid is refused and the selection is left exactly as it was.</summary>
         private void HandleThreadSelectCommand(string[] parts, uint stoppedTid)
         {
-            if (parts.Length < 2) { EmitThreadSelected(_selectedTid, false, "thread expects: thread <tid>"); return; }
+            if (parts.Length < 2) { EmitThreadSelected(0, false, "thread expects: thread <tid>"); return; }
             uint tid;
             if (!uint.TryParse(parts[1], out tid))
             {
-                EmitThreadSelected(_selectedTid, false, "not a thread id: '" + parts[1] + "'");
+                EmitThreadSelected(0, false, "not a thread id: '" + parts[1] + "'");
                 return;
             }
             if (!_threads.Contains(tid))
             {
-                EmitThreadSelected(_selectedTid, false, "unknown or exited thread " + tid);
+                EmitThreadSelected(tid, false, "unknown or exited thread " + tid);
+                return;
+            }
+            if (tid == _breakTid)
+            {
+                // Live, but it is the debugger's own injected break thread — it is not in the list we
+                // offered, and it dies on resume. Refuse by name rather than let a reply come back from it.
+                EmitThreadSelected(tid, false, "thread " + tid + " is the debugger's injected break thread");
                 return;
             }
             _selectedTid = tid;
@@ -490,10 +502,19 @@ namespace ClarionDbg.Cli
             Console.WriteLine($"  thread {tid} selected{(tid == stoppedTid ? " (the stopped thread)" : " — reads now answer for this thread")}");
         }
 
+        /// <summary>The reply to `thread &lt;tid&gt;`. On success the tid is the thread now selected; on a
+        /// REFUSAL it is the thread that was ASKED FOR, not the one that survived — the host needs to match
+        /// the reply to the request it sent, and the selection it still has is the one it already knew about.
+        ///
+        /// A tid of 0 emits NO "tid" member, for the same reason <see cref="WithTid"/> does it: absence is
+        /// the only safe way to say "unknown", and a literal 0 would read as a real thread. That is the case
+        /// for a malformed request (no tid given, or one that would not parse) and for a `thread` that
+        /// arrived while the target is running, where there is no stop and so no selection to name.</summary>
         private void EmitThreadSelected(uint tid, bool ok, string error)
         {
             if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"threadselected\",\"tid\":" + tid
+                Console.WriteLine("@JSON {\"event\":\"threadselected\""
+                    + (tid != 0 ? ",\"tid\":" + tid : "")
                     + ",\"ok\":" + (ok ? "true" : "false")
                     + (error != null ? ",\"error\":" + Json.Str(error) : "") + "}");
             if (!ok) Console.WriteLine("  thread: " + error);
@@ -559,8 +580,12 @@ namespace ClarionDbg.Cli
             // 2. window-z: the candidate owning the topmost cross-thread visible window (active MDI child).
             //    Best-effort: a throw, an empty enumeration, or a window set naming no candidate all fall
             //    through to step 3 rather than failing the pause.
+            // Best-effort, but NOT silent: a bare catch here would make a genuine defect in the window walk
+            // indistinguishable from "the app has no windows up", and every pause would quietly fall through
+            // to `newest` with nothing in the log to say why. The reason rides along in the rule name.
+            string windowFailure = null;
             try { FillWindowEvidence(candidates, GetProcessId(_hProcess)); }
-            catch { /* window manager unavailable / racing teardown — fall through to creation order */ }
+            catch (Exception ex) { windowFailure = ex.GetType().Name; }
 
             ThreadProbe best = null;
             foreach (var p in candidates)
@@ -574,7 +599,8 @@ namespace ClarionDbg.Cli
             // 3. newest candidate by creation order
             foreach (var p in candidates)
                 if (best == null || p.Seq > best.Seq) best = p;
-            LogPauseChoice(best.Tid, "newest", candidates.Count);
+            LogPauseChoice(best.Tid, windowFailure == null ? "newest" : "newest(window-probe-failed:" + windowFailure + ")",
+                           candidates.Count);
             return best.Tid;
         }
 
