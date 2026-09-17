@@ -73,24 +73,30 @@ const document = {
 // deps applyValue touches that are not under test
 const values = new Map();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
-const dtApply = () => {};
 const beginEdit = () => {};
 const STAR = '*';
+// dtApply is REAL, not a stub: it inserts its own .vas tag next to the same cell and runs AFTER wireEdit,
+// so on a DATE/TIME/integer row it sits between the cell and the pencil. Stubbing it out is precisely how a
+// position-based pencil lookup passed this test while leaving a live pencil on every numeric row.
+const dtModes = {};
 
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
-const src = ['clearEditMeta','setEditMeta','wireEdit','applyValue'].map(n => {
+const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
+             'clearEditMeta','setEditMeta','wireEdit','applyValue'].map(n => {
   try { return extract(n); }
   catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
 }).join('\n');
 eval(src);
 
 // ---- scenario ----
-function makeRow(){
+function makeRow(name){
   const tree = new El('div');                    // rows live in a container (the THREAD tag inserts beside the row)
-  const row = new El('div'); row.dataset.name = 'AUT:AU_LNAME';
+  const row = new El('div'); row.dataset.name = name || 'AUT:AU_LNAME';
   const v = new El('span'); v.classList.add('vval','pending'); v.textContent = '…';
   row.append(v); tree.append(row); ROW = row; return row;
 }
+// sibling order after the cell, which is what a position-based lookup gets wrong
+function siblings(row){ return row.children.map(c => c.classList.toString().split(' ')[0]).join(','); }
 function state(row){
   const v = row.querySelector('.vval');
   const btn = row.querySelector('.vedit-btn');
@@ -131,6 +137,33 @@ console.log('4) a normal reply still re-arms editing');
 applyValue('AUT:AU_LNAME', true, "'White'", 'STRING(41)', true, THREAD_A);
 s = state(row); console.log('   ' + JSON.stringify(s));
 check('editable + va + pencil restored', s.cls.includes('editable') && s.va === THREAD_A.va && s.pencil);
+
+// ---- the same lifecycle on rows where dtApply inserts a .vas tag between the cell and the pencil ----
+// A STRING row alone never exercises that ordering, which is how a position-based pencil lookup slipped through.
+function numericScenario(label, name, resolved, typeName, meta){
+  console.log(label);
+  const row = makeRow(name);
+  applyValue(name, true, resolved, typeName, true, meta);
+  let s = state(row);
+  console.log('   after a resolved reply: ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
+  check('pencil armed, .vas tag present', s.pencil && siblings(row).includes('vas'));
+
+  applyValue(name, true, resolved, typeName, true, { note: 'not yet used on this thread — initial value' });
+  s = state(row);
+  console.log('   after a no-va reply:    ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
+  check('stale instance VA cleared', s.va === undefined, 'va=' + s.va);
+  check("'editable' cleared", !s.cls.includes('editable'));
+  check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
+
+  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  s = state(row);
+  console.log('   after a failed read:    ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
+  check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
+}
+numericScenario('5) LONG row (dtApply inserts .vas between the cell and the pencil)',
+                'JOB:JOBID', '4711', 'LONG', { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 });
+numericScenario('6) DATE row (same ordering, value rendered as a date)',
+                'TIT:PUBDATE', '80000', 'ULONG', { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 });
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

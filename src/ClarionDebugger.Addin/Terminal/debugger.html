@@ -896,12 +896,16 @@
   // Drop a cell's edit affordance and the instance address it was bound to. The pencil is a SIBLING of the
   // cell (wireEdit inserts it after), so it has to go too — a live pencil over a cleared va is exactly the
   // stale-write hazard this prevents. setEditMeta/wireEdit re-add both when the new reply carries a va.
+  //
+  // The pencil is reached through the handle wireEdit parks on the cell, never by sibling POSITION: dtApply
+  // inserts its own .vas tag after the same cell and runs AFTER wireEdit, so on a DATE/TIME/integer row the
+  // order is [vval, vas, vedit-btn] and a nextElementSibling check silently leaves the pencil behind.
+  // A handle also stays correct if a row ever holds more than one editable cell.
   function clearEditMeta(cell){
     if(!cell) return;
     cell.classList.remove('editable');
     delete cell.dataset.va; delete cell.dataset.tc; delete cell.dataset.sz; delete cell.dataset.pl;
-    const next=cell.nextElementSibling;   // wireEdit inserts the pencil immediately after the cell
-    if(next && next.classList.contains('vedit-btn')) next.remove();
+    if(cell._vedit){ cell._vedit.remove(); cell._vedit=null; }
   }
   function setEditMeta(cell, meta){
     if(!cell || !meta || !meta.va) return;
@@ -984,9 +988,12 @@
   function wireEdit(row){
     if(!row) return;
     const cell=row.querySelector('.vval'); if(!cell || !cell.dataset.va) return;
-    if(!row.querySelector('.vedit-btn')){
+    // keyed off a handle on the cell (like dtApply's ._vas) so clearEditMeta can find this exact pencil
+    // again regardless of what else gets inserted next to the cell afterwards
+    if(!cell._vedit){
       const btn=document.createElement('span'); btn.className='vedit-btn'; btn.title='Edit value'; btn.textContent='✎';
       btn.onclick=e=>{ e.stopPropagation(); beginEdit(cell); };
+      cell._vedit=btn;
       cell.insertAdjacentElement('afterend', btn);
     }
   }
