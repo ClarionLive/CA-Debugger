@@ -187,6 +187,45 @@
   .frame.uncertain { opacity:.55; }
   .frame .unc { flex:none; color:var(--orange); font-size:11px; cursor:help; }
 
+  /* ---- thread picker (Call Stack header) ----
+     The engine stops the PROCESS: every thread is frozen and any of them can be read. Which one the
+     panels mean is therefore a choice, and one the developer has to be able to see at a glance — a
+     THREADed record buffer resolves to a different instance per thread, so the same field name is a
+     loaded row on the browse's thread and an empty template on the frame's. */
+  .thsel { margin-left:8px; display:inline-flex; align-items:center; gap:4px; flex:0 1 auto; min-width:0; max-width:190px; padding:1px 7px;
+           border:1px solid var(--popup-border); border-radius:10px; background:var(--input); color:var(--fg);
+           font-size:10px; font-weight:600; letter-spacing:0; text-transform:none; cursor:pointer; }
+  .thsel:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thsel .thsel-t { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thsel .thsel-ic { flex:none; }
+  .thsel .thsel-ar { color:var(--fg-dim); font-size:9px; }
+  /* viewing a thread other than the one the engine stopped on — amber everywhere it shows */
+  .thsel.other { border-color:#e2b341; color:#e2b341; background:#e2b3411a; }
+  .thpick { display:none; margin:2px 8px 4px; border:1px solid var(--popup-border); border-radius:4px; background:var(--popup); overflow:hidden; }
+  .thpick.show { display:block; }
+  .thpick .thhdr { padding:4px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
+                   color:var(--section); border-bottom:1px solid var(--border); }
+  .throw { display:flex; align-items:baseline; gap:6px; padding:4px 9px; font-size:12px; cursor:pointer; white-space:nowrap; }
+  .throw:hover { background:var(--hover); }
+  .throw.sel { background:var(--sel); }
+  .throw .thmark { flex:none; width:10px; color:var(--accent-hi); font-size:9px; }
+  .throw.sel .thmark { color:var(--fg-bright); }
+  .throw .thname { flex:none; color:var(--fg-bright); font-weight:600; }
+  .throw .thproc { color:var(--yellow); overflow:hidden; text-overflow:ellipsis; }
+  .throw .thproc.none { color:var(--fg-dim); font-style:italic; }
+  .throw .thloc { color:var(--fg-dim); font-size:11px; }
+  .throw .thstate { color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 4px; }
+  .throw .thstop { margin-left:auto; flex:none; color:#e2b341; font-size:9px; font-weight:700; letter-spacing:.5px; }
+  /* the banner: while the panels show a thread the engine did NOT stop on, say so where the data is */
+  .thwarn { display:none; align-items:center; gap:8px; margin:3px 8px 0; padding:4px 9px; border-radius:4px;
+            background:#e2b3411f; border:1px solid #e2b34166; color:#e2b341; font-size:11px; }
+  .thwarn.show { display:flex; }
+  .thwarn .thback { margin-left:auto; flex:none; border:1px solid #e2b34166; border-radius:3px; padding:0 6px; cursor:pointer; }
+  .thwarn .thback:hover { background:#e2b3413d; color:var(--fg-bright); }
+  /* …and again in the toolbar, because the Call Stack panel can be collapsed or hidden entirely */
+  #thBadgeTop { display:none; color:#e2b341; font-size:11px; border:1px solid #e2b34166; border-radius:9px; padding:0 7px; }
+  body.viewing-other #thBadgeTop { display:inline-block; }
+
   .bpitem { border-bottom:1px solid transparent; }
   .bp { display:flex; align-items:center; gap:7px; padding:3px 8px 3px 14px; font-size:13px; }
   .bp:hover { background:var(--hover); }
@@ -316,7 +355,9 @@
        run-state indicator plus the gear (keyboard shortcuts) and theme toggles. -->
   <div class="toolbar">
     <span class="hdr-title" id="hdrTitle">CA Debugger</span>
-    <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span></div>
+    <!-- The "not the stopped thread" state also lives here: the Call Stack panel that owns the picker can
+         be collapsed or hidden, and this warning must never be the thing that got hidden. -->
+    <div class="runstate idle" id="runstate"><span class="dot"></span><span id="runtext">idle</span><span id="thBadgeTop" title="The panels are showing a thread other than the one execution stopped on"></span></div>
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
          surface until a Monaco-side context-menu / gutter trigger exists — that one sends this same message. -->
@@ -362,8 +403,10 @@
         </div>
       </details>
       <details class="section" open data-sec="stack">
-        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
+          <div class="thwarn" id="thWarn"><span id="thWarnText"></span><span class="thback" id="thBack" title="Show the thread the engine stopped on">Back to stopped thread</span></div>
+          <div class="thpick" id="thPick"><div class="thhdr">Read panels against</div><div id="thList"></div></div>
           <div class="listctl"><input id="stackFilter" placeholder="Filter frames — proc or module" autocomplete="off" /><button id="stackSort" class="sortbtn" title="Sort variables A→Z / declaration order (frames stay in call order)">A→Z</button></div>
           <div id="stackList"><div class="empty">Paused frames appear here.</div></div>
         </div>
@@ -433,7 +476,15 @@
   const STAR='<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg>';
   const $=id=>document.getElementById(id);
   const wv=window.chrome && window.chrome.webview;
-  function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
+  // Commands that resume the target (or end the session). They ALWAYS act on the thread the engine
+  // stopped on, never on whatever thread the panels are currently being read against, and the engine
+  // resets its own selection before running them — so the pad snaps its view back at the same moment,
+  // rather than stepping under a "viewing thread N" banner that stopped being true.
+  const RESUME_ACTIONS={continue:1,stepover:1,stepinto:1,stepout:1,stepi:1,nexti:1,runtocursor:1,pause:1,stop:1,start:1};
+  function send(action,data){
+    if(RESUME_ACTIONS[action]) snapToStoppedThread();
+    if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data}));
+  }
   function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
@@ -1150,7 +1201,14 @@
       if(open && isRef && !loaded){
         loaded=true; const b=ensureBox();
         b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">…</div>';
-        requestExpand(v, items=>{ renderKids(items); if(box) box.style.display=open?'':'none'; });
+        requestExpand(v, items=>{
+          // null = the reply was cancelled (the thread being read changed underneath it). Say so and allow
+          // a re-expand: the "…" placeholder would otherwise sit there as if it were still loading, and
+          // rendering it as "(no members)" would be a claim about a thread we never asked.
+          if(items===null){ loaded=false;
+            b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(thread changed — expand again to re-read)</div>';
+            if(box) box.style.display=open?'':'none'; return; }
+          renderKids(items); if(box) box.style.display=open?'':'none'; });
       }
       if(box) box.style.display=open?'':'none';
     }
@@ -1291,13 +1349,257 @@
     } };
   }
 
+  // ---- thread selection ------------------------------------------------------------------------
+  // The engine stops the PROCESS, so every thread is frozen and any of them can be read. Which one the
+  // panels mean is therefore a choice: a THREADed record buffer resolves to a different instance on each
+  // thread, so the same field name is a loaded row on the browse's thread and an empty template on the
+  // frame's. `selTid` is the thread every panel on screen is currently showing; `stopTid` is the thread
+  // execution actually stopped on. They are usually the same, and when they are not, that fact is on
+  // screen in three places (header chip, panel banner, toolbar badge) — showing one thread's values under
+  // another thread's name, silently, is the bug this whole ticket exists to prevent.
+  let threadRows=[];          // last `threads` event's rows
+  let stopTid=null;           // tid the engine stopped on (null = not known yet for this stop)
+  let selTid=null;            // tid the read paths are pointed at (null = unscoped / not known yet)
+  let threadSwitching=false;  // a `thread <tid>` is in flight
+  let switchGen=0;            // bumped per switch; guards the late sweep of rows left on "…"
+  let stackPendingTid=null;   // a stack re-read is outstanding for this tid (drives the empty-state text)
+
+  // Every thread-scoped reply carries the tid it was read on. A reply for a thread we are no longer
+  // showing must be dropped BEFORE it repaints anything: a switch leaves the previous thread's stack,
+  // watch and moduledata replies in flight, and letting one land paints thread A's values into thread B's
+  // panels.
+  // A reply with NO tid is not "some other thread" — it is an UNSCOPED reply from an engine build that
+  // doesn't stamp them. Those are accepted, or the pad would blank itself against such an engine.
+  function tidAccepted(m){
+    if(!m || m.tid===undefined || m.tid===null) return true;
+    if(selTid===null) return true;
+    return m.tid===selTid;
+  }
+
+  function threadRowFor(tid){ for(let i=0;i<threadRows.length;i++) if(threadRows[i].tid===tid) return threadRows[i]; return null; }
+  // "Thread 2" is the number the developer recognises from their own code; the raw tid is the engine's
+  // identity. clarionThread can legitimately be null (the RTL couldn't give one) — never invent one.
+  function threadName(t, tid){
+    if(t && t.clarionThread!=null) return 'Thread '+t.clarionThread;
+    return 'tid '+((t && t.tid!=null) ? t.tid : tid);
+  }
+  // A bare tid is useless in the list, so each row is named by its TOP CLARION PROCEDURE. With the app
+  // idle every UI thread sits in the same GetMessage syscall, which is exactly when this label is the
+  // only thing that tells the browse's thread from the frame's.
+  function threadProc(t){ return (t && t.proc) ? t.proc : null; }
+
+  function threadPickerOpen(){ const p=$('thPick'); return !!(p && p.classList.contains('show')); }
+  function closeThreadPicker(){ const p=$('thPick'); if(p) p.classList.remove('show'); }
+  function toggleThreadPicker(){
+    const p=$('thPick'); if(!p) return;
+    const open=!p.classList.contains('show');
+    p.classList.toggle('show', open);
+    // The chip lives in the <summary> and stays visible when the section is collapsed, but the list it
+    // opens lives in the body — so opening it has to open the section, or the click does nothing at all.
+    if(open){ const sec=(typeof secEl==='function') ? secEl('stack') : null; if(sec && !sec.open) sec.open=true; }
+    if(open) requestThreads();   // refresh marks/labels rather than showing the last stop's list
+  }
+  function requestThreads(){ if(isPaused) send('threads'); }
+
+  function renderThreadPicker(){
+    const box=$('thList'); if(!box) return;
+    box.innerHTML='';
+    if(!threadRows.length){
+      const e=document.createElement('div'); e.className='empty';
+      e.textContent = isPaused ? 'No thread list — this engine did not report one.' : 'Pause to list threads.';
+      box.appendChild(e); return;
+    }
+    threadRows.forEach(t=>{
+      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols and esc() does not
+      // escape quotes, so interpolating them (especially into the title attribute) would be an injection sink.
+      const r=document.createElement('div');
+      r.className='throw'+(t.tid===selTid?' sel':'')+(t.tid===stopTid?' stopped':'');
+      const mark=document.createElement('span'); mark.className='thmark'; mark.textContent=(t.tid===selTid?'●':'○');
+      const nm=document.createElement('span'); nm.className='thname'; nm.textContent=threadName(t,t.tid);
+      const proc=threadProc(t);
+      const pr=document.createElement('span'); pr.className='thproc'+(proc?'':' none');
+      pr.textContent = proc || (t.clarionFrames ? '(unnamed Clarion frame)' : '(no Clarion frames)');
+      r.appendChild(mark); r.appendChild(nm); r.appendChild(pr);
+      if(t.module){ const lo=document.createElement('span'); lo.className='thloc'; lo.textContent=t.module+':'+(t.line||0); r.appendChild(lo); }
+      if(t.state){ const st=document.createElement('span'); st.className='thstate'; st.textContent=t.state; r.appendChild(st); }
+      if(t.tid===stopTid){ const b=document.createElement('span'); b.className='thstop'; b.textContent='STOPPED HERE'; r.appendChild(b); }
+      r.title='tid '+t.tid+(t.clarionThread!=null?'  ·  Clarion thread '+t.clarionThread:'')
+            +'  ·  '+(t.clarionFrames||0)+' Clarion frame(s)'+(t.tid===stopTid?'  ·  execution stopped on this thread':'');
+      r.onclick=()=>selectThread(t.tid);
+      box.appendChild(r);
+    });
+  }
+
+  function renderThreadUi(){
+    const t=threadRowFor(selTid);
+    const chip=$('thSel'), txt=$('thSelText');
+    const other = (selTid!=null && stopTid!=null && selTid!==stopTid);
+    if(txt){
+      let label;
+      if(threadSwitching) label='switching…';
+      else if(selTid==null) label='thread —';
+      else { const p=threadProc(t); label=threadName(t,selTid)+(p?' · '+p:''); }
+      txt.textContent=label;   // textContent: the procedure name is the debuggee's, not ours
+    }
+    if(chip) chip.classList.toggle('other', other);
+    // The same fact in the panel that owns the data…
+    const warn=$('thWarn'), wtxt=$('thWarnText');
+    if(warn) warn.classList.toggle('show', other);
+    if(wtxt && other) wtxt.textContent='viewing '+threadName(t,selTid)+' — not the stopped thread';
+    // …and in the toolbar, which cannot be hidden.
+    document.body.classList.toggle('viewing-other', other);
+    const badge=$('thBadgeTop');
+    if(badge) badge.textContent = other ? ('viewing '+threadName(t,selTid)+' — not the stopped thread') : '';
+    renderThreadPicker();
+  }
+
+  function selectThread(tid){
+    closeThreadPicker();
+    if(tid==null || !isPaused) return;
+    if(tid===selTid){ return; }                 // already showing it — a re-read would only flicker
+    threadSwitching=true; renderThreadUi();
+    send('selectthread', String(tid));
+  }
+
+  function onThreads(m){
+    threadRows = Array.isArray(m.threads) ? m.threads : [];
+    stopTid = (typeof m.stopped==='number' && m.stopped>0) ? m.stopped : null;
+    // The ENGINE owns the selection — adopt what it reports rather than trusting our own optimism. This is
+    // also how the pad learns that a resume/step reset the selection back to the stopped thread.
+    const sel=(typeof m.selected==='number' && m.selected>0) ? m.selected : null;
+    if(sel!=null) selTid=sel; else if(selTid==null) selTid=stopTid;
+    threadSwitching=false;
+    renderThreadUi();
+  }
+
+  function onThreadSelected(m){
+    threadSwitching=false;
+    if(!m || m.ok!==true){
+      // The engine refused (unknown or exited tid). Its selection is unchanged, so resync from it rather
+      // than leaving the pad claiming a thread it never got.
+      toast('Thread '+((m&&m.tid!=null)?m.tid:'?')+': '+((m&&m.error)||'could not select'));
+      requestThreads(); renderThreadUi(); return;
+    }
+    selTid=m.tid;
+    beginThreadSwitch(m.tid);
+  }
+
+  // A switch invalidates EVERY reader of a resolved value, then re-reads the lot. Nothing on screen may
+  // survive it: the panels are about to describe a different thread.
+  function beginThreadSwitch(tid){
+    const gen=++switchGen;
+    cancelPendingCallbacks();          // framelocals/expand replies for the old thread can no longer arrive
+    invalidateThreadScopedState(gen);  // rows, tooltips, edit metadata, the values cache, open detail panels
+    stackPendingTid=tid;
+    buildStack([]);                    // the old thread's frames are not this thread's
+    buildLocals('', []);
+    buildModuleData(lastModule, []);
+    buildRegs(null);
+    lastLibState=null; lastLibError=null; renderLibState();
+    renderThreadUi();
+    send('stack'); send('moduledata'); send('rewatch'); send('regs');
+    refreshLibState();                 // only fires when the Library State panel is actually open
+    requestThreads();                  // refresh the list's own stopped/selected marks
+    armPendingSweep(gen, tid);
+  }
+
+  // A thread switch invalidates every reader of a per-thread value, not just the visible cell:
+  //   1. the row's value cell (text + num/noted/unavail classes)
+  //   2. the cell's tooltip — an engine note, a failed read's reason, or dtApply's 'raw: N'
+  //   3. the edit metadata (data-va + the ✎ pencil): a va is an address inside the OLD thread's instance,
+  //      and committing an edit against it would write another thread's memory
+  //   4. the DATE/TIME view tag (.vas), whose own title carries the old thread's raw value
+  //   5. the `values` cache — read by the hover data-tip long after the reply, including over a SOURCE
+  //      identifier where there is no row to look at, and by the tip's Copy Value action
+  //   6. any OPEN Watch .wdetail panel, which keeps showing whatever it was last given
+  function invalidateThreadScopedState(gen){
+    values.clear();                                                                     // (5)
+    document.querySelectorAll('[data-name]').forEach(row=>{
+      const v=row.querySelector('.vval'); if(!v) return;
+      // Rows that HAD an answer on the old thread are expecting a fresh one; rows still on "…" (a
+      // collapsed tree row nobody is watching) are not, and must not be swept later as unanswered.
+      if(v.textContent!=='…') v._pendGen=gen; else delete v._pendGen;
+      clearEditMeta(v);                                                                  // (3)
+      if(v._vas){ v._vas.remove(); v._vas=null; }                                        // (4)
+      delete v.dataset.raw; delete v.dataset.dtname; delete v.dataset.dtmode;
+      v.classList.remove('unavail','noted','num'); v.classList.add('pending');           // (1)
+      v.removeAttribute('title');                                                        // (2)
+      v.textContent='…';
+      row.classList.remove('clipped');
+    });
+    document.querySelectorAll('.wdetail').forEach(d=>{ if(d.style.display!=='none') d.textContent='…'; });   // (6)
+  }
+
+  // Replies keyed by request id (frame locals, reference expansion) were asked for against the PREVIOUS
+  // thread. Drop the callbacks so a late reply can't run, and tell each caller its "…" placeholder is
+  // never going to be filled — a row left on "…" reads as still loading, forever.
+  function cancelPendingCallbacks(){
+    Object.keys(_flCbs).forEach(k=>{ const cb=_flCbs[k]; delete _flCbs[k]; try{ cb(null); }catch(e){} });
+    Object.keys(_expandCbs).forEach(k=>{ const cb=_expandCbs[k]; delete _expandCbs[k]; try{ cb(null); }catch(e){} });
+  }
+
+  // "…" means a reply is on its way. If the engine never answers for this thread (it exited between the
+  // list and the click; the read failed with no event at all), the row must stop pretending to load.
+  const PENDING_SWEEP_MS=4000;
+  function armPendingSweep(gen, tid){
+    setTimeout(()=>{
+      if(gen!==switchGen || !isPaused) return;   // a newer switch, or a resume, already owns the screen
+      let n=0;
+      document.querySelectorAll('.vval.pending').forEach(v=>{
+        if(v._pendGen!==gen || v.textContent!=='…') return;
+        v.classList.remove('pending'); v.classList.add('unavail');
+        v.textContent='(no reply)'; v.title='No reply from thread '+tid+' for this name.';
+        delete v._pendGen; n++;
+      });
+      if(stackPendingTid===tid){ stackPendingTid=null; renderStack(); }
+      if(n) logLine('err','thread '+tid+': '+n+' value(s) got no reply');
+    }, PENDING_SWEEP_MS);
+  }
+
+  // Stepping or continuing always acts on the STOPPED thread and resets the engine's selection, so the
+  // view has to snap back visibly the moment such a command leaves the pad — not one round trip later,
+  // and not at the next stop under a banner that is no longer true.
+  function snapToStoppedThread(){
+    closeThreadPicker();
+    threadSwitching=false;
+    if(stopTid!=null && selTid!==stopTid) selTid=stopTid;
+    renderThreadUi();
+  }
+
+  // Every thread identity belongs to ONE stop. Clearing them at a resume (and again at the next pause)
+  // is what stops a stale selection from gating the new stop's replies: the engine picks the stopped
+  // thread again, and a leftover selTid pointing at last stop's thread would drop every reply it sends.
+  //
+  // `stoppedTid` is the new stop's own thread when the pause event names it (an additive field — an
+  // engine that omits it leaves the pad exactly as it was, learning the stopped thread from the `threads`
+  // reply instead). Taking it here means the stopped-thread marker is right from the first moment of the
+  // stop, even if the inventory request that follows fails or is overtaken; the inventory only ever adds
+  // to it (the Clarion thread number, the procedure), never contradicts it.
+  function resetThreadState(stoppedTid){
+    threadRows=[]; stopTid=null; selTid=null; threadSwitching=false; stackPendingTid=null;
+    switchGen++;                 // invalidates any armed sweep
+    if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
+    closeThreadPicker(); renderThreadUi();
+  }
+
+  (function wireThreadUi(){
+    const chip=$('thSel');
+    // The chip lives inside the <summary>, where any click would collapse the section — swallow it.
+    if(chip) chip.onclick=e=>{ e.preventDefault(); e.stopPropagation(); toggleThreadPicker(); };
+    const back=$('thBack');
+    if(back) back.onclick=e=>{ e.stopPropagation(); if(stopTid!=null) selectThread(stopTid); };
+  })();
+
   // ---- call stack ----
   // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. The CURRENT
   // frame (index 0) auto-expands. Frames always render in CALL ORDER; the sort button sorts the variables
   // INSIDE a frame (shared varSortAlpha). The filter matches procedure/module. The twisty toggles locals;
   // clicking the frame name jumps the editor.
   let stackQ='', lastFrames=null;
-  function buildStack(frames){ lastFrames=frames||[]; renderStack();
+  function buildStack(frames){ lastFrames=frames||[];
+    // A stack reply (or the deliberate clear that starts a switch) is the answer the panel was waiting for.
+    if(lastFrames.length) stackPendingTid=null;
+    renderStack();
     // Mirror the CURRENT frame's locals into the Variables pane. requestFrameLocals guards a missing/bad
     // frame and calls back [] (clearing the section). Watch resolves against the top frame, so frame 0 is
     // the right one to surface here.
@@ -1308,7 +1610,16 @@
       el.style.display=show?'':'none'; if(el._box) el._box.style.display=(show && el._open)?'':'none'; }); }
   function renderStack(){
     const list=$('stackList'); list.innerHTML=''; const frames=lastFrames||[]; $('stackCount').textContent=frames.length;
-    if(!frames.length){ list.innerHTML='<div class="empty">Paused frames appear here.</div>'; return; }
+    if(!frames.length){
+      // While a thread switch is in flight the list is empty because we THREW AWAY the previous thread's
+      // frames, not because this thread has none — say which, so an engine that never answers doesn't
+      // leave the panel reading like a normal empty stack.
+      const t=threadRowFor(stackPendingTid);
+      list.innerHTML='<div class="empty">'+(stackPendingTid!=null
+        ? 'Reading '+esc(threadName(t,stackPendingTid))+'…'
+        : 'Paused frames appear here.')+'</div>';
+      return;
+    }
     // Frames stay in CALL ORDER (frame 0 = current → callers); only the variables inside sort.
     frames.forEach((f,idx)=>{
       // Locals availability hinges on having a frame base (ebp), NOT on a resolved proc name: a frame may
@@ -1328,7 +1639,12 @@
       function load(){ if(loaded) return; loaded=true; const b=ensureBox();
         b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">…</div>';
         requestFrameLocals(f, items=>{ b.innerHTML='';
-          if(!items || !items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
+          // null = cancelled by a thread switch; "(no locals)" would be a statement about this frame that
+          // we never actually got an answer for.
+          if(items===null){ loaded=false;
+            b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(thread changed — expand again to re-read)</div>';
+            if(box) box.style.display=open?'':'none'; return; }
+          if(!items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
           else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx));
           if(box) box.style.display=open?'':'none'; }); }
       function toggle(){ if(!canLoc) return; open=!open; el._open=open; el.querySelector('.ar').textContent=open?'▾':'▸';
@@ -1618,22 +1934,31 @@
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
         $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
+        // A new stop is a new thread world: the engine has re-picked the stopped thread and dropped any
+        // selection. Forget last stop's tids FIRST — a leftover selTid would drop every reply this stop
+        // is about to push — then adopt the thread this stop is ON, when the event names it. The host
+        // asks for the inventory too, which fills in the picker and the readable labels.
+        resetThreadState(m.tid);
         buildRegs(m.regs); setPaused(true); refreshLibState(); break;
-      case 'resumed': setPaused(false); lastLibState=null; lastLibError=null; renderLibState(); break;
+      case 'resumed': setPaused(false); resetThreadState(); lastLibState=null; lastLibError=null; renderLibState(); break;
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
-      case 'stack': buildStack(m.frames||[]); break;
-      case 'framelocals': { const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'libstate': onLibState(m.reqId, m.error, m.items||[]); break;
-      case 'moduledata': buildModuleData(m.module, m.items||[]); break;
-      case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
+      case 'threads': onThreads(m); break;
+      case 'threadselected': onThreadSelected(m); break;
+      // Thread-scoped replies: a reply for a thread we are no longer showing is dropped before it can
+      // repaint anything (tidAccepted also lets through an engine that doesn't stamp its replies).
+      case 'stack': if(tidAccepted(m)) buildStack(m.frames||[]); break;
+      case 'framelocals': { if(!tidAccepted(m)) break; const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
+      case 'libstate': if(tidAccepted(m)) onLibState(m.reqId, m.error, m.items||[]); break;
+      case 'moduledata': if(tidAccepted(m)) buildModuleData(m.module, m.items||[]); break;
+      case 'expanded': { if(!tidAccepted(m)) break; const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
+      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
       case 'varset': onVarSet(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
-      case 'regs': buildRegs(m.regs); break;
+      case 'regs': if(tidAccepted(m)) buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;
-      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); lastLibState=null; lastLibError=null; renderLibState(); break;
+      case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); resetThreadState(); lastLibState=null; lastLibError=null; renderLibState(); break;
     }
   }
   function collectSyms(symbols){ const out=[]; (symbols||[]).forEach(s=>{ out.push({name:s.name,type:s.typeName}); (s.fields||[]).forEach(f=>out.push({name:f.name,type:f.typeName})); }); return out; }
