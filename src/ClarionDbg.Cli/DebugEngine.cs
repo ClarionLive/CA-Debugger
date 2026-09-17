@@ -702,7 +702,7 @@ namespace ClarionDbg.Cli
                         // selection it cannot display would put one thread's code on screen while the pad
                         // says you are viewing another — the mismatch relocated, not fixed. It is still
                         // STAMPED with the thread it read from, so the choice is checkable rather than
-                        // assumed, and a thread-aware disassembly view is a follow-up ticket.
+                        // assumed, and a thread-aware disassembly view is ticket 381aabd7.
                         HandleDisasmCommand(parts, ref ctx, haveCtx, tid);
                         break;
 

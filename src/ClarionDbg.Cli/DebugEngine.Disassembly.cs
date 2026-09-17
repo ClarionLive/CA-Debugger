@@ -75,7 +75,7 @@ namespace ClarionDbg.Cli
         /// lives outside the pad's thread-scoped message path and cannot show which thread it is decoding,
         /// so following a selection it cannot display would be a silent mismatch rather than a feature.
         /// The reply is stamped with the tid anyway, so a host CAN tell — and a thread-aware disassembly
-        /// view is a follow-up ticket rather than a thing to half-do here.</summary>
+        /// view is ticket 381aabd7, rather than a thing to half-do here.</summary>
         private void HandleDisasmCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
         {
             uint addr = haveCtx ? ctx.Eip : 0;
