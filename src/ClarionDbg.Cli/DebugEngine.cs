@@ -173,6 +173,85 @@ namespace ClarionDbg.Cli
             return _threadSeq.TryGetValue(tid, out s) ? s : int.MaxValue;
         }
 
+        // ---- per-stop thread selection (`thread <tid>`) ----
+        // Which thread the READ commands answer about, for THIS STOP ONLY. PausedWait resets it to the
+        // stopped thread at every new stop, so a selection is never carried across one and the host can
+        // never be shown a stale thread's data as if it were the new stop's. Resume-type commands always
+        // act on the stopped thread and reset this first — see the command loop.
+        private uint _selectedTid;
+
+        /// <summary>The thread a read command should answer about: the selected one, which is usually (but
+        /// not always) the stopped one. Holds the registers to read the stack/locals/disassembly at and the
+        /// handle the threaded-data and Library State emulators need.</summary>
+        private sealed class ThreadView
+        {
+            public uint Tid;
+            public IntPtr HThread;
+            public Native.CONTEXT_X86 Ctx;
+            public bool HaveCtx;
+            public bool Owned;      // true when WE opened HThread and must close it
+
+            public void Release()
+            {
+                if (Owned && HThread != IntPtr.Zero) Native.CloseHandle(HThread);
+                HThread = IntPtr.Zero; Owned = false;
+            }
+        }
+
+        /// <summary>Build the view for the current selection. When nothing is selected, or the selection IS
+        /// the stopped thread, this reuses the stopped thread's already-open handle and context and opens
+        /// nothing. The whole process is frozen at a stop, so another thread's context is stable to read.</summary>
+        private ThreadView AcquireView(uint stoppedTid, IntPtr stoppedH, ref Native.CONTEXT_X86 stoppedCtx, bool stoppedHave)
+        {
+            if (_selectedTid == 0 || _selectedTid == stoppedTid)
+                return new ThreadView { Tid = stoppedTid, HThread = stoppedH, Ctx = stoppedCtx,
+                                        HaveCtx = stoppedHave, Owned = false };
+
+            var v = new ThreadView { Tid = _selectedTid };
+            v.HThread = OpenThreadForContext(_selectedTid);
+            v.Owned = v.HThread != IntPtr.Zero;
+            var c = NewContext();
+            v.HaveCtx = v.HThread != IntPtr.Zero && Native.GetThreadContext(v.HThread, ref c);
+            v.Ctx = c;
+            return v;
+        }
+
+        /// <summary>Resume-type verbs. These ALWAYS act on the stopped thread, never the selected one, and
+        /// reset the selection before they run so the next stop is never reported against a stale view.</summary>
+        private static bool IsResumeVerb(string verb)
+        {
+            switch (verb)
+            {
+                case "continue": case "c": case "g":
+                case "step": case "stepinto": case "s": case "i":
+                case "stepover": case "next": case "n":
+                case "stepout": case "out": case "finish": case "o":
+                case "stepi": case "si": case "nexti": case "ni":
+                case "pause": case "break": case "runtocursor":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>Stamp a thread-scoped event with the tid it describes, so the host can drop a reply that
+        /// arrived for a thread it is no longer showing. Splicing the member in here rather than threading a
+        /// tid parameter through six JSON builders keeps one rule in one place: if it is emitted from the
+        /// pause loop about a thread, it carries that thread's id. Member order is not significant in
+        /// JSON.</summary>
+        private static string WithTid(string json, uint tid)
+        {
+            if (string.IsNullOrEmpty(json) || json[0] != '{') return json;
+            string head = "{\"tid\":" + tid;
+            return json.Length == 2 ? head + "}" : head + "," + json.Substring(1);
+        }
+
+        /// <summary>Emit a thread-scoped @JSON event for <paramref name="tid"/>.</summary>
+        private void EmitThreadEvent(uint tid, string json)
+        {
+            if (EmitJson) Console.WriteLine("@JSON " + WithTid(json, tid));
+        }
+
         // logical user breakpoints + armed-byte map (VA -> original byte)
         private readonly List<UserBreakpoint> _bps = new List<UserBreakpoint>();
         private readonly Dictionary<uint, byte> _armed = new Dictionary<uint, byte>();
@@ -440,35 +519,6 @@ namespace ClarionDbg.Cli
             return Native.DBG_CONTINUE;  // release the injected break thread (it then exits)
         }
 
-        /// <summary>Choose the most useful thread to report at a pause: prefer one whose EIP is in
-        /// TSWD-mapped Clarion code (any loaded module); else the first readable non-break thread;
-        /// else the main thread.</summary>
-        private uint PickPauseThread(uint breakTid)
-        {
-            uint fallback = 0;
-            foreach (uint t in _threads)
-            {
-                if (t == breakTid) continue;
-                IntPtr h = OpenThreadForContext(t);
-                if (h == IntPtr.Zero) continue;
-                var c = NewContext();
-                bool ok = Native.GetThreadContext(h, ref c);
-                Native.CloseHandle(h);
-                if (!ok) continue;
-                if (fallback == 0) fallback = t;
-                // EIP in any mapped Clarion image's code → this is the thread worth reporting. Resolve
-                // against the owning module (multi-DLL: the active thread may be in a DLL, not the EXE).
-                var m = ModuleAt(c.Eip);
-                if (m != null && m.Dbg != null)
-                {
-                    int line, mi; uint rec;
-                    if (m.Dbg.ResolveAddr(c.Eip - m.LoadBase, out line, out mi, out rec)) return t;
-                }
-            }
-            if (fallback != 0) return fallback;
-            return _mainTid != 0 ? _mainTid : breakTid;
-        }
-
         // ------------------------------------------------------------------ pause + command loop
 
         /// <summary>
@@ -479,6 +529,8 @@ namespace ClarionDbg.Cli
         {
             _pauseRequested = false;  // any pause we reach consumes a pending pause request
             _instrStep = false;       // and consumes a pending instruction-step
+            _selectedTid = tid;       // a new stop always starts on the stopped thread — a selection is
+                                      // per-stop and is never carried across one
             ClearThreadedCache();     // a fresh stop: re-resolve .cwtls instances rather than trust the last one
             uint va = haveCtx ? ctx.Eip : 0;
             var m = haveCtx ? ModuleAt(va) : null;
@@ -506,6 +558,15 @@ namespace ClarionDbg.Cli
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 string verb = parts[0].ToLowerInvariant();
+
+                // Resume-type commands act on the STOPPED thread and reset the selection FIRST, so the stop
+                // they produce is never reported against the thread the user was merely looking at. This is
+                // deliberately ahead of the dispatch: it must hold even if a handler throws.
+                if (IsResumeVerb(verb)) _selectedTid = tid;
+
+                // Everything below reads the SELECTED thread. Ordinarily that IS the stopped thread and this
+                // opens nothing; after `thread <tid>` it is another thread's frozen context.
+                var view = AcquireView(tid, hThread, ref ctx, haveCtx);
                 try
                 {
                 switch (verb)
@@ -550,10 +611,12 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "regs":
-                        if (haveCtx && EmitJson)
-                            Console.WriteLine("@JSON " + Json.RegsEvent(Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags)));
-                        else if (haveCtx)
-                            Console.WriteLine($"  EAX={ctx.Eax:X8} EBX={ctx.Ebx:X8} ECX={ctx.Ecx:X8} EDX={ctx.Edx:X8} ESI={ctx.Esi:X8} EDI={ctx.Edi:X8} EBP={ctx.Ebp:X8} ESP={ctx.Esp:X8} EIP={ctx.Eip:X8}");
+                        if (view.HaveCtx && EmitJson)
+                            EmitThreadEvent(view.Tid, Json.RegsEvent(Json.Regs(view.Ctx.Eax, view.Ctx.Ebx, view.Ctx.Ecx, view.Ctx.Edx, view.Ctx.Esi, view.Ctx.Edi, view.Ctx.Ebp, view.Ctx.Esp, view.Ctx.Eip, view.Ctx.EFlags)));
+                        else if (view.HaveCtx)
+                            Console.WriteLine($"  EAX={view.Ctx.Eax:X8} EBX={view.Ctx.Ebx:X8} ECX={view.Ctx.Ecx:X8} EDX={view.Ctx.Edx:X8} ESI={view.Ctx.Esi:X8} EDI={view.Ctx.Edi:X8} EBP={view.Ctx.Ebp:X8} ESP={view.Ctx.Esp:X8} EIP={view.Ctx.Eip:X8}");
+                        else
+                            EmitError("regs: no context for thread " + view.Tid);
                         break;
 
                     case "mem":
@@ -565,11 +628,19 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "stack": case "bt": case "where":
-                        HandleStackCommand(parts, ref ctx, haveCtx);
+                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
                         break;
 
                     case "moduledata": case "moddata":
-                        HandleModuleDataCommand(parts, ref ctx, haveCtx);
+                        HandleModuleDataCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
+                        break;
+
+                    case "threads":
+                        HandleThreadsCommand(tid);
+                        break;
+
+                    case "thread":
+                        HandleThreadSelectCommand(parts, tid);
                         break;
 
                     case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
@@ -577,11 +648,11 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "framelocals":   // locals of one call-stack frame (Call-Stack-driven Variables)
-                        HandleFrameLocalsCommand(parts);
+                        HandleFrameLocalsCommand(parts, view.Tid);
                         break;
 
                     case "disasm": case "u":
-                        HandleDisasmCommand(parts, ref ctx, haveCtx);
+                        HandleDisasmCommand(parts, ref view.Ctx, view.HaveCtx);
                         break;
 
                     case "sym":
@@ -592,7 +663,7 @@ namespace ClarionDbg.Cli
                         // resolve + read a data symbol's CURRENT-THREAD value. THREADed (.cwtls) names
                         // resolve by emulating THR$GetInstance read-only, so this answers inline like every
                         // other read — no resume, no leaving the pause loop.
-                        HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx);
+                        HandleWatchCommand(parts, view.Tid, view.HThread, ref view.Ctx, view.HaveCtx);
                         break;
 
                     case "threadscan":
@@ -605,7 +676,7 @@ namespace ClarionDbg.Cli
                         // per-thread RTL "Library State" (ERROR/EVENT/FIELD/…). Read by EMULATING each
                         // ClaRUN getter read-only — synchronous and safe at any stop, so it answers inline
                         // (no thread hijack, no leaving the pause loop).
-                        HandleLibStateCommand(parts, tid, hThread);
+                        HandleLibStateCommand(parts, view.Tid, view.HThread);
                         break;
 
                     case "quit": case "q": case "kill":
@@ -622,6 +693,13 @@ namespace ClarionDbg.Cli
                     // A command-handler bug must never crash the engine — that would terminate the
                     // debuggee. Report it and keep the pause loop alive.
                     EmitError("command '" + verb + "' failed: " + ex.Message);
+                }
+                finally
+                {
+                    // Closes only a handle WE opened for a non-stopped selection; the stopped thread's
+                    // handle belongs to the caller. Runs on the resume paths too, which return out of the
+                    // switch above.
+                    view.Release();
                 }
             }
         }
@@ -671,6 +749,8 @@ namespace ClarionDbg.Cli
                     case "moduledata": case "moddata":
                     case "disasm": case "u":
                     case "setval":
+                    case "threads": case "thread": case "threadscan":
+                    case "framelocals": case "libstate": case "expand":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;
                     default:

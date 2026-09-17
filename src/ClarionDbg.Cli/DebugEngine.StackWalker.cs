@@ -16,10 +16,12 @@ namespace ClarionDbg.Cli
         private const int STACK_FRAMES_DEFAULT = 32;
         private const int STACK_FRAMES_MAX = 256;
 
-        /// <summary>stack [maxFrames] — resolved call stack while paused (frame 0 = current EIP).</summary>
-        private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        /// <summary>stack [maxFrames] — resolved call stack while paused (frame 0 = current EIP). Walks the
+        /// SELECTED thread's registers, which is usually but not always the stopped thread's; the reply is
+        /// stamped with that tid so the host can drop it if it has since switched threads.</summary>
+        private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
         {
-            if (!haveCtx) { EmitError("stack: no thread context"); return; }
+            if (!haveCtx) { EmitError("stack: no context for thread " + tid); return; }
             int max = STACK_FRAMES_DEFAULT;
             if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX))
             {
@@ -27,8 +29,8 @@ namespace ClarionDbg.Cli
                 return;
             }
             var frames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, max);
-            if (EmitJson) Console.WriteLine("@JSON " + Json.Stack(frames));
-            Console.WriteLine($"  stack ({frames.Count} frame(s)):");
+            EmitThreadEvent(tid, Json.Stack(frames));
+            Console.WriteLine($"  stack of thread {tid} ({frames.Count} frame(s)):");
             for (int i = 0; i < frames.Count; i++)
             {
                 var f = frames[i];

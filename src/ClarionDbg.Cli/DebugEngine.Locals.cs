@@ -62,7 +62,7 @@ namespace ClarionDbg.Cli
         /// its own (it runs on its procedure's frame via DO), so a routine frame surfaces its enclosing
         /// procedure's locals read at the same EBP; a METHOD's enclosing procedure is a SEPARATE stack frame,
         /// so methods show only their own. Emits a `framelocals` event keyed by reqId. Read-only.</summary>
-		private void HandleFrameLocalsCommand(string[] parts)
+		private void HandleFrameLocalsCommand(string[] parts, uint tid)
 		{
 			if (parts.Length < 4) { EmitError("framelocals expects: framelocals reqId va ebp"); return; }
 			string reqId = parts[1];
@@ -94,9 +94,8 @@ namespace ClarionDbg.Cli
 					+ " inGap=" + inGap + "\"}");
 				rows = LocalRowsFor(m, entry, ebp, inGap);
 			}
-			if (EmitJson)
-				Console.WriteLine("@JSON {\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
-					+ ",\"items\":[" + string.Join(",", rows) + "]}");
+			EmitThreadEvent(tid, "{\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
+				+ ",\"items\":[" + string.Join(",", rows) + "]}");
 		}
 
         /// <summary>The entry RVA of the procedure that lexically contains <paramref name="rva"/> — the
@@ -436,7 +435,7 @@ namespace ClarionDbg.Cli
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
         /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
         /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
-        private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
         {
             var rows = new List<string>();
             string module = null;
@@ -462,11 +461,10 @@ namespace ClarionDbg.Cli
                 }
             }
 
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"moduledata\",\"module\":" + Json.Str(module)
-                    + ",\"items\":[" + string.Join(",", rows) + "]}");
-            else
-                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"}");
+            EmitThreadEvent(tid, "{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
+                + ",\"items\":[" + string.Join(",", rows) + "]}");
+            if (!EmitJson)
+                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {tid}");
         }
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by

@@ -71,7 +71,7 @@ namespace ClarionDbg.Cli
             if (probeName != null) ProbeNameOnEachThread(probeName, probes);
             FillWindowEvidence(probes, GetProcessId(_hProcess));
 
-            Console.WriteLine($"  threadscan: {probes.Count} live thread(s), stopped tid={stoppedTid}");
+            Console.WriteLine($"  threadscan (read-only diagnostic; runs no target code): {probes.Count} live thread(s), stopped tid={stoppedTid}");
             Console.WriteLine("    seq  tid    stopped  state     eip        image            clfr  wins      top Clarion frame                     Cla$THREAD  created");
             foreach (var p in probes)
             {
@@ -104,13 +104,15 @@ namespace ClarionDbg.Cli
 
         /// <summary>Measure every live thread. Creation order first (main thread first), which is the order
         /// the evidence is easiest to read in; the heuristic work happens on the caller's side.</summary>
-        private List<ThreadProbe> ProbeAllThreads(uint stoppedTid)
+        private List<ThreadProbe> ProbeAllThreads(uint stoppedTid, bool withClarionThread = true)
         {
             var probes = new List<ThreadProbe>();
             var tids = new List<uint>(_threads);
             tids.Sort((a, b) => SeqOf(a).CompareTo(SeqOf(b)));
 
-            var rt = RuntimeModule();
+            // Cla$THREAD costs one emulator run per thread. The `threads` list wants it (the developer reads
+            // the Clarion thread number); PickPauseThread does not, and a pause should not pay for it.
+            var rt = withClarionThread ? RuntimeModule() : null;
             uint claThreadRva = rt != null && rt.Pe != null ? rt.Pe.FindExportRva("Cla$THREAD") : 0;
 
             foreach (uint t in tids)
@@ -133,7 +135,7 @@ namespace ClarionDbg.Cli
                     FillStackEvidence(p, c);
                     FillStartAddress(p, h);
                     p.Created = ThreadCreationTime(h);
-                    p.ClarionThread = ReadClarionThreadNumber(rt, claThreadRva, t, h);
+                    if (withClarionThread) p.ClarionThread = ReadClarionThreadNumber(rt, claThreadRva, t, h);
                 }
                 finally { Native.CloseHandle(h); }
                 probes.Add(p);
@@ -153,6 +155,16 @@ namespace ClarionDbg.Cli
         // the engine, and GetWindowText does that for a foreign window, so the caption is read with
         // WM_GETTEXT's non-blocking sibling, InternalGetWindowText.
 
+        // DO NOT ADD A MESSAGE-SENDING API HERE. The target is FROZEN while we hold the debug event, so:
+        //   * SendMessage / SendMessageTimeout / SendNotifyMessage block on a thread that cannot pump — they
+        //     deadlock the ENGINE, and with it the debuggee, until the timeout (or forever).
+        //   * GetWindowText and GetWindowTextLength look harmless but send WM_GETTEXT cross-process. That is
+        //     why the caption below is read with InternalGetWindowText, which reads the window's stored text
+        //     directly and sends nothing. Do not "simplify" it back to GetWindowText.
+        //   * PostMessage does not block, but the message sits in the queue and is delivered when we resume —
+        //     a side effect on the program under test, which a debugger must never introduce.
+        // Everything used here is a pure window-manager state read: EnumWindows, GetWindow,
+        // GetWindowThreadProcessId, IsWindowVisible, GetClassName, InternalGetWindowText.
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -396,6 +408,191 @@ namespace ClarionDbg.Cli
             }
             sb.Append("]}");
             return sb.ToString();
+        }
+        // ============================================================ thread inventory + selection (item 1/2)
+        //
+        // `threads`        list every live thread, described by its topmost CLARION frame (what makes the list
+        //                  readable when every thread is parked in GetMessage) — see the frozen protocol.
+        // `thread <tid>`   choose which thread the read commands answer about for the REST OF THIS STOP.
+        //
+        // The selection is per-stop and never carried across one: PausedWait resets it to the stopped thread
+        // every time. Resume-type commands always act on the stopped thread and reset the selection first, so
+        // a step can never be reported against a thread the user was merely looking at.
+
+        /// <summary>threads — the thread list for the picker. Ordered stopped-thread-first, then newest
+        /// created first (an MDI child's thread is newer than the frame's).</summary>
+        private void HandleThreadsCommand(uint stoppedTid)
+        {
+            var probes = ProbeAllThreads(stoppedTid);
+            probes.Sort((x, y) =>
+            {
+                if (x.IsStopped != y.IsStopped) return x.IsStopped ? -1 : 1;   // stopped thread first
+                return y.Seq.CompareTo(x.Seq);                                  // then newest first
+            });
+
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"threads\",\"stopped\":").Append(stoppedTid)
+              .Append(",\"selected\":").Append(_selectedTid)
+              .Append(",\"threads\":[");
+            for (int i = 0; i < probes.Count; i++)
+            {
+                var p = probes[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"tid\":").Append(p.Tid)
+                  .Append(",\"clarionThread\":").Append(ClarionThreadJson(p.ClarionThread))
+                  .Append(",\"proc\":").Append(Json.Str(p.TopProc))
+                  .Append(",\"module\":").Append(Json.Str(p.TopModule))
+                  .Append(",\"line\":").Append(p.TopLine)
+                  .Append(",\"state\":").Append(Json.Str(p.State))
+                  .Append(",\"clarionFrames\":").Append(p.ClarionFrames)
+                  .Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")
+                  .Append(",\"selected\":").Append(p.Tid == _selectedTid ? "true" : "false")
+                  .Append('}');
+            }
+            sb.Append("]}");
+            if (EmitJson) Console.WriteLine("@JSON " + sb);
+
+            Console.WriteLine($"  threads ({probes.Count}), stopped {stoppedTid}, selected {_selectedTid}:");
+            foreach (var p in probes)
+                Console.WriteLine($"    {(p.IsStopped ? "*" : " ")}{(p.Tid == _selectedTid ? ">" : " ")} tid {p.Tid,-6} "
+                    + $"{p.State,-8} {(p.TopProc ?? "(no Clarion frame)")}"
+                    + (p.TopModule != null ? "  " + p.TopModule + ":" + p.TopLine : "")
+                    + (ClarionThreadJson(p.ClarionThread) != "null" ? "  [Clarion thread " + p.ClarionThread + "]" : ""));
+        }
+
+        /// <summary>The RTL's thread number as a JSON value. Clarion numbers its threads from 1, so a 0 back
+        /// from Cla$THREAD means "not a Clarion thread" — that is not a thread number, and the protocol says
+        /// never to invent one, so it and every unreadable outcome map to null.</summary>
+        private static string ClarionThreadJson(string raw)
+        {
+            int n;
+            return int.TryParse(raw, out n) && n > 0 ? n.ToString() : "null";
+        }
+
+        /// <summary>thread &lt;tid&gt; — point the read commands at another thread for the rest of this stop.
+        /// An unknown or exited tid is refused and the selection is left exactly as it was.</summary>
+        private void HandleThreadSelectCommand(string[] parts, uint stoppedTid)
+        {
+            if (parts.Length < 2) { EmitThreadSelected(_selectedTid, false, "thread expects: thread <tid>"); return; }
+            uint tid;
+            if (!uint.TryParse(parts[1], out tid))
+            {
+                EmitThreadSelected(_selectedTid, false, "not a thread id: '" + parts[1] + "'");
+                return;
+            }
+            if (!_threads.Contains(tid))
+            {
+                EmitThreadSelected(_selectedTid, false, "unknown or exited thread " + tid);
+                return;
+            }
+            _selectedTid = tid;
+            EmitThreadSelected(tid, true, null);
+            Console.WriteLine($"  thread {tid} selected{(tid == stoppedTid ? " (the stopped thread)" : " — reads now answer for this thread")}");
+        }
+
+        private void EmitThreadSelected(uint tid, bool ok, string error)
+        {
+            if (EmitJson)
+                Console.WriteLine("@JSON {\"event\":\"threadselected\",\"tid\":" + tid
+                    + ",\"ok\":" + (ok ? "true" : "false")
+                    + (error != null ? ",\"error\":" + Json.Str(error) : "") + "}");
+            if (!ok) Console.WriteLine("  thread: " + error);
+        }
+
+        // ============================================================ which thread a Pause reports (item 3)
+
+        /// <summary>
+        /// Choose the thread to report at a pause, by its STACK rather than its EIP.
+        ///
+        /// Measured on clbrws.exe (task 0128a37e item 0): with the app idle, the frame thread AND every browse
+        /// thread sit at win32u!NtUserGetMessage+0xC, so the old EIP test disqualified all of them and the
+        /// fallback took the frame — the thread whose copy of the record buffer was never filled. What DOES
+        /// separate them is the stack (only Clarion threads carry Clarion frames: 2 of 8 threads in the
+        /// measured run) and, between several Clarion threads, which one's window is on top.
+        ///
+        /// The rules, in order:
+        ///   1. CANDIDATE = a thread other than the injected break thread whose stack carries at least one
+        ///      Clarion frame. This is binary and reliable. The frame COUNT is not usable for ranking — the
+        ///      ESP-scan fallback over-includes stale return addresses, and the measured frame thread showed
+        ///      10 frames against the browse thread's 3.
+        ///   2. window-z  Among candidates, the one owning the topmost visible window whose parent belongs to
+        ///      ANOTHER thread — i.e. sibling z-rank 0 under the MDI client, the active MDI child. Measured:
+        ///      opening Publishers then Authors and re-activating Publishers flips the ranking to Publishers,
+        ///      which is what the developer is looking at. Creation order cannot see that, which is why it is
+        ///      only the tiebreak.
+        ///   3. newest    No window evidence (no windows up yet, mid-teardown, or the enumeration named no
+        ///      candidate): the newest candidate by OS creation order.
+        ///   4. first-readable / main  No candidate at all: the first readable non-break thread in creation
+        ///      order, else the main thread. This is the pre-existing fallback, unchanged.
+        ///
+        /// Step 2 is BEST-EFFORT throughout — any failure falls through to 3 and then 4, so a pause always
+        /// lands somewhere sane. It is also strictly read-only: it reads window-manager state and sends no
+        /// messages (see the prohibition above the user32 P/Invokes).
+        /// </summary>
+        private uint PickPauseThread(uint breakTid)
+        {
+            List<ThreadProbe> probes;
+            try { probes = ProbeAllThreads(0, withClarionThread: false); }
+            catch (Exception ex)
+            {
+                uint lr0 = LastResortThread(breakTid);
+                LogPauseChoice(lr0, "probe-failed(" + ex.GetType().Name + ")", 0);
+                return lr0;
+            }
+
+            // 1. candidates: a Clarion frame on the stack, and never the injected break thread
+            var candidates = new List<ThreadProbe>();
+            foreach (var p in probes)
+                if (p.Tid != breakTid && p.HaveCtx && p.ClarionFrames > 0) candidates.Add(p);
+
+            if (candidates.Count == 0)
+            {
+                uint fb = 0;
+                foreach (var p in probes)          // probes are already in creation order
+                    if (p.Tid != breakTid && p.HaveCtx) { fb = p.Tid; break; }
+                if (fb != 0) { LogPauseChoice(fb, "first-readable", 0); return fb; }
+                uint lr = LastResortThread(breakTid);
+                LogPauseChoice(lr, "main", 0);
+                return lr;
+            }
+
+            // 2. window-z: the candidate owning the topmost cross-thread visible window (active MDI child).
+            //    Best-effort: a throw, an empty enumeration, or a window set naming no candidate all fall
+            //    through to step 3 rather than failing the pause.
+            try { FillWindowEvidence(candidates, GetProcessId(_hProcess)); }
+            catch { /* window manager unavailable / racing teardown — fall through to creation order */ }
+
+            ThreadProbe best = null;
+            foreach (var p in candidates)
+                if (p.CrossRank != int.MaxValue && (best == null || p.CrossRank < best.CrossRank)) best = p;
+            if (best != null)
+            {
+                LogPauseChoice(best.Tid, "window-z", candidates.Count);
+                return best.Tid;
+            }
+
+            // 3. newest candidate by creation order
+            foreach (var p in candidates)
+                if (best == null || p.Seq > best.Seq) best = p;
+            LogPauseChoice(best.Tid, "newest", candidates.Count);
+            return best.Tid;
+        }
+
+        /// <summary>The pre-existing last resort: the main thread, else the thread the break landed on.</summary>
+        private uint LastResortThread(uint breakTid)
+        {
+            return _mainTid != 0 ? _mainTid : breakTid;
+        }
+
+        /// <summary>Say which thread a pause chose and WHY. The Owner asked about a thread they did not pick;
+        /// the next person to wonder the same should find the answer in the log rather than in this file.</summary>
+        private void LogPauseChoice(uint tid, string rule, int candidates)
+        {
+            string text = $"pause: thread {tid} chosen by {rule} ({candidates} Clarion candidate(s) of {_threads.Count} live thread(s))";
+            Console.WriteLine("  [" + text + "]");
+            if (EmitJson)
+                Console.WriteLine("@JSON {\"event\":\"console\",\"level\":\"info\",\"text\":" + Json.Str(text)
+                    + ",\"tid\":" + tid + "}");
         }
     }
 }

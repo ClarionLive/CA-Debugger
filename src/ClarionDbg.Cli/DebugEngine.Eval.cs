@@ -165,7 +165,7 @@ namespace ClarionDbg.Cli
                 // merely out of scope right now (we are paused elsewhere) — flag that so the Watch row reads
                 // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
                 bool outOfScope = haveCtx && IsKnownLocalName(name);
-                if (EmitJson) Console.WriteLine("@JSON " + Json.WatchMiss(name, outOfScope));
+                EmitThreadEvent(_selectedTid, Json.WatchMiss(name, outOfScope));
                 Console.WriteLine($"  watch {name}: {(outOfScope ? "out of scope" : "not found")}");
                 return;
             }
@@ -211,7 +211,7 @@ namespace ClarionDbg.Cli
         /// instead of leaving it pending — the failure the old EmitError path never delivered.</summary>
         private void EmitWatchError(string name, string reason)
         {
-            if (EmitJson) Console.WriteLine("@JSON " + Json.WatchError(name, reason));
+            EmitThreadEvent(_selectedTid, Json.WatchError(name, reason));
             Console.WriteLine($"  watch {name}: {reason}");
         }
 
@@ -233,8 +233,7 @@ namespace ClarionDbg.Cli
             string value = FormatValueAt(typeCode, target, size, places, instanceVa);
             bool isNullRef = typeCode == 0x16 && value == "(null)";
             string tn = ClarionTypeLabel(typeCode, target, size, places, isNullRef);
-            if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note));
+            EmitThreadEvent(_selectedTid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}{(note != null ? " — " + note : "")}");
             for (int row = 0; row < read; row += 16)
             {

@@ -215,20 +215,16 @@ namespace ClarionDbg.Cli
 
         private void EmitLibStateRows(string reqId, List<string> rows)
         {
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
-                    + ",\"items\":[" + string.Join(",", rows) + "]}");
-            else
-                foreach (var r in rows) Console.WriteLine("  " + r);
+            EmitThreadEvent(_selectedTid, "{\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
+                + ",\"items\":[" + string.Join(",", rows) + "]}");
+            if (!EmitJson) foreach (var r in rows) Console.WriteLine("  " + r);
         }
 
         private void EmitLibStateError(string reqId, string error)
         {
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
-                    + ",\"error\":" + Json.Str(error) + ",\"items\":[]}");
-            else
-                Console.WriteLine("  libstate: " + error);
+            EmitThreadEvent(_selectedTid, "{\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
+                + ",\"error\":" + Json.Str(error) + ",\"items\":[]}");
+            if (!EmitJson) Console.WriteLine("  libstate: " + error);
         }
     }
 }
