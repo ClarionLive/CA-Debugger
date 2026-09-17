@@ -46,7 +46,7 @@ const dtModes = {};
 
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
 const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','wireEdit','applyValue','showTipFor'].map(n => {
+             'clearEditMeta','setEditMeta','applyNote','wireEdit','applyValue','showTipFor'].map(n => {
   try { return extract(n); }
   catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
 }).join('\n');

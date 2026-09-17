@@ -72,7 +72,7 @@ function refreshWatchClipping() { }
 // ---- the page's own code ---------------------------------------------------------------------------
 const FNS = ['esc', 'send', 'resetThreadState',
   'dtParseInt', 'fieldPart', 'fmtClarionDate', 'fmtClarionTime', 'dtDefault', 'dtModeFor', 'dtApply', 'dtCycle',
-  'clearEditMeta', 'setEditMeta', 'wireEdit', 'applyValue', 'showTipFor',
+  'clearEditMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
   'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
@@ -465,6 +465,65 @@ console.log('\n9) a refused selection leaves the pad on the thread it actually h
         !sentActions().includes('stack') && !sentActions().includes('rewatch'), sentActions().join(','));
   check('the pad resyncs from the engine', sentActions().includes('threads'));
   check('the chip is not left saying "switching…"', $('thSelText').textContent !== 'switching…', $('thSelText').textContent);
+}
+
+console.log('\n9b) a refusal names the thread that was ASKED FOR — it is never read as a selection');
+{
+  // Protocol amendment 3: on ok:false the tid is the REQUESTED thread and the engine's selection is
+  // unchanged. Nothing in the reply may move the pad's own selection; the authoritative one comes from
+  // the `threads` resync. A malformed request carries NO tid at all — absent, never 0.
+  resetAll();
+  onThreads(THREADS_EVENT);
+  selectThread(BROWSE_TID);
+  onMessage(JSON.stringify({ type: 'threadselected', tid: BROWSE_TID, ok: false, error: 'unknown or exited thread ' + BROWSE_TID }));
+  check('the REQUESTED thread is what the message names', TOASTS.some(t => t.startsWith('Thread ' + BROWSE_TID + ':')),
+        TOASTS.join('|'));
+  check('the pad keeps the selection it already had', selTid === STOP_TID, 'selTid=' + selTid);
+
+  // a malformed request: no tid member at all
+  resetAll();
+  onThreads(THREADS_EVENT);
+  selectThread(BROWSE_TID);
+  onMessage(JSON.stringify({ type: 'threadselected', ok: false, error: "thread expects: thread <tid>" }));
+  check('no tid is invented in the message', TOASTS.some(t => t === 'thread expects: thread <tid>'), TOASTS.join('|'));
+  check('the selection still does not move', selTid === STOP_TID, 'selTid=' + selTid);
+  check('the chip is not left saying "switching…"', $('thSelText').textContent !== 'switching…');
+  check('and it never reads an absent tid as thread 0', !TOASTS.some(t => t.indexOf('Thread 0') >= 0), TOASTS.join('|'));
+
+  // ok with no tid tells us nothing about what we are looking at: ask, do not assume
+  resetAll();
+  onThreads(THREADS_EVENT);
+  selectThread(BROWSE_TID);
+  clearSent();
+  onMessage(JSON.stringify({ type: 'threadselected', ok: true }));
+  check('an ok with no tid is not taken as a selection', selTid === STOP_TID, 'selTid=' + selTid);
+  check('…it asks the engine what is actually selected', sentActions().includes('threads'), sentActions().join(','));
+}
+
+console.log('\n9c) a module-data row says the same thing about a thread as a Watch row does');
+{
+  // The engine can now qualify a moduledata row the way it qualifies a watch reply. Dropping the note in
+  // the Variables tree would show a ,THREAD module symbol's shared template value as though it were this
+  // thread's own — while a Watch row for the SAME name at the SAME stop says otherwise. One function now
+  // does the marking for both panels, so they cannot drift into two vocabularies for one fact.
+  const NOTE = 'no thread instance — shared template value';
+  const c = new El('span'); c.classList.add('vval'); c.textContent = '0';
+  check('the caveat is marked and explained, not just underlined',
+        applyNote(c, NOTE) && c.classList.contains('noted') && c.title === NOTE,
+        JSON.stringify({ cls: c.classList.toString(), title: c.title }));
+
+  const plain = new El('span'); plain.classList.add('vval'); plain.textContent = '1';
+  applyNote(plain, undefined);
+  check('a row with no caveat is left alone', !plain.classList.contains('noted') && plain.title === undefined);
+
+  // dtApply owns the title on a numeric row, so the caveat has to be applied AFTER it or the explanation
+  // is overwritten by 'raw: N' and the dotted underline is left with nothing behind it. The Watch panel's
+  // ordering is proved end to end by tools/test-pad-editmeta.js; this keeps the tree's the same way round.
+  const tree = pad.extract(html, 'renderVarRow');
+  check('the Variables tree applies it AFTER dtApply', tree.indexOf('dtApply(') < tree.indexOf('applyNote('),
+        'dtApply@' + tree.indexOf('dtApply(') + ' applyNote@' + tree.indexOf('applyNote('));
+  check('and the Watch panel uses the same function',
+        pad.extract(html, 'applyValue').indexOf('applyNote(') > 0);
 }
 
 console.log('\n10) a row is never left on "…" when no reply can come');

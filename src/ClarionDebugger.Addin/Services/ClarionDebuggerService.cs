@@ -224,7 +224,10 @@ namespace ClarionDebugger.Services
         public event Action<string, string, string, uint?> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON, tid)
         public event Action<Dictionary<string, string>, uint?> RegsReceived; // standalone regs reply (regs, tid)
         public event Action<DebugThreadList> ThreadsReceived;      // thread inventory for the current stop
-        public event Action<uint, bool, string> ThreadSelected;     // 'thread <tid>' result: tid, ok, error
+        // 'thread <tid>' result. The tid is the thread that was ASKED FOR (null when the request was
+        // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
+        // the selection it had and asks 'threads' for the authoritative one.
+        public event Action<uint?, bool, string> ThreadSelected;
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
@@ -803,7 +806,10 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "threadselected":
-                    ThreadSelected?.Invoke(GetUIntOrNull(json, "tid") ?? 0u, GetBool(json, "ok"), GetStr(json, "error"));
+                    // The tid is the thread that was ASKED FOR, and a malformed request carries none at all
+                    // — passed through as null rather than 0, because 0 would be a sentinel the pad reads
+                    // as a real thread id. Absent is the only way to say "unknown".
+                    ThreadSelected?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "ok"), GetStr(json, "error"));
                     break;
 
                 case "watch":

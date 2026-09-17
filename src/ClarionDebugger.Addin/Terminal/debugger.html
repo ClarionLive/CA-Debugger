@@ -957,6 +957,17 @@
     delete cell.dataset.va; delete cell.dataset.tc; delete cell.dataset.sz; delete cell.dataset.pl;
     if(cell._vedit){ cell._vedit.remove(); cell._vedit=null; }
   }
+  // A REAL value that carries a caveat — a THREADed name with no instance on the thread being read, or one
+  // this thread hasn't used yet. ONE function for it, because the Watch panel and the Variables tree are
+  // saying the same thing about the same name at the same stop: two markings would drift into two
+  // vocabularies for one fact.
+  // Callers apply it AFTER dtApply: dtApply owns cell.title for its own 'raw: N' hint and would otherwise
+  // overwrite the explanation on every integer/DATE/TIME row, leaving the dotted underline with nothing
+  // behind it. An ordinary value keeps dtApply's tooltip; only a qualified one's explanation wins.
+  function applyNote(cell, note){
+    if(!cell || !note) return false;
+    cell.classList.add('noted'); cell.title=note; return true;
+  }
   function setEditMeta(cell, meta){
     if(!cell || !meta || !meta.va) return;
     cell.classList.add('editable');
@@ -997,11 +1008,7 @@
       setEditMeta(v, meta);
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
-      // A real value with a caveat (e.g. a THREADed variable this thread hasn't used yet). Applied AFTER
-      // dtApply, which owns cell.title for its own 'raw: N' hint and would otherwise overwrite the caveat on
-      // every integer/DATE/TIME row — leaving the dotted 'noted' underline with nothing to explain it.
-      // An ordinary value keeps dtApply's tooltip; only a qualified one's explanation wins.
-      if(meta && meta.note){ v.classList.add('noted'); v.title=meta.note; }
+      applyNote(v, meta && meta.note);   // …then the caveat, which must win the tooltip back off dtApply
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -1181,6 +1188,10 @@
     container.appendChild(row);
     wireEdit(row);   // adds the ✎ edit-value pencil when this row carries edit metadata
     dtApply(row.querySelector('.vval'), v.name, v.value);   // DATE/TIME view-as
+    // …then the caveat, if the engine qualified this row. Same function the Watch panel uses: without it
+    // a ,THREAD module symbol's shared template value reads here as this thread's own, while a Watch row
+    // for the SAME name at the SAME stop says otherwise.
+    applyNote(row.querySelector('.vval'), v.note);
 
     // TOP-LEVEL scalar leaf (a local or module-data item): make it watchable by name — pin star + right-click
     // "Add to Watch", the same affordances a Global gets. Watches resolve against the current frame FIRST (a
@@ -1503,11 +1514,15 @@
   function onThreadSelected(m){
     threadSwitching=false;
     if(!m || m.ok!==true){
-      // The engine refused (unknown or exited tid). Its selection is unchanged, so resync from it rather
-      // than leaving the pad claiming a thread it never got.
-      toast('Thread '+((m&&m.tid!=null)?m.tid:'?')+': '+((m&&m.error)||'could not select'));
+      // A refusal names the thread that was ASKED FOR, not the one that survived — so nothing here may be
+      // read as a selection. The pad KEEPS the selection it already had (selectThread never moved it; it
+      // only set the switching flag) and re-asks `threads` for the engine's authoritative answer.
+      // A malformed request carries no tid at all: don't invent one in the message.
+      toast(((m && m.tid!=null) ? 'Thread '+m.tid+': ' : '') + ((m && m.error) || 'could not select that thread'));
       requestThreads(); renderThreadUi(); return;
     }
+    // ok with no tid would leave us not knowing what we are looking at — ask, rather than assume.
+    if(m.tid==null){ requestThreads(); renderThreadUi(); return; }
     selTid=m.tid;
     beginThreadSwitch(m.tid);
   }
