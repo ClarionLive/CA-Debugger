@@ -69,13 +69,14 @@ namespace ClarionDbg.Cli
                 failures.Add("empty object: stamping produced malformed JSON");
 
             CheckEditVeto(failures);
+            CheckThreadedWriteGuard(failures);
 
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
             {
                 Console.WriteLine($"protocolcheck: {shapes.Length} event shapes OK - a known tid is stamped, "
-                                  + "an unknown tid is absent (never 0 or -1); and a vetoed row offers no "
-                                  + "editable descendant.");
+                                  + "an unknown tid is absent (never 0 or -1); a vetoed row offers no "
+                                  + "editable descendant; and a write cannot land on the shared template.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -140,6 +141,56 @@ namespace ClarionDbg.Cli
             if (CountVa(scalarVetoed) != 0) failures.Add("edit-veto: a vetoed scalar row still carried edit metadata");
             if (scalarVetoed.IndexOf("\"note\":", StringComparison.Ordinal) < 0)
                 failures.Add("edit-veto: a vetoed row dropped its explanation");
+        }
+
+        /// <summary>
+        /// A write must never land on the shared .cwtls TEMPLATE.
+        ///
+        /// The template is the block every Clarion thread's instance is copied from, so writing it changes
+        /// the value threads that DO NOT EXIST YET will start with — a side effect on the program's future,
+        /// from a debugger that is supposed to observe it. The row-level veto stops the pencil appearing,
+        /// but the veto only covers rows the engine builds and can classify: a row held from before a thread
+        /// switch, an expanded node, or a hand-typed CLI setval all reach the writer directly. This asserts
+        /// the guard AT THE WRITE, which is the only place that covers every path in.
+        ///
+        /// The template branch is pure address arithmetic, so it is fully assertable with no debuggee. The
+        /// other-thread branch needs a live THR$GetInstance emulation and so is NOT covered here — it is
+        /// exercised against a real target instead; see the ticket notes.
+        /// </summary>
+        private static void CheckThreadedWriteGuard(List<string> failures)
+        {
+            var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            // An image mapped at 0x400000 whose .cwtls template block is RVA 0xC8000..0xCC000.
+            eng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000);
+            const uint tid = 4812;
+            string why;
+
+            // THE RULE: the template block is refused, at its first byte, in the middle and at its last.
+            uint[] inside = { 0x4C8000, 0x4CAF60, 0x4CBFFF };
+            foreach (var va in inside)
+            {
+                if (eng.ThreadedWriteAllowedForTest(va, tid, out why))
+                    failures.Add("threaded-write: 0x" + va.ToString("X") + " is inside the shared template but the write was allowed");
+                else if (string.IsNullOrEmpty(why))
+                    failures.Add("threaded-write: 0x" + va.ToString("X") + " was refused with no reason for the pad to show");
+                else if (why.IndexOf("template", StringComparison.OrdinalIgnoreCase) < 0)
+                    failures.Add("threaded-write: the refusal does not say why: " + why);
+            }
+
+            // CONTROLS: ordinary addresses must still be writable, or the guard has broken editing for
+            // everyone. One below the block, one above, one in a different image entirely.
+            uint[] outside = { 0x4C7FFF, 0x4CC000, 0x401000, 0x00A2FD00 };
+            foreach (var va in outside)
+            {
+                if (!eng.ThreadedWriteAllowedForTest(va, tid, out why))
+                    failures.Add("threaded-write control: ordinary address 0x" + va.ToString("X")
+                                 + " was refused — " + why);
+            }
+
+            // An engine with no threaded image must not refuse anything.
+            var plain = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            if (!plain.ThreadedWriteAllowedForTest(0x4CAF60, tid, out why))
+                failures.Add("threaded-write control: a target with no threaded image still refused a write — " + why);
         }
 
         /// <summary>How many rows in this JSON carry edit metadata (a `"va":` member).</summary>
