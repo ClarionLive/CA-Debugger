@@ -303,11 +303,16 @@ namespace ClarionDebugger.Terminal
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
-        private void OnSvcThreadSelected(uint tid, bool ok, string error) => UI(() =>
+        // The tid here is the thread that was ASKED FOR, and a malformed request carries none — so it is
+        // forwarded through TidJson, which OMITS the member rather than writing a 0 the page would read as
+        // a real thread id. On a refusal the engine's selection is unchanged; the page keeps the selection
+        // it had and re-asks 'threads' for the authoritative one.
+        private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
-            Post("{\"type\":\"threadselected\",\"tid\":" + tid + ",\"ok\":" + (ok ? "true" : "false")
+            Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
-            if (!ok) Console("err", "thread " + tid + ": " + (error ?? "could not select"));
+            if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
+                                  + ": " + (error ?? "could not select"));
         });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
@@ -1244,7 +1249,12 @@ namespace ClarionDebugger.Terminal
         /// dropped. Emitting 0 for "unknown" would make every such reply look like a different thread's.</summary>
         private static string TidJson(uint? tid)
         {
-            return tid.HasValue ? ",\"tid\":" + tid.Value.ToString(CultureInfo.InvariantCulture) : string.Empty;
+            // 0 is treated as "unknown" too, not written out: no Win32 thread has id 0, so a 0 reaching here
+            // is a caller that turned an absent tid into a sentinel — which the page would then read as a
+            // real thread and start dropping good replies against. Enforcing it here rather than trusting
+            // every caller is the point; the engine's own writer does the same on its side.
+            if (!tid.HasValue || tid.Value == 0) return string.Empty;
+            return ",\"tid\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
 
         /// <summary>Push the engine's thread inventory to the page (Call Stack thread picker). Names come from
@@ -1844,6 +1854,15 @@ namespace ClarionDebugger.Terminal
         }
 
         // minimal extractor for the flat {action,data} messages from the page
+        /// <summary>Read one field out of a message from the page.
+        /// <para>
+        /// RULE FOR EVERY PAYLOAD THIS READS: a field whose content is user-typed or comes from the
+        /// debuggee goes LAST. This takes the FIRST <c>"key":</c> it finds anywhere in the text, so a
+        /// string value containing <c>"tid":123</c> or <c>"line":9</c> is read as that field when it sits
+        /// ahead of the real one. The page's own senders say the same thing where they build their
+        /// payloads — breakonprocentry puts module+line ahead of the procedure name, editvar puts tid
+        /// ahead of the value the user typed — and any new payload must do the same.
+        /// </para></summary>
         private static string JsonVal(string json, string key)
         {
             string search = "\"" + key + "\":";

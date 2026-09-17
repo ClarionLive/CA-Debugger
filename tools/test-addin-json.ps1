@@ -17,28 +17,31 @@
 # Exit code 0 = all checks passed.
 
 param(
-  [string] $ServicePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs')
+  [string] $ServicePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'),
+  [string] $WebViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs')
 )
 
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -Raw -LiteralPath $ServicePath
+$web = Get-Content -Raw -LiteralPath $WebViewPath
 
 function Get-Method {
-  param([string] $Signature)
-  $i = $src.IndexOf($Signature, [StringComparison]::Ordinal)
+  param([string] $Signature, [string] $From)
+  if (-not $From) { $From = $src }
+  $i = $From.IndexOf($Signature, [StringComparison]::Ordinal)
   if ($i -lt 0) {
-    # Pointed at a version that predates the reader under test: say so plainly instead of throwing
+    # Pointed at a version that predates the method under test: say so plainly instead of throwing
     # halfway through, which reads like a broken test rather than the before/after proof it is.
-    Write-Host "  FAIL  absent from this version of the service: $Signature"
+    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
     Write-Host ''
-    Write-Host 'This service predates the reader these checks cover. 1 FAILURE(S)'
+    Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
     exit 1
   }
   $depth = 0; $started = $false
-  for ($j = $i; $j -lt $src.Length; $j++) {
-    $c = $src[$j]
+  for ($j = $i; $j -lt $From.Length; $j++) {
+    $c = $From[$j]
     if ($c -eq '{') { $depth++; $started = $true }
-    elseif ($c -eq '}') { $depth--; if ($started -and $depth -eq 0) { return $src.Substring($i, $j - $i + 1) } }
+    elseif ($c -eq '}') { $depth--; if ($started -and $depth -eq 0) { return $From.Substring($i, $j - $i + 1) } }
   }
   throw "unterminated: $Signature"
 }
@@ -46,7 +49,8 @@ function Get-Method {
 $methods = @(
   (Get-Method 'private static string ScanNumberToken(string json, string key)'),
   (Get-Method 'private static int? GetIntOrNull(string json, string key)'),
-  (Get-Method 'private static uint? GetUIntOrNull(string json, string key)')
+  (Get-Method 'private static uint? GetUIntOrNull(string json, string key)'),
+  (Get-Method 'private static string TidJson(uint? tid)' $web)
 ) -join "`n"
 
 # same bodies, reachable from PowerShell
@@ -103,6 +107,13 @@ Check 'empty input' ($null -eq [PadJsonProbe]::GetUIntOrNull('', 'tid')) ''
 Check 'a threads ROW parsed on its own' ([PadJsonProbe]::GetUIntOrNull('{"tid":4812,"clarionThread":null}', 'tid') -eq 4812) ''
 Check 'a negative tid is not a thread id' ($null -eq [PadJsonProbe]::GetUIntOrNull('{"tid":-3}', 'tid')) ''
 Check 'the signed reader still reads a negative' ([PadJsonProbe]::GetIntOrNull('{"line":-3}', 'line') -eq -3) ''
+
+Write-Host ''
+Write-Host 'and the WRITER says "unknown" the same way the reader hears it: by leaving the member out'
+Check 'an absent tid writes no member at all' ([PadJsonProbe]::TidJson($null) -eq '') "'$([PadJsonProbe]::TidJson($null))'"
+Check 'a 0 is a sentinel, not a thread - written as absent too' ([PadJsonProbe]::TidJson(0) -eq '') "'$([PadJsonProbe]::TidJson(0))'"
+Check 'a real tid is written' ([PadJsonProbe]::TidJson(116932) -eq ',"tid":116932') ([PadJsonProbe]::TidJson(116932))
+Check 'a high DWORD is written whole' ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') ([PadJsonProbe]::TidJson(4294967295))
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
