@@ -124,6 +124,8 @@ namespace ClarionDebugger.Services
         public int Size;            // byte width — for edit-variable-value
         public int Places;          // DECIMAL scale (watch reports 0; correct places only for frame locals)
         public bool OutOfScope;     // a known frame local, but execution is paused outside its procedure
+        public string Error;        // resolved by name but unreadable (e.g. a THREADed instance the RTL wouldn't yield)
+        public string Note;         // a real but qualified value (e.g. a THREADed variable this thread hasn't used yet)
     }
 
     /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
@@ -640,9 +642,7 @@ namespace ClarionDebugger.Services
                     if (pause != null)
                     {
                         pause.ResolvedPath = ResolveModulePath(pause.Module);
-                        // a 'watch' pause is a transient func-eval round-trip — don't record its trap VA
-                        if (!string.Equals(pause.Reason, "watch", StringComparison.OrdinalIgnoreCase))
-                            CurrentVa = pause.Va;
+                        CurrentVa = pause.Va;
                         SetState(DebugSessionState.Paused);
                         Paused?.Invoke(pause);
                     }
@@ -988,7 +988,13 @@ namespace ClarionDebugger.Services
             try
             {
                 var w = new DebugWatch { Name = GetStr(json, "name"), Found = GetBool(json, "found") };
-                if (!w.Found) { w.OutOfScope = GetBool(json, "outOfScope"); return w; }
+                if (!w.Found)
+                {
+                    w.OutOfScope = GetBool(json, "outOfScope");
+                    w.Error = GetStr(json, "error");   // a read that failed, as opposed to a name that isn't known
+                    return w;
+                }
+                w.Note = GetStr(json, "note");
                 w.Threaded = GetBool(json, "threaded");
                 w.TypeName = GetStr(json, "typeName");
                 w.Va = GetStr(json, "va");

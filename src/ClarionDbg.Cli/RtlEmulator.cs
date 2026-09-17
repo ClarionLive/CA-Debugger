@@ -65,14 +65,16 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Run the function at <paramref name="va"/> (zero args) and return EAX. Optionally seed EAX
-        /// (used by dispatcher getters that pass a selector in EAX before the call).</summary>
-        public uint Call(uint va, uint eaxSeed = 0)
+        /// (used by dispatcher getters that pass a selector in EAX before the call) and EBX (register-passed
+        /// second argument, e.g. THR$GetInstance's .cwtls base).</summary>
+        public uint Call(uint va, uint eaxSeed = 0, uint ebxSeed = 0)
         {
             _shadow.Clear(); Array.Clear(_stack, 0, _stack.Length); Trace.Clear();   // fresh state so one emulator can run many getters
             foreach (Register reg in new[] { Register.EAX, Register.EBX, Register.ECX, Register.EDX,
                                              Register.ESI, Register.EDI, Register.EBP })
                 _r[reg] = 0;
             _r[Register.EAX] = eaxSeed;
+            _r[Register.EBX] = ebxSeed;
             _r[Register.ESP] = _stackBase + StackSize - 0x100;
             _zf = _cf = _sf = _of = _df = false;
             Push(RetSentinel);
@@ -414,6 +416,11 @@ namespace ClarionDbg.Cli
         uint ReadMemSized(uint addr, MemorySize sz) => ReadN(addr, MemSize(sz));
 
         readonly Dictionary<uint, byte> _shadow = new Dictionary<uint, byte>();   // copy-on-write overlay: debuggee writes land here, never in the target
+
+        /// <summary>True when the last <see cref="Call"/> wrote to debuggee memory (outside the modeled stack),
+        /// even if it then threw. The real function would have mutated target state — e.g. THR$GetInstance
+        /// allocating a thread's instance on first touch — so its result is not a read-only answer.</summary>
+        public bool WroteDebuggeeMemory => _shadow.Count > 0;
 
         uint ReadN(uint addr, int n)
         {

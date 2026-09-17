@@ -136,6 +136,9 @@
   .veq { color:var(--fg-dim); margin:0 5px; }
   .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
   .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
+  /* a read that failed (never leave a row on "…"); and a real value that carries a caveat */
+  .vval.unavail { color:#c98a8a; font-style:italic; }
+  .vval.noted { border-bottom:1px dotted #8a8a5a; }
   .vval.changed { color:#ffd089; background:#5a431b66; border-radius:3px; padding:0 3px; }
   .lib-grp { color:var(--fg-dim); font-size:10px; text-transform:uppercase; letter-spacing:.5px; padding:5px 10px 2px; border-top:1px solid #ffffff0f; }
   .lib-grp:first-child { border-top:0; }
@@ -890,6 +893,20 @@
   // edit-variable-value: build the inline data-attrs for an editable scalar cell (engine-controlled
   // hex/number metadata — safe in attributes); empty string for non-editable rows.
   function editAttrs(v){ return v.va ? (' data-va="'+v.va+'" data-tc="'+v.typeCode+'" data-sz="'+(v.size||0)+'" data-pl="'+(v.places||0)+'"') : ''; }
+  // Drop a cell's edit affordance and the instance address it was bound to. The pencil is a SIBLING of the
+  // cell (wireEdit inserts it after), so it has to go too — a live pencil over a cleared va is exactly the
+  // stale-write hazard this prevents. setEditMeta/wireEdit re-add both when the new reply carries a va.
+  //
+  // The pencil is reached through the handle wireEdit parks on the cell, never by sibling POSITION: dtApply
+  // inserts its own .vas tag after the same cell and runs AFTER wireEdit, so on a DATE/TIME/integer row the
+  // order is [vval, vas, vedit-btn] and a nextElementSibling check silently leaves the pencil behind.
+  // A handle also stays correct if a row ever holds more than one editable cell.
+  function clearEditMeta(cell){
+    if(!cell) return;
+    cell.classList.remove('editable');
+    delete cell.dataset.va; delete cell.dataset.tc; delete cell.dataset.sz; delete cell.dataset.pl;
+    if(cell._vedit){ cell._vedit.remove(); cell._vedit=null; }
+  }
   function setEditMeta(cell, meta){
     if(!cell || !meta || !meta.va) return;
     cell.classList.add('editable');
@@ -898,15 +915,43 @@
 
   // apply a watch value to any matching row (Watch list + Variables tree)
   function applyValue(name, found, value, typeName, threaded, meta){
-    if(found) values.set(name,{value:value,type:typeName,threaded:threaded});
+    // The cache behind the source data-tip and the Watch detail panel. It must carry the caveat with the
+    // value — a "not yet used on this thread" template value would otherwise resurface in a tip as an
+    // ordinary live value — and a reply that resolved to NOTHING must evict it, or the tip keeps quoting a
+    // previous stop's value for a name the engine just said it cannot read.
+    if(found) values.set(name,{value:value,type:typeName,threaded:threaded,note:(meta&&meta.note)||null});
+    else values.delete(name);
     document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
-      v.classList.remove('pending');
-      if(!found){ v.textContent=(meta&&meta.outOfScope)?'(out of scope)':'(not found)'; v.classList.add('pending'); return; }
+      v.classList.remove('pending','unavail','noted'); v.removeAttribute('title');
+      // Rows are REUSED across stops, so every reply must first strip the previous one's edit metadata.
+      // setEditMeta only ever ADDS (it early-returns when this reply carries no va), and wireEdit keeps an
+      // existing pencil — so without this a row that resolved to thread A's instance would keep A's va and
+      // its pencil when a later stop reports the value unreadable or not-yet-allocated, and committing an
+      // edit would write ANOTHER thread's memory while the row shows the template value.
+      clearEditMeta(v);
+      if(!found){
+        // Three distinct misses, and every one of them RESOLVES the row — a value that can't be read must
+        // never leave "…" sitting there looking like it's still loading.
+        const err=meta&&meta.error;
+        v.textContent = err ? '(unavailable)' : (meta&&meta.outOfScope) ? '(out of scope)' : '(not found)';
+        v.classList.add(err?'unavail':'pending');
+        if(err) v.title=err;
+        // An OPEN detail panel is showing the previous stop's value; it has to follow the row, or the Watch
+        // panel keeps displaying a value for a name the engine just reported it could not read.
+        const det0=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'"]');
+        if(det0 && det0.style.display!=='none') det0.textContent=v.textContent;
+        return;
+      }
       v.textContent=value;
       setEditMeta(v, meta);
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
+      // A real value with a caveat (e.g. a THREADed variable this thread hasn't used yet). Applied AFTER
+      // dtApply, which owns cell.title for its own 'raw: N' hint and would otherwise overwrite the caveat on
+      // every integer/DATE/TIME row — leaving the dotted 'noted' underline with nothing to explain it.
+      // An ordinary value keeps dtApply's tooltip; only a qualified one's explanation wins.
+      if(meta && meta.note){ v.classList.add('noted'); v.title=meta.note; }
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -955,9 +1000,12 @@
   function wireEdit(row){
     if(!row) return;
     const cell=row.querySelector('.vval'); if(!cell || !cell.dataset.va) return;
-    if(!row.querySelector('.vedit-btn')){
+    // keyed off a handle on the cell (like dtApply's ._vas) so clearEditMeta can find this exact pencil
+    // again regardless of what else gets inserted next to the cell afterwards
+    if(!cell._vedit){
       const btn=document.createElement('span'); btn.className='vedit-btn'; btn.title='Edit value'; btn.textContent='✎';
       btn.onclick=e=>{ e.stopPropagation(); beginEdit(cell); };
+      cell._vedit=btn;
       cell.insertAdjacentElement('afterend', btn);
     }
   }
@@ -1521,7 +1569,11 @@
     let val=(vEl&&vEl.textContent.trim()) || (known&&known.value) || '';
     if(!val || val==='…') val = known&&known.value ? known.value : '(not watched — ☆ to add)';
     tipTarget={name,type,val};
-    $('dtName').textContent=name; $('dtType').textContent=type; $('dtVal').textContent=val;
+    $('dtName').textContent=name; $('dtType').textContent=type;
+    // carry the caveat into the tip: without it a shared-template or not-yet-used value reads as this
+    // thread's own live value, which is the misreading the row's own marker exists to prevent
+    const note=known&&known.note;
+    $('dtVal').textContent = note ? (val+'  ('+note+')') : val;
     // Anchor OVER the row (same Y) so the cursor reaches the tip/icons by moving right —
     // not down across the next row (which would steal the hover).
     const r=el.getBoundingClientRect();
@@ -1574,7 +1626,7 @@
       case 'libstate': onLibState(m.reqId, m.error, m.items||[]); break;
       case 'moduledata': buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope}); break;
+      case 'watch': applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
       case 'varset': onVarSet(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
