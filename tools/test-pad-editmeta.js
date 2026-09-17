@@ -140,30 +140,37 @@ check('editable + va + pencil restored', s.cls.includes('editable') && s.va === 
 
 // ---- the same lifecycle on rows where dtApply inserts a .vas tag between the cell and the pencil ----
 // A STRING row alone never exercises that ordering, which is how a position-based pencil lookup slipped through.
-function numericScenario(label, name, resolved, typeName, meta){
+function numericScenario(label, name, resolved, typeName, meta, rawTooltip){
   console.log(label);
+  const NOTE = 'not yet used on this thread — initial value';
+  const ERR = 'THR$GetInstance returned no instance';
   const row = makeRow(name);
   applyValue(name, true, resolved, typeName, true, meta);
   let s = state(row);
   console.log('   after a resolved reply: ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
   check('pencil armed, .vas tag present', s.pencil && siblings(row).includes('vas'));
+  // dtApply owns the tooltip for an ORDINARY value and must keep doing so
+  if (rawTooltip) check("dtApply's raw tooltip preserved", s.title === rawTooltip, 'title=' + JSON.stringify(s.title));
 
-  applyValue(name, true, resolved, typeName, true, { note: 'not yet used on this thread — initial value' });
+  applyValue(name, true, resolved, typeName, true, { note: NOTE });
   s = state(row);
   console.log('   after a no-va reply:    ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
   check('stale instance VA cleared', s.va === undefined, 'va=' + s.va);
   check("'editable' cleared", !s.cls.includes('editable'));
   check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
+  // the dotted 'noted' underline is meaningless without the explanation behind it
+  check('note survives dtApply in the tooltip', s.title === NOTE, 'title=' + JSON.stringify(s.title));
 
-  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  applyValue(name, false, null, null, false, { error: ERR });
   s = state(row);
   console.log('   after a failed read:    ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
   check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
+  check('engine reason in the tooltip', s.title === ERR, 'title=' + JSON.stringify(s.title));
 }
 numericScenario('5) LONG row (dtApply inserts .vas between the cell and the pencil)',
-                'JOB:JOBID', '4711', 'LONG', { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 });
-numericScenario('6) DATE row (same ordering, value rendered as a date)',
-                'TIT:PUBDATE', '80000', 'ULONG', { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 });
+                'JOB:JOBID', '4711', 'LONG', { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 }, '');
+numericScenario('6) DATE row (same ordering, value rendered as a date, raw kept in the tooltip)',
+                'TIT:PUBDATE', '80000', 'ULONG', { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 }, 'raw: 80000');
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

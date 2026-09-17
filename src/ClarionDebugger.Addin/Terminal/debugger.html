@@ -935,11 +935,14 @@
         return;
       }
       v.textContent=value;
-      // a real value with a caveat (e.g. a THREADed variable this thread hasn't used yet)
-      if(meta && meta.note){ v.classList.add('noted'); v.title=meta.note; }
       setEditMeta(v, meta);
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
+      // A real value with a caveat (e.g. a THREADed variable this thread hasn't used yet). Applied AFTER
+      // dtApply, which owns cell.title for its own 'raw: N' hint and would otherwise overwrite the caveat on
+      // every integer/DATE/TIME row — leaving the dotted 'noted' underline with nothing to explain it.
+      // An ordinary value keeps dtApply's tooltip; only a qualified one's explanation wins.
+      if(meta && meta.note){ v.classList.add('noted'); v.title=meta.note; }
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
