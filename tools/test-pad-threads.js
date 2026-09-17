@@ -234,7 +234,9 @@ console.log('\n3) selecting a thread asks the engine, then re-reads everything f
         $('stackList').innerHTML.includes('Reading Thread 2'), $('stackList').innerHTML);
 }
 
-console.log('\n4) the switch invalidates EVERY reader of the old thread\'s value');
+// "EVERY reader" is not something a test can prove — an unknown seventh reader would pass it silently.
+// Six is a number the next person can check against the enumeration in invalidateThreadScopedState.
+console.log('\n4) the switch invalidates all six readers of the old thread\'s value');
 {
   resetAll();
   onThreads(THREADS_EVENT);
@@ -296,7 +298,9 @@ console.log('\n5) a reply for the thread we are no longer showing is dropped');
   check('an UNSTAMPED reply is treated as unscoped and accepted', state(row).text === "'New Moon Books'", state(row).text);
 }
 
-console.log('\n6) a watch row re-resolves into 50414e39\'s per-thread states, not a second vocabulary');
+// The "not a second vocabulary" half of this claim is proved structurally in 9c (one function, both
+// panels); this body only shows the states arrive and are rendered, so that is all the name says.
+console.log('\n6) a watch row re-resolves into 50414e39\'s per-thread states');
 {
   resetAll();
   onThreads(THREADS_EVENT);
@@ -503,7 +507,8 @@ console.log('\n9b) a refusal names the thread that was ASKED FOR — it is never
   check('…it asks the engine what is actually selected', sentActions().includes('threads'), sentActions().join(','));
 }
 
-console.log('\n9d) a switch that was REFUSED gives the rows their editing back');
+// Not only a refusal: one of the three cases is an ok that names no thread, which is not one.
+console.log('\n9d) a switch that did NOT happen gives the rows their editing back');
 {
   // The TOCTOU guard strips every editable row at REQUEST time, before anyone knows the answer. When the
   // answer is "no", the selection never moved and the values on screen are still right — but nothing has
@@ -589,14 +594,17 @@ console.log('\n10) a row is never left on "…" when no reply can come');
   check('the console records it', LOGGED.some(l => l.includes('got no reply')), LOGGED.join('|'));
 }
 
-console.log('\n11) the sweep never fires over a newer switch or a resumed target');
+console.log('\n11) the sweep never fires over a newer switch, nor once the target has resumed');
 {
+  // armPendingSweep gives up on a row still showing "…" — but only for the switch that armed it, and only
+  // while the target is still stopped. Both halves are guarantees this name claims, so both are exercised:
+  // the name used to promise the resume half while nothing in the body resumed anything.
   resetAll();
   onThreads(THREADS_EVENT);
   const row = makeRow('PUB:PUB_NAME');
   applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
   onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
-  onThreads(freshThreadsEvent(BROWSE_TID));
+  onThreads(freshThreadsEvent(BROWSE_TID, BROWSE_TID));
   onThreadSelected({ type: 'threadselected', tid: STOP_TID, ok: true });   // switched again straight away
   // the reply for the SECOND switch arrives
   onMessage(JSON.stringify({ type: 'watch', name: 'PUB:PUB_NAME', found: true, value: "'Algodata'",
@@ -604,6 +612,32 @@ console.log('\n11) the sweep never fires over a newer switch or a resumed target
   await sleep(PENDING_SWEEP_MS + 40);
   check('the first switch\'s sweep does not overwrite the second switch\'s value',
         state(row).text === "'Algodata'", state(row).text);
+
+  // the target resumes before the sweep is due: the row is mid-switch and still on "…", and marking it
+  // "(no reply)" would blame a thread for not answering a question nobody can answer while it runs
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const row2 = makeRow('PUB:PUB_NAME');
+  applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  check('(setup) the row is mid-switch, waiting on a reply', state(row2).text === '…');
+  onMessage(JSON.stringify({ type: 'resumed', mode: 'continue' }));
+  await sleep(PENDING_SWEEP_MS + 40);
+  check('a resumed target is never told a thread failed to answer',
+        state(row2).text === '…' && !state(row2).cls.includes('unavail'), state(row2).text);
+
+  // …and the !isPaused clause on its own, with the switch generation left intact, since a real resume
+  // trips the generation guard too and would hide it
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const row3 = makeRow('PUB:PUB_NAME');
+  applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  isPaused = false;                       // running again; the sweep for this same switch is still armed
+  await sleep(PENDING_SWEEP_MS + 40);
+  check('the paused check alone is enough to hold the sweep back',
+        state(row3).text === '…' && !state(row3).cls.includes('unavail'), state(row3).text);
+  isPaused = true;
 }
 
 console.log('\n11b) a thread id near the top of the DWORD range is a normal id, not "unknown"');
