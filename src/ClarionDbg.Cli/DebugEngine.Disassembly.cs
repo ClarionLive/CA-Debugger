@@ -68,7 +68,7 @@ namespace ClarionDbg.Cli
         /// mixed source/asm view). Especially useful when paused in external / no-source code
         /// (a DebugBreak int3, or an OS call) where the source pane is blank.
         /// </summary>
-        private void HandleDisasmCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        private void HandleDisasmCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
         {
             uint addr = haveCtx ? ctx.Eip : 0;
             int count = 16;
@@ -144,7 +144,11 @@ namespace ClarionDbg.Cli
             }
 
             if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"disasm\",\"addr\":\"0x" + addr.ToString("X") + "\",\"tag\":" + Json.Str(tag) + ",\"instrs\":[" + string.Join(",", jsonRows) + "]}");
+                // Stamped like every other thread-scoped reply. It matters MORE here than it looks: the
+                // default address is the SELECTED thread's EIP, but the standalone disassembly view refreshes
+                // by a VA it tracked from the stopped thread's pause event. Without the tid the host cannot
+                // tell a decode of the thread it is showing from a decode of the thread it stopped on.
+                EmitThreadEvent(tid, "{\"event\":\"disasm\",\"addr\":\"0x" + addr.ToString("X") + "\",\"tag\":" + Json.Str(tag) + ",\"instrs\":[" + string.Join(",", jsonRows) + "]}");
             else
             {
                 Console.WriteLine($"  disasm at 0x{addr:X} ({decoded} instr):");

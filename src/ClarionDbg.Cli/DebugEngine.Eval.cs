@@ -154,7 +154,7 @@ namespace ClarionDbg.Cli
             uint slotVa; LocalSym lsym; LoadedModule lowner;
             if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, name, out slotVa, out lsym, out lowner))
             {
-                EmitWatchValue(name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places);
+                EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places);
                 return;
             }
 
@@ -165,7 +165,7 @@ namespace ClarionDbg.Cli
                 // merely out of scope right now (we are paused elsewhere) — flag that so the Watch row reads
                 // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
                 bool outOfScope = haveCtx && IsKnownLocalName(name);
-                EmitThreadEvent(_selectedTid, Json.WatchMiss(name, outOfScope));
+                EmitThreadEvent(tid, Json.WatchMiss(name, outOfScope));
                 Console.WriteLine($"  watch {name}: {(outOfScope ? "out of scope" : "not found")}");
                 return;
             }
@@ -174,7 +174,7 @@ namespace ClarionDbg.Cli
 
             if (!threaded)
             {
-                EmitWatchValue(name, templateVa, templateVa, false, loc.TypeCode, loc.Size);
+                EmitWatchValue(tid, name, templateVa, templateVa, false, loc.TypeCode, loc.Size);
                 return;
             }
 
@@ -182,14 +182,14 @@ namespace ClarionDbg.Cli
             switch (TryResolveThreadedInstance(owner, templateVa, tid, hThread, out instanceVa, out reason))
             {
                 case ThreadedResolve.Ok:
-                    EmitWatchValue(name, templateVa, instanceVa, true, loc.TypeCode, loc.Size);
+                    EmitWatchValue(tid, name, templateVa, instanceVa, true, loc.TypeCode, loc.Size);
                     break;
 
                 case ThreadedResolve.Unallocated:
                     // The thread has never touched this data, so there is no instance to read. Its first touch
                     // will start from the template's initial value, so show that — read-only, since writing the
                     // template would change what EVERY future thread starts from.
-                    EmitWatchValue(name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                    EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
                                    note: "not yet used on this thread — initial value", editable: false);
                     break;
 
@@ -197,21 +197,21 @@ namespace ClarionDbg.Cli
                     // Not a Clarion thread (e.g. a pause that landed on a worker or the injected break thread):
                     // the template IS what code here reads, so show it — but it is shared data, not this
                     // thread's own, and writing it would change what every future thread starts from.
-                    EmitWatchValue(name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                    EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
                                    note: reason, editable: false);
                     break;
 
                 default:
-                    EmitWatchError(name, reason);
+                    EmitWatchError(tid, name, reason);
                     break;
             }
         }
 
         /// <summary>A watch that could not be read. Emitted against the NAME so the host can resolve that row
         /// instead of leaving it pending — the failure the old EmitError path never delivered.</summary>
-        private void EmitWatchError(string name, string reason)
+        private void EmitWatchError(uint tid, string name, string reason)
         {
-            EmitThreadEvent(_selectedTid, Json.WatchError(name, reason));
+            EmitThreadEvent(tid, Json.WatchError(name, reason));
             Console.WriteLine($"  watch {name}: {reason}");
         }
 
@@ -221,7 +221,7 @@ namespace ClarionDbg.Cli
         /// for global/static data (whose DataLocation does not carry them). <paramref name="note"/> annotates a
         /// value that is real but qualified (an unallocated thread instance), and <paramref name="editable"/>
         /// can veto the edit pencil for a value that must not be written back.</summary>
-        private void EmitWatchValue(string name, uint templateVa, uint instanceVa, bool threaded, byte typeCode, uint size,
+        private void EmitWatchValue(uint tid, string name, uint templateVa, uint instanceVa, bool threaded, byte typeCode, uint size,
                                     byte target = 0, int places = 0, string note = null, bool editable = true)
         {
             int len = (int)Math.Min(Math.Max(size, 1), 4096);
@@ -233,7 +233,7 @@ namespace ClarionDbg.Cli
             string value = FormatValueAt(typeCode, target, size, places, instanceVa);
             bool isNullRef = typeCode == 0x16 && value == "(null)";
             string tn = ClarionTypeLabel(typeCode, target, size, places, isNullRef);
-            EmitThreadEvent(_selectedTid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note));
+            EmitThreadEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}{(note != null ? " — " + note : "")}");
             for (int row = 0; row < read; row += 16)
             {

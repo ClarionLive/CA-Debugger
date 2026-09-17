@@ -180,6 +180,13 @@ namespace ClarionDbg.Cli
         // act on the stopped thread and reset this first — see the command loop.
         private uint _selectedTid;
 
+        // The throwaway ntdll thread DebugBreakProcess injected to cause THIS stop, or 0 when the stop was
+        // not pause-initiated. It is a real live thread, so `threads` would list it and `thread <tid>` would
+        // happily select it — a thread that exits the moment the target resumes and has nothing to do with
+        // the program. PickPauseThread already skipped it; the picker has to skip it too, and only
+        // OnPauseBreak knows which tid it was. Cleared when the stop ends.
+        private uint _breakTid;
+
         /// <summary>The thread a read command should answer about: the selected one, which is usually (but
         /// not always) the stopped one. Holds the registers to read the stack/locals/disassembly at and the
         /// handle the threaded-data and Library State emulators need.</summary>
@@ -216,8 +223,14 @@ namespace ClarionDbg.Cli
             return v;
         }
 
-        /// <summary>Resume-type verbs. These ALWAYS act on the stopped thread, never the selected one, and
-        /// reset the selection before they run so the next stop is never reported against a stale view.</summary>
+        /// <summary>Resume-type verbs the PAUSE LOOP implements. These always act on the stopped thread,
+        /// never the selected one, and reset the selection before they run so the next stop is never
+        /// reported against a stale view.
+        ///
+        /// This list must contain only verbs the pause loop's switch actually handles. It once also named
+        /// pause/break/runtocursor — which the switch does NOT implement — so those reset the selection and
+        /// then fell through to "unknown command": a verb that did nothing silently discarded the user's
+        /// `thread &lt;tid&gt;` for the rest of the stop. They are rejected explicitly instead, below.</summary>
         private static bool IsResumeVerb(string verb)
         {
             switch (verb)
@@ -227,27 +240,28 @@ namespace ClarionDbg.Cli
                 case "stepover": case "next": case "n":
                 case "stepout": case "out": case "finish": case "o":
                 case "stepi": case "si": case "nexti": case "ni":
-                case "pause": case "break": case "runtocursor":
                     return true;
                 default:
                     return false;
             }
         }
 
+        /// <summary>Test seam for <see cref="WithTid"/>; the rule it asserts is documented there, so that
+        /// deleting this seam cannot delete the rationale.</summary>
+        internal static string WithTidForTest(string json, uint tid) { return WithTid(json, tid); }
+
         /// <summary>Stamp a thread-scoped event with the tid it describes, so the host can drop a reply that
         /// arrived for a thread it is no longer showing. Splicing the member in here rather than threading a
-        /// tid parameter through six JSON builders keeps one rule in one place: if it is emitted from the
+        /// tid parameter through seven JSON builders keeps one rule in one place: if it is emitted from the
         /// pause loop about a thread, it carries that thread's id. Member order is not significant in JSON.
         ///
         /// A tid of 0 emits NO "tid" member at all. ABSENCE is the only safe way to say "unknown": the host
         /// treats an unstamped reply as unscoped and accepts it, but would read a literal 0 (or -1) as a real
-        /// thread id and start dropping good replies. Every stamped event today is emitted from inside the
-        /// pause loop, where the tid is always known — this guard is here so that stays true if some future
-        /// caller emits one of these events from a path that has no thread.</summary>
-        /// <summary>Test seam for `protocolcheck` — the tid contract is asserted directly rather than
-        /// inferred from a live run, because the unknown-tid case cannot be produced by one.</summary>
-        internal static string WithTidForTest(string json, uint tid) { return WithTid(json, tid); }
-
+        /// thread id and start dropping good replies — a silently blank panel rather than an error. Every
+        /// stamped event today is emitted from inside the pause loop, where the tid is always known; this
+        /// guard is here so that stays true if some future caller emits one from a path that has no thread.
+        /// `ClarionDbg protocolcheck` asserts both halves, because the unknown-tid case cannot be produced
+        /// against a live debuggee.</summary>
         private static string WithTid(string json, uint tid)
         {
             if (string.IsNullOrEmpty(json) || json[0] != '{' || tid == 0) return json;
@@ -522,9 +536,17 @@ namespace ClarionDbg.Cli
             var ctx = NewContext();
             bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
             CancelStep();
-            if (_interactive)
-                PausedWait(tid, hThread, ref ctx, haveCtx, "pause");
-            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            _breakTid = breakTid;   // hide the injected thread from the picker for this stop
+            try
+            {
+                if (_interactive)
+                    PausedWait(tid, hThread, ref ctx, haveCtx, "pause");
+            }
+            finally
+            {
+                _breakTid = 0;      // it dies on resume; never carry it into the next stop
+                if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            }
             return Native.DBG_CONTINUE;  // release the injected break thread (it then exits)
         }
 
@@ -636,7 +658,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "setval":   // write a new value into a live variable (edit-variable-value)
-                        HandleSetValCommand(parts);
+                        HandleSetValCommand(parts, view.Tid);
                         break;
 
                     case "stack": case "bt": case "where":
@@ -644,7 +666,16 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "moduledata": case "moddata":
-                        HandleModuleDataCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
+                        HandleModuleDataCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid, view.HThread);
+                        break;
+
+                    case "pause": case "break": case "runtocursor":
+                        // Resume-shaped in intent, but the pause loop implements none of them: `pause` only
+                        // means anything while the target RUNS (DrainCommandsWhileRunning has it), and
+                        // run-to-cursor is composed host-side from `bp add` + `continue`. Rejecting them
+                        // here keeps them out of IsResumeVerb, so they can no longer discard the user's
+                        // thread selection on their way to "unknown command".
+                        EmitError(verb + ": the target is already paused");
                         break;
 
                     case "threads":
@@ -664,7 +695,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "disasm": case "u":
-                        HandleDisasmCommand(parts, ref view.Ctx, view.HaveCtx);
+                        HandleDisasmCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
                         break;
 
                     case "sym":
@@ -748,6 +779,17 @@ namespace ClarionDbg.Cli
                     case "pause": case "break":
                         RequestPause();            // inject a break → pause at the app's current location
                         break;
+                    case "thread":
+                    {
+                        // A selectthread that raced a resume. Answer in the command's OWN vocabulary: the
+                        // host is waiting for a threadselected reply, and a generic error would leave its
+                        // picker stuck on "switching…". Echo the tid it asked for so it can match the reply
+                        // to its request; there is no stop, so there is no selection to name instead.
+                        uint wantTid;
+                        EmitThreadSelected(parts.Length > 1 && uint.TryParse(parts[1], out wantTid) ? wantTid : 0,
+                                           false, "no thread selection while the target is running");
+                        break;
+                    }
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
                         break;
@@ -761,7 +803,7 @@ namespace ClarionDbg.Cli
                     case "moduledata": case "moddata":
                     case "disasm": case "u":
                     case "setval":
-                    case "threads": case "thread": case "threadscan":
+                    case "threads": case "threadscan":
                     case "framelocals": case "libstate": case "expand":
                         EmitError("target is running — " + verb + " is only valid while paused");
                         break;

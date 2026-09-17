@@ -23,11 +23,36 @@ namespace ClarionDbg.Cli
                 || code == 0x18 || code == 0x23 || code == 0x24;
         }
 
-        private void HandleSetValCommand(string[] parts)
+        /// <summary>setval &lt;va&gt; &lt;typeCode&gt; &lt;size&gt; &lt;places&gt; &lt;valueB64&gt; [tid]
+        ///
+        /// The optional trailing tid is the thread the HOST believed it was editing when it built the row.
+        /// A THREADed value's VA is one thread's instance, so if the selection moved between the row being
+        /// read and the edit being sent — a switch racing a keystroke — writing it would silently modify a
+        /// different thread's data at an address that is still perfectly valid. That is the one outcome this
+        /// ticket has to make impossible, so the write is refused and says so.
+        ///
+        /// An ABSENT tid means "unscoped" and is accepted, matching the rest of the protocol: a host that
+        /// does not send one is exactly as safe as it was before, and absence is never a sentinel.</summary>
+        private void HandleSetValCommand(string[] parts, uint selectedTid)
         {
-            if (parts.Length < 6) { EmitError("setval expects: setval <va> <typeCode> <size> <places> <valueB64>"); return; }
+            if (parts.Length < 6) { EmitError("setval expects: setval <va> <typeCode> <size> <places> <valueB64> [tid]"); return; }
 
             uint va = ParseHexU(parts[1]);
+            if (parts.Length > 6)
+            {
+                uint wantTid;
+                if (!uint.TryParse(parts[6], out wantTid))
+                {
+                    EmitVarSetError(va, "setval: bad thread id '" + parts[6] + "'");
+                    return;
+                }
+                if (wantTid != selectedTid)
+                {
+                    EmitVarSetError(va, "not written: this edit was for thread " + wantTid
+                                        + ", but thread " + selectedTid + " is selected now");
+                    return;
+                }
+            }
             byte code = (byte)ParseHexU(parts[2]);
             int size, places;
             if (!int.TryParse(parts[3], out size) || size <= 0 || size > 4096) { EmitVarSetError(va, "bad size"); return; }
