@@ -237,11 +237,20 @@ namespace ClarionDbg.Cli
         /// <summary>Stamp a thread-scoped event with the tid it describes, so the host can drop a reply that
         /// arrived for a thread it is no longer showing. Splicing the member in here rather than threading a
         /// tid parameter through six JSON builders keeps one rule in one place: if it is emitted from the
-        /// pause loop about a thread, it carries that thread's id. Member order is not significant in
-        /// JSON.</summary>
+        /// pause loop about a thread, it carries that thread's id. Member order is not significant in JSON.
+        ///
+        /// A tid of 0 emits NO "tid" member at all. ABSENCE is the only safe way to say "unknown": the host
+        /// treats an unstamped reply as unscoped and accepts it, but would read a literal 0 (or -1) as a real
+        /// thread id and start dropping good replies. Every stamped event today is emitted from inside the
+        /// pause loop, where the tid is always known — this guard is here so that stays true if some future
+        /// caller emits one of these events from a path that has no thread.</summary>
+        /// <summary>Test seam for `protocolcheck` — the tid contract is asserted directly rather than
+        /// inferred from a live run, because the unknown-tid case cannot be produced by one.</summary>
+        internal static string WithTidForTest(string json, uint tid) { return WithTid(json, tid); }
+
         private static string WithTid(string json, uint tid)
         {
-            if (string.IsNullOrEmpty(json) || json[0] != '{') return json;
+            if (string.IsNullOrEmpty(json) || json[0] != '{' || tid == 0) return json;
             string head = "{\"tid\":" + tid;
             return json.Length == 2 ? head + "}" : head + "," + json.Substring(1);
         }
