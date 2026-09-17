@@ -25,6 +25,10 @@ namespace ClarionDbg.Cli
 
         /// <summary>setval &lt;va&gt; &lt;typeCode&gt; &lt;size&gt; &lt;places&gt; &lt;valueB64&gt; [tid]
         ///
+        /// TWO guards, deliberately at different levels. The optional tid catches a stale SELECTION — what
+        /// the host believed it was editing. <see cref="ThreadedWriteAllowed"/> catches a stale ADDRESS, and
+        /// needs nothing from the host at all, so it also covers the paths nobody told us about.
+        ///
         /// The optional trailing tid is the thread the HOST believed it was editing when it built the row.
         /// A THREADed value's VA is one thread's instance, so if the selection moved between the row being
         /// read and the edit being sent — a switch racing a keystroke — writing it would silently modify a
@@ -58,6 +62,15 @@ namespace ClarionDbg.Cli
             if (!int.TryParse(parts[3], out size) || size <= 0 || size > 4096) { EmitVarSetError(va, "bad size"); return; }
             if (!int.TryParse(parts[4], out places)) places = 0;
 
+            // The ADDRESS guard. The tid check above catches a stale SELECTION — the host telling us which
+            // thread it meant. This catches a stale ADDRESS, and it needs no cooperation from anyone: a VA
+            // that names THREADed data which is not the selected thread's own is refused however it got
+            // here, including from a row the host built before a switch, an expanded node whose veto we
+            // cannot see, or a hand-typed CLI setval. Enforcing at the WRITE covers every path into it
+            // rather than every row that might produce one.
+            string threadedWhy;
+            if (!ThreadedWriteAllowed(va, selectedTid, out threadedWhy)) { EmitVarSetError(va, threadedWhy); return; }
+
             string value;
             try { value = Encoding.UTF8.GetString(Convert.FromBase64String(parts[5])); }
             catch { EmitVarSetError(va, "bad value encoding"); return; }
@@ -70,6 +83,103 @@ namespace ClarionDbg.Cli
             string nv = FormatValueAt(code, 0, (uint)size, places, va);
             Console.WriteLine($"  setval 0x{va:X}: {nv}");
             if (EmitJson) Console.WriteLine("@JSON " + Json.VarSet(va, true, nv, null));
+        }
+
+        /// <summary>
+        /// May a write land at <paramref name="va"/> for the selected thread?
+        ///
+        /// Two refusals, both about THREADed (.cwtls) data:
+        ///  • the VA is inside an image's .cwtls TEMPLATE range — the shared block every Clarion thread's
+        ///    instance is copied from. Writing it changes the initial value every FUTURE thread starts with,
+        ///    which is a side effect on threads that do not exist yet. No legitimate edit ever carries a
+        ///    template VA: a row that falls back to the template is vetoed and offers no pencil. This test
+        ///    is pure address arithmetic, so it holds even when nothing else can be resolved.
+        ///  • the VA is inside ANOTHER live thread's instance block for that image — the stale-row case,
+        ///    where the address is still perfectly valid and belongs to somebody else.
+        ///
+        /// Everything else is allowed, and that includes a VA we could not classify. The instance comparison
+        /// FAILS OPEN on purpose: an unresolvable VA is overwhelmingly an ordinary global, local or module
+        /// value, and refusing those to catch a rarer case would break editing for everyone. The template
+        /// test, which is the one that cannot be recovered from, fails CLOSED and needs no resolution at all.
+        /// </summary>
+        private bool ThreadedWriteAllowed(uint va, uint selectedTid, out string reason)
+        {
+            reason = null;
+            foreach (var m in _modules)
+            {
+                if (m == null || m.LoadBase == 0 || !m.HasThreadedData) continue;
+                uint span = m.CwtlsHi - m.CwtlsLo;
+                if (span == 0) continue;
+                uint tmplLo = m.LoadBase + m.CwtlsLo;
+
+                // 1. the shared template
+                if (va >= tmplLo && va < tmplLo + span)
+                {
+                    uint ownBase;
+                    string where = TryInstanceBase(m, selectedTid, out ownBase)
+                        ? " — thread " + selectedTid + "'s own copy is at 0x" + (va - tmplLo + ownBase).ToString("X")
+                        : " and thread " + selectedTid + " has no instance of it";
+                    reason = "not written: 0x" + va.ToString("X") + " is the shared " + m.Name
+                           + " template, not one thread's data" + where;
+                    return false;
+                }
+
+                // 2. this thread's own instance block — the ordinary, correct case
+                uint selBase;
+                if (TryInstanceBase(m, selectedTid, out selBase) && va >= selBase && va < selBase + span)
+                    return true;
+
+                // 3. somebody else's instance block
+                foreach (uint t in _threads)
+                {
+                    if (t == selectedTid) continue;
+                    uint otherBase;
+                    if (!TryInstanceBase(m, t, out otherBase)) continue;
+                    if (va < otherBase || va >= otherBase + span) continue;
+                    reason = "not written: 0x" + va.ToString("X") + " is thread " + t + "'s copy of the "
+                           + m.Name + " data, but thread " + selectedTid + " is selected";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>The base of one thread's .cwtls instance block for an image, via the same read-only
+        /// THR$GetInstance emulation every other per-thread read uses. False when the thread has no instance
+        /// or it could not be resolved. Cached per (thread, image) for the stop, so a write costs at most one
+        /// emulation per thread per threaded image and usually none.</summary>
+        private bool TryInstanceBase(LoadedModule m, uint tid, out uint instanceBase)
+        {
+            instanceBase = 0;
+            uint cwtlsBase = m.LoadBase + m.CwtlsLo;
+            IntPtr h = OpenThreadForContext(tid);
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                uint instanceVa; string why;
+                if (TryResolveThreadedInstance(m, cwtlsBase, tid, h, out instanceVa, out why) != ThreadedResolve.Ok)
+                    return false;
+                instanceBase = instanceVa;
+                return true;
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        /// <summary>Test seam for `protocolcheck`: assert the shipped write guard, not a copy of its rules.</summary>
+        internal bool ThreadedWriteAllowedForTest(uint va, uint tid, out string reason)
+        {
+            return ThreadedWriteAllowed(va, tid, out reason);
+        }
+
+        /// <summary>Test seam: register a mapped image with a known .cwtls range, so the template-range
+        /// refusal can be asserted without a live debuggee (that branch is pure address arithmetic).</summary>
+        internal void RegisterThreadedModuleForTest(string name, uint loadBase, uint cwtlsLo, uint cwtlsHi)
+        {
+            _modules.Add(new LoadedModule
+            {
+                Name = name, LoadBase = loadBase, Size = 0x200000,
+                CwtlsLo = cwtlsLo, CwtlsHi = cwtlsHi, ThrGetInstanceIatRva = 4,
+            });
         }
 
         private void EmitVarSetError(uint va, string err)
