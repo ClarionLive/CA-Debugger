@@ -545,9 +545,12 @@ namespace ClarionDbg.Cli
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
-            if (EmitJson)
-                Console.WriteLine("@JSON " + Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
-                    haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
+            // `paused` carries the STOPPED thread's tid. It describes one thread's location and registers,
+            // so it is thread-scoped like the rest; carrying the tid means the host knows which thread it
+            // stopped on even if its follow-up `threads` request fails or races. Additive: a host that does
+            // not read the field is unaffected.
+            EmitThreadEvent(tid, Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
+                haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
             Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
 
             while (true)
