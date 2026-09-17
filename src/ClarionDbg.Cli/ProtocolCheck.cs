@@ -75,8 +75,10 @@ namespace ClarionDbg.Cli
             if (failures.Count == 0)
             {
                 Console.WriteLine($"protocolcheck: {shapes.Length} event shapes OK - a known tid is stamped, "
-                                  + "an unknown tid is absent (never 0 or -1); a vetoed row offers no "
-                                  + "editable descendant; and a write cannot land on the shared template.");
+                                  + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
+                                  + "descendants offer no edit metadata (the expand path is a known gap — "
+                                  + "see HandleExpandCommand, ticket cc3ac96e); and no write, of any length, "
+                                  + "can touch the shared template.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -169,7 +171,7 @@ namespace ClarionDbg.Cli
             uint[] inside = { 0x4C8000, 0x4CAF60, 0x4CBFFF };
             foreach (var va in inside)
             {
-                if (eng.ThreadedWriteAllowedForTest(va, tid, out why))
+                if (eng.ThreadedWriteAllowedForTest(va, 1, tid, out why))
                     failures.Add("threaded-write: 0x" + va.ToString("X") + " is inside the shared template but the write was allowed");
                 else if (string.IsNullOrEmpty(why))
                     failures.Add("threaded-write: 0x" + va.ToString("X") + " was refused with no reason for the pad to show");
@@ -179,13 +181,30 @@ namespace ClarionDbg.Cli
 
             // CONTROLS: ordinary addresses must still be writable, or the guard has broken editing for
             // everyone. One below the block, one above, one in a different image entirely.
+            // These are SINGLE-BYTE controls and that is now said out loud. 0x4C7FFF was previously
+            // asserted as "must be allowed" full stop, which is true of one byte and false of two — the
+            // control case was itself the hole the claims audit found.
             uint[] outside = { 0x4C7FFF, 0x4CC000, 0x401000, 0x00A2FD00 };
             foreach (var va in outside)
             {
-                if (!eng.ThreadedWriteAllowedForTest(va, tid, out why))
-                    failures.Add("threaded-write control: ordinary address 0x" + va.ToString("X")
-                                 + " was refused — " + why);
+                if (!eng.ThreadedWriteAllowedForTest(va, 1, tid, out why))
+                    failures.Add("threaded-write control: a one-byte write at ordinary address 0x"
+                                 + va.ToString("X") + " was refused — " + why);
             }
+
+            // A WRITE IS AN INTERVAL. Starting outside the block is not the same as staying outside it.
+            if (eng.ThreadedWriteAllowedForTest(0x4C7FFF, 2, tid, out why))
+                failures.Add("threaded-write: a 2-byte write at 0x4C7FFF runs INTO the shared template but was allowed");
+            if (eng.ThreadedWriteAllowedForTest(0x4C7C01, 1024, tid, out why))
+                failures.Add("threaded-write: a 1024-byte write at 0x4C7C01 puts 0x3FF bytes on the shared template but was allowed");
+            // ...and the byte before the block is still fine when the write really does stay outside it.
+            if (!eng.ThreadedWriteAllowedForTest(0x4C7FFE, 2, tid, out why))
+                failures.Add("threaded-write control: a 2-byte write ending exactly at the template's first byte was refused — " + why);
+            // The far edge: a write ending on the block's last byte overlaps; one starting after it does not.
+            if (eng.ThreadedWriteAllowedForTest(0x4CBFFF, 4, tid, out why))
+                failures.Add("threaded-write: a write starting on the template's last byte was allowed");
+            if (!eng.ThreadedWriteAllowedForTest(0x4CC000, 4096, tid, out why))
+                failures.Add("threaded-write control: a write starting just past the template was refused — " + why);
 
             // THE CASE WHOSE ABSENCE LET A HOLE THROUGH: an image with a real .cwtls section whose
             // THR$GetInstance import did not resolve (locally linked runtime, renamed DLL, import by
@@ -195,16 +214,16 @@ namespace ClarionDbg.Cli
             // not see this.
             var noImport = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
             noImport.RegisterThreadedModuleForTest("static.exe", 0x400000, 0xC8000, 0xCC000, 0);
-            if (noImport.ThreadedWriteAllowedForTest(0x4CAF60, tid, out why))
+            if (noImport.ThreadedWriteAllowedForTest(0x4CAF60, 1, tid, out why))
                 failures.Add("threaded-write: the shared template was writable on an image whose "
                              + "THR$GetInstance import did not resolve — an unrecoverable guard must not "
                              + "depend on an optional capability");
-            if (!noImport.ThreadedWriteAllowedForTest(0x401000, tid, out why))
+            if (!noImport.ThreadedWriteAllowedForTest(0x401000, 1, tid, out why))
                 failures.Add("threaded-write control: an ordinary address was refused on a no-import image — " + why);
 
             // An engine with no threaded image must not refuse anything.
             var plain = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
-            if (!plain.ThreadedWriteAllowedForTest(0x4CAF60, tid, out why))
+            if (!plain.ThreadedWriteAllowedForTest(0x4CAF60, 1, tid, out why))
                 failures.Add("threaded-write control: a target with no threaded image still refused a write — " + why);
         }
 
