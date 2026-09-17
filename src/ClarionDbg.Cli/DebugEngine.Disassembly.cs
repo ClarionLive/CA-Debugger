@@ -68,6 +68,14 @@ namespace ClarionDbg.Cli
         /// mixed source/asm view). Especially useful when paused in external / no-source code
         /// (a DebugBreak int3, or an OS call) where the source pane is blank.
         /// </summary>
+        /// <summary>disasm [addr] [count] [tag] [before] — decode instructions around an address.
+        ///
+        /// <paramref name="ctx"/> and <paramref name="tid"/> are the STOPPED thread's, never the selected
+        /// thread's, even while another thread is selected for every other read. The disassembly window
+        /// lives outside the pad's thread-scoped message path and cannot show which thread it is decoding,
+        /// so following a selection it cannot display would be a silent mismatch rather than a feature.
+        /// The reply is stamped with the tid anyway, so a host CAN tell — and a thread-aware disassembly
+        /// view is a follow-up ticket rather than a thing to half-do here.</summary>
         private void HandleDisasmCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
         {
             uint addr = haveCtx ? ctx.Eip : 0;
@@ -144,10 +152,9 @@ namespace ClarionDbg.Cli
             }
 
             if (EmitJson)
-                // Stamped like every other thread-scoped reply. It matters MORE here than it looks: the
-                // default address is the SELECTED thread's EIP, but the standalone disassembly view refreshes
-                // by a VA it tracked from the stopped thread's pause event. Without the tid the host cannot
-                // tell a decode of the thread it is showing from a decode of the thread it stopped on.
+                // Stamped like every other thread-scoped reply, even though this one is pinned to the
+                // stopped thread: the stamp is what makes "disasm is always the stopped thread" a checkable
+                // fact on the wire instead of a claim in a comment.
                 EmitThreadEvent(tid, "{\"event\":\"disasm\",\"addr\":\"0x" + addr.ToString("X") + "\",\"tag\":" + Json.Str(tag) + ",\"instrs\":[" + string.Join(",", jsonRows) + "]}");
             else
             {

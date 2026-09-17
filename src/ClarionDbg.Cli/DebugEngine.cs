@@ -695,7 +695,15 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "disasm": case "u":
-                        HandleDisasmCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
+                        // DELIBERATELY the STOPPED thread, not the selection. The standalone disassembly
+                        // window subscribes to the disasm reply directly and drives it by its own tag,
+                        // OUTSIDE the pad's thread-scoped message path: it has no thread picker, no
+                        // "viewing thread N" banner, and no way to say which thread it decoded. Honouring a
+                        // selection it cannot display would put one thread's code on screen while the pad
+                        // says you are viewing another — the mismatch relocated, not fixed. It is still
+                        // STAMPED with the thread it read from, so the choice is checkable rather than
+                        // assumed, and a thread-aware disassembly view is a follow-up ticket.
+                        HandleDisasmCommand(parts, ref ctx, haveCtx, tid);
                         break;
 
                     case "sym":
