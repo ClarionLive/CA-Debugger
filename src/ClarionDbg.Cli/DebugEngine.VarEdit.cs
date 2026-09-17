@@ -94,6 +94,15 @@ namespace ClarionDbg.Cli
         ///    which is a side effect on threads that do not exist yet. No legitimate edit ever carries a
         ///    template VA: a row that falls back to the template is vetoed and offers no pencil. This test
         ///    is pure address arithmetic, so it holds even when nothing else can be resolved.
+        ///
+        ///    THE PRINCIPLE, because it generalises: A GUARD THAT CANNOT BE RECOVERED FROM MUST NOT DEPEND
+        ///    ON AN OPTIONAL CAPABILITY. This loop used to skip any image without HasThreadedData, which is
+        ///    `CwtlsHi != 0 AND ThrGetInstanceIatRva != 0` — so an image with a real .cwtls section whose
+        ///    THR$GetInstance import could not be resolved (a statically or locally linked runtime, a renamed
+        ///    runtime DLL, an import by ordinal) had its rows vetoed by the row-level checks, which gate on
+        ///    CwtlsHi alone, while the write guard waved the same template through. The template test needs
+        ///    no import; only the other-thread comparison does. So the loop gates on the section, and the
+        ///    import gates only the part that actually needs it.
         ///  • the VA is inside ANOTHER live thread's instance block for that image — the stale-row case,
         ///    where the address is still perfectly valid and belongs to somebody else.
         ///
@@ -107,16 +116,17 @@ namespace ClarionDbg.Cli
             reason = null;
             foreach (var m in _modules)
             {
-                if (m == null || m.LoadBase == 0 || !m.HasThreadedData) continue;
-                uint span = m.CwtlsHi - m.CwtlsLo;
-                if (span == 0) continue;
+                // Gated on the SECTION, not on HasThreadedData: the template refusal below needs no import.
+                if (m == null || m.LoadBase == 0 || m.CwtlsHi == 0) continue;
+                uint tmplSpan = m.CwtlsHi - m.CwtlsLo;     // file-aligned; over-width here is only padding
+                if (tmplSpan == 0) continue;
                 uint tmplLo = m.LoadBase + m.CwtlsLo;
 
-                // 1. the shared template
-                if (va >= tmplLo && va < tmplLo + span)
+                // 1. the shared template — unconditional, needs nothing resolved
+                if (va >= tmplLo && va < tmplLo + tmplSpan)
                 {
                     uint ownBase;
-                    string where = TryInstanceBase(m, selectedTid, out ownBase)
+                    string where = m.HasThreadedData && TryInstanceBase(m, selectedTid, out ownBase)
                         ? " — thread " + selectedTid + "'s own copy is at 0x" + (va - tmplLo + ownBase).ToString("X")
                         : " and thread " + selectedTid + " has no instance of it";
                     reason = "not written: 0x" + va.ToString("X") + " is the shared " + m.Name
@@ -124,9 +134,19 @@ namespace ClarionDbg.Cli
                     return false;
                 }
 
+                // The instance-block comparisons DO need the import, and they are the recoverable half:
+                // without it we simply cannot say whose copy an address is, and allowing is the safe answer.
+                if (!m.HasThreadedData) continue;
+
+                // An instance block is the DECLARED threaded-data size the RTL allocates, not the section's
+                // file-aligned span — using the span would over-refuse up to FileAlignment-1 bytes past a
+                // real block, into adjacent heap where a legitimately editable allocation can sit. Refusing
+                // a valid write breaks editing, which is worse than the case it would catch.
+                uint blockSpan = m.CwtlsDataSize != 0 ? m.CwtlsDataSize : tmplSpan;
+
                 // 2. this thread's own instance block — the ordinary, correct case
                 uint selBase;
-                if (TryInstanceBase(m, selectedTid, out selBase) && va >= selBase && va < selBase + span)
+                if (TryInstanceBase(m, selectedTid, out selBase) && va >= selBase && va < selBase + blockSpan)
                     return true;
 
                 // 3. somebody else's instance block
@@ -135,7 +155,7 @@ namespace ClarionDbg.Cli
                     if (t == selectedTid) continue;
                     uint otherBase;
                     if (!TryInstanceBase(m, t, out otherBase)) continue;
-                    if (va < otherBase || va >= otherBase + span) continue;
+                    if (va < otherBase || va >= otherBase + blockSpan) continue;
                     reason = "not written: 0x" + va.ToString("X") + " is thread " + t + "'s copy of the "
                            + m.Name + " data, but thread " + selectedTid + " is selected";
                     return false;
@@ -173,12 +193,16 @@ namespace ClarionDbg.Cli
 
         /// <summary>Test seam: register a mapped image with a known .cwtls range, so the template-range
         /// refusal can be asserted without a live debuggee (that branch is pure address arithmetic).</summary>
-        internal void RegisterThreadedModuleForTest(string name, uint loadBase, uint cwtlsLo, uint cwtlsHi)
+        /// <param name="iatRva">0 models an image with a real .cwtls section whose THR$GetInstance import
+        /// could not be resolved — the configuration in which the template refusal must still hold.</param>
+        internal void RegisterThreadedModuleForTest(string name, uint loadBase, uint cwtlsLo, uint cwtlsHi,
+                                                    uint iatRva = 4)
         {
             _modules.Add(new LoadedModule
             {
                 Name = name, LoadBase = loadBase, Size = 0x200000,
-                CwtlsLo = cwtlsLo, CwtlsHi = cwtlsHi, ThrGetInstanceIatRva = 4,
+                CwtlsLo = cwtlsLo, CwtlsHi = cwtlsHi, CwtlsDataSize = cwtlsHi - cwtlsLo,
+                ThrGetInstanceIatRva = iatRva,
             });
         }
 

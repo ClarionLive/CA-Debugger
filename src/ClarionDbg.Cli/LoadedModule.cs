@@ -25,7 +25,15 @@ namespace ClarionDbg.Cli
         public bool Preloaded;         // true = registered from the solution list (kept on unload); false = runtime-discovered (dropped on unload)
 
         // per-module threaded-data eval (Tier 1/2 only; 0 when the image has no .cwtls / no import)
-        public uint CwtlsLo, CwtlsHi;          // .cwtls section RVA range
+        public uint CwtlsLo, CwtlsHi;          // .cwtls section RVA range (file-aligned Span: may include padding)
+        public uint CwtlsDataSize;             // .cwtls VirtualSize — the DECLARED threaded-data size, which is
+                                               // what the RTL allocates per thread. CwtlsHi-CwtlsLo is
+                                               // max(VirtualSize, SizeOfRawData) and so can run up to
+                                               // FileAlignment-1 bytes past a real instance block, into
+                                               // unrelated heap. Harmless for the template range (it only
+                                               // covers this image's own padding); NOT harmless for an
+                                               // instance-block window, which would over-refuse writes to
+                                               // whatever the allocator put next.
         public uint ThrGetInstanceIatRva;      // IAT slot RVA of ClaRUN.dll!THR$GetInstance
 
         public bool HasDebug { get { return Dbg != null; } }
@@ -39,7 +47,12 @@ namespace ClarionDbg.Cli
             if (Pe == null) return;
             var cwtls = Pe.FindSection(".cwtls");
             uint iat = Pe.FindImportIatSlotRva("ClaRUN.dll", "THR$GetInstance");
-            if (cwtls != null) { CwtlsLo = cwtls.VirtualAddress; CwtlsHi = cwtls.VirtualAddress + cwtls.Span; }
+            if (cwtls != null)
+            {
+                CwtlsLo = cwtls.VirtualAddress;
+                CwtlsHi = cwtls.VirtualAddress + cwtls.Span;
+                CwtlsDataSize = cwtls.VirtualSize != 0 ? cwtls.VirtualSize : cwtls.Span;
+            }
             ThrGetInstanceIatRva = iat;
         }
     }
