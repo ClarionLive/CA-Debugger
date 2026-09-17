@@ -147,6 +147,32 @@ namespace ClarionDbg.Cli
         private readonly HashSet<uint> _threads = new HashSet<uint>();
         private uint _mainTid;               // first thread (from CREATE_PROCESS) — pause fallback
 
+        // Creation order per live tid (0 = the CREATE_PROCESS main thread, then 1,2,… as CREATE_THREAD
+        // events arrive). A HashSet has no order, and "which thread is newest" is exactly the question a
+        // pause has to answer — an MDI child's thread is newer than the frame's. Dropped on EXIT_THREAD so
+        // a reused tid never inherits a dead thread's position; the counter itself never rewinds.
+        private readonly Dictionary<uint, int> _threadSeq = new Dictionary<uint, int>();
+        private int _nextThreadSeq;
+
+        private void NoteThreadCreated(uint tid)
+        {
+            _threads.Add(tid);
+            if (!_threadSeq.ContainsKey(tid)) _threadSeq[tid] = _nextThreadSeq++;
+        }
+
+        private void NoteThreadExited(uint tid)
+        {
+            _threads.Remove(tid);
+            _threadSeq.Remove(tid);
+        }
+
+        /// <summary>Creation order of a live tid; int.MaxValue for one we never saw created (sorts last).</summary>
+        private int SeqOf(uint tid)
+        {
+            int s;
+            return _threadSeq.TryGetValue(tid, out s) ? s : int.MaxValue;
+        }
+
         // logical user breakpoints + armed-byte map (VA -> original byte)
         private readonly List<UserBreakpoint> _bps = new List<UserBreakpoint>();
         private readonly Dictionary<uint, byte> _armed = new Dictionary<uint, byte>();
@@ -268,7 +294,7 @@ namespace ClarionDbg.Cli
                     case Native.CREATE_PROCESS_DEBUG_EVENT:
                         // union @+12: hFile(+12) hProcess(+16) hThread(+20) lpBaseOfImage(+24)
                         _exe.LoadBase = U32(buf, 24);
-                        _mainTid = tid; _threads.Add(tid);
+                        _mainTid = tid; NoteThreadCreated(tid);
                         PlantAll();
                         uint preferred = _exe.Pe != null ? _exe.Pe.ImageBase : 0;
                         Console.WriteLine($"process created: loadBase=0x{_exe.LoadBase:X} (preferred 0x{preferred:X}){(_exe.LoadBase != preferred ? "  [relocated]" : "")}");
@@ -290,11 +316,11 @@ namespace ClarionDbg.Cli
                         break;
 
                     case Native.CREATE_THREAD_DEBUG_EVENT:
-                        _threads.Add(tid);
+                        NoteThreadCreated(tid);
                         break;
 
                     case Native.EXIT_THREAD_DEBUG_EVENT:
-                        _threads.Remove(tid);
+                        NoteThreadExited(tid);
                         ClearThreadedCache(tid);   // a reused tid must never inherit this thread's .cwtls block
                         break;
 
@@ -567,6 +593,12 @@ namespace ClarionDbg.Cli
                         // resolve by emulating THR$GetInstance read-only, so this answers inline like every
                         // other read — no resume, no leaving the pause loop.
                         HandleWatchCommand(parts, tid, hThread, ref ctx, haveCtx);
+                        break;
+
+                    case "threadscan":
+                        // MEASUREMENT PROBE (task 0128a37e item 0): per-thread evidence at this stop —
+                        // read-only, no target code runs. See DebugEngine.Threads.cs.
+                        HandleThreadScanCommand(tid, parts);
                         break;
 
                     case "libstate":
