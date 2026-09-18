@@ -57,8 +57,6 @@
   .runstate.running .dot { background:#4ec9b0; box-shadow:0 0 6px #4ec9b088; }
   .runstate.idle .dot { background:#888; }
 
-  .locbar { flex:none; padding:5px 12px; background:var(--titlebar); border-bottom:1px solid var(--border); font-size:12px; color:var(--fg-dim); }
-  .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
 
   /* Target bar — the resolved EXE, always on screen. This used to be announced only in the Debug
      Console, which is a hideable section, so with it collapsed there was no way to see what was
@@ -300,6 +298,9 @@
 
   .srchdr { flex:none; display:flex; align-items:center; gap:5px; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
   .srchdr .file { color:var(--fg); }
+  /* the paused line number, moved here when the redundant run-state band was removed (87c66af6).
+     Same token the other two places the page prints a line number use (.frame .ln, .bp .ln). */
+  .srchdr .ln { color:var(--num); }
   #srchdrText { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
   .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
@@ -395,8 +396,6 @@
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
     </button>
   </div>
-
-  <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="exebar">
     <span class="lbl">Target</span>
@@ -893,14 +892,12 @@
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
-    // Every state must write the status line. Only 'idle' used to, so once a session started the
-    // bar kept the idle text — the app was visibly running while the bar still read "Not running —
-    // press Start on the IDE toolbar." The paused text is written by the pause handler, which has
-    // the procedure/module/line to name; the states below have nothing to add, so they say what is
-    // true and no more.
-    if(state==='idle'){ $('locbar').textContent='Not running — press Start on the IDE toolbar.'; clearSrc(); }
-    else if(state==='launching'){ $('locbar').textContent='Launching…'; }
-    else if(state==='running'){ $('locbar').textContent='Running — use the target, or Pause to break in.'; }
+    // The run state itself is the indicator above (dot + text) and nothing else needs to restate it:
+    // the band that used to sit under the header said the same thing in words, was written from here
+    // while the indicator was written two lines up, and the two could disagree — it could read
+    // "Not running" while the dot said running (87c66af6).
+    // Going idle still clears the source panel, which is a real action, not a caption.
+    if(state==='idle') clearSrc();
   }
 
   // ---- the Watch list survives closing Clarion (ticket 08adccc7) ----
@@ -2137,9 +2134,18 @@
 
   // ---- source snippet (current location) ----
   function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; }
+  // The one place the current location is written, so the pause event and the source reply cannot say
+  // it two different ways. `line` is optional: the gutter in the snippet below also shows it, but the
+  // snippet can be absent (paused where the pad has no source file) or its section collapsed, and this
+  // header is neither.
+  function setSrcHeader(file, proc, line){
+    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file||'?')+'</span>'
+      +(line?':<span class="ln">'+esc(String(line))+'</span>':'')
+      +(proc?' — '+esc(proc):'');
+  }
   function buildSource(file, proc, startLine, lines, current){
     curFile=file; curLine=current;
-    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
+    setSrcHeader(file, proc, current);
     const src=$('src'); src.innerHTML='';
     // wrap known data-symbol names so they get the same hover data-tip as the panels
     let re=null;
@@ -2245,7 +2251,12 @@
       case 'target': setTarget(m); break;
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
-        $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
+        // Where the stop is, in the source header — the band this used to write is gone (87c66af6).
+        // Written HERE and not only by the 'source' reply because a `source` message does not always
+        // follow: pause somewhere the pad has no source file for and this is the only statement of the
+        // location there is. The 'source' case below overwrites it with the same shape once the snippet
+        // arrives, so the two never read differently.
+        setSrcHeader(m.module, m.proc, m.line);
         // A new stop is a new thread world: the engine has re-picked the stopped thread and dropped any
         // selection. Forget last stop's tids FIRST — a leftover selTid would drop every reply this stop
         // is about to push — then adopt the thread this stop is ON, when the event names it. The host

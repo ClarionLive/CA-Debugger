@@ -48,6 +48,7 @@ let paused = false, runState = 'idle', targetPath = null;
 // The page's own `let`s do not leak out of eval(), so the ones its functions assign are declared HERE
 // beside the rest of the page state rather than left as implicit sloppy-mode globals.
 let restoredForTarget = null, untargetedRemoval = false;
+let curFile = null;            // clearSrc()'s own binding (see 87c66af6: idle still clears the source)
 let renders = 0;
 // collaborators applyValue reaches for that these checks do not exercise
 function clearEditMeta() { }
@@ -62,7 +63,7 @@ function logLine() { }
 const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS', 'WATCH_IDLE_TEXT', 'WATCH_IDLE_TITLE',
 
   'nameKey', 'watchedKey', 'targetKey', 'loadWatchStore', 'saveWatches', 'applyValue', 'cssEsc',
-  'clearEditMeta', 'clearValueMeta',
+  'clearEditMeta', 'clearValueMeta', 'clearSrc',
   'restoreWatchesFor', 'addWatchSilent', 'addWatch', 'removeWatch', 'watchWaitingHtml',
   'settleWaitingCells', 'setRunState'];
 const missing = [];
@@ -348,6 +349,18 @@ ok(storedNames(lastPath).length === 1, 'the target just written survived its own
   JSON.stringify(storedNames(lastPath)));
 ok(Object.keys(readStore().byTarget).length <= MAX_TARGETS, 'and the bound still holds',
   String(Object.keys(readStore().byTarget).length));
+
+// ---- 87c66af6: setRunState lost its caption writes; the one real action in that block must remain ----
+// This suite extracts the REAL setRunState (test-pad-threads.js stubs it), so it is the only place the
+// assertion means anything.
+console.log('\nsetRunState after the run-state band was removed');
+$('srchdrText').textContent = '▣ CUST.CLW:412 — BrowseCustomers';
+setRunState('running');
+ok($('srchdrText').textContent === '▣ CUST.CLW:412 — BrowseCustomers',
+  'a non-idle state leaves the source header alone', $('srchdrText').textContent);
+setRunState('idle');
+ok($('srchdrText').textContent.startsWith('No source'),
+  'going idle still clears the source panel', $('srchdrText').textContent);
 
 console.log('\n' + (fails ? fails + ' of ' + checks + ' CHECKS FAILED' : 'ALL ' + checks + ' CHECKS PASSED'));
 process.exit(fails ? 1 : 0);

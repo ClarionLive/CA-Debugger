@@ -79,7 +79,7 @@ function renderWatchList() { }   // builds rows with innerHTML; not what these c
 function saveWatches() { }       // localStorage persistence; covered by test-pad-watch-persist.js
 
 // ---- the page's own code ---------------------------------------------------------------------------
-const FNS = ['esc', 'send', 'resetThreadState',
+const FNS = ['esc', 'send', 'resetThreadState', 'setSrcHeader', 'clearSrc',
   'dtParseInt', 'fieldPart', 'fmtClarionDate', 'fmtClarionTime', 'dtDefault', 'dtModeFor', 'dtApply', 'dtCycle',
   'clearEditMeta', 'clearValueMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
   'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
@@ -857,6 +857,36 @@ console.log('\n12) replies keyed by request id are cancelled, not left hanging')
   const before = CALLS.length;
   onMessage(JSON.stringify({ type: 'framelocals', reqId: '1', items: [{ name: 'X', value: '1' }], tid: STOP_TID }));
   check('a late frame-locals reply does nothing', CALLS.length === before);
+}
+
+// ---- 87c66af6: the run-state band under the header is gone; its location detail moved to the header ----
+// The band duplicated the run-state indicator and could contradict it. What it did NOT duplicate was the
+// paused location, and a `source` reply does not always follow a pause — so these check the header now
+// carries it in both cases, rather than trusting that the source panel will.
+console.log('\n13) the paused location survives the removal of the run-state band');
+{
+  resetAll();
+  check('the band itself is gone from the page', !/locbar/.test(html));
+  check('and nothing still writes to it', html.indexOf("$('locbar')") < 0);
+
+  // paused with NO source reply behind it — the case the source panel cannot cover
+  onMessage(JSON.stringify({ type: 'paused', proc: 'BrowseCustomers', module: 'CUST.CLW', line: 412, tid: STOP_TID }));
+  const h = $('srchdrText').innerHTML;
+  console.log('   header after a bare pause: ' + JSON.stringify(h));
+  check('the header names the module', h.includes('CUST.CLW'), h);
+  check('…the line, which was the band\'s only unique detail', h.includes('412'), h);
+  check('…and the procedure', h.includes('BrowseCustomers'), h);
+
+  // and when the snippet does arrive, it must not say the location a different way
+  onMessage(JSON.stringify({ type: 'source', file: 'CUST.CLW', proc: 'BrowseCustomers',
+                             startLine: 410, lines: ['a', 'b', 'c'], current: 412 }));
+  console.log('   header after the source reply: ' + JSON.stringify($('srchdrText').innerHTML));
+  check('the source reply renders the identical header', $('srchdrText').innerHTML === h,
+        JSON.stringify($('srchdrText').innerHTML) + ' vs ' + JSON.stringify(h));
+
+  // NOT tested here: that going idle still calls clearSrc(). setRunState is a no-op stub in this suite
+  // (line 74), so a check here would be testing the stub. It is asserted in test-pad-watch-persist.js,
+  // which extracts the real one.
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
