@@ -98,7 +98,7 @@ const src = FNS.map(n => {
 // call, so the checks that drive it pass vacuously and the run still exits 0.
 if (missing.length) {
   const what = missing.length + ' of ' + FNS.length + ' page function(s) not found in ' +
-               (pagePath || pad.DEFAULT_PAGE) + ': ' + missing.join(', ');
+               pad.resolvePage(pagePath) + ': ' + missing.join(', ');
   if (!ALLOW_MISSING) {
     console.log('  FAIL  ' + what);
     console.log('        Renamed or moved? Update FNS in this file. Testing a pre-fix page on purpose?');

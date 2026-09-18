@@ -51,7 +51,6 @@ const values = new Map();
 const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
 const beginEdit = () => {};
-const STAR = '*';
 // dtApply is REAL, not a stub: it inserts its own .vas tag next to the same cell and runs AFTER wireEdit,
 // so on a DATE/TIME/integer row it sits between the cell and the pencil. Stubbing it out is precisely how a
 // position-based pencil lookup passed this test while leaving a live pencil on every numeric row.
@@ -72,7 +71,7 @@ if (missing.length) {
   // A stub answers every call with `undefined`, so the checks that exercise it stop testing the page and
   // start testing the stub — and still exit 0. Refuse to run rather than report a pass nobody can trust.
   const what = missing.length + ' of ' + NEEDED.length + ' page function(s) not found in ' +
-               (pagePath || pad.DEFAULT_PAGE) + ': ' + missing.join(', ');
+               pad.resolvePage(pagePath) + ': ' + missing.join(', ');
   if (!ALLOW_MISSING) {
     console.log('  FAIL  ' + what);
     console.log('        Renamed or moved? Update NEEDED in this file. Testing a pre-fix page on purpose?');

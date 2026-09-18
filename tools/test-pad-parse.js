@@ -11,7 +11,7 @@
 // Exit code 0 = every inline block parses.
 const pad = require('./pad-dom');
 const pagePath = process.argv.slice(2).find(a => !a.startsWith('--'));
-const page = pagePath || pad.DEFAULT_PAGE;
+const page = pad.resolvePage(pagePath);
 const html = pad.readPage(pagePath);
 
 // A block with src= has no body here to compile, and a type= that is not JavaScript (a template, JSON-LD)
