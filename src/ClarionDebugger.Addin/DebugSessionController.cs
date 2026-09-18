@@ -137,11 +137,25 @@ namespace ClarionDebugger
         ///     re-enabling Start now that the old engine has actually died (close→reopen completion path).
         /// If the current target reports a LIVE session (a fresh pad already started its own), we leave its state
         /// alone — the old teardown completing must not stomp a new live session.
+        ///
+        /// The CALLER is checked too, which is what <paramref name="target"/> is for. "Stopped" is a claim about
+        /// the pad making it, and ClarionDebuggerService.Stop() no longer publishes Idle when it could not
+        /// confirm the engine process dead — so a caller that still reports a live session is telling us its
+        /// teardown did not finish. Publishing Idle on that word would re-enable Start against a target still
+        /// owned by the old process, which is the close→reopen→restart race this controller exists to prevent.
+        /// The cost is deliberate and one-sided: after a teardown that never confirmed, Start stays disabled
+        /// until the pad is closed and reopened (Unregister clears _target, and the next Register then reads
+        /// Idle). A disabled Start after a failed kill is a far cheaper wrong answer than an enabled one.
         /// </summary>
         public static void NotifyStopped(IDebugSessionTarget target)
         {
             lock (_gate)
             {
+                // The teardown that is reporting in must actually be over. A pad whose Stop() could not confirm
+                // the process dead still reads non-idle, and its word for "stopped" is not good enough.
+                try { if (target != null && !target.IsSessionIdle) return; }
+                catch { }   // a throwing target can't be confirmed live either way — fall through to the check below
+
                 bool currentIsIdle;
                 try { currentIsIdle = _target == null || _target.IsSessionIdle; }
                 catch { currentIsIdle = _target == null; } // a throwing target can't be confirmed live — only Idle if none

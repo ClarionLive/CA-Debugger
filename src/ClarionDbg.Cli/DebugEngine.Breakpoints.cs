@@ -164,7 +164,9 @@ namespace ClarionDbg.Cli
                 }
             }
             Console.WriteLine($"bp: removed {canon}:{found.Line}");
-            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
+            // Echo the whole breakpoint, not just its planted line: `canon` IS found.Module here, and the
+            // host needs found.RequestedLine to know which of the lines sharing this planted record went.
+            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(found));
         }
 
         /// <summary>Plant breakpoints already bound to this exact image (used when a pre-loaded
