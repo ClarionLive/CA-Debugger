@@ -69,7 +69,7 @@ namespace ClarionDbg.Cli
         /// second argument, e.g. THR$GetInstance's .cwtls base).</summary>
         public uint Call(uint va, uint eaxSeed = 0, uint ebxSeed = 0)
         {
-            _shadow.Clear(); Array.Clear(_stack, 0, _stack.Length); Trace.Clear();   // fresh state so one emulator can run many getters
+            _shadow.Clear(); _writes.Clear(); Array.Clear(_stack, 0, _stack.Length); Trace.Clear();   // fresh state so one emulator can run many getters
             foreach (Register reg in new[] { Register.EAX, Register.EBX, Register.ECX, Register.EDX,
                                              Register.ESI, Register.EDI, Register.EBP })
                 _r[reg] = 0;
@@ -417,10 +417,50 @@ namespace ClarionDbg.Cli
 
         readonly Dictionary<uint, byte> _shadow = new Dictionary<uint, byte>();   // copy-on-write overlay: debuggee writes land here, never in the target
 
+        /// <summary>Where the debuggee writes landed, coalesced into contiguous runs (<see cref="_shadow"/>
+        /// holds the bytes; this holds the addresses). A caller needs WHERE, not just WHETHER: "it wrote" on
+        /// its own cannot tell the runtime's allocate-on-first-touch path — which writes the very block it
+        /// then hands back — from an incidental scratch write that says nothing about the result.</summary>
+        struct WriteRun { public uint Lo, Hi; }          // Hi inclusive
+        readonly List<WriteRun> _writes = new List<WriteRun>();
+
         /// <summary>True when the last <see cref="Call"/> wrote to debuggee memory (outside the modeled stack),
         /// even if it then threw. The real function would have mutated target state — e.g. THR$GetInstance
-        /// allocating a thread's instance on first touch — so its result is not a read-only answer.</summary>
+        /// allocating a thread's instance on first touch. Treat it as a QUESTION, not a verdict: it says the
+        /// run was not purely read-only, not that the result is worthless. Ask <see cref="WroteWithin"/> what
+        /// the write actually touched before discarding a result over it.</summary>
         public bool WroteDebuggeeMemory => _shadow.Count > 0;
+
+        /// <summary>True when a debuggee write landed anywhere inside [<paramref name="lo"/>, lo+<paramref
+        /// name="len"/>). This is how a caller tells an allocation of the block it is about to return from a
+        /// write somewhere unrelated.</summary>
+        public bool WroteWithin(uint lo, uint len)
+        {
+            if (len == 0 || _writes.Count == 0) return false;
+            uint hi = lo + (len - 1);
+            if (hi < lo) return false;                   // caller handed us a span that wraps — not answerable
+            foreach (var w in _writes) if (w.Lo <= hi && w.Hi >= lo) return true;
+            return false;
+        }
+
+        /// <summary>Record a debuggee write, extending the run in progress rather than starting a new one, so
+        /// a REP STOS over a whole block is one <see cref="Trace"/> line instead of thousands.</summary>
+        void NoteWrite(uint lo, int n)
+        {
+            uint hi = lo + (uint)(n - 1);
+            if (hi < lo) return;                         // wrapped; InStack already refuses these
+            if (_writes.Count > 0)
+            {
+                var last = _writes[_writes.Count - 1];
+                if (lo >= last.Lo && lo - last.Lo <= (last.Hi - last.Lo) + 1)   // contiguous with / inside it
+                {
+                    if (hi > last.Hi) { last.Hi = hi; _writes[_writes.Count - 1] = last; }
+                    return;
+                }
+            }
+            _writes.Add(new WriteRun { Lo = lo, Hi = hi });
+            Trace.Add($"wrote 0x{lo:X}");
+        }
 
         uint ReadN(uint addr, int n)
         {
@@ -435,6 +475,7 @@ namespace ClarionDbg.Cli
         void WriteN(uint addr, uint v, int n)
         {
             if (InStack(addr, n)) { for (int i = 0; i < n; i++) _stack[addr - _stackBase + i] = (byte)(v >> (8 * i)); return; }
+            NoteWrite(addr, n);   // every debuggee write funnels through here, so this is where WHERE is recorded
             for (int i = 0; i < n; i++) _shadow[addr + (uint)i] = (byte)(v >> (8 * i));   // shadow, not the debuggee
         }
 

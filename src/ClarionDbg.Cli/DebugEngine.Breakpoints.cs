@@ -279,7 +279,10 @@ namespace ClarionDbg.Cli
             var ubp = FindBpAt(m, rva);
             if (ubp != null && (ubp.Condition != null || ubp.HitMode != null || ubp.Trace != null))
             {
-                if (!ShouldPauseAtBp(ubp))
+                // tid + hThread go in because a condition or a {NAME} token may name THREADed (.cwtls) data,
+                // which has one instance PER THREAD: the answer is only meaningful for the thread that hit.
+                // Both are already in hand here — hThread is the handle opened above for this hit.
+                if (!ShouldPauseAtBp(ubp, tid, hThread))
                 {
                     if (haveCtx)
                     {

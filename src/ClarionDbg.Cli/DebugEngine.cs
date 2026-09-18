@@ -503,7 +503,16 @@ namespace ClarionDbg.Cli
 
                     case Native.EXIT_THREAD_DEBUG_EVENT:
                         NoteThreadExited(tid);
-                        ClearThreadedCache(tid);   // a reused tid must never inherit this thread's .cwtls block
+                        // DEFENCE IN DEPTH, NOT LOAD-BEARING — and saying so is the point. It does run with a
+                        // non-empty cache: the previous episode's entries outlive that episode and sit there
+                        // while the target runs, which is exactly when EXIT_THREAD arrives, so this really
+                        // does drop the dead tid's block. What it cannot do is change an answer, because
+                        // every episode that READS the cache clears all of it on the way in (PausedWait and
+                        // ShouldPauseAtBp), so a dead tid's entry is already gone before anyone looks.
+                        // It stops being ornamental the moment a reader resolves a threaded name without
+                        // opening an episode — then a reused tid inheriting a dead thread's block is a live
+                        // bug and this is the line that prevents it. Cheap; kept.
+                        ClearThreadedBlockCache(tid);
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -642,7 +651,8 @@ namespace ClarionDbg.Cli
             _instrStep = false;       // and consumes a pending instruction-step
             _selectedTid = tid;       // a new stop always starts on the stopped thread — a selection is
                                       // per-stop and is never carried across one
-            ClearThreadedCache();     // a fresh stop: re-resolve .cwtls instances rather than trust the last one
+            ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
+                                        // rather than trust bases cached while the target was last frozen
             uint va = haveCtx ? ctx.Eip : 0;
             var m = haveCtx ? ModuleAt(va) : null;
             uint rva = m != null ? va - m.LoadBase : va;

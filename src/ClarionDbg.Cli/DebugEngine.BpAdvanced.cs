@@ -11,9 +11,16 @@ namespace ClarionDbg.Cli
     /// evaluates them in a fixed order: condition gate → hit-count rule → tracepoint (log+resume) → pause.
     ///
     /// Value access reuses the same resolution the Watch panel uses (<see cref="ResolveDataAcrossModules"/>
-    /// + <see cref="FormatValueAt"/>), but reads SYNCHRONOUSLY at hit time. THREADed (.cwtls) data needs a
-    /// func-eval round-trip (it can't be read inline), so for v1 a condition/token over threaded data is
-    /// treated as indeterminate (condition ⇒ pause so the user notices; token ⇒ {?name}).
+    /// + <see cref="FormatValueAt"/>), and reads SYNCHRONOUSLY at hit time — including THREADed (.cwtls)
+    /// data, which resolves to the HITTING thread's instance through the same read-only THR$GetInstance
+    /// emulation the Watch panel uses (<see cref="TryResolveThreadedInstance"/>). Nothing here runs target
+    /// code, so the whole decision still answers inline.
+    ///
+    /// This file used to say a func-eval round-trip was required and that threaded data could not be read
+    /// inline. That stopped being true at 992d3e4, and the claim outliving it is the whole of 465a3873: the
+    /// bail it justified made every condition, hit count and {NAME} token over a THREADed name read 0 — not
+    /// unsupported, quietly WRONG. If a comment here ever says something cannot be done, check it against
+    /// the code before believing it.
     /// </summary>
     internal sealed partial class DebugEngine
     {
@@ -30,13 +37,26 @@ namespace ClarionDbg.Cli
 
         /// <summary>Centralized decision for a breakpoint that carries advanced properties. Returns true to
         /// pause (a real stop), false to resume silently. Order: condition gate, then hit-count rule (over
-        /// condition-satisfied hits), then tracepoint (log + resume). Side effect: increments HitCount.</summary>
-        private bool ShouldPauseAtBp(UserBreakpoint bp)
+        /// condition-satisfied hits), then tracepoint (log + resume). Side effect: increments HitCount.
+        ///
+        /// <paramref name="tid"/>/<paramref name="hThread"/> are the HITTING thread — the one whose .cwtls
+        /// instances a condition or token has to read. A THREADed name means nothing without them: the same
+        /// breakpoint on two threads is two different values.</summary>
+        private bool ShouldPauseAtBp(UserBreakpoint bp, uint tid, IntPtr hThread)
         {
+            // A hit is an EPISODE, exactly like a stop, and this is its single entrance — every hit-time
+            // value read below goes through here. The .cwtls block cache is only valid while the target is
+            // frozen at one debug event, and a NON-PAUSING hit never reaches PausedWait (it returns
+            // DBG_CONTINUE straight from OnUserBp), which is precisely the case a conditional breakpoint
+            // exists to produce: hit many times, pausing none of them. Clearing here is what "resolve fresh
+            // per hit" means in practice — nothing survives from the last hit or the last stop, while the
+            // several names of one condition or trace message still share one emulation per image.
+            ClearThreadedBlockCache();
+
             // 1) Condition gate — false ⇒ resume silently; indeterminate ⇒ pause and surface why.
             if (!string.IsNullOrEmpty(bp.Condition))
             {
-                bool? cond = TryEvalCondition(bp.Condition);
+                bool? cond = TryEvalCondition(bp.Condition, tid, hThread);
                 if (cond == false) return false;
                 if (cond == null)
                 {
@@ -63,7 +83,7 @@ namespace ClarionDbg.Cli
             // 3) Tracepoint — interpolate {var} tokens, log, and keep running (never pauses).
             if (bp.Trace != null)
             {
-                EmitTrace(bp, InterpolateTrace(bp.Trace));
+                EmitTrace(bp, InterpolateTrace(bp.Trace, tid, hThread));
                 return false;
             }
 
@@ -80,9 +100,10 @@ namespace ClarionDbg.Cli
 
         /// <summary>Evaluate a simple <c>LHS &lt;op&gt; RHS</c> condition against live target memory.
         /// LHS is a data name (global / module-static / record buffer / record field — the same scope the
-        /// Watch panel resolves). RHS is a numeric literal, a quoted string, or another data name. Returns
-        /// the boolean result, or null when it cannot be evaluated (unparseable, unresolvable, or threaded).</summary>
-        private bool? TryEvalCondition(string expr)
+        /// Watch panel resolves, THREADed names included, read on the hitting thread). RHS is a numeric
+        /// literal, a quoted string, or another data name. Returns the boolean result, or null when it
+        /// cannot be evaluated (unparseable, unresolvable, or unreadable).</summary>
+        private bool? TryEvalCondition(string expr, uint tid, IntPtr hThread)
         {
             if (string.IsNullOrWhiteSpace(expr)) return true;
 
@@ -94,8 +115,8 @@ namespace ClarionDbg.Cli
             if (lhsName.Length == 0 || rhsRaw.Length == 0) return null;
 
             double lnum; string lstr;
-            int lk = ReadVarValue(lhsName, out lnum, out lstr);
-            if (lk == 0) return null; // unresolvable / unreadable / threaded ⇒ indeterminate
+            int lk = ReadVarValue(lhsName, tid, hThread, out lnum, out lstr);
+            if (lk == 0) return null; // unresolvable / unreadable ⇒ indeterminate
 
             // Resolve RHS: quoted string literal, numeric literal, or a second data name.
             bool rhsString; double rnum = 0; string rstr = null;
@@ -109,7 +130,7 @@ namespace ClarionDbg.Cli
             }
             else
             {
-                int rk = ReadVarValue(rhsRaw, out rnum, out rstr);
+                int rk = ReadVarValue(rhsRaw, tid, hThread, out rnum, out rstr);
                 if (rk == 0) return null;
                 rhsString = rk == 2;
             }
@@ -168,16 +189,16 @@ namespace ClarionDbg.Cli
 
         // ------------------------------------------------------------------ tracepoint interpolation
 
-        /// <summary>Substitute <c>{name}</c> tokens with the live value of each data name. Unresolvable or
-        /// threaded names render as <c>{?name}</c> so the message still logs.</summary>
-        private string InterpolateTrace(string template)
+        /// <summary>Substitute <c>{name}</c> tokens with the live value of each data name, read on the
+        /// hitting thread. A name that cannot be read renders as <c>{?name}</c> so the message still logs.</summary>
+        private string InterpolateTrace(string template, uint tid, IntPtr hThread)
         {
             if (string.IsNullOrEmpty(template)) return string.Empty;
             return Regex.Replace(template, @"\{([^{}]+)\}", mm =>
             {
                 string nm = mm.Groups[1].Value.Trim();
                 double n; string s;
-                int k = ReadVarValue(nm, out n, out s);
+                int k = ReadVarValue(nm, tid, hThread, out n, out s);
                 if (k == 1) return n.ToString(CultureInfo.InvariantCulture);
                 if (k == 2) return s ?? string.Empty;
                 return "{?" + nm + "}";
@@ -186,19 +207,49 @@ namespace ClarionDbg.Cli
 
         // ------------------------------------------------------------------ synchronous value read
 
-        /// <summary>Read a data name's CURRENT value synchronously at hit time. Returns 0 = not found /
-        /// unreadable / threaded, 1 = numeric (num set), 2 = string (str set). Reuses the Watch panel's
-        /// name resolution; numeric scalars are decoded raw (locale/quote-proof), everything else falls
-        /// back to the shared display formatter.</summary>
-        private int ReadVarValue(string name, out double num, out string str)
+        /// <summary>Read a data name's CURRENT value synchronously at hit time, on the thread that hit.
+        /// Returns 0 = not found / unreadable, 1 = numeric (num set), 2 = string (str set). Reuses the Watch
+        /// panel's name resolution AND its THREADed instance resolution; numeric scalars are decoded raw
+        /// (locale/quote-proof), everything else falls back to the shared display formatter.</summary>
+        private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str)
         {
             num = 0; str = null;
             TswdDebugInfo.DataLocation loc; LoadedModule owner;
             if (!ResolveDataAcrossModules(name, out owner, out loc)) return 0;
 
-            uint va = owner.LoadBase + loc.Rva;
+            uint templateVa = owner.LoadBase + loc.Rva;
+            uint va = templateVa;
             bool threaded = owner.CwtlsHi != 0 && loc.Rva >= owner.CwtlsLo && loc.Rva < owner.CwtlsHi;
-            if (threaded) return 0; // .cwtls needs a func-eval; can't read inline at hit time (v1)
+            if (threaded)
+            {
+                // Same resolver, same vocabulary as the Watch panel and the Variables tree (see
+                // DebugEngine.Locals.cs) — one shape for "what does this THREADed name read here", not three.
+                uint instanceVa; string reason;
+                switch (TryResolveThreadedInstance(owner, templateVa, tid, hThread, out instanceVa, out reason))
+                {
+                    case ThreadedResolve.Ok:
+                        va = instanceVa;
+                        break;
+
+                    case ThreadedResolve.Unallocated:
+                        // The hitting thread has never touched this data, so there is no instance. Its first
+                        // touch starts from the template's initial value, so that IS what the condition is
+                        // asking about — the same answer the Watch row gives, annotated there and silent here.
+                        break;
+
+                    case ThreadedResolve.Template:
+                        // Not a Clarion thread: the shared template is what code here reads. Real value.
+                        break;
+
+                    default:
+                        // DELIBERATELY NOT the panels' fallback. A panel row must show something, so Locals
+                        // falls back to the template and labels it. A gate must not: answering a condition
+                        // from the wrong thread's data is a silent wrong answer, and the whole point of this
+                        // ticket is that a quiet 0 is worse than an admitted "don't know". Indeterminate
+                        // instead — the caller pauses and prints why.
+                        return 0;
+                }
+            }
 
             byte code = loc.TypeCode;
             switch (code)
