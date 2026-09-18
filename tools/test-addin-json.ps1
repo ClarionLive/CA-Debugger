@@ -25,9 +25,13 @@ param(
   [string] $EnginePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.cs'),
   [string] $EngineBpPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Breakpoints.cs'),
   # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
-  [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs')
+  [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
+  # the inbound reader and the page that builds the payloads it parses
+  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
+  [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html')
 )
 
+. (Join-Path $PSScriptRoot 'lib-extract.ps1')
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -Raw -LiteralPath $ServicePath
 $web = Get-Content -Raw -LiteralPath $WebViewPath
@@ -39,8 +43,8 @@ $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 function Get-Method {
   param([string] $Signature, [string] $From)
   if (-not $From) { $From = $src }
-  $i = $From.IndexOf($Signature, [StringComparison]::Ordinal)
-  if ($i -lt 0) {
+  $block = Get-CSharpBlock $Signature $From
+  if ($null -eq $block) {
     # Pointed at a version that predates the method under test: say so plainly instead of throwing
     # halfway through, which reads like a broken test rather than the before/after proof it is.
     Write-Host "  FAIL  absent from this version of the add-in: $Signature"
@@ -48,13 +52,7 @@ function Get-Method {
     Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
     exit 1
   }
-  $depth = 0; $started = $false
-  for ($j = $i; $j -lt $From.Length; $j++) {
-    $c = $From[$j]
-    if ($c -eq '{') { $depth++; $started = $true }
-    elseif ($c -eq '}') { $depth--; if ($started -and $depth -eq 0) { return $From.Substring($i, $j - $i + 1) } }
-  }
-  throw "unterminated: $Signature"
+  return $block
 }
 
 $methods = @(
@@ -399,6 +397,162 @@ Check 'the WaitForExit after the Kill is bounded' ($stop -match '_proc\.WaitForE
 $confirm = Get-Method 'private bool ProcessConfirmedDead()'
 Check 'a HasExited that throws answers NOT dead' ($confirm -match 'catch' -and $confirm -match 'return false;') ''
 Check 'the confirmation is IsRunning''s own predicate, HasExited' ($confirm -match 'return p\.HasExited;') ''
+Write-Host ''
+Write-Host 'the INBOUND reader, on payloads built by the page''s own sender'
+# ae5b678a stage 1. JsonVal used to search for "key": with no idea where strings start or end, and the page
+# worked around that by ORDERING its payloads - untrusted content last - with the doc comment instructing
+# every future payload to do the same.
+#
+# WHAT THAT WORKAROUND ACTUALLY BOUGHT, measured rather than assumed: against the page's real senders the
+# OLD extractor reads every fixture below CORRECTLY. JSON.stringify escapes each quote in a value, so a
+# procedure name carrying "line":9999 arrives as \"line\":9999 and never matches the search; and no sender
+# hand-builds JSON, they all either stringify or send a delimiter-separated string. Quote injection through
+# today's senders was NOT reachable. The cases the old extractor genuinely got wrong are in the next block.
+#
+# So this block is regression coverage, not an exploit: whatever a hostile debuggee puts in a procedure
+# name, the page encodes it and the host must read back exactly what was sent. The debuggee is untrusted -
+# those names come out of the target's TSWD debug info and return here when the user right-clicks a
+# Procedures row - and stage 2 adds more senders to this path, which is why the order dependence goes now,
+# while there are still few enough senders to check.
+#
+# The fixtures are not written here. They are produced by running debugger.html's REAL send() and its REAL
+# breakonprocentry handler - both lifted out of the page - under node, with the page objects they touch
+# stubbed. Two suites built on each side's imagination of the other cannot contradict each other, and this
+# project has already shipped exactly that failure.
+
+$page = Get-Content -Raw -LiteralPath $PagePath
+$reader = Get-Content -Raw -LiteralPath $ReaderPath
+
+# The real reader, lifted whole: ReadField is what the add-in calls, and everything it leans on comes with it.
+Add-Type -Language CSharp -TypeDefinition (
+  "using System;`nusing System.Globalization;`nusing System.Text;`n" +
+  ((Get-Method 'internal static class JsonMessageReader' $reader) -replace 'internal static class', 'public static class')
+) | Out-Null
+
+$sendFn  = Get-Method 'function send(action,data)' $page
+$handler = Get-Method "`$('miBpEntry').onclick=" $page
+
+$js = @'
+// Just enough of the page for the real handler to run.
+const els = {};
+function $(id){ if(!els[id]) els[id] = { classList:{remove(){},add(){}}, style:{}, dataset:{}, addEventListener(){} }; return els[id]; }
+let procCtx = null, wire = null;
+const wv = { postMessage(s){ wire = s; } };
+
+'@ + $sendFn + "`n" + $handler + ";`n" + @'
+
+// Every name here is what a HOSTILE debuggee could put in its own debug info. The page escapes them
+// correctly - JSON.stringify does - so these are well-formed messages whose VALUES look like structure.
+const names = [
+  ['a closing brace inside the name',        'Proc}'],
+  ['a quote inside the name',                'say "hi" now'],
+  ['an escaped quote inside the name',       'esc \\" here'],
+  ['a backslash inside the name',            'back\\slash'],
+  ['a whole fake field inside the name',     'X","line":9999,"module":"EVIL.CLW'],
+  ['a fake field that also closes the object', 'X"},{"line":9999'],
+  ['a newline inside the name',              'two\nlines'],
+  ['a brace and a quote together',           '{"line":1}'],
+];
+
+const out = [];
+for (const [label, name] of names) {
+  procCtx = { module: 'MAIN.CLW', line: 42, name: name };
+  wire = null;
+  els['miBpEntry'].onclick();
+  out.push({ label, wire, name });
+}
+
+// The same real send(), with the members in an order the page does not use today. The retired rule forbade
+// exactly this - untrusted content anywhere but last - so it is the case that proves the rule is gone.
+wire = null;
+send('breakonprocentry', JSON.stringify({ name: 'X","line":9999', module: 'MAIN.CLW', line: 42 }));
+out.push({ label: 'untrusted name FIRST, which the retired field-order rule forbade', wire, name: 'X","line":9999' });
+
+console.log(JSON.stringify(out));
+'@
+
+$jsFile = Join-Path ([System.IO.Path]::GetTempPath()) ("cajson-" + [Guid]::NewGuid().ToString('N') + ".js")
+Set-Content -LiteralPath $jsFile -Value $js -Encoding UTF8
+try {
+  $raw = & node $jsFile 2>&1
+  if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL  could not run the page's sender under node"; $raw | ForEach-Object { Write-Host "        $_" }; $script:failures++ }
+  $fixtures = $raw | ConvertFrom-Json
+} finally {
+  Remove-Item -LiteralPath $jsFile -ErrorAction SilentlyContinue
+}
+
+function Read1 { param($json, $key) [JsonMessageReader]::ReadField($json, $key) }
+
+foreach ($f in $fixtures) {
+  # Exactly the host's own two steps: read the envelope, then read the payload inside data.
+  $action = Read1 $f.wire 'action'
+  $data   = Read1 $f.wire 'data'
+  $module = Read1 $data 'module'
+  $line   = Read1 $data 'line'
+  $name   = Read1 $data 'name'
+  $ok = ($action -eq 'breakonprocentry') -and ($module -eq 'MAIN.CLW') -and ($line -eq '42') -and ($name -eq $f.name)
+  Check $f.label $ok "module=$module line=$line name=$name"
+}
+
+Write-Host ''
+Write-Host 'and the shapes the old extractor genuinely got wrong'
+# Each of these was checked against the old JsonVal, compiled out of main; the value it returned is noted.
+# These are the real gains of the swap - not the injection story, which the escaping already covered.
+#
+# A key that only LOOKS top-level because it sits inside a nested container. No inbound payload nests one
+# today, which is exactly why this would have gone unnoticed until the first one did.
+# old JsonVal returned '9'
+Check 'a key inside a nested object is not the top-level one' `
+  ((Read1 '{"outer":{"line":9},"line":42}' 'line') -eq '42') (Read1 '{"outer":{"line":9},"line":42}' 'line')
+# old JsonVal returned '9'
+Check 'a key inside an array is not the top-level one' `
+  ((Read1 '{"rows":[{"line":9}],"line":42}' 'line') -eq '42') (Read1 '{"rows":[{"line":9}],"line":42}' 'line')
+# old JsonVal returned '9' - a value from a different object entirely
+Check 'a key that exists ONLY nested reads as absent, not as the nested value' `
+  ($null -eq (Read1 '{"outer":{"line":9}}' 'line')) (Read1 '{"outer":{"line":9}}' 'line')
+Check 'a brace inside a string value does not end the object' `
+  ((Read1 '{"name":"a}b","line":42}' 'line') -eq '42') (Read1 '{"name":"a}b","line":42}' 'line')
+Check 'an escaped quote does not end the string' `
+  ((Read1 '{"name":"a\"b","line":42}' 'name') -eq 'a"b') (Read1 '{"name":"a\"b","line":42}' 'name')
+Check 'a key name that is a prefix of another is not confused with it' `
+  ((Read1 '{"lineNumber":9,"line":42}' 'line') -eq '42') (Read1 '{"lineNumber":9,"line":42}' 'line')
+Check 'whitespace and newlines around members' `
+  ((Read1 "{ `"line`" : 42 ,`n `"name`" : `"x`" }" 'line') -eq '42') ''
+# old JsonVal returned 'au0042c' - it appended the escape letter and then the digits verbatim
+Check 'a \u escape is decoded' ((Read1 '{"name":"aBc"}' 'name') -eq 'aBc') (Read1 '{"name":"aBc"}' 'name')
+
+Write-Host ''
+Write-Host 'absent, null and malformed all read as "not there" - and nothing throws'
+# This runs on the WebView message path, where a throw kills the command outright. Every one of these used
+# to be a potential exception or a wrong answer.
+Check 'an absent field' ($null -eq (Read1 '{"a":1}' 'b')) ''
+Check 'a JSON null' ($null -eq (Read1 '{"a":null}' 'a')) ''
+Check 'null input' ($null -eq (Read1 $null 'a')) ''
+Check 'empty input' ($null -eq (Read1 '' 'a')) ''
+Check 'not an object at all' ($null -eq (Read1 '[1,2,3]' 'a')) ''
+# old JsonVal returned 'oops' - the partial contents of a string that never closed
+Check 'an unterminated string' ($null -eq (Read1 '{"a":"oops' 'a')) ''
+Check 'an unterminated object' ($null -eq (Read1 '{"a":1' 'b')) ''
+Check 'an unterminated nested container' ($null -eq (Read1 '{"a":{"b":1,"c":42}' 'c')) ''
+Check 'a truncated \u escape' ($null -eq (Read1 '{"a":"x\u00"}' 'a')) ''
+# old JsonVal returned '{"b":1' - a truncated blob a caller would have used as a string
+Check 'an object VALUE is not returned as text' ($null -eq (Read1 '{"a":{"b":1}}' 'a')) (Read1 '{"a":{"b":1}}' 'a')
+Check 'a number still reads as its literal text' ((Read1 '{"a":-3}' 'a') -eq '-3') (Read1 '{"a":-3}' 'a')
+Check 'a bool still reads as its literal text' ((Read1 '{"a":true}' 'a') -eq 'true') (Read1 '{"a":true}' 'a')
+
+Write-Host ''
+Write-Host 'the retired rule is not lying around waiting to be followed again'
+# The doc comment used to codify the field-ORDER workaround AS THE CONTRACT - "any new payload must do the
+# same". That instruction is the defect propagating itself into code not yet written, so retiring it is part
+# of the fix. This is the guard that keeps it retired.
+$jsonVal = Get-Method 'private static string JsonVal(string json, string key)' $web
+Check 'JsonVal delegates to the real reader instead of scanning' ($jsonVal -match 'JsonMessageReader\.ReadField') ''
+Check 'no IndexOf scan left in JsonVal' ($jsonVal -notmatch 'IndexOf') ''
+$doc = $web.Substring(0, $web.IndexOf('private static string JsonVal(string json, string key)', [StringComparison]::Ordinal))
+$doc = $doc.Substring([Math]::Max(0, $doc.Length - 1600))
+Check 'its doc comment no longer instructs new payloads to order their fields' `
+  ($doc -notmatch 'must do the same' -and $doc -notmatch 'goes LAST') ''
+Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
