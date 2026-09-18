@@ -1170,7 +1170,10 @@ namespace ClarionDebugger.Terminal
                 Post(sb.ToString());
                 Console("pause", "paused [" + p.Reason + "]  " + (p.Resolved ? p.Module + " line " + p.Line + (p.Proc != null ? " in " + p.Proc : "") : "(unresolved)"));
 
-                SendSource(p.ResolvedPath, p.Proc, p.Line);
+                // The module goes in as well as the path: when the path does not resolve there is still a
+                // source message, carrying the module so the page can name the stop and clear the last one's
+                // listing instead of leaving it on screen.
+                SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
                 _svc.RequestStack();          // per-frame locals now load lazily from the Call Stack (frame 0 auto)
                 _svc.RequestModuleData();
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
@@ -1424,29 +1427,45 @@ namespace ClarionDebugger.Terminal
             if (m.HasDebug) Console("info", "module loaded: " + m.Name + " (symbols)");
         }
 
-        /// <summary>Read ~±12 lines around the current line from the resolved .clw and show them.</summary>
-        private void SendSource(string path, string proc, int line)
+        /// <summary>Read ~±12 lines around the current line from the resolved .clw and show them.
+        /// <para>
+        /// ALWAYS posts a <c>source</c> message, even when there is nothing to read. "This stop has no
+        /// source" is a state the page has to be TOLD about: this used to return silently, so no source
+        /// message followed the pause and the page's <c>$('src')</c>, <c>curFile</c> and <c>curLine</c> kept
+        /// the PREVIOUS stop's file, listing and highlight under the new stop's header (87c66af6 made the
+        /// 'paused' arm always write that header). <c>curFile</c> is load-bearing: the page sends
+        /// run-to-cursor as <c>curFile + ':' + line</c>, so a stale one armed a breakpoint in a file the user
+        /// was no longer stopped in.
+        /// </para>
+        /// <para>
+        /// An empty <c>lines</c> array is that message, and it keeps buildSource the ONE writer of the
+        /// listing — the same shape 87c66af6 gave the location caption. <paramref name="module"/> is what
+        /// <c>file</c> carries when there is no path, so the header still names where the stop is.
+        /// </para></summary>
+        private void SendSource(string module, string path, string proc, int line)
         {
-            try
+            string[] all = null;
+            // Unreadable is the same as absent as far as the page is concerned — either way there is no
+            // listing for this stop, and either way it must be told so.
+            try { if (!string.IsNullOrEmpty(path) && File.Exists(path)) all = File.ReadAllLines(path); }
+            catch { all = null; }
+
+            bool have = all != null && all.Length > 0;
+            int start = have ? Math.Max(1, line - 12) : 0;
+            int end = have ? Math.Min(all.Length, line + 12) : -1;
+            var sb = new StringBuilder("{\"type\":\"source\",\"file\":")
+                .Append(Str(have ? Path.GetFileName(path) : module))
+                .Append(",\"proc\":").Append(Str(proc))
+                .Append(",\"startLine\":").Append(start)
+                .Append(",\"current\":").Append(line)
+                .Append(",\"lines\":[");
+            for (int i = start; i <= end; i++)
             {
-                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
-                string[] all = File.ReadAllLines(path);
-                int start = Math.Max(1, line - 12);
-                int end = Math.Min(all.Length, line + 12);
-                var sb = new StringBuilder("{\"type\":\"source\",\"file\":").Append(Str(Path.GetFileName(path)))
-                    .Append(",\"proc\":").Append(Str(proc))
-                    .Append(",\"startLine\":").Append(start)
-                    .Append(",\"current\":").Append(line)
-                    .Append(",\"lines\":[");
-                for (int i = start; i <= end; i++)
-                {
-                    if (i > start) sb.Append(',');
-                    sb.Append(Str(all[i - 1]));
-                }
-                sb.Append("]}");
-                Post(sb.ToString());
+                if (i > start) sb.Append(',');
+                sb.Append(Str(all[i - 1]));
             }
-            catch { }
+            sb.Append("]}");
+            Post(sb.ToString());
         }
 
         // ------------------------------------------------------------------ gutter breakpoints

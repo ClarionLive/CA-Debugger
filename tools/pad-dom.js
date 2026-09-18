@@ -87,6 +87,7 @@ class El {
   addEventListener() { }
   focus() { }      // the in-place value editor focuses and selects itself when it opens
   select() { }
+  scrollIntoView() { }   // buildSource scrolls the current source line into view after it renders
   matches(sel) {
     const p = parseSel(sel);
     if (!p.classes.every(c => this.classList.contains(c))) return false;

@@ -354,6 +354,27 @@ Check 'the old planted-line RemoveAll is gone' ($src -notmatch 'RemoveAll\(b => 
 Check 'the engine only unplants a shared INT3 when nothing else references it' ($bpSrc -match 'stillReferenced' -and $bpSrc -match 'b\.Owner == found\.Owner && b\.Rvas\.Contains\(rva\)') ''
 
 Write-Host ''
+Write-Host 'a stop with no source file still TELLS the page so, instead of saying nothing'
+# 87c66af6 made the page's 'paused' arm always write the location into the source header. SendSource used to
+# return silently when the .clw path could not be resolved, so no `source` message followed that pause and
+# the page kept the PREVIOUS stop's file, listing and highlight under the NEW stop's header - and curFile is
+# load-bearing, because run-to-cursor is sent as curFile + ':' + line.
+#
+# The page half is covered behaviourally by tools/test-pad-source.js, which runs the real buildSource. What
+# belongs here is the HOST's half of the contract: there is a message on every path. Asserted against the
+# shipped method body, brace-matched out, and the signature prefix matches the pre-fix arity too so an older
+# add-in fails these checks rather than aborting the suite.
+$sendSource = Get-Method 'private void SendSource(' $web
+Check 'SendSource posts exactly one source message' ((([regex]::Matches($sendSource, 'Post\(')).Count) -eq 1) `
+  ((([regex]::Matches($sendSource, 'Post\(')).Count).ToString() + ' Post() call(s)')
+# THE RULE: no path out of SendSource that skips the message. An early `return;` is exactly how the old one
+# left the page holding the last stop's listing.
+Check 'and has no early return that would skip it' ($sendSource -notmatch 'return;') ''
+Check 'it still reads the file when there is one' ($sendSource -match 'File\.ReadAllLines') ''
+# ...and the caller hands it the module, so the message can name the stop when the path does not resolve.
+Check 'the pause handler passes the module as well as the path' ($web -match 'SendSource\(p\.Module, p\.ResolvedPath, p\.Proc, p\.Line\)') ''
+
+Write-Host ''
 Write-Host 'teardown: "stopped" has to be a check, not a claim'
 # Task 51d2f1e4. Stop() used to discard the WaitForExit result, swallow the Kill and set Idle in a finally
 # regardless, so a debugger that reported "stopped" could still own a live process. The decision table below

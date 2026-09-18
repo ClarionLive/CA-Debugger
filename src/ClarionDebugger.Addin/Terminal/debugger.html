@@ -2133,7 +2133,10 @@
   }
 
   // ---- source snippet (current location) ----
-  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; }
+  // Session teardown ('clear'): no stop at all, so the header goes back to its idle prompt. The only other
+  // writer of curFile/curLine is buildSource, and this one only ever CLEARS them, so the two cannot
+  // disagree about which file the page is showing.
+  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; curLine=0; }
   // The one place the current location is written, so the pause event and the source reply cannot say
   // it two different ways. `line` is optional: the gutter in the snippet below also shows it, but the
   // snippet can be absent (paused where the pad has no source file) or its section collapsed, and this
@@ -2143,10 +2146,25 @@
       +(line?':<span class="ln">'+esc(String(line))+'</span>':'')
       +(proc?' — '+esc(proc):'');
   }
+  // The ONE writer of the listing and of curFile/curLine, which is why a stop with NO source file for it
+  // arrives here too, as an empty `lines` array: the host always posts a `source` message (see SendSource).
+  // It used to post none at all in that case, and then $('src'), curFile and curLine all kept the PREVIOUS
+  // stop's file, listing and highlight while the header above named the new location — and curFile is
+  // load-bearing, because run-to-cursor is sent as curFile+':'+line, so the stale one armed a breakpoint in
+  // a file the user was no longer stopped in.
   function buildSource(file, proc, startLine, lines, current){
-    curFile=file; curLine=current;
     setSrcHeader(file, proc, current);
     const src=$('src'); src.innerHTML='';
+    if(!lines || !lines.length){
+      // No listing => no file to act on. Everything keyed off curFile (run-to-cursor, the source
+      // right-click, the breakpoint dots) reads null and does nothing, rather than acting on the last stop.
+      curFile=null; curLine=0;
+      const none=document.createElement('div'); none.className='empty';
+      none.textContent='No source for this stop'+(file?' ('+file+')':'')+'.';
+      src.appendChild(none);
+      return;
+    }
+    curFile=file; curLine=current;
     // wrap known data-symbol names so they get the same hover data-tip as the panels
     let re=null;
     const names=allSyms.map(s=>s.name).filter(Boolean).sort((a,b)=>b.length-a.length);
