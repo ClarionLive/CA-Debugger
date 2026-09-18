@@ -734,31 +734,6 @@ namespace ClarionDebugger.Terminal
         // eventual Monaco-side trigger (context menu / gutter click) needs no new plumbing here — it sends
         // the same "runtocursor" web message with no data.
 
-        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor.
-        private static MethodInfo _monacoCursor;
-
-        /// <summary>Resolve ClarionAssistant's live-cursor query, if that addin is loaded. Same reflection
-        /// pattern as ResolveMonacoNavigator (no compile-time reference between the two addins). Frozen
-        /// contract: bool ClarionAssistant.Services.MonacoSourceNavigator.TryGetActiveCursor(out string filePath, out int line, out int column)</summary>
-        private static MethodInfo ResolveMonacoCursorGetter()
-        {
-            if (_monacoCursor != null) return _monacoCursor;
-            try
-            {
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    Type t;
-                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
-                    catch { t = null; }
-                    if (t == null) continue;
-                    var mi = t.GetMethod("TryGetActiveCursor", BindingFlags.Public | BindingFlags.Static);
-                    if (mi != null) { _monacoCursor = mi; break; }
-                }
-            }
-            catch { }
-            return _monacoCursor;
-        }
-
         /// <summary>Resolve "module:line" from the ACTIVE Monaco editor's live cursor, or null if there is no
         /// usable cursor — reporting WHY to the Debug Console in that case, since every failure here is
         /// something the user can act on (install/enable ClarionAssistant, open a source file, click a line).
@@ -767,10 +742,15 @@ namespace ClarionDebugger.Terminal
         /// name IS the module name — the same assumption EditorBreakpointService makes).</summary>
         private string ResolveMonacoCursorSpec()
         {
-            var mi = ResolveMonacoCursorGetter();
+            var mi = _hookCursor.Method;
             if (mi == null)
             {
-                Console("err", "run to cursor: ClarionAssistant isn't loaded — can't read the active editor's cursor.");
+                // Say WHICH failure this is. "Not loaded", "your ClarionAssistant predates the hook" and
+                // "the hook is there but its signature has drifted" are three different problems with three
+                // different fixes, and they are all invisible from the page. The third one in particular has
+                // no other way of ever being reported: every other caller treats an unbound hook as
+                // "ClarionAssistant isn't here" and quietly takes the native path.
+                Console("err", "run to cursor: " + _hookCursor.Explain() + " — can't read the active editor's cursor.");
                 return null;
             }
 
@@ -841,6 +821,12 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
+                // Cross-addin hooks cache their MISSES for the whole session, so a ClarionAssistant that was
+                // absent (or older, or a mismatched build) when the last session started would stay "absent"
+                // for the life of the IDE process. A session start is the natural point to re-scan, and the
+                // only one worth paying for it at.
+                RearmAndReportMonacoHooks();
+
                 // The Target EXE field is intentionally gone — Start always sources the target from the app.
                 // On EVERY Start we re-resolve from the active project and use the fresh result. A manual Browse
                 // pick is honoured only as a ONE-SHOT tied to the solution/project context it was chosen for: if
@@ -1196,7 +1182,7 @@ namespace ClarionDebugger.Terminal
                 // panel refresh above, but DON'T jump the editor to the .clw — that activates the source
                 // tab and steals focus away from the disassembly view on every instruction step.
                 bool instrStep = string.Equals(p.Reason, "stepi", StringComparison.OrdinalIgnoreCase);
-                var execLine = ResolveMonacoExecutionLine();
+                var execLine = _hookExecLine.Method;
                 if (execLine != null)
                 {
                     // ClarionAssistant can paint the execution line itself (issue #26).
@@ -1205,7 +1191,7 @@ namespace ClarionDebugger.Terminal
                 else if (!instrStep && !string.IsNullOrEmpty(p.ResolvedPath))
                 {
                     // No SetExecutionLine hook (ClarionAssistant absent or an older build): unchanged path.
-                    TryJump(p.ResolvedPath, p.Line);
+                    JumpToLine(p.ResolvedPath, p.Line);
                     // JumpToCurrentLine activates the Clarion editor and grabs keyboard focus, so the
                     // next configured debug shortcut would be handled by the editor instead of this
                     // pane. Return focus to our pad so stepping shortcuts keep working in a loop.
@@ -1215,7 +1201,7 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Pause-time execution-line marker when ClarionAssistant exposes SetExecutionLine.
-        /// Navigation still goes through <see cref="TryJump"/> (skipped for a 'stepi' instruction step so
+        /// Navigation still goes through <see cref="JumpToLine"/> (skipped for a 'stepi' instruction step so
         /// the Disassembly view keeps focus); the marker itself is Monaco's when it reports it painted one.
         /// When it returns false (overlay OFF) or throws, the stock editor's native marker is painted
         /// instead, which also fixes the pre-#26 overlay-off case where no marker appeared at all. An
@@ -1224,20 +1210,19 @@ namespace ClarionDebugger.Terminal
         {
             if (string.IsNullOrEmpty(path)) { ClearExecutionLine(); return; }
 
-            bool nativeJumped = false;
-            if (!instrStep) nativeJumped = TryJump(path, line);
+            bool nativeMarkerPainted = false;
+            if (!instrStep) nativeMarkerPainted = JumpToLine(path, line);
 
             bool painted = InvokeExecutionLine(setter, path, line);
             if (painted)
             {
-                // Monaco owns the marker. If the navigator declined and TryJump fell back to the stock
+                // Monaco owns the marker. If the navigator declined and JumpToLine fell back to the stock
                 // editor, drop the native arrow it painted so there is only ever one marker.
-                if (nativeJumped) ClearCurrentLineMarker();
+                if (nativeMarkerPainted) ClearCurrentLineMarker();
             }
-            else if (!instrStep && !nativeJumped)
+            else if (!instrStep && !nativeMarkerPainted)
             {
-                try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
-                catch { }
+                PaintNativeMarker(path, line);
             }
 
             if (!instrStep) ReturnFocusToPad();
@@ -1535,13 +1520,18 @@ namespace ClarionDebugger.Terminal
         /// the visible Monaco editor never scrolls. Prefer the Monaco navigator (its frozen contract covers
         /// overlay ON and OFF and self-queues if the page isn't ready); only fall back to the stock editor's
         /// current-line jump — which also paints the execution-line marker — when ClarionAssistant is absent.
-        /// Returns true when it took that native path (so the native marker is now painted).</summary>
-        private static bool TryJump(string path, int line)
+        ///
+        /// RETURN VALUE IS <c>usedNativeMarker</c>, NOT SUCCESS. True means the jump went through the stock
+        /// editor, which also paints the native current-line marker, so the caller knows a native marker is
+        /// now on screen and may need clearing. This used to be named as a Try* method, which read like a
+        /// success flag and inverted the usual meaning of that prefix: it returns true precisely on the
+        /// FALLBACK path, and false when the preferred Monaco navigator handled the jump.</summary>
+        private static bool JumpToLine(string path, int line)
         {
             if (string.IsNullOrEmpty(path)) return false;
             try
             {
-                var nav = ResolveMonacoNavigator();
+                var nav = _hookNavigate.Method;
                 if (nav != null)
                 {
                     object handled = nav.Invoke(null, new object[] { path, line, 1 });
@@ -1549,41 +1539,17 @@ namespace ClarionDebugger.Terminal
                 }
             }
             catch { }
-            try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
-            catch { }
+            PaintNativeMarker(path, line);
             return true;
         }
 
-        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.SetExecutionLine.
-        private static MethodInfo _monacoExecLine;
-
-        /// <summary>Resolve ClarionAssistant's execution-line marker hook, if that addin is loaded and new
-        /// enough to have it. Same reflection pattern as <see cref="ResolveMonacoNavigator"/>.
-        /// Frozen contract (issue #26, with ClarionAssistant ticket #26a):
-        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.SetExecutionLine(string filePath, int line)
-        ///   set: path + line &gt;= 1 paints one global marker, with no navigation or focus change. Returns
-        ///   true when Monaco painted it, false when the overlay is OFF (caller paints the native marker).
-        ///   clear: null/empty path or line &lt;= 0. Always returns true; idempotent.
-        /// Null == method missing (ClarionAssistant absent or an older build) → callers keep the pre-#26
-        /// behaviour exactly and make no new calls.</summary>
-        private static MethodInfo ResolveMonacoExecutionLine()
+        /// <summary>Paint the stock editor's current-execution-line marker (the yellow bar) at
+        /// <paramref name="path"/>:<paramref name="line"/>, which is a side effect of its current-line jump.
+        /// A throw is swallowed: failing to paint a marker must never break stepping.</summary>
+        private static void PaintNativeMarker(string path, int line)
         {
-            if (_monacoExecLine != null) return _monacoExecLine;
-            try
-            {
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    Type t;
-                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
-                    catch { t = null; }
-                    if (t == null) continue;
-                    var mi = t.GetMethod("SetExecutionLine", BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(string), typeof(int) }, null);
-                    if (mi != null && mi.ReturnType == typeof(bool)) { _monacoExecLine = mi; break; }
-                }
-            }
+            try { ICSharpCode.SharpDevelop.Debugging.DebuggerService.JumpToCurrentLine(path, line, 1, line, 1); }
             catch { }
-            return _monacoExecLine;
         }
 
         /// <summary>Call SetExecutionLine; a throw counts as "not painted" so stepping never breaks.</summary>
@@ -1601,7 +1567,7 @@ namespace ClarionDebugger.Terminal
         /// stock editor's native arrow. Without the hook this is exactly <see cref="ClearCurrentLineMarker"/>.</summary>
         private static void ClearExecutionLine()
         {
-            var setter = ResolveMonacoExecutionLine();
+            var setter = _hookExecLine.Method;
             if (setter != null) InvokeExecutionLine(setter, null, 0);
             ClearCurrentLineMarker();
         }
@@ -1610,44 +1576,210 @@ namespace ClarionDebugger.Terminal
         /// SetExecutionLine hook is bound; without it no clear happened here before #26, so none happens now.</summary>
         private static void ClearExecutionLineIfHooked()
         {
-            if (ResolveMonacoExecutionLine() != null) ClearExecutionLine();
+            if (_hookExecLine.Method != null) ClearExecutionLine();
         }
 
-        // Cached cross-addin hook: ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine.
-        private static MethodInfo _monacoNav;
+        // ─────────────────────────────────────────── cross-addin reflection: ONE resolver for every hook
+        //
+        // Every hook into ClarionAssistant lives on ONE type, and there is no compile-time reference between
+        // the two addins, so they all bind by name at runtime. Three near-identical AppDomain scans used to
+        // do that; this is the single copy of it.
+        //
+        // Reflection across an addin boundary fails SILENTLY by nature: rename a method or change a parameter
+        // on the other side and the feature simply stops existing, with nothing anywhere saying so. The whole
+        // shape of what follows is about making that failure legible — bind by FULL signature, tell "not
+        // loaded" apart from "older build" and from "wrong shape", and notice a second loaded copy.
 
-        /// <summary>Resolve ClarionAssistant's Monaco-aware navigation entry point, if that addin is loaded.
-        /// The Clarion source editor is replaced by ClarionAssistant's Monaco overlay; positioning an
-        /// already-open Monaco editor has no public API, so ClarionAssistant exposes this hook for us.
-        /// We have no compile-time reference to that addin, so we bind by name via reflection and cache it.
-        /// Frozen contract (with CA-Terminal-1-CC):
-        ///   bool ClarionAssistant.Services.MonacoSourceNavigator.NavigateToFileAndLine(string filePath, int line, int column)
-        ///   line/column 1-based; returns true when it handled the request (covers Monaco overlay ON and OFF,
-        ///   and self-queues if the editor isn't ready yet); false only when it could not (bad/missing path).
-        /// Absent type == ClarionAssistant not loaded (dev not using Monaco) → caller uses the native path.</summary>
-        private static MethodInfo ResolveMonacoNavigator()
+        private const string MonacoTypeName = "ClarionAssistant.Services.MonacoSourceNavigator";
+
+        /// <summary>The assembly the hook type must come from. Verified against the shipped
+        /// ClarionAssistant.dll, whose simple name is exactly this; it is unsigned, so the name is the only
+        /// identity available. This is NOT an attack boundary — any in-process IDE addin is already fully
+        /// trusted. It stops us binding to an unrelated assembly that happens to define the same type name,
+        /// and it is what makes a STALE second copy reportable instead of silently chosen.</summary>
+        private const string MonacoAssemblyName = "ClarionAssistant";
+
+        /// <summary>Why a hook is not callable. Three different problems with three different fixes, and
+        /// collapsing them all into "null" is what made this integration undiagnosable:
+        /// <list type="bullet">
+        /// <item>NotLoaded — ClarionAssistant isn't installed or enabled. Normal; the user fixes it.</item>
+        /// <item>OlderBuild — it IS loaded but predates this hook. The user upgrades it.</item>
+        /// <item>WrongShape — the method is there under a DIFFERENT signature, i.e. the two addins have
+        /// drifted apart. A developer fixes it, and nothing else in either process would ever say so.</item>
+        /// </list></summary>
+        private enum HookStatus { Unresolved, Bound, NotLoaded, OlderBuild, WrongShape }
+
+        /// <summary>One late-bound static method on MonacoSourceNavigator, bound by FULL signature and cached
+        /// for the session — INCLUDING the misses. Before this, an unresolved hook re-scanned every loaded
+        /// assembly on every call, so a single step ran three whole-AppDomain scans whenever ClarionAssistant
+        /// was absent or older. <see cref="Rearm"/> drops the cache at session start, the one moment where the
+        /// set of loaded addins can usefully have changed and re-paying for the scan is worth it.</summary>
+        private sealed class MonacoHook
         {
-            if (_monacoNav != null) return _monacoNav;
-            try
+            private readonly string _name;
+            private readonly Type _returns;
+            private readonly Type[] _takes;
+            private MethodInfo _mi;
+            private HookStatus _status;
+
+            public MonacoHook(string name, Type returns, params Type[] takes)
             {
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                _name = name; _returns = returns; _takes = takes;
+            }
+
+            /// <summary>The bound method, or null when it did not resolve. Resolves on first use.</summary>
+            public MethodInfo Method { get { Resolve(); return _mi; } }
+
+            public HookStatus Status { get { Resolve(); return _status; } }
+
+            /// <summary>Forget the cached resolution, misses included, so the next use re-scans.</summary>
+            public void Rearm() { _mi = null; _status = HookStatus.Unresolved; }
+
+            /// <summary>One clause naming what is wrong and what fixes it, for the Debug Console. Null once
+            /// the hook is bound.</summary>
+            public string Explain()
+            {
+                switch (Status)
                 {
-                    Type t;
-                    try { t = asm.GetType("ClarionAssistant.Services.MonacoSourceNavigator", false); }
-                    catch { t = null; }
-                    if (t == null) continue;
-                    var mi = t.GetMethod("NavigateToFileAndLine", BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(string), typeof(int), typeof(int) }, null);
-                    if (mi != null && mi.ReturnType == typeof(bool)) { _monacoNav = mi; break; }
+                    case HookStatus.NotLoaded:
+                        return "ClarionAssistant isn't loaded";
+                    case HookStatus.OlderBuild:
+                        return "this build of ClarionAssistant has no " + _name + " — upgrade it";
+                    case HookStatus.WrongShape:
+                        return "ClarionAssistant's " + _name + " has a different signature than this debugger "
+                             + "expects — the two addins have drifted apart, so upgrade both to matching builds";
+                    default:
+                        return null;
                 }
             }
-            catch { }
-            return _monacoNav;
+
+            private void Resolve()
+            {
+                if (_status != HookStatus.Unresolved) return;
+                // Pessimistic default: anything throwing below settles as NotLoaded and STAYS cached, so a
+                // failing scan can never degrade into a scan on every call.
+                _status = HookStatus.NotLoaded;
+                try
+                {
+                    var t = FindMonacoType();
+                    if (t == null) return;
+                    // Bind by full signature, not by name. A name-only bind accepts a method whose parameters
+                    // have drifted and then throws at Invoke time, where it reads as "the feature didn't work"
+                    // rather than "the two addins disagree" — and for an out-parameter hook read through an
+                    // object[] it may not even throw, just write back plausible-looking garbage.
+                    var exact = t.GetMethod(_name, BindingFlags.Public | BindingFlags.Static, null, _takes, null);
+                    if (exact != null && exact.ReturnType == _returns)
+                    {
+                        _mi = exact; _status = HookStatus.Bound; return;
+                    }
+                    // The type resolved, so ClarionAssistant IS loaded. Absent by name means an older build;
+                    // present under another shape (or as overloads, none of which fit) means version skew.
+                    bool byNameExists;
+                    try { byNameExists = t.GetMethod(_name, BindingFlags.Public | BindingFlags.Static) != null; }
+                    catch (AmbiguousMatchException) { byNameExists = true; }
+                    _status = byNameExists ? HookStatus.WrongShape : HookStatus.OlderBuild;
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>Frozen contract (with CA-Terminal-1-CC):
+        ///   bool NavigateToFileAndLine(string filePath, int line, int column)
+        ///   line/column 1-based; true when it handled the request (covers the Monaco overlay ON and OFF, and
+        ///   self-queues if the editor isn't ready yet); false only when it could not (bad/missing path).
+        /// The Clarion source editor is replaced by ClarionAssistant's Monaco overlay and positioning an
+        /// already-open Monaco editor has no public API, which is why that addin exposes this for us.</summary>
+        private static readonly MonacoHook _hookNavigate =
+            new MonacoHook("NavigateToFileAndLine", typeof(bool), typeof(string), typeof(int), typeof(int));
+
+        /// <summary>Frozen contract (issue #26, with ClarionAssistant ticket #26a):
+        ///   bool SetExecutionLine(string filePath, int line)
+        ///   set: path + line &gt;= 1 paints one global marker, with no navigation or focus change. Returns
+        ///   true when Monaco painted it, false when the overlay is OFF (caller paints the native marker).
+        ///   clear: null/empty path or line &lt;= 0. Always returns true; idempotent.
+        /// Unbound → callers keep the pre-#26 behaviour exactly and make no new calls.</summary>
+        private static readonly MonacoHook _hookExecLine =
+            new MonacoHook("SetExecutionLine", typeof(bool), typeof(string), typeof(int));
+
+        /// <summary>Frozen contract:
+        ///   bool TryGetActiveCursor(out string filePath, out int line, out int column)
+        /// This one is read through Invoke with an object[] whose slots are written back, so a drifted
+        /// parameter list would come back as plausible-looking values rather than a throw — which is why the
+        /// by-ref types are spelled out here and the bind is exact.</summary>
+        private static readonly MonacoHook _hookCursor =
+            new MonacoHook("TryGetActiveCursor", typeof(bool),
+                typeof(string).MakeByRefType(), typeof(int).MakeByRefType(), typeof(int).MakeByRefType());
+
+        /// <summary>Set when more than one loaded assembly answers to <see cref="MonacoAssemblyName"/>;
+        /// cleared by <see cref="RearmMonacoHooks"/>. Reported once per session rather than per scan.</summary>
+        private static string _monacoDupeNote;
+
+        /// <summary>The single AppDomain scan behind every hook. Requires the defining assembly to be named
+        /// <see cref="MonacoAssemblyName"/>, and records when MORE THAN ONE loaded assembly answers to it:
+        /// two ClarionAssistant builds in one process is the stale-copy case, where every hook binds to
+        /// whichever loaded first and the user watches a feature behave like a version they are not running.
+        /// Silently taking the first match is exactly how that stays invisible.</summary>
+        private static Type FindMonacoType()
+        {
+            Type first = null;
+            var copies = new List<string>();
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                string simple;
+                try { simple = asm.GetName().Name; }
+                catch { continue; }
+                if (!string.Equals(simple, MonacoAssemblyName, StringComparison.OrdinalIgnoreCase)) continue;
+                Type t;
+                try { t = asm.GetType(MonacoTypeName, false); }
+                catch { t = null; }
+                if (t == null) continue;
+                if (first == null) first = t;
+                // Version and location are gathered independently: Location throws for some assemblies, and
+                // losing the VERSION is what would make this note useless — telling the two copies apart is
+                // the entire point of it.
+                string ver, loc;
+                try { ver = asm.GetName().Version.ToString(); } catch { ver = "<unknown version>"; }
+                try { loc = asm.Location; } catch { loc = null; }
+                copies.Add(ver + " @ " + (string.IsNullOrEmpty(loc) ? "<no file>" : loc));
+            }
+            if (copies.Count > 1)
+            {
+                _monacoDupeNote = copies.Count + " loaded copies of " + MonacoAssemblyName
+                    + "; hooks bind to the first — " + string.Join(" | ", copies.ToArray());
+            }
+            return first;
+        }
+
+        /// <summary>Drop every cached resolution, misses included, so the next use re-scans. Called at session
+        /// start: ClarionAssistant may have been enabled, or a newer build loaded, since the last miss was
+        /// cached, and that miss would otherwise stand for the life of the IDE process.</summary>
+        private static void RearmMonacoHooks()
+        {
+            _hookNavigate.Rearm(); _hookExecLine.Rearm(); _hookCursor.Rearm();
+            _monacoDupeNote = null;
+        }
+
+        /// <summary>Re-scan at session start and say, once, what is actually wrong with the cross-addin hooks.
+        /// Only the two conditions a user cannot otherwise discover are reported: a signature that has drifted
+        /// (nothing else in either process would ever mention it, because every caller reads an unbound hook
+        /// as "ClarionAssistant isn't here" and quietly takes the native path), and a second loaded copy.
+        /// NotLoaded is deliberately silent — it is the normal state for anyone not using Monaco, and a
+        /// console line about it every session would be noise.</summary>
+        private void RearmAndReportMonacoHooks()
+        {
+            RearmMonacoHooks();
+            var hooks = new[] { _hookNavigate, _hookExecLine, _hookCursor };
+            foreach (var h in hooks)
+            {
+                if (h.Status == HookStatus.WrongShape) Console("err", "Monaco hook: " + h.Explain());
+            }
+            // After the hooks have resolved, so the scan has had a chance to spot a second copy.
+            if (_monacoDupeNote != null) Console("warn", "Monaco hooks: " + _monacoDupeNote);
         }
 
         /// <summary>Open a source file in the Clarion editor and place the caret on <paramref name="line"/>
         /// (1-based). Used for click-to-navigate from the pane (breakpoint list, call-stack frame). Unlike
-        /// the pause-time <see cref="TryJump"/>, this does NOT paint the yellow current-execution-line marker
+        /// the pause-time <see cref="JumpToLine"/>, this does NOT paint the yellow current-execution-line marker
         /// — clicking a breakpoint isn't an execution stop.
         ///
         /// Prefer ClarionAssistant's Monaco navigator when present: with the Monaco overlay on, our native
@@ -1668,7 +1800,7 @@ namespace ClarionDebugger.Terminal
             // (native caret) branch and self-queues if the page isn't ready. 1-based line + column.
             try
             {
-                var nav = ResolveMonacoNavigator();
+                var nav = _hookNavigate.Method;
                 if (nav != null)
                 {
                     object handled = nav.Invoke(null, new object[] { path, line, 1 });
@@ -1703,7 +1835,7 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>
-        /// After TryJump moves the Clarion editor to the current line (which steals keyboard focus),
+        /// After JumpToLine moves the Clarion editor to the current line (which steals keyboard focus),
         /// bring the debugger pad back to front and refocus the WebView so the next configured
         /// shortcut is delivered to the debugger page rather than the Clarion editor. Posted via
         /// BeginInvoke so it runs after the editor's activation has settled.
