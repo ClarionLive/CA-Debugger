@@ -195,8 +195,12 @@ namespace ClarionDbg.Cli
             // A WRITE IS AN INTERVAL. Starting outside the block is not the same as staying outside it.
             if (eng.ThreadedWriteAllowedForTest(0x4C7FFF, 2, tid, out why))
                 failures.Add("threaded-write: a 2-byte write at 0x4C7FFF runs INTO the shared template but was allowed");
+            // 0x4C7C01 + 1024 = 0x4C8001, so exactly ONE byte of this write lands on the block — which is
+            // the point: the overlap does not have to be large to be a write on shared data. (An earlier
+            // version of this line claimed 0x3FF bytes. Wrong by three orders of magnitude, in the file
+            // whose job is to keep claims honest.)
             if (eng.ThreadedWriteAllowedForTest(0x4C7C01, 1024, tid, out why))
-                failures.Add("threaded-write: a 1024-byte write at 0x4C7C01 puts 0x3FF bytes on the shared template but was allowed");
+                failures.Add("threaded-write: a 1024-byte write at 0x4C7C01 reaches the shared template's first byte but was allowed");
             // ...and the byte before the block is still fine when the write really does stay outside it.
             if (!eng.ThreadedWriteAllowedForTest(0x4C7FFE, 2, tid, out why))
                 failures.Add("threaded-write control: a 2-byte write ending exactly at the template's first byte was refused — " + why);
