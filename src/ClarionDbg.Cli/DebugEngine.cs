@@ -361,7 +361,7 @@ namespace ClarionDbg.Cli
 
         // ---- threaded data (watch NAME on THREADed .cwtls data) ----
         // Resolved by emulating ClaRUN!THR$GetInstance READ-ONLY on the paused thread's TLS — no hijack, no
-        // func-eval, no resume. See DebugEngine.Eval.cs (TryResolveThreadedInstance) for why the old
+        // func-eval, no resume. See DebugEngine.Watch.cs (TryResolveThreadedInstance) for why the old
         // thread-hijack had to go.
 
         // source-level stepping state

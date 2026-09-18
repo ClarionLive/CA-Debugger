@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text;
 using ClarionDbg.Core;
@@ -19,7 +19,7 @@ namespace ClarionDbg.Cli
         // context is stable to read; nothing here runs target code. The per-thread register read is
         // GetThreadContext, the stack is reconstructed from ReadProcessMemory, and Cla$THREAD is EMULATED
         // against that thread's TEB the same way Library State and THR$GetInstance already are
-        // (DebugEngine.LibState.cs / DebugEngine.Eval.cs). Re-introducing a thread hijack here would undo
+        // (DebugEngine.LibState.cs / DebugEngine.Watch.cs). Re-introducing a thread hijack here would undo
         // exactly what 50414e39 removed. See also the message-sending prohibition above the user32 imports.
 
         private const int SCAN_FRAMES = 48;     // frames to walk per thread when scanning (deeper than the

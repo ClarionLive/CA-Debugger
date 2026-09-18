@@ -95,7 +95,8 @@ namespace ClarionDbg.Cli
             Console.WriteLine("        | mem 0xADDR LEN | regs | stack [maxFrames] | sym NAME | watch NAME | quit");
             Console.WriteLine("        (while running: pause, bp add/del/list, sym, quit)");
             Console.WriteLine("      watch resolves THREADed (.cwtls) data to the paused thread's live");
-            Console.WriteLine("      instance via a THR$GetInstance func-eval, then dumps the value.");
+            Console.WriteLine("      instance by emulating THR$GetInstance READ-ONLY against that thread's");
+            Console.WriteLine("      TLS - no func-eval, no thread hijack - then dumps the value.");
         }
 
         private static (PeImage pe, TswdDebugInfo dbg) LoadDebug(string exe)
