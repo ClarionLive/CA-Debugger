@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Threading;
 using ClarionDbg.Core;
 
@@ -115,6 +116,11 @@ namespace ClarionDbg.Cli
         private const uint TRAP_FLAG = 0x100;        // EFLAGS TF bit
         private const int MAX_STEPS = 2000000;       // hard cap of single-steps per step command
         private const uint CALL_WINDOW = 8;          // max CALL instr length for return-addr detection
+        // ONE meaning, and it is the declared one: a callee with a line record this close to entry is
+        // Clarion code (StepMachine's `follow` test). It was ALSO being used as "am I still inside the
+        // prologue" in BeginStep, where 0x100 let a start point 256 bytes into the procedure BODY count as
+        // "at entry" and disable the ESP gate. That test now measures against the procedure's own first line
+        // record instead (FirstRecordRvaInProc) and needs no constant, so this one is not reused.
         private const uint PROLOGUE_WINDOW = 0x100;  // callee with a line record this close to entry is Clarion code
         private const uint ESP_SLACK = 0x10;         // frame-depth slack for step-over stop checks
         private const uint OUT_GAP_MAX = 0x200;      // step-out: max gap for "this looks like the call statement"
@@ -136,6 +142,11 @@ namespace ClarionDbg.Cli
         private LoadedModule _exe;           // module 0 — the launched image
 
         private IntPtr _hProcess = IntPtr.Zero;
+        // The debuggee's pid, from CREATE_PROCESS. INVARIANT: valid exactly when _hProcess is non-zero —
+        // the two are assigned together from the same PROCESS_INFORMATION, on the only path that has one.
+        // ProcessId() enforces that rather than trusting it, because a pid left behind for a process we no
+        // longer hold reads as a live process, which is the same defect class as a sentinel thread id.
+        private uint _pid;
         private bool _seenInitialBreak;
         public int Hits { get; private set; }
 
@@ -217,9 +228,17 @@ namespace ClarionDbg.Cli
             var v = new ThreadView { Tid = _selectedTid };
             v.HThread = OpenThreadForContext(_selectedTid);
             v.Owned = v.HThread != IntPtr.Zero;
-            var c = NewContext();
-            v.HaveCtx = v.HThread != IntPtr.Zero && Native.GetThreadContext(v.HThread, ref c);
-            v.Ctx = c;
+            // Once the handle is open, this method owns it until it returns. A throw from GetThreadContext
+            // between those two points would otherwise strand it: the caller's finally releases the view it
+            // was RETURNED, and on a throw it is never returned one. Not reachable in practice — which is
+            // exactly why it would have leaked quietly if it ever became reachable.
+            try
+            {
+                var c = NewContext();
+                v.HaveCtx = v.HThread != IntPtr.Zero && Native.GetThreadContext(v.HThread, ref c);
+                v.Ctx = c;
+            }
+            catch { v.Release(); throw; }
             return v;
         }
 
@@ -230,7 +249,15 @@ namespace ClarionDbg.Cli
         /// This list must contain only verbs the pause loop's switch actually handles. It once also named
         /// pause/break/runtocursor — which the switch does NOT implement — so those reset the selection and
         /// then fell through to "unknown command": a verb that did nothing silently discarded the user's
-        /// `thread &lt;tid&gt;` for the rest of the stop. They are rejected explicitly instead, below.</summary>
+        /// `thread &lt;tid&gt;` for the rest of the stop. They are rejected explicitly instead, below.
+        ///
+        /// THIS IS THE ONE OWNER of the resume-verb set. There were three hand-maintained copies: this, the
+        /// pause-loop switch, and the running-state switch (the pad held a fourth until a9f3407). The
+        /// running-state switch now asks this method instead of listing them again, leaving TWO sites — this
+        /// one, and the pause-loop switch, whose labels dispatch to different handlers and so cannot be a
+        /// list. `ClarionDbg protocolcheck` asserts the set both ways: every verb the pause loop dispatches
+        /// is accepted, and the verbs the running-state switch implements itself (pause/break in particular)
+        /// are rejected, because this is consulted BEFORE that switch and a wrong accept diverts them.</summary>
         private static bool IsResumeVerb(string verb)
         {
             switch (verb)
@@ -246,25 +273,69 @@ namespace ClarionDbg.Cli
             }
         }
 
-        /// <summary>Test seam for <see cref="WithTid"/>; the rule it asserts is documented there, so that
-        /// deleting this seam cannot delete the rationale.</summary>
+        /// <summary>Test seam for <see cref="IsResumeVerb"/>.</summary>
+        internal static bool IsResumeVerbForTest(string verb) { return IsResumeVerb(verb); }
+
+        // ---------------------------------------------------------------- the absent-tid rule, in ONE place
+        //
+        // THE RULE: a thread id is either a real Win32 tid or the field is ABSENT. Never 0, never -1.
+        //
+        // The host treats an unstamped reply as UNSCOPED and accepts it, but reads a literal 0 (or -1) as a
+        // real thread id: it then matches nothing, and the pad starts dropping replies it should have shown
+        // — a silently blank panel rather than an error.
+        //
+        // The rule was broken THREE times in one day by two different agents (ticket a39d9477), every time on
+        // a path that BYPASSED the helper the rule lived in. It lived in WithTid, which splices whole events;
+        // the four hand-built emitters in DebugEngine.Threads.cs never went through it, so each either
+        // re-implemented the rule or simply omitted it. So the rule now lives in ONE predicate below, and
+        // BOTH writers derive from it — nothing else in the engine decides whether a tid is written.
+        //
+        // IF YOU ARE ADDING A FIFTH EMITTER: do not type the member. Call AppendTidMember (or WithTid) and
+        // add your builder to ProtocolCheck.CheckHandBuiltTidEmitters, which runs the REAL builders rather
+        // than copies of their shapes. A hand-typed `,"tid":` is the exact defect this rule holder exists to
+        // stop, and no compiler can stop you typing it — protocolcheck is what catches it.
+
+        /// <summary>THE RULE, stated once: is this a thread id worth writing to the wire?
+        ///
+        /// 0 is the engine's own "no thread here" value. uint.MaxValue is the `(uint)-1` an int cast can
+        /// produce — the protocol names -1 as a forbidden sentinel, and 0xFFFFFFFF is what -1 actually looks
+        /// like once it reaches a uint tid, so it is rejected here rather than printed as 4294967295.</summary>
+        private static bool TidIsKnown(uint tid) { return tid != 0 && tid != uint.MaxValue; }
+
+        /// <summary>Append the tid member to an object that ALREADY has at least one member, or append
+        /// nothing at all when the tid is unknown. The one writer for every hand-built emitter; the leading
+        /// comma is inside the guard on purpose, so an absent tid cannot leave a dangling separator.</summary>
+        private static void AppendTidMember(StringBuilder sb, uint tid)
+        {
+            if (TidIsKnown(tid)) sb.Append(",\"tid\":").Append(tid);
+        }
+
+        /// <summary>Test seams for the two writers. The rule they assert is documented above, so that
+        /// deleting a seam cannot delete the rationale.</summary>
         internal static string WithTidForTest(string json, uint tid) { return WithTid(json, tid); }
+
+        internal static string AppendTidMemberForTest(string json, uint tid)
+        {
+            var sb = new StringBuilder(json.Substring(0, json.Length - 1));
+            AppendTidMember(sb, tid);
+            return sb.Append('}').ToString();
+        }
 
         /// <summary>Stamp a thread-scoped event with the tid it describes, so the host can drop a reply that
         /// arrived for a thread it is no longer showing. Splicing the member in here rather than threading a
         /// tid parameter through seven JSON builders keeps one rule in one place: if it is emitted from the
-        /// pause loop about a thread, it carries that thread's id. Member order is not significant in JSON.
+        /// pause loop about a thread, it carries that thread's id. Member order is not significant in JSON,
+        /// but the tid is written FIRST here because that is the shape already on the wire, and this change
+        /// was meant to be structural rather than observable.
         ///
-        /// A tid of 0 emits NO "tid" member at all. ABSENCE is the only safe way to say "unknown": the host
-        /// treats an unstamped reply as unscoped and accepts it, but would read a literal 0 (or -1) as a real
-        /// thread id and start dropping good replies — a silently blank panel rather than an error. Every
-        /// stamped event today is emitted from inside the pause loop, where the tid is always known; this
-        /// guard is here so that stays true if some future caller emits one from a path that has no thread.
-        /// `ClarionDbg protocolcheck` asserts both halves, because the unknown-tid case cannot be produced
-        /// against a live debuggee.</summary>
+        /// An unknown tid emits NO "tid" member at all — see <see cref="TidIsKnown"/> for why absence is the
+        /// only safe representation. Every stamped event today is emitted from inside the pause loop, where
+        /// the tid is always known; the guard is here so that stays true if some future caller emits one from
+        /// a path that has no thread. `ClarionDbg protocolcheck` asserts both halves, because the unknown-tid
+        /// case cannot be produced against a live debuggee.</summary>
         private static string WithTid(string json, uint tid)
         {
-            if (string.IsNullOrEmpty(json) || json[0] != '{' || tid == 0) return json;
+            if (string.IsNullOrEmpty(json) || json[0] != '{' || !TidIsKnown(tid)) return json;
             string head = "{\"tid\":" + tid;
             return json.Length == 2 ? head + "}" : head + "," + json.Substring(1);
         }
@@ -303,10 +374,16 @@ namespace ClarionDbg.Cli
         private uint _prevVa;         // EIP at the previous single-step trap (for call-entry detection)
         private uint _stepStartVa;    // EIP when the step began (OverInstr stops once EIP leaves it)
         private int _stepCount;
-        private bool _startAtProcEntry; // step began inside the callee's prologue window (PROLOGUE_WINDOW
-                                         // of its symbol entry) — Over must not gate on ESP for its first
-                                         // hop, since the prologue's own `sub esp,N` legitimately drops ESP
-                                         // before any nested call happens
+        // The prologue ESP-gate bypass. The step began BELOW its procedure's own first line record — i.e.
+        // in the prologue, before any statement of that procedure has run — so Over must not gate on ESP
+        // there: the prologue's own `sub esp,N` legitimately drops ESP before any nested call happens.
+        // These three are ONE piece of state and are set and cleared together (BeginStep / CancelStep):
+        // the bypass is armed only inside the procedure the step started in, which is what the module +
+        // entry RVA identify. Arming it without that bound skipped the ESP gate for the whole step session
+        // and let Over stop inside a callee — see PrologueBypassApplies in DebugEngine.Stepping.cs.
+        private bool _startAtProcEntry;
+        private LoadedModule _startSymModule;  // owning image of the procedure the step began in
+        private uint _startSymEntryRva;        // ... and that procedure's EntryRva
         private bool _skipRunning;    // running full-speed to a call-skip temp BP; TF off
         private uint _skipEntryEsp;   // ESP at the callee's entry instruction (return depth = this + 4)
 
@@ -360,7 +437,10 @@ namespace ClarionDbg.Cli
                 throw new InvalidOperationException("CreateProcess failed, win32 error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
             Console.WriteLine($"launched {Path.GetFileName(_exePath)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
+            // Assigned together, from the same PROCESS_INFORMATION, on the only path that has one:
+            // CreateProcess either filled `pi` or threw above. See the invariant on _pid.
             _hProcess = pi.hProcess;
+            _pid = pi.dwProcessId;
 
             var buf = new byte[1024];
             bool running = true;
@@ -600,9 +680,16 @@ namespace ClarionDbg.Cli
 
                 // Everything below reads the SELECTED thread. Ordinarily that IS the stopped thread and this
                 // opens nothing; after `thread <tid>` it is another thread's frozen context.
-                var view = AcquireView(tid, hThread, ref ctx, haveCtx);
+                //
+                // AcquireView is INSIDE the try that owns Release(). It used to sit above it, where a throw
+                // would have escaped the command loop entirely and taken the pause with it, instead of being
+                // reported by the catch below. Note this alone does NOT close the handle-leak window the
+                // review found: a throw part-way through AcquireView never returns a view for the finally to
+                // release, so AcquireView is made exception-safe on its own side too.
+                ThreadView view = null;
                 try
                 {
+                    view = AcquireView(tid, hThread, ref ctx, haveCtx);
                 switch (verb)
                 {
                     case "continue": case "c": case "g":
@@ -749,8 +836,8 @@ namespace ClarionDbg.Cli
                 {
                     // Closes only a handle WE opened for a non-stopped selection; the stopped thread's
                     // handle belongs to the caller. Runs on the resume paths too, which return out of the
-                    // switch above.
-                    view.Release();
+                    // switch above. Null only if AcquireView threw, and it releases its own handle then.
+                    if (view != null) view.Release();
                 }
             }
         }
@@ -776,6 +863,21 @@ namespace ClarionDbg.Cli
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 string verb = parts[0].ToLowerInvariant();
+                // A resume verb while the target is already running. Decided HERE rather than by a third
+                // copy of the verb list in the switch below, so the set has one owner (IsResumeVerb).
+                //
+                // This is ahead of the switch, so it changes control flow, not just shape: a verb diverted
+                // here never reaches its case. That is safe only because IsResumeVerb accepts EXACTLY the
+                // verbs that fell to the "only valid while paused" case and nothing else — in particular it
+                // rejects pause/break, which this switch DOES implement and which must still reach it.
+                // `ClarionDbg protocolcheck` asserts both halves of that, including the non-resume verbs
+                // this switch handles, because getting it wrong looks identical on the happy path.
+                if (IsResumeVerb(verb))
+                {
+                    EmitError("target is running — " + verb + " is only valid while paused");
+                    continue;
+                }
+
                 switch (verb)
                 {
                     case "bp":
@@ -801,11 +903,11 @@ namespace ClarionDbg.Cli
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
                         break;
-                    case "continue": case "c": case "g":
-                    case "step": case "stepinto": case "s": case "i":
-                    case "stepover": case "next": case "n":
-                    case "stepout": case "out": case "finish": case "o":
-                    case "stepi": case "si": case "nexti": case "ni":
+                    // The resume verbs USED TO BE LISTED HERE, as a third hand-maintained copy of the set.
+                    // They are now recognised by IsResumeVerb ahead of this switch — one owner, so adding a
+                    // verb in one place cannot leave another place stale. They still produce exactly this
+                    // error; only who decides they are resume verbs has changed. The read verbs below are
+                    // NOT a duplicated set and stay where they are.
                     case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
                     case "locals": case "vars":
                     case "moduledata": case "moddata":
