@@ -37,39 +37,57 @@ namespace ClarionDbg.Cli
             Failed,        // could not resolve (no import, no TEB, emulator refusal, unreadable result)
         }
 
-        // Per-thread, per-image .cwtls instance base, cached for the duration of one stop: every field of
-        // every record in an image shares one instance block, so a whole table expanding costs one emulation
-        // instead of one per row. Keyed by (tid, image load base); dropped when the thread exits and at each
-        // new stop, so a reused tid can never inherit a dead thread's block.
-        private readonly Dictionary<ulong, uint> _tlsBaseCache = new Dictionary<ulong, uint>();
+        // Per-thread, per-image .cwtls INSTANCE BLOCK base: the address this image's whole .cwtls span maps
+        // to on one thread. Every field of every record in an image shares one block, so a whole table
+        // expanding costs one emulation instead of one per row. Keyed by (tid, image load base).
+        //
+        // ONE NOUN, deliberately: what is cached is a .cwtls instance-block base, NOT a TLS base. The TEB's
+        // TLS array is how THR$GetInstance FINDS the block; it is not the thing stored here.
+        //
+        // LIFETIME — a cached block base only means anything while the target is FROZEN at one debug event,
+        // so every episode that reads it clears it on the way in: a stop (ClearThreadedBlockCache in
+        // PausedWait) and a breakpoint-hit evaluation (ClearThreadedBlockCache in ShouldPauseAtBp). Between
+        // two episodes the target ran arbitrary code — a thread can exit and its tid be reused, an image can
+        // unload and reload at the same base, the runtime can move a thread's block — so nothing cached is
+        // allowed to cross an episode boundary. The per-tid overload is defence in depth on top of that; see
+        // its call site on EXIT_THREAD.
+        private readonly Dictionary<ulong, uint> _threadedBlockCache = new Dictionary<ulong, uint>();
 
-        private static ulong TlsCacheKey(uint tid, uint loadBase) { return ((ulong)tid << 32) | loadBase; }
+        private static ulong ThreadedBlockKey(uint tid, uint loadBase) { return ((ulong)tid << 32) | loadBase; }
 
-        private void ClearThreadedCache() { _tlsBaseCache.Clear(); }
-        private void ClearThreadedCache(uint tid)
+        private void ClearThreadedBlockCache() { _threadedBlockCache.Clear(); }
+        private void ClearThreadedBlockCache(uint tid)
         {
             var dead = new List<ulong>();
-            foreach (var k in _tlsBaseCache.Keys) if ((uint)(k >> 32) == tid) dead.Add(k);
-            foreach (var k in dead) _tlsBaseCache.Remove(k);
+            foreach (var k in _threadedBlockCache.Keys) if ((uint)(k >> 32) == tid) dead.Add(k);
+            foreach (var k in dead) _threadedBlockCache.Remove(k);
         }
 
         /// <summary>Map a THREADed template VA to the paused thread's instance by emulating the owning image's
         /// imported THR$GetInstance read-only. No target code runs, so this is safe at any stop and answers
-        /// inline. A run that writes debuggee memory is the runtime's allocate-on-first-touch path: the thread
-        /// has no instance yet, and creating one would be a side effect, so that reports Unallocated rather
-        /// than a made-up address.</summary>
+        /// inline. A run that writes THE BLOCK IT THEN RETURNS is the runtime's allocate-on-first-touch path:
+        /// the thread has no instance yet, and creating one would be a side effect, so that reports
+        /// Unallocated rather than a made-up address. A write ANYWHERE ELSE is not that path and does not
+        /// discard the result — it is reported instead, because an emulation nobody can see going wrong is
+        /// how a broken read gets shown to the user as a real value.</summary>
         private ThreadedResolve TryResolveThreadedInstance(LoadedModule owner, uint templateVa, uint tid,
                                                            IntPtr hThread, out uint instanceVa, out string reason)
         {
             instanceVa = 0; reason = null;
             uint cwtlsBase = owner.LoadBase + owner.CwtlsLo;
 
-            // one emulation per (thread, image) per stop — every field resolves off the cached block
+            // one emulation per (thread, image) per episode — every other field resolves off the cached block
+            ulong key = ThreadedBlockKey(tid, owner.LoadBase);
             uint cached;
-            if (_tlsBaseCache.TryGetValue(TlsCacheKey(tid, owner.LoadBase), out cached))
+            if (_threadedBlockCache.TryGetValue(key, out cached))
             {
-                instanceVa = templateVa - cwtlsBase + cached;
-                return ThreadedResolve.Ok;
+                uint hit = templateVa - cwtlsBase + cached;
+                // Probe the cached answer exactly as the freshly-emulated one is probed below. A cached base
+                // is an address the TARGET owns, not a fact we derived, and nothing here can promise the
+                // block is still mapped. If one byte will not read, drop the entry and re-emulate rather than
+                // report Ok for an address the caller would then render as a value.
+                if (ReadBlock(hit, new byte[1]) >= 1) { instanceVa = hit; return ThreadedResolve.Ok; }
+                _threadedBlockCache.Remove(key);
             }
 
             if (owner.ThrGetInstanceIatRva == 0)
@@ -92,6 +110,9 @@ namespace ClarionDbg.Cli
             try { emu = BuildEmulator(rt, tid, teb); }
             catch (Exception ex) { reason = "could not build the RTL emulator: " + ex.Message; return ThreadedResolve.Failed; }
 
+            uint delta = templateVa - cwtlsBase;                    // this name's offset inside the .cwtls span
+            uint cwtlsSize = owner.CwtlsHi > owner.CwtlsLo ? owner.CwtlsHi - owner.CwtlsLo : 0;
+
             uint result;
             try
             {
@@ -99,17 +120,62 @@ namespace ClarionDbg.Cli
             }
             catch (Exception ex)
             {
-                // The allocate path writes before it fails us; that write is the tell-tale, whatever the
-                // emulator choked on afterwards.
-                if (emu.WroteDebuggeeMemory) { reason = "not yet allocated on this thread"; return ThreadedResolve.Unallocated; }
+                // A throw leaves no result, so there is no block to test the write against — the write itself
+                // is the only evidence, and the allocate path writes before it loses us. Still report
+                // Unallocated, but never SILENTLY: an emulation that is genuinely broken and happens to write
+                // first would otherwise reach the user as "not yet used on this thread" with the template's
+                // value shown as real. Library State prints every failure it swallows; this used to print none.
+                if (emu.WroteDebuggeeMemory)
+                {
+                    reason = "not yet allocated on this thread";
+                    NoteThreadedEmulation(owner, "reporting 'not yet allocated' after a failed emulation", ex, emu);
+                    return ThreadedResolve.Unallocated;
+                }
                 reason = ex is RtlEmulator.NotSupported
                     ? "THR$GetInstance is not emulatable on this runtime (" + ex.Message + ")"
                     : "THR$GetInstance emulation failed — " + ex.GetType().Name + ": " + ex.Message;
                 return ThreadedResolve.Failed;
             }
 
-            if (emu.WroteDebuggeeMemory) { reason = "not yet allocated on this thread"; return ThreadedResolve.Unallocated; }
-            if (result == 0) { reason = "THR$GetInstance returned no instance"; return ThreadedResolve.Failed; }
+            if (result == 0)
+            {
+                // Nothing came back. With a debuggee write that is the allocate path losing us partway;
+                // without one the emulation simply produced no instance.
+                if (emu.WroteDebuggeeMemory) { reason = "not yet allocated on this thread"; return ThreadedResolve.Unallocated; }
+                reason = "THR$GetInstance returned no instance";
+                return ThreadedResolve.Failed;
+            }
+
+            // Every formula below subtracts `delta` from the result to get the block base. A result smaller
+            // than the offset cannot be this name's instance — the subtraction would wrap and hand the cache a
+            // base pointing at nothing.
+            if (result < delta)
+            {
+                reason = $"THR$GetInstance returned 0x{result:X}, below this name's .cwtls offset (0x{delta:X})";
+                return ThreadedResolve.Failed;
+            }
+            uint blockBase = result - delta;
+
+            // The allocate-on-first-touch discriminator. This USED to be a one-way door: ANY debuggee write
+            // discarded the result, so a single incidental scratch write in THR$GetInstance's read path made
+            // every THREADed name on the thread report "not yet used on this thread" — a template value shown
+            // as this thread's own. A write only means "allocated" when it landed in the block being handed
+            // back. Anything else is reported and stepped over, not treated as a verdict.
+            if (emu.WroteDebuggeeMemory)
+            {
+                if (cwtlsSize == 0 || emu.WroteWithin(blockBase, cwtlsSize))
+                {
+                    // cwtlsSize == 0 means there is no block span to test against, so the cautious old answer
+                    // is the only honest one — but say so rather than let it pass for a measurement.
+                    reason = "not yet allocated on this thread";
+                    if (cwtlsSize == 0)
+                        NoteThreadedEmulation(owner, "no .cwtls span to test the write against — assuming the allocate path", null, emu);
+                    return ThreadedResolve.Unallocated;
+                }
+                NoteThreadedEmulation(owner,
+                    $"kept instance 0x{result:X} despite a debuggee write outside its block (0x{blockBase:X}+0x{cwtlsSize:X})",
+                    null, emu);
+            }
 
             // A thread that is not a Clarion thread (or an image whose data isn't really threaded) legitimately
             // gets the TEMPLATE back — that IS what code on that thread reads, so the value is real and worth
@@ -130,10 +196,30 @@ namespace ClarionDbg.Cli
                 reason = $"THR$GetInstance returned an unreadable instance (0x{result:X})";
                 return ThreadedResolve.Failed;
             }
-            _tlsBaseCache[TlsCacheKey(tid, owner.LoadBase)] = result - (templateVa - cwtlsBase);
+            _threadedBlockCache[key] = blockBase;
 
             instanceVa = result;
             return ThreadedResolve.Ok;
+        }
+
+        /// <summary>Report an emulation whose outcome the user will never see stated in the value itself — a
+        /// failure swallowed behind "Unallocated", a debuggee write we decided NOT to treat as the allocate
+        /// path, or a span we could not test. None of these change what is displayed, which is exactly why
+        /// none of them may be silent: a broken emulation that happens to write first would otherwise pass for
+        /// "not yet used on this thread" with the template's value shown as real. Mirrors Library State, which
+        /// prints every getter it could not run. The emulator's own trace goes with it (capped — a block-sized
+        /// REP STOS is one line, but a long call chain is not) because "wrote 0x…" is the whole question.</summary>
+        private void NoteThreadedEmulation(LoadedModule owner, string what, Exception ex, RtlEmulator emu)
+        {
+            Console.WriteLine($"  threaded {owner.Name}: {what}"
+                              + (ex != null ? $" — {ex.GetType().Name}: {ex.Message}" : ""));
+            const int cap = 12;
+            int n = 0;
+            foreach (var t in emu.Trace)
+            {
+                if (n++ == cap) { Console.WriteLine($"      emu: … ({emu.Trace.Count - cap} more)"); break; }
+                Console.WriteLine("      emu: " + t);
+            }
         }
 
         // ------------------------------------------------------------------ watch (by name)
