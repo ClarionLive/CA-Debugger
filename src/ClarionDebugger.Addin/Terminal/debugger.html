@@ -499,8 +499,23 @@
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
   let paused=false;
-  const watched=new Map();   // name -> {threaded}
-  const values=new Map();    // name -> {value,type,threaded} latest resolved value (for source tips)
+  // CLARION DATA NAMES ARE CASE-INSENSITIVE. PUB:PUB_NAME and Pub:Pub_Name are one variable, and the
+  // engine echoes whatever spelling it was ASKED for — so a watch typed into the box in one case and the
+  // same field's row in the Variables tree in another are two spellings of one name. The host's watch set
+  // is case-insensitive and rightly collapses them, which means only ONE spelling is ever re-requested;
+  // anything that compares names here with === then leaves the other row waiting for a reply that is
+  // never coming. Every name comparison in this page goes through nameKey().
+  const nameKey = n => (n==null?'':String(n)).toLowerCase();
+  const watched=new Map();   // name (as the user spelled it) -> {threaded}; looked up via watchedKey()
+  const values=new Map();    // nameKey -> {value,type,threaded} latest resolved value (for source tips)
+  // The Watch panel's own key for a name, whatever case it is asked about — so one variable cannot end up
+  // holding two rows, one of which stops being answered the moment the host collapses the spellings.
+  function watchedKey(name){
+    if(watched.has(name)) return name;
+    const k=nameKey(name);
+    for(const n of watched.keys()) if(nameKey(n)===k) return n;
+    return null;
+  }
   let allSyms=[];            // [{name,type}] for type-ahead + source-id wrapping
   let curFile=null, curLine=0;
 
@@ -867,13 +882,14 @@
 
   // ---- add a watch (from any of the 4 mechanisms) ----
   function addWatchSilent(name){
-    if(!name || watched.has(name)) return false;
+    if(!name || watchedKey(name)) return false;
     watched.set(name,{}); renderWatchList(); send('watch',name);
     return true;
   }
   function addWatch(name){
     if(!name) return;
-    if(watched.has(name)){ toast(name+' already watched'); return; }
+    const dup=watchedKey(name);
+    if(dup){ toast((dup===name?name:dup+' (same name)')+' already watched'); return; }
     addWatchSilent(name); toast('Watching '+name);
   }
   function addWatchMany(names){
@@ -930,7 +946,8 @@
     if(!procCtx||!procCtx.module||!procCtx.line||isNaN(procCtx.line)) return;
     // module+line FIRST so the host's minimal JSON parser reads them before the (untrusted) proc name
     send('breakonprocentry', JSON.stringify({ module:procCtx.module, line:procCtx.line, name:procCtx.name })); };
-  function removeWatch(name){ if(watched.delete(name)){ renderWatchList(); send('unwatch',name); } }
+  function removeWatch(name){ const k=watchedKey(name);
+    if(k && watched.delete(k)){ renderWatchList(); send('unwatch',k); } }
 
   function renderWatchList(){
     const list=$('watchList'); list.innerHTML='';
@@ -944,7 +961,7 @@
       const toggle=e=>{ if(e&&e.target.closest('.rmw,.vval.editable,.vedit')) return;
         const open=detail.style.display==='none';
         detail.style.display=open?'':'none'; row.querySelector('.wch').textContent=open?'▾':'▸';
-        if(open){ const v=values.get(name); detail.textContent=v?v.value:(row.querySelector('.vval').textContent||''); } };
+        if(open){ const v=values.get(nameKey(name)); detail.textContent=v?v.value:(row.querySelector('.vval').textContent||''); } };
       row.querySelector('.rmw').onclick=e=>{ e.stopPropagation(); removeWatch(name); };
       row.onclick=toggle;
       list.appendChild(row); list.appendChild(detail);
@@ -991,9 +1008,11 @@
     // value — a "not yet used on this thread" template value would otherwise resurface in a tip as an
     // ordinary live value — and a reply that resolved to NOTHING must evict it, or the tip keeps quoting a
     // previous stop's value for a name the engine just said it cannot read.
-    if(found) values.set(name,{value:value,type:typeName,threaded:threaded,note:(meta&&meta.note)||null});
-    else values.delete(name);
-    document.querySelectorAll('[data-name="'+cssEsc(name)+'"]').forEach(row=>{
+    if(found) values.set(nameKey(name),{value:value,type:typeName,threaded:threaded,note:(meta&&meta.note)||null});
+    else values.delete(nameKey(name));
+    // The trailing `i` is the whole fix for the reported symptom: a reply for one spelling resolves the
+    // rows keyed in another, instead of leaving them on "…" for the rest of the session.
+    document.querySelectorAll('[data-name="'+cssEsc(name)+'" i]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
       v.classList.remove('pending','unavail','noted'); v.removeAttribute('title');
       // Rows are REUSED across stops, so every reply must first strip the previous one's edit metadata.
@@ -1011,7 +1030,7 @@
         if(err) v.title=err;
         // An OPEN detail panel is showing the previous stop's value; it has to follow the row, or the Watch
         // panel keeps displaying a value for a name the engine just reported it could not read.
-        const det0=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'"]');
+        const det0=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'" i]');
         if(det0 && det0.style.display!=='none') det0.textContent=v.textContent;
         return;
       }
@@ -1030,7 +1049,7 @@
       // watch rows: flag clipped values (reveals the ▸ chevron) and refresh an open detail panel
       if(row.classList.contains('watchrow')){
         row.classList.toggle('clipped', v.scrollWidth > v.clientWidth + 1);
-        const det=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'"]');
+        const det=document.querySelector('.wdetail[data-detail="'+cssEsc(name)+'" i]');
         if(det && det.style.display!=='none') det.textContent=value;
       }
     });
@@ -1389,7 +1408,10 @@
     }
     return { el: row, setVisible(b){
       row.style.display=b?'':'none';
-      if(!isGroup){ if(!watched.has(name)) send(b?'watch':'unwatch', name); return; }
+      // watchedKey, not has(): with an exact match a tree row scrolling out of view sends `unwatch` for a
+      // name the Watch panel still holds under another spelling, and the host drops it case-insensitively
+      // — after which the Watch row is never answered again. That is reachable by scrolling alone.
+      if(!isGroup){ if(!watchedKey(name)) send(b?'watch':'unwatch', name); return; }
       if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
       else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; row.querySelector('.ar').textContent='▸'; }
     } };
@@ -1967,7 +1989,7 @@
   const tip=$('datatip'); let tipTarget=null, tipTimer=null;
   function showTipFor(el){
     const vEl=el.querySelector('.vval'), tEl=el.querySelector('.vtype');
-    const name=el.dataset.name||''; const known=values.get(name);
+    const name=el.dataset.name||''; const known=values.get(nameKey(name));
     const type=(tEl&&tEl.textContent.trim()) || (known&&known.type) || '';
     let val=(vEl&&vEl.textContent.trim()) || (known&&known.value) || '';
     if(!val || val==='…') val = known&&known.value ? known.value : '(not watched — ☆ to add)';

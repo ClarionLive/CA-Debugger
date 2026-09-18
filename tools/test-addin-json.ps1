@@ -116,6 +116,17 @@ Check 'a real tid is written' ([PadJsonProbe]::TidJson(116932) -eq ',"tid":11693
 Check 'a high DWORD is written whole' ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') ([PadJsonProbe]::TidJson(4294967295))
 
 Write-Host ''
+Write-Host 'every watch request goes through the path that ANSWERS a refusal'
+# ClarionDebuggerService.Watch refuses a name it cannot put on the line/space-split wire and sends nothing,
+# so no reply can ever come and the row that asked waits for the whole session. WatchOrExplain posts the
+# miss instead. A call that bypasses it re-opens that silent path, and nothing else would notice.
+$bare = [regex]::Matches($web, '_svc\.Watch\(')
+Check 'no bare _svc.Watch( call outside WatchOrExplain' ($bare.Count -le 1) "$($bare.Count) occurrence(s)"
+Check 'WatchOrExplain exists and posts a miss' ($web -match 'WatchOrExplain' -and $web -match '\\"found\\":false')
+$names = [regex]::Matches($web, 'WatchOrExplain\(')
+Check 'and it is used by the add, the re-read and the pause broadcast' ($names.Count -ge 4) "$($names.Count) site(s) incl. its definition"
+
+Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
 Write-Host 'ALL CHECKS PASSED'
 exit 0

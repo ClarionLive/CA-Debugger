@@ -42,11 +42,18 @@ function extractConst(html, name) {
 function dataKey(attr) { return attr.replace(/^data-/, '').replace(/-([a-z])/g, (_, c) => c.toUpperCase()); }
 function parseSel(sel) {
   const out = { classes: [], attrs: [] };
-  const re = /\.([A-Za-z0-9_-]+)|\[([A-Za-z0-9_-]+)(?:\s*=\s*"((?:[^"\\]|\\.)*)")?\]/g;
+  // `[attr="value" i]` — the CSS case-insensitive attribute flag. The page uses it to resolve a row keyed
+  // in one spelling from a reply carrying another, so a mini-DOM that ignored the flag would match
+  // case-sensitively and report a bug that is not there (or hide one that is).
+  const re = /\.([A-Za-z0-9_-]+)|\[([A-Za-z0-9_-]+)(?:\s*=\s*"((?:[^"\\]|\\.)*)")?(\s+[iI])?\]/g;
   let m;
   while ((m = re.exec(sel))) {
     if (m[1]) out.classes.push(m[1]);
-    else out.attrs.push({ name: m[2], value: m[3] === undefined ? null : m[3].replace(/\\(.)/g, '$1') });
+    else out.attrs.push({
+      name: m[2],
+      value: m[3] === undefined ? null : m[3].replace(/\\(.)/g, '$1'),
+      ci: !!m[4],
+    });
   }
   return out;
 }
@@ -81,7 +88,9 @@ class El {
     if (!p.classes.every(c => this.classList.contains(c))) return false;
     return p.attrs.every(a => {
       const v = this.dataset[dataKey(a.name)];
-      return a.value === null ? v !== undefined : v === a.value;
+      if (a.value === null) return v !== undefined;
+      if (v === undefined) return false;
+      return a.ci ? String(v).toLowerCase() === a.value.toLowerCase() : v === a.value;
     });
   }
   walk(fn) { for (const c of this.children) { fn(c); c.walk(fn); } }

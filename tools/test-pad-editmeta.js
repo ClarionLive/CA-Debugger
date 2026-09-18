@@ -24,8 +24,10 @@ const document = {
   createElement: t => new El(t),
   querySelectorAll: sel => (sel.startsWith('[data-name=') && ROW) ? [ROW] : [],
   querySelector: sel => {
-    const m = /^\.wdetail\[data-detail="(.*)"\]$/.exec(sel);
-    if (m && DETAIL && DETAIL.dataset.detail === m[1]) return DETAIL;
+    // `[… i]` — the page looks the panel up case-insensitively, because Clarion names are
+    // case-insensitive and the reply carries whatever spelling was asked for.
+    const m = /^\.wdetail\[data-detail="(.*)"(\s+i)?\]$/.exec(sel);
+    if (m && DETAIL && DETAIL.dataset.detail.toLowerCase() === m[1].toLowerCase()) return DETAIL;
     return null;
   },
 };
@@ -37,6 +39,8 @@ const window = { innerWidth: 1200, innerHeight: 800 };
 let tipTarget = null, tipTimer = null;
 // deps applyValue touches that are not under test
 const values = new Map();
+// Clarion data names are case-insensitive; the page keys this cache through nameKey (see debugger.html).
+const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
 const beginEdit = () => {};
 const STAR = '*';

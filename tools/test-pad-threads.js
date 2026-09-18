@@ -39,6 +39,8 @@ function logLine(level, text) { LOGGED.push(level + ': ' + text); }
 // page state the extracted functions close over
 let isPaused = true;
 const values = new Map();
+const watched = new Map();             // the Watch panel's rows, keyed as the user spelled them
+const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
 const dtModes = {};
 let allSyms = [], lastModule = '', lastFrames = null, stackQ = '';
@@ -68,6 +70,7 @@ function setAbout() { } function setTarget() { } function setRunState() { } func
 function buildVarTree() { } function collectSyms() { return []; } function buildBps() { } function buildProcs() { }
 function buildSource() { } function clearSrc() { } function onVarSet() { } function setLayoutDirty() { }
 function refreshWatchClipping() { }
+function renderWatchList() { }   // builds rows with innerHTML; not what these checks are about
 
 // ---- the page's own code ---------------------------------------------------------------------------
 const FNS = ['esc', 'send', 'resetThreadState',
@@ -77,7 +80,7 @@ const FNS = ['esc', 'send', 'resetThreadState',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
   'onThreads', 'onThreadSelected', 'onEngineError', 'rearmCurrentThread', 'beginThreadSwitch', 'invalidateThreadScopedState',
-  'viewingOtherThread', 'editThreadSuffix',
+  'viewingOtherThread', 'editThreadSuffix', 'watchedKey', 'addWatchSilent', 'addWatch', 'removeWatch',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
   'buildStack', 'renderStack', 'onMessage'];
 const missing = [];
@@ -614,6 +617,69 @@ console.log('\n9c) a module-data row says the same thing about a thread as a Wat
         'dtApply@' + tree.indexOf('dtApply(') + ' applyNote@' + tree.indexOf('applyNote('));
   check('and the Watch panel uses the same function',
         pad.extract(html, 'applyValue').indexOf('applyNote(') > 0);
+}
+
+console.log('\n9e) one Clarion name, however it is spelled, is one variable');
+{
+  // The Owner's screenshot: after a switch the WATCH row for a field sat on "…" while the VARIABLES tree
+  // row for the SAME field showed its value. Clarion names are case-insensitive and the engine echoes the
+  // spelling it was ASKED for, so the two rows were two spellings of one name — and the host's watch set
+  // collapses them, so only one was ever re-requested. Every name comparison in the page now goes through
+  // nameKey(); these are the four places that compared with === .
+  const TREE = 'PUB:PUB_NAME', TYPED = 'Pub:Pub_Name';
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const treeRow = makeRow(TREE);                       // keyed from the engine's symbol table
+  const watchRow = makeRow(TYPED, { watch: true });    // keyed from what the developer typed into the box
+
+  // 1. a reply for one spelling resolves the rows keyed in the other
+  onMessage(JSON.stringify({ type: 'watch', name: TREE, found: true, value: "'GA'", typeName: 'STRING(41)',
+                             threaded: true, va: A_INSTANCE.va, typeCode: '0x18', size: 41, tid: STOP_TID }));
+  console.log('   reply for ' + TREE + ' -> tree ' + JSON.stringify(state(treeRow).text)
+              + ', watch ' + JSON.stringify(state(watchRow).text));
+  check('the tree row resolves', state(treeRow).text === "'GA'");
+  check('and so does the Watch row keyed in another case', state(watchRow).text === "'GA'",
+        state(watchRow).text);
+  check('both get the edit metadata, not just the one that matched', state(watchRow).va === A_INSTANCE.va);
+
+  // 2. the values cache, read by the hover tip under the spelling of whatever is hovered. A tip over a ROW
+  //    would fall back to the cell's own text and pass whatever the cache did, so this hovers a SOURCE
+  //    IDENTIFIER — no row, no cell, nothing but the cache — which is the reader that actually depends on it.
+  const token = new El('span'); token.dataset.name = TYPED;   // the source spells it as the developer wrote it
+  doc.body.appendChild(token);
+  showTipFor(token);
+  check('the hover tip over a source identifier in another case finds the value',
+        $('dtVal').textContent.includes('GA'), $('dtVal').textContent);
+
+  // 3. the Watch panel cannot hold one variable twice
+  watched.clear(); TOASTS.length = 0;
+  addWatch(TYPED);                       // the developer types it into the box
+  addWatch(TREE);                        // …then pins the same field from the tree, in its spelling
+  console.log('   watch panel holds: ' + JSON.stringify([...watched.keys()]));
+  check('a second spelling is not a second row', watched.size === 1, JSON.stringify([...watched.keys()]));
+  check('…and the user is told it is already there', TOASTS.some(t => t.includes('already watched')),
+        TOASTS.join('|'));
+
+  // 4. a tree row scrolling out of view must not unwatch what the Watch panel is holding. Its guard asks
+  //    watchedKey, so the other spelling counts as held and no `unwatch` is sent.
+  check('the tree spelling resolves to the row the panel holds', watchedKey(TREE) === TYPED,
+        String(watchedKey(TREE)));
+}
+
+console.log('\n9f) a watch the engine will never answer is answered here');
+{
+  // Host-side (ClarionDebuggerWebView.WatchOrExplain): the service refuses a name it cannot put on the
+  // line/space-split wire and sends NOTHING, so no reply can ever come. The page must still see a miss.
+  // This checks the page half — that such a reply resolves the row and explains itself.
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const row = makeRow('BAD NAME', { watch: true });
+  onMessage(JSON.stringify({ type: 'watch', name: 'BAD NAME', found: false, outOfScope: false,
+                             error: 'not a data name the debugger can read — letters, digits and _ : $ . only, up to 128 characters' }));
+  const s = state(row);
+  console.log('   ' + JSON.stringify(s));
+  check('the row resolves instead of waiting forever', s.text === '(unavailable)' && !s.cls.includes('pending'));
+  check('and says why, where the user will look', (s.title || '').includes('letters, digits'), s.title);
 }
 
 console.log('\n10) a row is never left on "…" when no reply can come');
