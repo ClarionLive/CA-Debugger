@@ -209,7 +209,8 @@ namespace ClarionDebugger.Services
         public event Action<DebugPause> Paused;
         public event Action<string> Resumed;                       // resume mode: continue/step/stepover/stepout
         public event Action<DebugBreakpoint> BreakpointSet;
-        public event Action<string, int> BreakpointRemoved;        // module, line
+        public event Action<string, int> BreakpointRemoved;        // module, requested line (planted line
+                                                                  // only from a pre-requestedLine engine)
         public event Action<string, int, string> BreakpointError;  // module, line, error
         public event Action<string, int, string, int> Traced;      // tracepoint fired: module, line, interpolated message, hit count
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
@@ -728,11 +729,18 @@ namespace ClarionDebugger.Services
                     var bp = ParseBpFields(json, GetStr(json, "module"));
                     lock (_breakpoints)
                     {
+                        // Identity is the line the USER asked for, not the record the engine snapped to:
+                        // two gutter lines can snap to one planted line and they are two breakpoints, not
+                        // one. Keying this on Line collapsed them into a single pane row.
                         DebugBreakpoint known = null;
                         foreach (var b in _breakpoints)
-                            if (b.Module == bp.Module && b.Line == bp.Line) { known = b; break; }
+                            if (SameBpIdentity(b, bp)) { known = b; break; }
                         if (known == null) _breakpoints.Add(bp);
-                        else CopyBpProps(bp, known);   // refresh props/hit count on a re-confirm (properties edit)
+                        else
+                        {
+                            known.Line = bp.Line;      // a re-plant can snap the same requested line elsewhere
+                            CopyBpProps(bp, known);    // refresh props/hit count on a re-confirm (properties edit)
+                        }
                     }
                     BreakpointSet?.Invoke(bp);
                     break;
@@ -740,9 +748,13 @@ namespace ClarionDebugger.Services
                 case "bp-del":
                     string delMod = GetStr(json, "module");
                     int delLine = GetInt(json, "line");
+                    // The engine removed exactly ONE logical breakpoint and names it by its requested line.
+                    // GetIntOrNull, not GetInt: absent must stay distinguishable from 0, because 0 is a real
+                    // RequestedLine for an unresolved raw breakpoint.
+                    int? delRequested = GetIntOrNull(json, "requestedLine");
                     lock (_breakpoints)
-                        _breakpoints.RemoveAll(b => b.Module == delMod && b.Line == delLine);
-                    BreakpointRemoved?.Invoke(delMod, delLine);
+                        _breakpoints.RemoveAll(b => BpDelMatches(b, delMod, delRequested, delLine));
+                    BreakpointRemoved?.Invoke(delMod, delRequested ?? delLine);
                     break;
 
                 case "bp-error":
@@ -1279,6 +1291,27 @@ namespace ClarionDebugger.Services
                 Trace = GetStr(json, "trace"),
                 HitCount = GetInt(json, "hitCount")
             };
+        }
+
+        /// <summary>Whether a bp-set echo names a breakpoint the host already lists. Identity is
+        /// (module, requested line): the planted line is where the engine SNAPPED the breakpoint, and
+        /// two distinct gutter lines can snap to the same record, so keying identity on it merges two
+        /// breakpoints into one row and loses one of them.</summary>
+        internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)
+        {
+            return a.Module == b.Module && a.RequestedLine == b.RequestedLine;
+        }
+
+        /// <summary>Which host entries one bp-del removes. The engine deletes exactly one logical
+        /// breakpoint and names it by <c>requestedLine</c>, so this matches that one and leaves any
+        /// neighbour sharing its planted line alone. Only when the echo carries NO requestedLine — an
+        /// engine build older than this protocol change — does it fall back to the planted line, which
+        /// can still match several: that is the old behaviour, kept deliberately so an old engine keeps
+        /// deleting something rather than silently deleting nothing.</summary>
+        internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)
+        {
+            if (b.Module != module) return false;
+            return requestedLine.HasValue ? b.RequestedLine == requestedLine.Value : b.Line == plantedLine;
         }
 
         /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an

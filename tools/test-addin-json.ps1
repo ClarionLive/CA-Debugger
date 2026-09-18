@@ -18,12 +18,20 @@
 
 param(
   [string] $ServicePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'),
-  [string] $WebViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs')
+  [string] $WebViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs'),
+  # the ENGINE side of the wire: the breakpoint-identity checks run its real writer into the host's real
+  # reader, so both files have to be on hand rather than one side being imagined in a string literal
+  [string] $EngineJsonPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\Json.cs'),
+  [string] $EnginePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.cs'),
+  [string] $EngineBpPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Breakpoints.cs')
 )
 
 $ErrorActionPreference = 'Stop'
 $src = Get-Content -Raw -LiteralPath $ServicePath
 $web = Get-Content -Raw -LiteralPath $WebViewPath
+$engine = Get-Content -Raw -LiteralPath $EngineJsonPath
+$engineSrc = Get-Content -Raw -LiteralPath $EnginePath
+$bpSrc = Get-Content -Raw -LiteralPath $EngineBpPath
 
 function Get-Method {
   param([string] $Signature, [string] $From)
@@ -131,6 +139,147 @@ Check 'no raw SendCommand( anywhere in the bridge' ($raw.Count -eq 0) "$($raw.Co
 Check 'WatchOrExplain exists and posts a miss' ($web -match 'WatchOrExplain' -and $web -match '\\"found\\":false')
 $names = [regex]::Matches($web, 'WatchOrExplain\(')
 Check 'it is used by the add, the re-read and the pause broadcast' ($names.Count -eq 4) "$($names.Count) site(s) incl. its definition"
+
+Write-Host ''
+Write-Host 'breakpoint identity on the wire: two source lines that snap to ONE planted line'
+# Task 05959085. The engine may snap two distinct gutter lines onto the same code record, and then they
+# share one planted line while staying two logical breakpoints. Everything below runs the REAL writer from
+# the engine side (Json.BpSet/BpDel out of Json.cs) into the REAL reader from the host side (ParseBpFields,
+# GetIntOrNull, SameBpIdentity, BpDelMatches out of ClarionDebuggerService.cs), so the two sides can
+# actually contradict each other. A fixture typed out by hand here could not.
+#
+# What the list mechanics below do NOT cover: the `case "bp-set"` / `case "bp-del"` arms sit inside one
+# very long switch and cannot be brace-matched out, so the add/remove LOOPS are mirrored in PowerShell.
+# The KEYS they use are the real methods, and the structural checks at the end of this section pin the
+# real arms to those same methods so the mirror cannot drift away from the shipped call sites.
+
+# Pull the real bodies out first: keeping the extraction out of the here-string keeps the C# shim readable.
+$wireMethods = @(
+  (Get-Method 'public static string Str(string s)' $engine),
+  (Get-Method 'public static string BpSet(UserBreakpoint bp)' $engine),
+  (Get-Method 'public static string BpDel(UserBreakpoint bp)' $engine),
+  (Get-Method 'private static void AppendBpProps(StringBuilder sb, UserBreakpoint bp)' $engine)
+) -join "`n"
+$hostMethods = @(
+  (Get-Method 'private static DebugBreakpoint ParseBpFields(string json, string module)'),
+  (Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)'),
+  (Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)'),
+  (Get-Method 'private static string GetStr(string json, string key)'),
+  (Get-Method 'private static int GetInt(string json, string key)'),
+  (Get-Method 'private static int? GetIntOrNull(string json, string key)'),
+  (Get-Method 'private static string ScanNumberToken(string json, string key)')
+) -join "`n"
+$bpRecord = Get-Method 'public sealed class DebugBreakpoint'
+
+$bpTypes = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+
+$bpRecord
+
+// The engine's breakpoint, cut down to the fields the real BpSet/BpDel bodies below actually touch. The
+// field NAMES are asserted against DebugEngine.cs further down so this cannot quietly drift; and if the
+// engine renamed one, the extracted bodies would stop compiling here rather than passing anyway.
+public sealed class UserBreakpoint {
+    public string Module; public int RequestedLine; public int Line;
+    public readonly List<uint> Rvas = new List<uint>();
+    public string Condition; public string HitMode; public int HitValue; public string Trace; public int HitCount;
+}
+
+public static class BpWire {
+$($wireMethods -replace 'private static', 'public static')
+}
+
+public static class BpHost {
+$($hostMethods -replace 'private static', 'public static' -replace 'internal static', 'public static')
+}
+"@
+Add-Type -TypeDefinition $bpTypes -Language CSharp | Out-Null
+
+function EngineBp { param($mod, $req, $line)
+  $b = New-Object UserBreakpoint; $b.Module = $mod; $b.RequestedLine = $req; $b.Line = $line; $b
+}
+# the host's bp-set arm: parse the echo, then add-or-refresh under the real identity key
+function HostBpSet { param($list, $json)
+  $bp = [BpHost]::ParseBpFields($json, [BpHost]::GetStr($json, 'module'))
+  foreach ($b in $list) { if ([BpHost]::SameBpIdentity($b, $bp)) { $b.Line = $bp.Line; return } }
+  [void]$list.Add($bp)
+}
+# the host's bp-del arm: read both lines off the echo, then drop what the real predicate matches
+function HostBpDel { param($list, $json)
+  $mod = [BpHost]::GetStr($json, 'module')
+  $planted = [BpHost]::GetInt($json, 'line')
+  $req = [BpHost]::GetIntOrNull($json, 'requestedLine')
+  $keep = New-Object System.Collections.ArrayList
+  foreach ($b in $list) { if (-not [BpHost]::BpDelMatches($b, $mod, $req, $planted)) { [void]$keep.Add($b) } }
+  , $keep
+}
+function Lines { param($list) (($list | ForEach-Object { "$($_.RequestedLine)->$($_.Line)" }) -join ' ') }
+
+# requested 10 and requested 12 both snapped to record line 11
+$bp10 = EngineBp 'clbrws011.clw' 10 11
+$bp12 = EngineBp 'clbrws011.clw' 12 11
+
+$rows = New-Object System.Collections.ArrayList
+HostBpSet $rows ([BpWire]::BpSet($bp10))
+HostBpSet $rows ([BpWire]::BpSet($bp12))
+Check 'two gutter lines sharing one planted line are 2 host rows, not 1' ($rows.Count -eq 2) (Lines $rows)
+
+# the user removes the one at source line 10; the engine echoes the breakpoint it actually dropped
+$surv = HostBpDel $rows ([BpWire]::BpDel($bp10))
+Check 'removing one of them leaves exactly 1 row' ($surv.Count -eq 1) (Lines $surv)
+Check 'and the row left behind is the SURVIVOR, requested line 12' ($surv.Count -eq 1 -and $surv[0].RequestedLine -eq 12) (Lines $surv)
+Check 'the survivor keeps the planted line it shares, 11' ($surv.Count -eq 1 -and $surv[0].Line -eq 11) (Lines $surv)
+
+# ...and the same the other way round, so the result is not an artefact of list order
+$rowsB = New-Object System.Collections.ArrayList
+HostBpSet $rowsB ([BpWire]::BpSet($bp10))
+HostBpSet $rowsB ([BpWire]::BpSet($bp12))
+$survB = HostBpDel $rowsB ([BpWire]::BpDel($bp12))
+Check 'removing the SECOND one instead leaves requested line 10' ($survB.Count -eq 1 -and $survB[0].RequestedLine -eq 10) (Lines $survB)
+
+Write-Host ''
+Write-Host 'the writer carries both lines, so a caller cannot send half an identity'
+$delJson = [BpWire]::BpDel($bp10)
+Check 'bp-del names the requested line the user asked for' ([BpHost]::GetIntOrNull($delJson, 'requestedLine') -eq 10) $delJson
+Check 'bp-del still names the planted line as well' ([BpHost]::GetInt($delJson, 'line') -eq 11) $delJson
+# The rule lives in the SIGNATURE: BpDel takes the breakpoint, so there is no bare-int overload for a
+# caller to reach for and no way to emit a bp-del naming only where the engine snapped it.
+Check 'BpDel takes the breakpoint, not a bare line' ($engine -match 'public static string BpDel\(UserBreakpoint bp\)' -and $engine -notmatch 'BpDel\(string module, int line\)') ''
+Check 'the cut-down stub matches the real UserBreakpoint field names' ($engineSrc -match 'public int RequestedLine;\s' -and $engineSrc -match 'public int Line;\s' -and $engineSrc -match 'public string Module;\s') ''
+
+Write-Host ''
+Write-Host 'an engine that predates requestedLine still deletes something, not nothing'
+# Derived from the real writer's output with the one member an older build would not have emitted taken
+# back out, so the framing, module and planted line are still exactly what the engine produces today.
+$legacy = $delJson -replace ',"requestedLine":\d+', ''
+Check 'the legacy echo really has no requestedLine' ($legacy -notmatch 'requestedLine') $legacy
+Check 'an absent requestedLine reads as absent, not as line 0' ($null -eq [BpHost]::GetIntOrNull($legacy, 'requestedLine')) ''
+$legacySurv = HostBpDel $rows $legacy
+Check 'the old planted-line sweep still fires, so the delete is not a no-op' ($legacySurv.Count -lt $rows.Count) (Lines $legacySurv)
+# Honest about what the fallback costs: an old engine CANNOT say which of the two went, so the old
+# over-broad sweep is what is left. That is the pre-existing behaviour, and it beats deleting nothing.
+Check 'against an old engine both rows sharing the planted line still go (known fallback cost)' ($legacySurv.Count -eq 0) (Lines $legacySurv)
+# The case that would be an outright regression: a lone breakpoint surviving its own delete.
+$solo = New-Object System.Collections.ArrayList
+HostBpSet $solo ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 42 44)))
+$soloLegacy = ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 42 44))) -replace ',"requestedLine":\d+', ''
+Check 'a single breakpoint is still removed by an old engine echo' ((HostBpDel $solo $soloLegacy).Count -eq 0) ''
+
+Write-Host ''
+Write-Host 'the real handler arms use these same keys, so the mirror above cannot drift'
+Check 'the bp-set arm dedupes through SameBpIdentity' ($src -match 'if \(SameBpIdentity\(b, bp\)\)') ''
+Check 'the bp-del arm removes through BpDelMatches' ($src -match 'RemoveAll\(b => BpDelMatches\(b, delMod, delRequested, delLine\)\)') ''
+# GetInt answers 0 for an absent field, and 0 is a real RequestedLine for an unresolved raw breakpoint,
+# so reading requestedLine with GetInt would turn "old engine" into "delete the raw breakpoints".
+Check 'bp-del reads requestedLine with the absent-aware reader' ($src -match 'GetIntOrNull\(json, "requestedLine"\)') ''
+Check 'the old planted-line RemoveAll is gone' ($src -notmatch 'RemoveAll\(b => b\.Module == delMod && b\.Line == delLine\)') ''
+# The host fix assumes the engine keeps the shared INT3 planted for the survivor. That is the ref-count in
+# DebugEngine.Breakpoints.cs; this pins it structurally. It is engine behaviour, NOT exercised here.
+Check 'the engine only unplants a shared INT3 when nothing else references it' ($bpSrc -match 'stillReferenced' -and $bpSrc -match 'b\.Owner == found\.Owner && b\.Rvas\.Contains\(rva\)') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
