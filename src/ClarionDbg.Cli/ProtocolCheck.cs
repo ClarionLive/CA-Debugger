@@ -60,21 +60,32 @@ namespace ClarionDbg.Cli
             }
 
             // 3. Sentinels must not appear anywhere, including the -1 an int cast could produce.
+            //
+            // This check used to search the stamped output for the literal `"tid":-1` — which a uint tid can
+            // never produce, so it passed without asserting anything: `(uint)-1` stamps as 4294967295, a
+            // number the pad would have read as a real thread. The assertion is now the same one the rest of
+            // the file makes, that NO tid member is written at all, and it is made against the value that
+            // actually reaches the writer.
             string neg = DebugEngine.WithTidForTest(shapes[0], unchecked((uint)-1));
-            if (neg.IndexOf("\"tid\":-1", StringComparison.Ordinal) >= 0)
-                failures.Add("paused: a -1 sentinel reached the wire");
+            if (HasTopLevelTid(neg))
+                failures.Add("paused: a -1 sentinel reached the wire as " + unchecked((uint)-1)
+                             + " — an unknown tid must be an absent member");
+            if (neg != shapes[0])
+                failures.Add("paused: a -1 tid must leave the event untouched, got " + neg);
 
             // 4. A thread-scoped event with no payload is still well-formed JSON when stamped.
             if (DebugEngine.WithTidForTest("{}", 42) != "{\"tid\":42}")
                 failures.Add("empty object: stamping produced malformed JSON");
 
+            CheckHandBuiltTidEmitters(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
 
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
             {
-                Console.WriteLine($"protocolcheck: {shapes.Length} event shapes OK - a known tid is stamped, "
+                Console.WriteLine($"protocolcheck: {shapes.Length} spliced event shapes + all 4 hand-built "
+                                  + "emitters OK - a known tid is stamped, "
                                   + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
                                   + "descendants offer no edit metadata (the expand path is a known gap — "
                                   + "see HandleExpandCommand, ticket cc3ac96e); and no write, of any length, "
@@ -83,6 +94,92 @@ namespace ClarionDbg.Cli
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
             return 1;
+        }
+
+        /// <summary>
+        /// The absent-tid rule, asserted against the FOUR hand-built emitters — the ones WithTid never saw.
+        ///
+        /// WithTid splices whole events and so was the only tid writer the checks above could reach. The
+        /// emitters in DebugEngine.Threads.cs build their JSON by hand, which is why all three recorded
+        /// breakages of this rule happened on one of them: `threadselected` carried a second, duplicated copy
+        /// of the rule, and `LogPauseChoice` carried none at all and wrote a top-level `"tid":` whatever the
+        /// value was — including the 0 that LastResortThread returns when there is no main thread.
+        ///
+        /// These run the REAL builders through internal seams, not copies of their shapes. A check written
+        /// against a hand-written copy asserts only that two hand-written strings agree, which is exactly the
+        /// evidence that was missing when this rule was broken three times in one day.
+        ///
+        /// Each emitter is checked three ways: a known tid IS written (the CONTROL — without it, a builder
+        /// that dropped the member entirely would pass the other two for the wrong reason), and both unknown
+        /// values (0 and the (uint)-1 that an int cast produces) write no member.
+        ///
+        /// FOUR is a count that can be checked against the code: threadselected, the pause-choice console
+        /// event, the `threads` rows and the `threadscan` rows. If a fifth hand-built emitter appears, this
+        /// check does not grow to meet it — add it here, and see the rule holder's note in DebugEngine.cs.
+        /// </summary>
+        private static void CheckHandBuiltTidEmitters(List<string> failures)
+        {
+            const uint known = 116932;
+            const uint minusOne = unchecked((uint)-1);
+
+            // --- 1. threadselected: a top-level tid, so the pad's own extraction rule applies directly.
+            string sel = DebugEngine.ThreadSelectedJsonForTest(known, true, null);
+            if (!HasTopLevelTid(sel) || sel.IndexOf("\"tid\":116932", StringComparison.Ordinal) < 0)
+                failures.Add("threadselected control: a KNOWN tid was not written at all — " + sel);
+            foreach (var bad in new[] { 0u, minusOne })
+            {
+                string r = DebugEngine.ThreadSelectedJsonForTest(bad, false, "unknown or exited thread");
+                if (HasTopLevelTid(r))
+                    failures.Add("threadselected: tid " + bad + " emitted a tid member — " + r);
+                if (r.IndexOf("\"error\":", StringComparison.Ordinal) < 0)
+                    failures.Add("threadselected: a refusal with an unknown tid dropped its error text — " + r);
+            }
+
+            // --- 2. the pause-choice console event: the emitter that was writing the member unconditionally.
+            string pc = DebugEngine.PauseChoiceJsonForTest("pause: thread 116932 chosen by window-z", known);
+            if (!HasTopLevelTid(pc))
+                failures.Add("pause-choice control: a KNOWN tid was not written at all — " + pc);
+            foreach (var bad in new[] { 0u, minusOne })
+            {
+                // tid 0 is REACHABLE here: LastResortThread returns _mainTid, else breakTid, else 0.
+                string r = DebugEngine.PauseChoiceJsonForTest("pause: thread 0 chosen by main", bad);
+                if (HasTopLevelTid(r))
+                    failures.Add("pause-choice: tid " + bad + " emitted a tid member — the pad would read it "
+                                 + "as a real thread: " + r);
+                if (r.IndexOf("\"text\":", StringComparison.Ordinal) < 0)
+                    failures.Add("pause-choice: the log text was lost when the tid was absent — " + r);
+            }
+
+            // --- 3+4. threads rows and threadscan rows: PER-ROW tids, one nesting level down.
+            //     HasTopLevelTid deliberately ignores those (a row's tid is not the event's own), so they are
+            //     checked by counting the member instead — which is also how a sentinel would show up.
+            string rows = DebugEngine.ThreadsJsonForTest(known, known, new[] { known, 0u, minusOne });
+            CheckNoSentinelRows(failures, "threads", rows, known);
+            string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
+            CheckNoSentinelRows(failures, "threadscan", scan, known);
+        }
+
+        /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
+        /// Feeding the builder a known tid alongside 0 and (uint)-1 in the SAME event is the point: it
+        /// asserts the rule is applied per row, not decided once for the whole event.</summary>
+        private static void CheckNoSentinelRows(List<string> failures, string name, string json, uint known)
+        {
+            if (Count(json, "\"tid\":" + known) != 1)
+                failures.Add(name + " control: the one known tid was not written exactly once — " + json);
+            int zero = Count(json, "\"tid\":0,") + Count(json, "\"tid\":0}");
+            if (zero != 0)
+                failures.Add(name + ": " + zero + " row(s) wrote a 0 tid — a row the pad would attribute to a "
+                             + "real thread it will never match");
+            if (Count(json, "\"tid\":" + unchecked((uint)-1)) != 0)
+                failures.Add(name + ": a row wrote the (uint)-1 sentinel — " + json);
+        }
+
+        /// <summary>Occurrences of <paramref name="needle"/> in <paramref name="hay"/>.</summary>
+        private static int Count(string hay, string needle)
+        {
+            int n = 0, i = 0;
+            while ((i = hay.IndexOf(needle, i, StringComparison.Ordinal)) >= 0) { n++; i += needle.Length; }
+            return n;
         }
 
         /// <summary>

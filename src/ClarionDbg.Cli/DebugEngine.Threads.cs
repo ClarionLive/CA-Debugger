@@ -377,7 +377,7 @@ namespace ClarionDbg.Cli
         private static string Trunc(string s, int n)
             => s == null ? "" : (s.Length <= n ? s : s.Substring(0, n - 1) + "…");
 
-        private string ThreadScanJson(uint stoppedTid, List<ThreadProbe> probes)
+        private static string ThreadScanJson(uint stoppedTid, List<ThreadProbe> probes)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"threadscan\",\"stopped\":").Append(stoppedTid).Append(",\"threads\":[");
@@ -385,8 +385,11 @@ namespace ClarionDbg.Cli
             {
                 var p = probes[i];
                 if (i > 0) sb.Append(',');
-                sb.Append("{\"tid\":").Append(p.Tid)
-                  .Append(",\"seq\":").Append(p.Seq)
+                // The tid goes through AppendTidMember like every other tid the engine writes, which means
+                // it lands at the END of the row rather than the front. Member order is not significant to
+                // any consumer (all of them parse the object), and one guarded writer is worth more than a
+                // familiar field order — see the rule holder in DebugEngine.cs.
+                sb.Append("{\"seq\":").Append(p.Seq)
                   .Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")
                   .Append(",\"state\":").Append(Json.Str(p.State))
                   .Append(",\"eip\":\"0x").Append(p.Eip.ToString("X8")).Append('"')
@@ -403,8 +406,9 @@ namespace ClarionDbg.Cli
                   .Append(",\"probed\":").Append(Json.Str(p.Probed))
                   .Append(",\"visibleWindows\":").Append(p.VisibleWindows)
                   .Append(",\"hiddenWindows\":").Append(p.HiddenWindows)
-                  .Append(",\"crossRank\":").Append(p.CrossRank == int.MaxValue ? -1 : p.CrossRank)
-                  .Append('}');
+                  .Append(",\"crossRank\":").Append(p.CrossRank == int.MaxValue ? -1 : p.CrossRank);
+                AppendTidMember(sb, p.Tid);
+                sb.Append('}');
             }
             sb.Append("]}");
             return sb.ToString();
@@ -435,27 +439,7 @@ namespace ClarionDbg.Cli
                 return y.Seq.CompareTo(x.Seq);                                  // then newest first
             });
 
-            var sb = new StringBuilder();
-            sb.Append("{\"event\":\"threads\",\"stopped\":").Append(stoppedTid)
-              .Append(",\"selected\":").Append(_selectedTid)
-              .Append(",\"threads\":[");
-            for (int i = 0; i < probes.Count; i++)
-            {
-                var p = probes[i];
-                if (i > 0) sb.Append(',');
-                sb.Append("{\"tid\":").Append(p.Tid)
-                  .Append(",\"clarionThread\":").Append(ClarionThreadJson(p.ClarionThread))
-                  .Append(",\"proc\":").Append(Json.Str(p.TopProc))
-                  .Append(",\"module\":").Append(Json.Str(p.TopModule))
-                  .Append(",\"line\":").Append(p.TopLine)
-                  .Append(",\"state\":").Append(Json.Str(p.State))
-                  .Append(",\"clarionFrames\":").Append(p.ClarionFrames)
-                  .Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")
-                  .Append(",\"selected\":").Append(p.Tid == _selectedTid ? "true" : "false")
-                  .Append('}');
-            }
-            sb.Append("]}");
-            if (EmitJson) Console.WriteLine("@JSON " + sb);
+            if (EmitJson) Console.WriteLine("@JSON " + ThreadsJson(stoppedTid, _selectedTid, probes));
 
             Console.WriteLine($"  threads ({probes.Count}), stopped {stoppedTid}, selected {_selectedTid}:");
             foreach (var p in probes)
@@ -463,6 +447,35 @@ namespace ClarionDbg.Cli
                     + $"{p.State,-8} {(p.TopProc ?? "(no Clarion frame)")}"
                     + (p.TopModule != null ? "  " + p.TopModule + ":" + p.TopLine : "")
                     + (ClarionThreadJson(p.ClarionThread) != "null" ? "  [Clarion thread " + p.ClarionThread + "]" : ""));
+        }
+
+        /// <summary>The `threads` event for the picker. A pure builder over already-measured probes, so
+        /// `ClarionDbg protocolcheck` can assert the absent-tid rule against THIS code rather than against a
+        /// hand-written copy of its shape — a fixture that is written twice is a fixture that agrees with
+        /// itself and with nothing else.</summary>
+        private static string ThreadsJson(uint stoppedTid, uint selectedTid, List<ThreadProbe> probes)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"threads\",\"stopped\":").Append(stoppedTid)
+              .Append(",\"selected\":").Append(selectedTid)
+              .Append(",\"threads\":[");
+            for (int i = 0; i < probes.Count; i++)
+            {
+                var p = probes[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"clarionThread\":").Append(ClarionThreadJson(p.ClarionThread))
+                  .Append(",\"proc\":").Append(Json.Str(p.TopProc))
+                  .Append(",\"module\":").Append(Json.Str(p.TopModule))
+                  .Append(",\"line\":").Append(p.TopLine)
+                  .Append(",\"state\":").Append(Json.Str(p.State))
+                  .Append(",\"clarionFrames\":").Append(p.ClarionFrames)
+                  .Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")
+                  .Append(",\"selected\":").Append(p.Tid == selectedTid ? "true" : "false");
+                AppendTidMember(sb, p.Tid);
+                sb.Append('}');
+            }
+            sb.Append("]}");
+            return sb.ToString();
         }
 
         /// <summary>The RTL's thread number as a JSON value. Clarion numbers its threads from 1, so a 0 back
@@ -506,18 +519,25 @@ namespace ClarionDbg.Cli
         /// REFUSAL it is the thread that was ASKED FOR, not the one that survived — the host needs to match
         /// the reply to the request it sent, and the selection it still has is the one it already knew about.
         ///
-        /// A tid of 0 emits NO "tid" member, for the same reason <see cref="WithTid"/> does it: absence is
-        /// the only safe way to say "unknown", and a literal 0 would read as a real thread. That is the case
-        /// for a malformed request (no tid given, or one that would not parse) and for a `thread` that
-        /// arrived while the target is running, where there is no stop and so no selection to name.</summary>
+        /// An unknown tid emits NO "tid" member. That is the case for a malformed request (no tid given, or
+        /// one that would not parse) and for a `thread` that arrived while the target is running, where there
+        /// is no stop and so no selection to name. This method used to carry its OWN copy of the rule — an
+        /// inline `tid != 0 ?` — which is how the rule came to be held in two places that could drift apart.
+        /// The decision now belongs to <see cref="AppendTidMember"/> and is made nowhere else.</summary>
         private void EmitThreadSelected(uint tid, bool ok, string error)
         {
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"threadselected\""
-                    + (tid != 0 ? ",\"tid\":" + tid : "")
-                    + ",\"ok\":" + (ok ? "true" : "false")
-                    + (error != null ? ",\"error\":" + Json.Str(error) : "") + "}");
+            if (EmitJson) Console.WriteLine("@JSON " + ThreadSelectedJson(tid, ok, error));
             if (!ok) Console.WriteLine("  thread: " + error);
+        }
+
+        /// <summary>The `threadselected` reply as JSON. Pure, so protocolcheck can run the real builder.</summary>
+        private static string ThreadSelectedJson(uint tid, bool ok, string error)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"threadselected\",\"ok\":").Append(ok ? "true" : "false");
+            if (error != null) sb.Append(",\"error\":").Append(Json.Str(error));
+            AppendTidMember(sb, tid);
+            return sb.Append('}').ToString();
         }
 
         // ============================================================ which thread a Pause reports (item 3)
@@ -611,14 +631,68 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Say which thread a pause chose and WHY. The Owner asked about a thread they did not pick;
-        /// the next person to wonder the same should find the answer in the log rather than in this file.</summary>
+        /// the next person to wonder the same should find the answer in the log rather than in this file.
+        ///
+        /// This was the LIVE hole in the absent-tid rule: it wrote a top-level `,"tid":` UNCONDITIONALLY, and
+        /// its tid comes from <see cref="LastResortThread"/>, which returns `breakTid` when `_mainTid` is 0 —
+        /// and 0 itself when both are. A pause that fell all the way to the last resort therefore stamped a
+        /// console event with `"tid":0`, which the pad reads as a real thread. The text still names the
+        /// chosen thread either way, so the log stays readable when the member is absent.</summary>
         private void LogPauseChoice(uint tid, string rule, int candidates)
         {
             string text = $"pause: thread {tid} chosen by {rule} ({candidates} Clarion candidate(s) of {_threads.Count} live thread(s))";
             Console.WriteLine("  [" + text + "]");
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"console\",\"level\":\"info\",\"text\":" + Json.Str(text)
-                    + ",\"tid\":" + tid + "}");
+            if (EmitJson) Console.WriteLine("@JSON " + PauseChoiceJson(text, tid));
+        }
+
+        /// <summary>The pause-choice console event as JSON. Pure, so protocolcheck can run the real
+        /// builder — this is the emitter that was breaking the rule, so a fixture would have been no
+        /// evidence at all.</summary>
+        private static string PauseChoiceJson(string text, uint tid)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"event\":\"console\",\"level\":\"info\",\"text\":").Append(Json.Str(text));
+            AppendTidMember(sb, tid);
+            return sb.Append('}').ToString();
+        }
+
+        // ------------------------------------------------------------ test seams for the hand-built emitters
+        //
+        // These exist so `ClarionDbg protocolcheck` can assert the absent-tid rule against THE REAL BUILDERS.
+        // The three fixed breakages were all on hand-built paths, so a check written against a hand-copied
+        // shape would have agreed with the copy and missed every one of them. `ThreadProbe` is private, so
+        // the seam takes plain tids and builds the probes here rather than exposing the type.
+
+        internal static string ThreadsJsonForTest(uint stoppedTid, uint selectedTid, uint[] tids)
+        {
+            return ThreadsJson(stoppedTid, selectedTid, ProbesForTest(tids, stoppedTid));
+        }
+
+        internal static string ThreadScanJsonForTest(uint stoppedTid, uint[] tids)
+        {
+            return ThreadScanJson(stoppedTid, ProbesForTest(tids, stoppedTid));
+        }
+
+        internal static string ThreadSelectedJsonForTest(uint tid, bool ok, string error)
+        {
+            return ThreadSelectedJson(tid, ok, error);
+        }
+
+        internal static string PauseChoiceJsonForTest(string text, uint tid)
+        {
+            return PauseChoiceJson(text, tid);
+        }
+
+        private static List<ThreadProbe> ProbesForTest(uint[] tids, uint stoppedTid)
+        {
+            var probes = new List<ThreadProbe>();
+            for (int i = 0; i < tids.Length; i++)
+                probes.Add(new ThreadProbe
+                {
+                    Tid = tids[i], Seq = i, IsStopped = tids[i] == stoppedTid && stoppedTid != 0,
+                    HaveCtx = true, State = "clarion", ClarionThread = "1",
+                });
+            return probes;
         }
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Threading;
 using ClarionDbg.Core;
 
@@ -246,25 +247,66 @@ namespace ClarionDbg.Cli
             }
         }
 
-        /// <summary>Test seam for <see cref="WithTid"/>; the rule it asserts is documented there, so that
-        /// deleting this seam cannot delete the rationale.</summary>
+        // ---------------------------------------------------------------- the absent-tid rule, in ONE place
+        //
+        // THE RULE: a thread id is either a real Win32 tid or the field is ABSENT. Never 0, never -1.
+        //
+        // The host treats an unstamped reply as UNSCOPED and accepts it, but reads a literal 0 (or -1) as a
+        // real thread id: it then matches nothing, and the pad starts dropping replies it should have shown
+        // — a silently blank panel rather than an error.
+        //
+        // The rule was broken THREE times in one day by two different agents (ticket a39d9477), every time on
+        // a path that BYPASSED the helper the rule lived in. It lived in WithTid, which splices whole events;
+        // the four hand-built emitters in DebugEngine.Threads.cs never went through it, so each either
+        // re-implemented the rule or simply omitted it. So the rule now lives in ONE predicate below, and
+        // BOTH writers derive from it — nothing else in the engine decides whether a tid is written.
+        //
+        // IF YOU ARE ADDING A FIFTH EMITTER: do not type the member. Call AppendTidMember (or WithTid) and
+        // add your builder to ProtocolCheck.CheckHandBuiltTidEmitters, which runs the REAL builders rather
+        // than copies of their shapes. A hand-typed `,"tid":` is the exact defect this rule holder exists to
+        // stop, and no compiler can stop you typing it — protocolcheck is what catches it.
+
+        /// <summary>THE RULE, stated once: is this a thread id worth writing to the wire?
+        ///
+        /// 0 is the engine's own "no thread here" value. uint.MaxValue is the `(uint)-1` an int cast can
+        /// produce — the protocol names -1 as a forbidden sentinel, and 0xFFFFFFFF is what -1 actually looks
+        /// like once it reaches a uint tid, so it is rejected here rather than printed as 4294967295.</summary>
+        private static bool TidIsKnown(uint tid) { return tid != 0 && tid != uint.MaxValue; }
+
+        /// <summary>Append the tid member to an object that ALREADY has at least one member, or append
+        /// nothing at all when the tid is unknown. The one writer for every hand-built emitter; the leading
+        /// comma is inside the guard on purpose, so an absent tid cannot leave a dangling separator.</summary>
+        private static void AppendTidMember(StringBuilder sb, uint tid)
+        {
+            if (TidIsKnown(tid)) sb.Append(",\"tid\":").Append(tid);
+        }
+
+        /// <summary>Test seams for the two writers. The rule they assert is documented above, so that
+        /// deleting a seam cannot delete the rationale.</summary>
         internal static string WithTidForTest(string json, uint tid) { return WithTid(json, tid); }
+
+        internal static string AppendTidMemberForTest(string json, uint tid)
+        {
+            var sb = new StringBuilder(json.Substring(0, json.Length - 1));
+            AppendTidMember(sb, tid);
+            return sb.Append('}').ToString();
+        }
 
         /// <summary>Stamp a thread-scoped event with the tid it describes, so the host can drop a reply that
         /// arrived for a thread it is no longer showing. Splicing the member in here rather than threading a
         /// tid parameter through seven JSON builders keeps one rule in one place: if it is emitted from the
-        /// pause loop about a thread, it carries that thread's id. Member order is not significant in JSON.
+        /// pause loop about a thread, it carries that thread's id. Member order is not significant in JSON,
+        /// but the tid is written FIRST here because that is the shape already on the wire, and this change
+        /// was meant to be structural rather than observable.
         ///
-        /// A tid of 0 emits NO "tid" member at all. ABSENCE is the only safe way to say "unknown": the host
-        /// treats an unstamped reply as unscoped and accepts it, but would read a literal 0 (or -1) as a real
-        /// thread id and start dropping good replies — a silently blank panel rather than an error. Every
-        /// stamped event today is emitted from inside the pause loop, where the tid is always known; this
-        /// guard is here so that stays true if some future caller emits one from a path that has no thread.
-        /// `ClarionDbg protocolcheck` asserts both halves, because the unknown-tid case cannot be produced
-        /// against a live debuggee.</summary>
+        /// An unknown tid emits NO "tid" member at all — see <see cref="TidIsKnown"/> for why absence is the
+        /// only safe representation. Every stamped event today is emitted from inside the pause loop, where
+        /// the tid is always known; the guard is here so that stays true if some future caller emits one from
+        /// a path that has no thread. `ClarionDbg protocolcheck` asserts both halves, because the unknown-tid
+        /// case cannot be produced against a live debuggee.</summary>
         private static string WithTid(string json, uint tid)
         {
-            if (string.IsNullOrEmpty(json) || json[0] != '{' || tid == 0) return json;
+            if (string.IsNullOrEmpty(json) || json[0] != '{' || !TidIsKnown(tid)) return json;
             string head = "{\"tid\":" + tid;
             return json.Length == 2 ? head + "}" : head + "," + json.Substring(1);
         }
