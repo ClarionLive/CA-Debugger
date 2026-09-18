@@ -1,84 +1,58 @@
 # Paced interactive smoke test for the Phase 2 engine.
 # Launches ClarionDbg break --interactive, waits for the paused event, then issues
 # step / stepover / stepout / continue with real delays, printing all output.
+#
+# The launch, the output pump and Wait-Paused come from engine-session.ps1, shared with
+# test-watch-threaded.ps1 (337b3222 item 10).
 param(
-    [string]$Engine = "H:\DevLaptop\Projects\ClarionDebugger\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe",
+    [string]$Engine = "$PSScriptRoot\..\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe",
     [string]$Target = "C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe",
     [string]$BreakArgs = "--bp clbrws001.clw:11",
     [string[]]$Commands = @("step", "step", "stepover", "stepout", "quit"),
     [int]$PauseTimeoutSec = 20
 )
+. "$PSScriptRoot\engine-session.ps1"
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $Engine
-$psi.Arguments = "break `"$Target`" $BreakArgs --interactive --json"
-$psi.RedirectStandardInput = $true
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-
-$proc = New-Object System.Diagnostics.Process
-$proc.StartInfo = $psi
-
-# synchronized sink filled from the OutputDataReceived event (runs on a threadpool thread)
-$sink = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-$handler = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $sink -Action {
-    if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add($EventArgs.Data) }
-}
-
-[void]$proc.Start()
-$proc.BeginOutputReadLine()
-
-$script:cursor = 0
-function Wait-Paused([int]$timeoutSec) {
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
-        while ($script:cursor -lt $sink.Count) {
-            $line = $sink[$script:cursor]; $script:cursor++
-            Write-Host $line
-            if ($line -match '"event":"paused"') { return $true }
-            if ($line -match '"event":"exited"') { return $false }
-        }
-        if ($proc.HasExited -and $script:cursor -ge $sink.Count) { return $false }
-        Start-Sleep -Milliseconds 100
-    }
-    return $false
-}
+$session = New-EngineSession -Engine $Engine -Target $Target -BreakArgs $BreakArgs
 
 function Drain {
-    while ($script:cursor -lt $sink.Count) { Write-Host $sink[$script:cursor]; $script:cursor++ }
+    foreach ($line in (Read-EngineLines $session)) { Write-Host $line }
+}
+function Wait-Paused([int]$timeoutSec) {
+    return (Wait-EnginePaused $session $timeoutSec -OnLine { param($line) Write-Host $line })
 }
 
 if (-not (Wait-Paused $PauseTimeoutSec)) {
     Drain
     Write-Host "!! never paused (breakpoint not reached) — killing"
-    try { $proc.StandardInput.WriteLine("quit") } catch {}
-    $proc.WaitForExit(5000) | Out-Null
-    if (-not $proc.HasExited) { $proc.Kill() }
-    Unregister-Event -SourceIdentifier $handler.Name
+    Stop-EngineSession $session -QuitWaitMs 5000
+    Stop-EngineTarget $session
+    Remove-EngineSession $session
     exit 3
 }
 
 foreach ($cmd in $Commands) {
     Write-Host ">>> $cmd"
-    $proc.StandardInput.WriteLine($cmd)
+    $session.Proc.StandardInput.WriteLine($cmd)
     if ($cmd -eq "quit") { break }
     if ($cmd -in @("step", "stepover", "stepout", "continue")) {
         if (-not (Wait-Paused $PauseTimeoutSec)) {
             Drain
             Write-Host "!! did not pause again after '$cmd' — killing"
-            try { $proc.StandardInput.WriteLine("quit") } catch {}
+            try { $session.Proc.StandardInput.WriteLine("quit") } catch {}
             break
         }
-    } else {
+    }
+    else {
         Start-Sleep -Milliseconds 300
         Drain
     }
 }
 
-$proc.WaitForExit(10000) | Out-Null
-if (-not $proc.HasExited) { $proc.Kill(); Write-Host "!! force-killed" }
+[void]$session.Proc.WaitForExit(10000)
+if (-not $session.Proc.HasExited) { $session.Proc.Kill(); Write-Host "!! force-killed" }
 Start-Sleep -Milliseconds 300
 Drain
-Write-Host "=== exit code: $($proc.ExitCode) ==="
-Unregister-Event -SourceIdentifier $handler.Name
+Write-Host "=== exit code: $($session.Proc.ExitCode) ==="
+Stop-EngineTarget $session
+Remove-EngineSession $session
