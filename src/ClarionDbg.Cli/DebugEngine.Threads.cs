@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Text;
 using ClarionDbg.Core;
@@ -41,7 +41,13 @@ namespace ClarionDbg.Cli
             public string TopModule;        // ... its compiland (file.clw)
             public int TopLine;             // ... its source line
             public List<string> TopFrames = new List<string>();  // first few Clarion frames, for the report
-            public string ClarionThread;    // Cla$THREAD for this thread, or a reason it is unavailable
+            // The RTL's own thread number and, separately, why there isn't one. These used to be a single
+            // string holding either a number or a failure reason ("no TEB", "(InvalidOperationException)"),
+            // re-parsed downstream by int.TryParse and compared against the literal "null" by the printer —
+            // a value whose meaning depended on parsing it back, which is the same defect class as a 0 tid.
+            // Clarion numbers its threads from 1, so there is no in-band way to say "none" with an int.
+            public int? ClarionThread;      // the Clarion thread number, or null when there is not one
+            public string ClarionThreadWhyNot;  // ... and why not: a failure reason, or "not a Clarion thread"
             public uint StartAddr;          // Win32 thread start address
             public string StartImage;       // ... and its owning image
             public DateTime Created;        // GetThreadTimes creation time (UTC)
@@ -66,7 +72,7 @@ namespace ClarionDbg.Cli
         /// would read, which is the direct evidence for "the browse's copy is filled, the frame's is not".</summary>
         private void HandleThreadScanCommand(uint stoppedTid, string[] parts)
         {
-            var probes = ProbeAllThreads(stoppedTid);
+            var probes = ProbeAllThreads(stoppedTid, withClarionThread: true, withDiagnostics: true);
             string probeName = parts != null && parts.Length > 1 ? parts[1] : null;
             if (probeName != null) ProbeNameOnEachThread(probeName, probes);
             // Guarded the same way the pause path guards it (PickPauseThread). Window evidence is
@@ -90,13 +96,13 @@ namespace ClarionDbg.Cli
                     p.EipImage ?? "(none)", p.ClarionFrames + (p.FramesUncertain ? "?" : ""),
                     p.VisibleWindows + "/" + (p.VisibleWindows + p.HiddenWindows)
                         + (p.CrossRank != int.MaxValue ? " r" + p.CrossRank : ""),
-                    Trunc(top, 37), p.ClarionThread ?? "-", p.Created == default(DateTime) ? "-" : p.Created.ToString("HH:mm:ss.fff")));
+                    Trunc(top, 37), ClarionThreadText(p), p.Created == default(DateTime) ? "-" : p.Created.ToString("HH:mm:ss.fff")));
             }
             foreach (var p in probes)
             {
                 Console.WriteLine($"    --- tid {p.Tid} (seq {p.Seq}){(p.IsStopped ? " [STOPPED]" : "")} ---");
                 Console.WriteLine($"        eip=0x{p.Eip:X8} esp=0x{p.Esp:X8} ebp=0x{p.Ebp:X8} image={p.EipImage ?? "(none)"}{(p.EipSym != null ? " sym=" + p.EipSym : "")}");
-                Console.WriteLine($"        start=0x{p.StartAddr:X8} in {p.StartImage ?? "(unknown)"}   clarionThread={p.ClarionThread ?? "-"}");
+                Console.WriteLine($"        start=0x{p.StartAddr:X8} in {p.StartImage ?? "(unknown)"}   clarionThread={ClarionThreadText(p)}");
                 if (p.Probed != null) Console.WriteLine($"        {probeName} = {p.Probed}");
                 Console.WriteLine($"        windows: {p.VisibleWindows} visible, {p.HiddenWindows} hidden"
                                   + (p.CrossRank != int.MaxValue ? $", crossRank={p.CrossRank}" : ""));
@@ -110,7 +116,7 @@ namespace ClarionDbg.Cli
 
         /// <summary>Measure every live thread. Creation order first (main thread first), which is the order
         /// the evidence is easiest to read in; the heuristic work happens on the caller's side.</summary>
-        private List<ThreadProbe> ProbeAllThreads(uint stoppedTid, bool withClarionThread = true)
+        private List<ThreadProbe> ProbeAllThreads(uint stoppedTid, bool withClarionThread, bool withDiagnostics)
         {
             var probes = new List<ThreadProbe>();
             var tids = new List<uint>(_threads);
@@ -125,12 +131,12 @@ namespace ClarionDbg.Cli
             {
                 var p = new ThreadProbe { Tid = t, Seq = SeqOf(t), IsStopped = t == stoppedTid };
                 IntPtr h = OpenThreadForContext(t);
-                if (h == IntPtr.Zero) { p.State = "unknown"; p.ClarionThread = "no thread handle"; probes.Add(p); continue; }
+                if (h == IntPtr.Zero) { p.State = "unknown"; p.ClarionThreadWhyNot = "no thread handle"; probes.Add(p); continue; }
                 try
                 {
                     var c = NewContext();
                     p.HaveCtx = Native.GetThreadContext(h, ref c);
-                    if (!p.HaveCtx) { p.State = "unknown"; p.ClarionThread = "no context"; probes.Add(p); continue; }
+                    if (!p.HaveCtx) { p.State = "unknown"; p.ClarionThreadWhyNot = "no context"; probes.Add(p); continue; }
                     p.Eip = c.Eip; p.Esp = c.Esp; p.Ebp = c.Ebp;
 
                     var m = ModuleAt(c.Eip);
@@ -138,10 +144,17 @@ namespace ClarionDbg.Cli
                     p.State = ClassifyEip(m, c.Eip);
                     if (p.State != "clarion") p.EipSym = NearestImportSymbol(c.Eip);
 
-                    FillStackEvidence(p, c);
-                    FillStartAddress(p, h);
-                    p.Created = ThreadCreationTime(h);
-                    if (withClarionThread) p.ClarionThread = ReadClarionThreadNumber(rt, claThreadRva, t, h);
+                    FillStackEvidence(p, c, withDiagnostics);
+                    // Diagnostic-only, and paid for per thread: FillStartAddress is an
+                    // NtQueryInformationThread, ThreadCreationTime is a GetThreadTimes, and the TopFrames
+                    // strings above are up to 8 formatted lines each. `threadscan` prints all three;
+                    // PickPauseThread and the `threads` picker read none of them.
+                    if (withDiagnostics)
+                    {
+                        FillStartAddress(p, h);
+                        p.Created = ThreadCreationTime(h);
+                    }
+                    if (withClarionThread) ReadClarionThreadNumber(p, rt, claThreadRva, t, h);
                 }
                 finally { Native.CloseHandle(h); }
                 probes.Add(p);
@@ -336,9 +349,14 @@ namespace ClarionDbg.Cli
         /// <summary>Walk this thread's stack and record the Clarion frames it carries. This is the whole
         /// point of the probe: two threads both parked in win32u!NtUserGetMessage are indistinguishable by
         /// EIP, but their STACKS are not.</summary>
-        private void FillStackEvidence(ThreadProbe p, Native.CONTEXT_X86 c)
+        /// <param name="withFrameText">Also format the first few frames as display strings. The COUNT and the
+        /// topmost frame are what the pause decision and the picker read; the strings are threadscan's alone,
+        /// so they are not built on a path that will throw them away.</param>
+        private void FillStackEvidence(ThreadProbe p, Native.CONTEXT_X86 c, bool withFrameText)
         {
             List<StackFrame> frames;
+            // The failure is recorded even when the frame text is off: a stack walk that threw is evidence,
+            // and dropping it on the quiet path would make a broken walk look like a thread with no frames.
             try { frames = BuildStack(c.Eip, c.Esp, c.Ebp, SCAN_FRAMES); }
             catch (Exception ex) { p.TopFrames.Add("(stack walk failed: " + ex.Message + ")"); return; }
 
@@ -351,7 +369,7 @@ namespace ClarionDbg.Cli
                 p.ClarionFrames++;
                 if (f.Uncertain) p.FramesUncertain = true;
                 if (p.TopProc == null) { p.TopProc = f.Proc; p.TopModule = f.Module; p.TopLine = f.Line; }
-                if (p.TopFrames.Count < 8)
+                if (withFrameText && p.TopFrames.Count < 8)
                     p.TopFrames.Add((f.Proc ?? "(unknown)") + "  " + f.Module + ":" + f.Line
                                     + "  RVA 0x" + f.Rva.ToString("X") + (f.Uncertain ? "  [scan]" : "  [chain]"));
             }
@@ -370,20 +388,36 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Cla$THREAD for one thread, read by EMULATING the export against THAT thread's TEB — the
-        /// same read-only path Library State uses. Never runs target code; returns the reason on failure so
-        /// the evidence never silently claims a number it could not read.</summary>
-        private string ReadClarionThreadNumber(LoadedModule rt, uint claThreadRva, uint tid, IntPtr hThread)
+        /// same read-only path Library State uses. Never runs target code; records the reason on failure so
+        /// the evidence never silently claims a number it could not read.
+        ///
+        /// Writes BOTH fields on the probe, because "which thread number" and "why there isn't one" are two
+        /// different questions and a caller should not have to parse one answer to find out which it got.
+        /// A Cla$THREAD of 0 or below is not a thread number: Clarion numbers its threads from 1, so that
+        /// answer means the thread is not a Clarion thread at all, and it is recorded as such rather than
+        /// passed on as a number no consumer could use.</summary>
+        private void ReadClarionThreadNumber(ThreadProbe p, LoadedModule rt, uint claThreadRva, uint tid, IntPtr hThread)
         {
-            if (rt == null) return "no ClaRUN";
-            if (claThreadRva == 0) return "no Cla$THREAD export";
+            if (rt == null) { p.ClarionThreadWhyNot = "no ClaRUN"; return; }
+            if (claThreadRva == 0) { p.ClarionThreadWhyNot = "no Cla$THREAD export"; return; }
             uint teb = GetTebBase(hThread);
-            if (teb == 0) return "no TEB";
+            if (teb == 0) { p.ClarionThreadWhyNot = "no TEB"; return; }
             try
             {
                 var emu = BuildEmulator(rt, tid, teb);
-                return ((int)emu.Call(rt.LoadBase + claThreadRva)).ToString();
+                int n = (int)emu.Call(rt.LoadBase + claThreadRva);
+                if (n > 0) p.ClarionThread = n;
+                else p.ClarionThreadWhyNot = "not a Clarion thread";
             }
-            catch (Exception ex) { return "(" + ex.GetType().Name + ")"; }
+            catch (Exception ex) { p.ClarionThreadWhyNot = "(" + ex.GetType().Name + ")"; }
+        }
+
+        /// <summary>What to show a human for this thread's Clarion thread number: the number, else why there
+        /// isn't one, else a dash. One place, so the console table and the detail lines cannot disagree.</summary>
+        private static string ClarionThreadText(ThreadProbe p)
+        {
+            return p.ClarionThread.HasValue ? p.ClarionThread.Value.ToString()
+                 : (p.ClarionThreadWhyNot ?? "-");
         }
 
         private static DateTime ThreadCreationTime(IntPtr hThread)
@@ -432,7 +466,8 @@ namespace ClarionDbg.Cli
                   .Append(",\"proc\":").Append(Json.Str(p.TopProc))
                   .Append(",\"module\":").Append(Json.Str(p.TopModule))
                   .Append(",\"line\":").Append(p.TopLine)
-                  .Append(",\"clarionThread\":").Append(Json.Str(p.ClarionThread))
+                  .Append(",\"clarionThread\":").Append(ClarionThreadJson(p.ClarionThread))
+                  .Append(",\"clarionThreadWhyNot\":").Append(Json.Str(p.ClarionThreadWhyNot))
                   .Append(",\"start\":\"0x").Append(p.StartAddr.ToString("X8")).Append('"')
                   .Append(",\"startImage\":").Append(Json.Str(p.StartImage))
                   .Append(",\"probed\":").Append(Json.Str(p.Probed))
@@ -459,7 +494,9 @@ namespace ClarionDbg.Cli
         /// created first (an MDI child's thread is newer than the frame's).</summary>
         private void HandleThreadsCommand(uint stoppedTid)
         {
-            var probes = ProbeAllThreads(stoppedTid);
+            // The picker shows the Clarion thread number and the topmost frame. It shows none of the
+            // diagnostic evidence, so it does not pay for it.
+            var probes = ProbeAllThreads(stoppedTid, withClarionThread: true, withDiagnostics: false);
             // Never offer the thread DebugBreakProcess injected to cause this stop. It is a real live
             // thread, so it would list and select like any other, but it belongs to the debugger, carries
             // no Clarion work, and exits the instant the target resumes. `threadscan` still shows it — that
@@ -478,7 +515,7 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"    {(p.IsStopped ? "*" : " ")}{(p.Tid == _selectedTid ? ">" : " ")} tid {p.Tid,-6} "
                     + $"{p.State,-8} {(p.TopProc ?? "(no Clarion frame)")}"
                     + (p.TopModule != null ? "  " + p.TopModule + ":" + p.TopLine : "")
-                    + (ClarionThreadJson(p.ClarionThread) != "null" ? "  [Clarion thread " + p.ClarionThread + "]" : ""));
+                    + (p.ClarionThread.HasValue ? "  [Clarion thread " + p.ClarionThread.Value + "]" : ""));
         }
 
         /// <summary>The `threads` event for the picker. A pure builder over already-measured probes, so
@@ -510,13 +547,14 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
-        /// <summary>The RTL's thread number as a JSON value. Clarion numbers its threads from 1, so a 0 back
-        /// from Cla$THREAD means "not a Clarion thread" — that is not a thread number, and the protocol says
-        /// never to invent one, so it and every unreadable outcome map to null.</summary>
-        private static string ClarionThreadJson(string raw)
+        /// <summary>The RTL's thread number as a JSON value: the number, or null. The decision about what
+        /// counts as a number is made where the value is READ (ReadClarionThreadNumber), not re-derived here
+        /// by parsing a string back — the old version of this method was the second holder of that rule, and
+        /// the printer beside it was a third, comparing against the literal "null". Same shape of defect as
+        /// two places deciding whether to write a tid.</summary>
+        private static string ClarionThreadJson(int? n)
         {
-            int n;
-            return int.TryParse(raw, out n) && n > 0 ? n.ToString() : "null";
+            return n.HasValue ? n.Value.ToString() : "null";
         }
 
         /// <summary>thread &lt;tid&gt; — point the read commands at another thread for the rest of this stop.
@@ -605,7 +643,7 @@ namespace ClarionDbg.Cli
         private uint PickPauseThread(uint breakTid)
         {
             List<ThreadProbe> probes;
-            try { probes = ProbeAllThreads(0, withClarionThread: false); }
+            try { probes = ProbeAllThreads(0, withClarionThread: false, withDiagnostics: false); }
             catch (Exception ex)
             {
                 uint lr0 = LastResortThread(breakTid);
@@ -722,7 +760,7 @@ namespace ClarionDbg.Cli
                 probes.Add(new ThreadProbe
                 {
                     Tid = tids[i], Seq = i, IsStopped = tids[i] == stoppedTid && stoppedTid != 0,
-                    HaveCtx = true, State = "clarion", ClarionThread = "1",
+                    HaveCtx = true, State = "clarion", ClarionThread = 1,
                 });
             return probes;
         }
