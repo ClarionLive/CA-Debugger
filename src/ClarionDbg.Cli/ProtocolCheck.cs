@@ -227,10 +227,11 @@ namespace ClarionDbg.Cli
         /// <summary>
         /// The three Step Over guards from ticket f83d5eec, each isolated with the others intact.
         ///
-        /// These cannot be produced against a live debuggee for the same reason the tid rule cannot: the
-        /// case that matters is the one that does NOT happen on a normal run. A Step Over only reaches the
-        /// ESP gate at all on StepMachine's documented "couldn't plant — fall through and keep
-        /// instruction-stepping" path, which needs a return address the debugger cannot write a byte to.
+        /// These are impractical to produce against a live debuggee — not impossible, and the difference is
+        /// worth stating in a file whose job is keeping claims honest. A Step Over reaches the ESP gate only
+        /// on StepMachine's documented "couldn't plant — fall through and keep instruction-stepping" path,
+        /// which needs a return address the debugger cannot write a byte to; that is reachable in principle
+        /// (a read-only or guarded page at a return site) and simply does not arise in a normal run.
         ///
         /// Isolation is the point, not coverage. A guard that is only ever exercised alongside another guard
         /// covering the same case is a DEAD guard whose test still passes — this repo shipped exactly that
