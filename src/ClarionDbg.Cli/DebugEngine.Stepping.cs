@@ -360,5 +360,29 @@ namespace ClarionDbg.Cli
         internal uint PrologueBypassEntryRvaForTest { get { return _startSymEntryRva; } }
 
         internal void CancelStepForTest() { CancelStep(); }
+
+        /// <summary>Arm an IN-FLIGHT step session the way BeginStep leaves one: a mode, the stepping thread,
+        /// the previous trap's EIP (<c>_prevVa</c> — the call-entry detector's anchor) and one call-skip temp
+        /// INT3. BeginStep itself needs a live context and a real line table, and the property under test is
+        /// what a breakpoint hit does to a session that is ALREADY in flight, which is a separate claim.</summary>
+        internal void ArmStepSessionForTest(uint tid, uint prevVa, uint tempVa)
+        {
+            _mode = StepMode.Over;
+            _stepTid = tid;
+            _prevVa = prevVa;
+            _temp[tempVa] = 0x90;
+        }
+
+        /// <summary>Is a step session still in flight? This is the exact condition OnSingleStep's step-2
+        /// guard tests (<c>_mode != StepMode.None</c>) before it runs StepMachine, so a false here means
+        /// nothing will stop the target.</summary>
+        internal bool StepInFlightForTest { get { return _mode != StepMode.None; } }
+
+        /// <summary>The call-entry detector's anchor (<c>_prevVa</c>).</summary>
+        internal uint PrevVaForTest { get { return _prevVa; } }
+
+        /// <summary>How many call-skip temp INT3s are still recorded. CancelStep restores and clears them
+        /// all, so this distinguishes a cancelled session from a surviving one independently of the mode.</summary>
+        internal int TempBpCountForTest { get { return _temp.Count; } }
     }
 }

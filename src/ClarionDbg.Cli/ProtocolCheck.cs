@@ -80,6 +80,7 @@ namespace ClarionDbg.Cli
             CheckHandBuiltTidEmitters(failures);
             CheckResumeVerbs(failures);
             CheckStepGuards(failures);
+            CheckBpHitVsStep(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
 
@@ -92,8 +93,11 @@ namespace ClarionDbg.Cli
                                   + "descendants offer no edit metadata (the expand path is a known gap — "
                                   + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
                                   + "can touch the shared template; the resume-verb set has one owner across "
-                                  + "its 2 remaining sites; and Step Over's ESP gate and its prologue bypass "
-                                  + "each hold with the other one out of the way.");
+                                  + "its 2 remaining sites; Step Over's ESP gate and its prologue bypass "
+                                  + "each hold with the other one out of the way; and a breakpoint hit "
+                                  + "supersedes an in-flight step only when it PAUSES — both pausing routes "
+                                  + "cancel the step, and a silently-resumed hit leaves the session, its "
+                                  + "temp INT3s and its call-entry anchor untouched.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -330,6 +334,153 @@ namespace ClarionDbg.Cli
             if (eng.PrologueBypassEntryRvaForTest != 0)
                 failures.Add("cancel-step: the bypass flag cleared but its procedure bound did not, leaving "
                              + "the next session bounded to a procedure it never started in");
+        }
+
+        /// <summary>
+        /// A breakpoint hit that does NOT pause leaves an in-flight step exactly as it was; a hit that DOES
+        /// pause supersedes it.
+        ///
+        /// OnUserBp used to call CancelStep unconditionally, BEFORE the advanced-breakpoint gate decided
+        /// whether the hit pauses at all. On the silent-resume path that left <c>_mode = StepMode.None</c>,
+        /// every call-skip temp INT3 restored and the temp re-arms dropped — so on the next trap
+        /// OnSingleStep's step-2 guard (<c>_mode != StepMode.None</c>) was false, StepMachine never ran, and
+        /// nothing stopped the target. The user's Step Over silently became a Continue while the pad still
+        /// showed Running.
+        ///
+        /// 465a3873 is what made it common rather than theoretical: a condition over THREADed data used to
+        /// return indeterminate and PAUSE, so the silent-resume path was nearly unreachable; it now evaluates
+        /// and false is an ordinary answer.
+        ///
+        /// Each case moves ONE thing and leaves the rest where a real step would have them. The silent-resume
+        /// case asserts its three consequences separately — the session, the temp bytes and the call-entry
+        /// anchor are three different repairs, and a half-applied fix must name which half is missing. The
+        /// two PAUSING cases exist because CancelStep has to be reachable from BOTH pausing routes: a plain
+        /// breakpoint that never enters the gate, and an advanced one whose gate said pause. A fix that
+        /// handled only one of those would pass the other's case.
+        /// </summary>
+        private static void CheckBpHitVsStep(List<string> failures)
+        {
+            // Not a multiple of 4, so Windows never assigns it: OpenThread fails, haveCtx stays false, and
+            // no thread on this machine is touched. Everything asserted below is engine bookkeeping.
+            const uint tid = 0xFFFFFFF1;
+            const uint loadBase = 0x00400000;
+            const uint va = 0x00401100;   // where the breakpoint is planted, and where the hit arrives
+            const uint prevVa = 0x00401000;   // the previous trap's EIP, the call-entry detector's anchor
+            const uint tempVa = 0x00402000;   // the step's one call-skip temp INT3
+
+            // ---- case 1: THE RULE. A hit-count rule that is not yet satisfied resumes SILENTLY.
+            var eng = NewEngine();
+            var bp = eng.ArmUserBpForTest(loadBase, va, null, "eq", 99, null);
+            eng.ArmStepSessionForTest(tid, prevVa, tempVa);
+            uint rc = 0;
+            string log = CaptureConsole(() => { rc = eng.OnUserBpForTest(tid, va); });
+
+            // CONTROLS first: without these the case could pass because nothing ran at all.
+            if (bp.HitCount != 1)
+                failures.Add("bp-hit control: the hit-count gate never ran (HitCount " + bp.HitCount
+                             + ", expected 1) — this case did not reach the silent-resume path, so its "
+                             + "assertions prove nothing");
+            if (log.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) >= 0)
+                failures.Add("bp-hit control: an unmet hit-count rule reported a breakpoint hit — it must "
+                             + "resume silently");
+            if (rc != Native.DBG_CONTINUE)
+                failures.Add("bp-hit control: the silent-resume path returned 0x" + rc.ToString("X")
+                             + ", not DBG_CONTINUE");
+
+            if (!eng.StepInFlightForTest)
+                failures.Add("bp-hit: a hit that resumed SILENTLY cancelled the in-flight step — "
+                             + "OnSingleStep's `_mode != StepMode.None` guard is now false, StepMachine "
+                             + "never runs, and the user's Step Over has become a Continue");
+            if (eng.TempBpCountForTest != 1)
+                failures.Add("bp-hit: a silently-resumed hit restored the step's call-skip temp INT3 ("
+                             + eng.TempBpCountForTest + " left, expected 1) — the skipped call's return "
+                             + "address is no longer covered, so the step has nothing left to stop on");
+            if (eng.PrevVaForTest != va)
+                failures.Add("bp-hit: a silently-resumed hit left the call-entry anchor at 0x"
+                             + eng.PrevVaForTest.ToString("X") + " instead of the hit address 0x"
+                             + va.ToString("X") + " — StepMachine's `ret > _prevVa && ret - _prevVa <= "
+                             + "CALL_WINDOW` test can read the re-arm trap as a call entry and plant a temp "
+                             + "INT3 at a bogus return address");
+            if (!eng.HasUserBpRearmForTest(tid, va))
+                failures.Add("bp-hit: the user-breakpoint re-plant for this thread was lost on the "
+                             + "silent-resume path — the breakpoint stops firing after its first hit");
+
+            // ---- case 2: PAUSING ROUTE A — a plain breakpoint, which never enters the gate at all.
+            var plain = NewEngine();
+            plain.ArmUserBpForTest(loadBase, va, null, null, 0, null);
+            plain.ArmStepSessionForTest(tid, prevVa, tempVa);
+            string plainLog = CaptureConsole(() => { plain.OnUserBpForTest(tid, va); });
+            if (plainLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
+                failures.Add("bp-hit control: a plain breakpoint did not report a hit, so this case never "
+                             + "reached the pausing route it is asserting about");
+            if (plain.StepInFlightForTest)
+                failures.Add("bp-hit: a PLAIN breakpoint hit pauses, and a pausing hit must supersede the "
+                             + "in-flight step — the session survived, so the next trap drives StepMachine "
+                             + "while the user is stopped at a breakpoint");
+            if (plain.TempBpCountForTest != 0)
+                failures.Add("bp-hit: a plain breakpoint hit left " + plain.TempBpCountForTest
+                             + " call-skip temp INT3(s) planted in the target");
+            if (!plain.HasUserBpRearmForTest(tid, va))
+                failures.Add("bp-hit: cancelling the step on a plain hit also dropped the user-breakpoint "
+                             + "re-plant — it is IsTemp=false and CancelStep must leave it alone");
+
+            // ---- case 3: PAUSING ROUTE B — an advanced breakpoint whose gate SAID pause. A fix that moved
+            // CancelStep into the plain-breakpoint branch only would pass case 2 and fail here.
+            var gated = NewEngine();
+            var gbp = gated.ArmUserBpForTest(loadBase, va, null, "eq", 1, null);   // first hit satisfies =1
+            gated.ArmStepSessionForTest(tid, prevVa, tempVa);
+            string gatedLog = CaptureConsole(() => { gated.OnUserBpForTest(tid, va); });
+            if (gbp.HitCount != 1 || gatedLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
+                failures.Add("bp-hit control: a hit-count rule of =1 did not pause on its first hit "
+                             + "(HitCount " + gbp.HitCount + ") — this case is not testing the gated "
+                             + "pausing route");
+            if (gated.StepInFlightForTest)
+                failures.Add("bp-hit: an ADVANCED breakpoint whose gate said PAUSE did not supersede the "
+                             + "in-flight step — CancelStep is reachable from the plain route only");
+            if (gated.TempBpCountForTest != 0)
+                failures.Add("bp-hit: a gated pausing hit left " + gated.TempBpCountForTest
+                             + " call-skip temp INT3(s) planted in the target");
+
+            // ---- case 4: the TRACEPOINT, which is what the pipeline actually reported. A tracepoint NEVER
+            // pauses, and it LOGS, so the log itself proves the non-pausing path was taken rather than the
+            // breakpoint simply not matching. The message carries no {token}, so nothing is read from a
+            // target that is not there.
+            var trace = NewEngine();
+            trace.ArmUserBpForTest(loadBase, va, null, null, 0, "step-in-flight probe");
+            trace.ArmStepSessionForTest(tid, prevVa, tempVa);
+            string traceLog = CaptureConsole(() => { trace.OnUserBpForTest(tid, va); });
+            if (traceLog.IndexOf("[TRACE] pc001.clw:100: step-in-flight probe", StringComparison.Ordinal) < 0)
+                failures.Add("bp-hit control: the tracepoint never logged — this case did not reach the "
+                             + "non-pausing path: " + traceLog.Replace("\r\n", " | "));
+            if (traceLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) >= 0)
+                failures.Add("bp-hit control: a tracepoint reported a breakpoint hit — a tracepoint logs "
+                             + "and resumes, it never pauses");
+            if (!trace.StepInFlightForTest)
+                failures.Add("bp-hit: a TRACEPOINT hit cancelled the in-flight step — a tracepoint never "
+                             + "pauses, so it must never supersede a step");
+            if (trace.PrevVaForTest != va)
+                failures.Add("bp-hit: a tracepoint hit left the call-entry anchor at 0x"
+                             + trace.PrevVaForTest.ToString("X") + " instead of 0x" + va.ToString("X"));
+        }
+
+        /// <summary>An engine with no target: every path below is bookkeeping, and the memory access it
+        /// attempts fails harmlessly on a null process handle.</summary>
+        private static DebugEngine NewEngine()
+        {
+            return new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+        }
+
+        /// <summary>Run <paramref name="body"/> with stdout captured, and hand back what it printed. The
+        /// engine's hit reporting is console output, so it is EVIDENCE here — which route a hit took is
+        /// visible in the log and nowhere else in its state.</summary>
+        private static string CaptureConsole(Action body)
+        {
+            var prev = Console.Out;
+            var buf = new System.IO.StringWriter();
+            Console.SetOut(buf);
+            try { body(); }
+            finally { Console.SetOut(prev); }
+            return buf.ToString();
         }
 
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
