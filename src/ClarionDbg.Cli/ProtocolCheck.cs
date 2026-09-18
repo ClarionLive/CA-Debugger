@@ -78,6 +78,7 @@ namespace ClarionDbg.Cli
                 failures.Add("empty object: stamping produced malformed JSON");
 
             CheckHandBuiltTidEmitters(failures);
+            CheckStepGuards(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
 
@@ -88,8 +89,9 @@ namespace ClarionDbg.Cli
                                   + "emitters OK - a known tid is stamped, "
                                   + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
                                   + "descendants offer no edit metadata (the expand path is a known gap — "
-                                  + "see HandleExpandCommand, ticket cc3ac96e); and no write, of any length, "
-                                  + "can touch the shared template.");
+                                  + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
+                                  + "can touch the shared template; and Step Over's ESP gate and its "
+                                  + "prologue bypass each hold with the other one out of the way.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -157,6 +159,113 @@ namespace ClarionDbg.Cli
             CheckNoSentinelRows(failures, "threads", rows, known);
             string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
             CheckNoSentinelRows(failures, "threadscan", scan, known);
+        }
+
+        /// <summary>
+        /// The three Step Over guards from ticket f83d5eec, each isolated with the others intact.
+        ///
+        /// These cannot be produced against a live debuggee for the same reason the tid rule cannot: the
+        /// case that matters is the one that does NOT happen on a normal run. A Step Over only reaches the
+        /// ESP gate at all on StepMachine's documented "couldn't plant — fall through and keep
+        /// instruction-stepping" path, which needs a return address the debugger cannot write a byte to.
+        ///
+        /// Isolation is the point, not coverage. A guard that is only ever exercised alongside another guard
+        /// covering the same case is a DEAD guard whose test still passes — this repo shipped exactly that
+        /// (armPendingSweep's `!isPaused` clause, dead to its test because a real resume also bumped the
+        /// switch generation). So each case below moves ONE input and leaves the rest where a real step
+        /// would have them.
+        /// </summary>
+        private static void CheckStepGuards(List<string> failures)
+        {
+            // ---- guard 1: THE ESP GATE, isolated from the bypass (bypass OFF, everything else real).
+            // A candidate 0x40 below the starting frame is deeper than ESP_SLACK (0x10) allows.
+            const uint startEsp = 0x0012F000;
+            if (DebugEngine.PassesEspGateForTest(false, startEsp - 0x40, startEsp))
+                failures.Add("esp gate: a stop 0x40 deeper than the step start passed the gate with the "
+                             + "prologue bypass OFF — Step Over would stop inside the callee");
+            // CONTROL: the gate must still admit a legitimate stop, or Step Over stops nowhere at all.
+            if (!DebugEngine.PassesEspGateForTest(false, startEsp, startEsp))
+                failures.Add("esp gate control: a stop at the starting frame depth was refused");
+            if (!DebugEngine.PassesEspGateForTest(false, startEsp - 0x10, startEsp))
+                failures.Add("esp gate control: a stop exactly ESP_SLACK deep was refused — the slack exists "
+                             + "because a single ENTER opcode can reserve the frame in one instruction");
+
+            // ---- guard 2: THE BYPASS, isolated from the gate (gate FAILING, so only the bypass can pass).
+            // This is the prologue case the bypass exists for: ESP has legitimately dropped past the slack
+            // because the procedure's own `sub esp,N` ran, and the stop is still in that same procedure.
+            if (!DebugEngine.PassesEspGateForTest(true, startEsp - 0x40, startEsp))
+                failures.Add("prologue bypass: a stop in the starting procedure's own frame was refused — "
+                             + "the prologue's `sub esp,N` drops ESP before any nested call happens");
+
+            // ---- guard 3: THE PROCEDURE BOUND on the bypass.
+            // The bypass is armed by _startAtProcEntry AND the candidate resolving to the same symbol. The
+            // defect being guarded was the first half alone: armed once in BeginStep, never cleared, so the
+            // gate was skipped for every stop in the session INCLUDING one in a different procedure. That
+            // conjunction lives in PrologueBypassApplies, which needs a live module to resolve a symbol; what
+            // IS assertable here is that a false bypass leaves the gate in charge — which is case 1 above,
+            // and is what a different-procedure candidate produces. Stated so the claim is not overread:
+            // this file asserts the CONSEQUENCE of the bound, not the symbol comparison itself.
+
+            // ---- guard 4: THE PROLOGUE PREDICATE — "below the procedure's own first line record".
+            // A record table for one procedure at 0x1000 whose first own statement is at 0x1040, with the
+            // next procedure at 0x2000. The old test (rva - entry <= 0x100) called everything up to 0x1100
+            // "at entry"; the new one stops at 0x1040.
+            var table = new List<AddrRec>
+            {
+                new AddrRec(0x0800, 10, 0),   // the PREVIOUS procedure's records
+                new AddrRec(0x0900, 11, 0),
+                new AddrRec(0x1040, 20, 1),   // this procedure's first own statement
+                new AddrRec(0x1080, 21, 1),
+                new AddrRec(0x2010, 30, 2),   // the NEXT procedure's
+            };
+            uint first = DebugEngine.FirstRecordRvaInProc(table, 0x1000, 0x2000);
+            if (first != 0x1040)
+                failures.Add("prologue predicate: the procedure's first own record resolved to 0x"
+                             + first.ToString("X") + ", expected 0x1040 — a record BELOW the entry belongs "
+                             + "to the previous procedure");
+
+            // THE CASE THE OLD PROLOGUE_WINDOW TEST GOT WRONG: 0x1080 is 0x80 into the procedure, inside a
+            // 0x100 window, but it is a real statement of the BODY. It must not read as prologue. Asserted
+            // through the predicate the engine actually uses, not re-derived from `first` — a check that
+            // only restates a value another check already pinned is a dead check that always passes.
+            if (DebugEngine.IsPrologueRva(0x1080, first))
+                failures.Add("prologue predicate: 0x1080 is a statement of the procedure body but still "
+                             + "counted as prologue — this is the 256-byte hole PROLOGUE_WINDOW left open");
+            // CONTROL: an address genuinely in the prologue still is one, or the fix broke what it fixed.
+            if (!DebugEngine.IsPrologueRva(0x1008, first))
+                failures.Add("prologue predicate control: 0x1008 sits below the procedure's first statement "
+                             + "and must still count as prologue");
+            // A procedure with no first record of its own is never "in the prologue", whatever the RVA.
+            if (DebugEngine.IsPrologueRva(0x1008, 0))
+                failures.Add("prologue predicate: a procedure with no line record of its own still armed "
+                             + "the bypass — there is nothing to measure against, so the ESP gate must hold");
+
+            // A procedure with NO line record of its own gets NO bypass: 0x2010 belongs to the next
+            // procedure, so there is nothing to measure against and the safe answer is the ESP gate.
+            uint none = DebugEngine.FirstRecordRvaInProc(table, 0x1800, 0x2000);
+            if (none != 0)
+                failures.Add("prologue predicate: a procedure with no record of its own claimed 0x"
+                             + none.ToString("X") + " — that record is the NEXT procedure's");
+            // ... and with no following symbol, the same record IS this procedure's. Without this control
+            // the check above would pass for a builder that always returned 0.
+            if (DebugEngine.FirstRecordRvaInProc(table, 0x1800, 0) != 0x2010)
+                failures.Add("prologue predicate control: with no following symbol, the last record belongs "
+                             + "to the procedure that precedes it");
+
+            // ---- guard 5: CancelStep CLEARS the bypass. It was set once in BeginStep and never cleared,
+            // so it survived into the next step session. Asserted directly: arm it, cancel, read it back.
+            var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            eng.ArmPrologueBypassForTest(0x1000);
+            if (!eng.PrologueBypassArmedForTest)
+                failures.Add("cancel-step control: the bypass could not be armed, so the reset below "
+                             + "asserts nothing");
+            eng.CancelStepForTest();
+            if (eng.PrologueBypassArmedForTest)
+                failures.Add("cancel-step: the prologue bypass survived CancelStep — the next step session "
+                             + "starts with its ESP gate already disabled");
+            if (eng.PrologueBypassEntryRvaForTest != 0)
+                failures.Add("cancel-step: the bypass flag cleared but its procedure bound did not, leaving "
+                             + "the next session bounded to a procedure it never started in");
         }
 
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.

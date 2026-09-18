@@ -116,6 +116,11 @@ namespace ClarionDbg.Cli
         private const uint TRAP_FLAG = 0x100;        // EFLAGS TF bit
         private const int MAX_STEPS = 2000000;       // hard cap of single-steps per step command
         private const uint CALL_WINDOW = 8;          // max CALL instr length for return-addr detection
+        // ONE meaning, and it is the declared one: a callee with a line record this close to entry is
+        // Clarion code (StepMachine's `follow` test). It was ALSO being used as "am I still inside the
+        // prologue" in BeginStep, where 0x100 let a start point 256 bytes into the procedure BODY count as
+        // "at entry" and disable the ESP gate. That test now measures against the procedure's own first line
+        // record instead (FirstRecordRvaInProc) and needs no constant, so this one is not reused.
         private const uint PROLOGUE_WINDOW = 0x100;  // callee with a line record this close to entry is Clarion code
         private const uint ESP_SLACK = 0x10;         // frame-depth slack for step-over stop checks
         private const uint OUT_GAP_MAX = 0x200;      // step-out: max gap for "this looks like the call statement"
@@ -345,10 +350,16 @@ namespace ClarionDbg.Cli
         private uint _prevVa;         // EIP at the previous single-step trap (for call-entry detection)
         private uint _stepStartVa;    // EIP when the step began (OverInstr stops once EIP leaves it)
         private int _stepCount;
-        private bool _startAtProcEntry; // step began inside the callee's prologue window (PROLOGUE_WINDOW
-                                         // of its symbol entry) — Over must not gate on ESP for its first
-                                         // hop, since the prologue's own `sub esp,N` legitimately drops ESP
-                                         // before any nested call happens
+        // The prologue ESP-gate bypass. The step began BELOW its procedure's own first line record — i.e.
+        // in the prologue, before any statement of that procedure has run — so Over must not gate on ESP
+        // there: the prologue's own `sub esp,N` legitimately drops ESP before any nested call happens.
+        // These three are ONE piece of state and are set and cleared together (BeginStep / CancelStep):
+        // the bypass is armed only inside the procedure the step started in, which is what the module +
+        // entry RVA identify. Arming it without that bound skipped the ESP gate for the whole step session
+        // and let Over stop inside a callee — see PrologueBypassApplies in DebugEngine.Stepping.cs.
+        private bool _startAtProcEntry;
+        private LoadedModule _startSymModule;  // owning image of the procedure the step began in
+        private uint _startSymEntryRva;        // ... and that procedure's EntryRva
         private bool _skipRunning;    // running full-speed to a call-skip temp BP; TF off
         private uint _skipEntryEsp;   // ESP at the callee's entry instruction (return depth = this + 4)
 
