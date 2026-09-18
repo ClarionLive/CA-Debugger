@@ -120,11 +120,17 @@ Write-Host 'every watch request goes through the path that ANSWERS a refusal'
 # ClarionDebuggerService.Watch refuses a name it cannot put on the line/space-split wire and sends nothing,
 # so no reply can ever come and the row that asked waits for the whole session. WatchOrExplain posts the
 # miss instead. A call that bypasses it re-opens that silent path, and nothing else would notice.
+# EXACTLY one: -le 1 also passes at zero, i.e. it would have passed if someone deleted the call and left
+# WatchOrExplain answering nothing.
 $bare = [regex]::Matches($web, '_svc\.Watch\(')
-Check 'no bare _svc.Watch( call outside WatchOrExplain' ($bare.Count -le 1) "$($bare.Count) occurrence(s)"
+Check 'exactly one _svc.Watch( call, the one inside WatchOrExplain' ($bare.Count -eq 1) "$($bare.Count) occurrence(s)"
+# SendCommand is PUBLIC, so _svc.SendCommand("watch " + n) would pass a name-based check and skip the
+# validation entirely. The pad drives the engine through the service's named methods, never raw commands.
+$raw = [regex]::Matches($web, 'SendCommand\s*\(')
+Check 'no raw SendCommand( anywhere in the bridge' ($raw.Count -eq 0) "$($raw.Count) occurrence(s)"
 Check 'WatchOrExplain exists and posts a miss' ($web -match 'WatchOrExplain' -and $web -match '\\"found\\":false')
 $names = [regex]::Matches($web, 'WatchOrExplain\(')
-Check 'and it is used by the add, the re-read and the pause broadcast' ($names.Count -ge 4) "$($names.Count) site(s) incl. its definition"
+Check 'it is used by the add, the re-read and the pause broadcast' ($names.Count -eq 4) "$($names.Count) site(s) incl. its definition"
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

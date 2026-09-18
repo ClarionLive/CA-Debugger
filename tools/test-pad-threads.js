@@ -80,7 +80,7 @@ const FNS = ['esc', 'send', 'resetThreadState',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
   'onThreads', 'onThreadSelected', 'onEngineError', 'rearmCurrentThread', 'beginThreadSwitch', 'invalidateThreadScopedState',
-  'viewingOtherThread', 'editThreadSuffix', 'watchedKey', 'addWatchSilent', 'addWatch', 'removeWatch',
+  'viewingOtherThread', 'editThreadSuffix', 'watchedKey', 'addWatchSilent', 'addWatch', 'removeWatch', 'syncRowWatch',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
   'buildStack', 'renderStack', 'onMessage'];
 const missing = [];
@@ -660,10 +660,30 @@ console.log('\n9e) one Clarion name, however it is spelled, is one variable');
   check('…and the user is told it is already there', TOASTS.some(t => t.includes('already watched')),
         TOASTS.join('|'));
 
-  // 4. a tree row scrolling out of view must not unwatch what the Watch panel is holding. Its guard asks
-  //    watchedKey, so the other spelling counts as held and no `unwatch` is sent.
+  // 4. a tree row scrolling out of view must not unwatch what the Watch panel is holding. This is the path
+  //    that makes the bug reachable with NO thread switch at all, so it is driven, not inferred: the
+  //    decision renderSymRow's setVisible makes is syncRowWatch, called here with the tree's spelling
+  //    while the Watch panel holds the typed one. (The closure itself cannot be driven — renderSymRow
+  //    builds its rows with innerHTML, which the mini-DOM does not parse.)
   check('the tree spelling resolves to the row the panel holds', watchedKey(TREE) === TYPED,
         String(watchedKey(TREE)));
+  clearSent();
+  const sentOnHide = syncRowWatch(TREE, false);
+  check('a tree row scrolling out of view sends NO unwatch for a name the panel holds',
+        sentOnHide === false && !sentActions().includes('unwatch'), sentActions().join(',') || '(nothing sent)');
+  clearSent();
+  syncRowWatch(TREE, true);
+  check('…and no redundant watch when it scrolls back in', !sentActions().includes('watch'),
+        sentActions().join(',') || '(nothing sent)');
+
+  // a name the Watch panel does NOT hold still follows visibility, or tree rows would never resolve at all
+  clearSent();
+  const sentForUnheld = syncRowWatch('PUB:CITY', true);
+  check('an unheld name is still watched on becoming visible',
+        sentForUnheld === true && SENT[0] && SENT[0].action === 'watch' && SENT[0].data === 'PUB:CITY');
+  clearSent();
+  syncRowWatch('PUB:CITY', false);
+  check('…and unwatched on leaving view', SENT[0] && SENT[0].action === 'unwatch');
 }
 
 console.log('\n9f) a watch the engine will never answer is answered here');
