@@ -57,8 +57,6 @@
   .runstate.running .dot { background:#4ec9b0; box-shadow:0 0 6px #4ec9b088; }
   .runstate.idle .dot { background:#888; }
 
-  .locbar { flex:none; padding:5px 12px; background:var(--titlebar); border-bottom:1px solid var(--border); font-size:12px; color:var(--fg-dim); }
-  .locbar .proc { color:var(--yellow); } .locbar .file { color:var(--blue); } .locbar .ln { color:var(--num); }
 
   /* Target bar — the resolved EXE, always on screen. This used to be announced only in the Debug
      Console, which is a hideable section, so with it collapsed there was no way to see what was
@@ -300,6 +298,9 @@
 
   .srchdr { flex:none; display:flex; align-items:center; gap:5px; background:var(--titlebar); border-bottom:1px solid var(--border); padding:4px 12px; font-size:12px; color:var(--fg-dim); }
   .srchdr .file { color:var(--fg); }
+  /* the paused line number, moved here when the redundant run-state band was removed (87c66af6).
+     Same token the other two places the page prints a line number use (.frame .ln, .bp .ln). */
+  .srchdr .ln { color:var(--num); }
   #srchdrText { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
   .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
@@ -395,8 +396,6 @@
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/></svg>
     </button>
   </div>
-
-  <div class="locbar" id="locbar">Not running — press Start on the IDE toolbar.</div>
 
   <div class="exebar">
     <span class="lbl">Target</span>
@@ -893,14 +892,12 @@
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
-    // Every state must write the status line. Only 'idle' used to, so once a session started the
-    // bar kept the idle text — the app was visibly running while the bar still read "Not running —
-    // press Start on the IDE toolbar." The paused text is written by the pause handler, which has
-    // the procedure/module/line to name; the states below have nothing to add, so they say what is
-    // true and no more.
-    if(state==='idle'){ $('locbar').textContent='Not running — press Start on the IDE toolbar.'; clearSrc(); }
-    else if(state==='launching'){ $('locbar').textContent='Launching…'; }
-    else if(state==='running'){ $('locbar').textContent='Running — use the target, or Pause to break in.'; }
+    // The run state itself is the indicator above (dot + text) and nothing else needs to restate it:
+    // the band that used to sit under the header said the same thing in words, was written from here
+    // while the indicator was written two lines up, and the two could disagree — it could read
+    // "Not running" while the dot said running (87c66af6).
+    // Going idle still clears the source panel, which is a real action, not a caption.
+    if(state==='idle') clearSrc();
   }
 
   // ---- the Watch list survives closing Clarion (ticket 08adccc7) ----
@@ -1122,11 +1119,33 @@
   // inserts its own .vas tag after the same cell and runs AFTER wireEdit, so on a DATE/TIME/integer row the
   // order is [vval, vas, vedit-btn] and a nextElementSibling check silently leaves the pencil behind.
   // A handle also stays correct if a row ever holds more than one editable cell.
+  //
+  // This is the EDIT half only — it deliberately leaves the DATE/TIME view-as state alone, because one
+  // caller (selectThread) wants exactly that: close the write path without disturbing what is on screen.
+  // Everyone else wants clearValueMeta below. If you are about to add a third caller, it is almost
+  // certainly that one.
   function clearEditMeta(cell){
     if(!cell) return;
     cell.classList.remove('editable');
     delete cell.dataset.va; delete cell.dataset.tc; delete cell.dataset.sz; delete cell.dataset.pl;
     if(cell._vedit){ cell._vedit.remove(); cell._vedit=null; }
+  }
+  // THE owner of clear-on-reuse for a value cell. A cell carries per-reply state in two families — the
+  // edit metadata above, and dtApply's DATE/TIME view-as tag with its cached raw value — and a row is
+  // REUSED across stops, so a reply that resolves to nothing has to drop both. It used to drop only the
+  // first: applyValue's miss branch called clearEditMeta and returned before dtApply, leaving a live .vas
+  // tag whose click handler (dtCycle) re-renders the cell from the stale dataset.raw — resurrecting the
+  // PREVIOUS value's text on a row the engine has just said it cannot read. The tag's own title quotes
+  // that old raw number too, and beginEdit pre-fills its editor from dataset.raw (gated on dataset.va,
+  // which clearEditMeta does drop — so the write path is fenced off by that guard alone).
+  //
+  // The correct clearing existed, but only inline inside invalidateThreadScopedState, which is how the two
+  // sites came to clear different SUBSETS of the same state. One function owns it now; that is the fix.
+  function clearValueMeta(cell){
+    if(!cell) return;
+    clearEditMeta(cell);
+    if(cell._vas){ cell._vas.remove(); cell._vas=null; }
+    delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode;
   }
   // A REAL value that carries a caveat — a THREADed name with no instance on the thread being read, or one
   // this thread hasn't used yet. ONE function for it, because the Watch panel and the Variables tree are
@@ -1167,7 +1186,10 @@
       // existing pencil — so without this a row that resolved to thread A's instance would keep A's va and
       // its pencil when a later stop reports the value unreadable or not-yet-allocated, and committing an
       // edit would write ANOTHER thread's memory while the row shows the template value.
-      clearEditMeta(v);
+      //
+      // clearValueMeta, not clearEditMeta: the DATE/TIME view-as tag caches the previous reply's raw value
+      // and must go with it. On the found path dtApply below puts a fresh tag back from the new value.
+      clearValueMeta(v);
       if(!found){
         // Three distinct misses, and every one of them RESOLVES the row — a value that can't be read must
         // never leave "…" sitting there looking like it's still loading.
@@ -1702,6 +1724,10 @@
     // the switch and writes the old thread's memory in the user's own program. The engine gets the tid on
     // the write too and refuses a mismatch; this is the half that stops the write ever being sent.
     cancelActiveEdit();                         // an OPEN editor captured its address when it opened
+    // clearEditMeta, NOT clearValueMeta: the job here is to close the write path, and nothing else. The
+    // rows still legitimately show the old thread's values until the reply arrives and
+    // invalidateThreadScopedState blanks them — stripping their view-as tags now would strip the tag off
+    // rows that keep their value, and leave them tagless if the engine never answers the switch.
     document.querySelectorAll('.vval.editable').forEach(clearEditMeta);
     threadSwitching=true; renderThreadUi();
     send('selectthread', String(tid));
@@ -1796,9 +1822,7 @@
       // Rows that HAD an answer on the old thread are expecting a fresh one; rows still on "…" (a
       // collapsed tree row nobody is watching) are not, and must not be swept later as unanswered.
       if(v.textContent!=='…') v._pendGen=gen; else delete v._pendGen;
-      clearEditMeta(v);                                                                  // (3)
-      if(v._vas){ v._vas.remove(); v._vas=null; }                                        // (4)
-      delete v.dataset.raw; delete v.dataset.dtname; delete v.dataset.dtmode;
+      clearValueMeta(v);                                                                 // (3) + (4)
       v.classList.remove('unavail','noted','num'); v.classList.add('pending');           // (1)
       v.removeAttribute('title');                                                        // (2)
       v.textContent='…';
@@ -1817,6 +1841,12 @@
 
   // "…" means a reply is on its way. If the engine never answers for this thread (it exited between the
   // list and the click; the read failed with no event at all), the row must stop pretending to load.
+  //
+  // The row's cell is not the only thing showing that "…": invalidateThreadScopedState blanks every OPEN
+  // Watch .wdetail panel to "…" as well, and a panel is only ever refilled by a REPLY (applyValue). So a
+  // name that is never answered used to resolve on the row while its expanded panel sat on "…" for the
+  // rest of the session — the two halves of the same watch disagreeing, and the panel the more prominent
+  // of them. Whatever this sweep writes on the cell it must write on the panel too.
   const PENDING_SWEEP_MS=4000;
   function armPendingSweep(gen, tid){
     setTimeout(()=>{
@@ -1827,6 +1857,13 @@
         v.classList.remove('pending'); v.classList.add('unavail');
         v.textContent='(no reply)'; v.title='No reply from thread '+tid+' for this name.';
         delete v._pendGen; n++;
+        // Same selector and same open-check applyValue uses for its own two detail updates (the `i` flag
+        // because the panel may be keyed in a different spelling from the reply).
+        const r=v.parentElement, nm=(r&&r.dataset)?(r.dataset.name||''):'';
+        if(nm){
+          const det=document.querySelector('.wdetail[data-detail="'+cssEsc(nm)+'" i]');
+          if(det && det.style.display!=='none') det.textContent=v.textContent;
+        }
       });
       if(stackPendingTid===tid){ stackPendingTid=null; renderStack(); }
       if(n) logLine('err','thread '+tid+': '+n+' value(s) got no reply');
@@ -2097,9 +2134,18 @@
 
   // ---- source snippet (current location) ----
   function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; }
+  // The one place the current location is written, so the pause event and the source reply cannot say
+  // it two different ways. `line` is optional: the gutter in the snippet below also shows it, but the
+  // snippet can be absent (paused where the pad has no source file) or its section collapsed, and this
+  // header is neither.
+  function setSrcHeader(file, proc, line){
+    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file||'?')+'</span>'
+      +(line?':<span class="ln">'+esc(String(line))+'</span>':'')
+      +(proc?' — '+esc(proc):'');
+  }
   function buildSource(file, proc, startLine, lines, current){
     curFile=file; curLine=current;
-    $('srchdrText').innerHTML='▣ <span class="file">'+esc(file)+'</span>'+(proc?' — '+esc(proc):'');
+    setSrcHeader(file, proc, current);
     const src=$('src'); src.innerHTML='';
     // wrap known data-symbol names so they get the same hover data-tip as the panels
     let re=null;
@@ -2205,7 +2251,12 @@
       case 'target': setTarget(m); break;
       case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
       case 'paused':
-        $('locbar').innerHTML='Paused in <span class="proc">'+esc(m.proc||'?')+'</span> at <span class="file">'+esc(m.module||'?')+'</span>:<span class="ln">'+m.line+'</span>';
+        // Where the stop is, in the source header — the band this used to write is gone (87c66af6).
+        // Written HERE and not only by the 'source' reply because a `source` message does not always
+        // follow: pause somewhere the pad has no source file for and this is the only statement of the
+        // location there is. The 'source' case below overwrites it with the same shape once the snippet
+        // arrives, so the two never read differently.
+        setSrcHeader(m.module, m.proc, m.line);
         // A new stop is a new thread world: the engine has re-picked the stopped thread and dropped any
         // selection. Forget last stop's tids FIRST — a leftover selTid would drop every reply this stop
         // is about to push — then adopt the thread this stop is ON, when the event names it. The host
