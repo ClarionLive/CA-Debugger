@@ -1483,9 +1483,23 @@ namespace ClarionDebugger.Terminal
             // Keep _pending in sync regardless of run state — it's what StartSession() resends wholesale
             // on the NEXT session, so a removal that only reached the live engine (running-session branch)
             // would otherwise resurrect the "removed" breakpoint on the next start.
-            _pending.RemoveAll(b => SameBp(b, module, line));
-            if (_svc.IsRunning) _svc.RemoveBreakpoint(module, line);
-            else SendBps();
+            //
+            // THE ORDERING BELOW IS DELIBERATE — do not "tidy" the trim back above the engine call.
+            // While running, _pending is trimmed ONLY if the engine actually took the removal.
+            // RemoveBreakpoint returns false when IsValidModuleName rejects the module or SendCommand
+            // fails, and the breakpoint is then still ARMED in the live session. Trimming anyway would
+            // forget an armed breakpoint: the user gets a stop they cannot account for and has nothing
+            // left to retry from. A stale pending entry is the better failure — it is visible in the
+            // pane and they can remove it again.
+            if (_svc.IsRunning)
+            {
+                if (_svc.RemoveBreakpoint(module, line)) _pending.RemoveAll(b => SameBp(b, module, line));
+            }
+            else
+            {
+                _pending.RemoveAll(b => SameBp(b, module, line));
+                SendBps();
+            }
         }
 
         private static bool SameBp(DebugBreakpoint b, string module, int line)
