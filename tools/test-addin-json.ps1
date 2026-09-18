@@ -23,7 +23,9 @@ param(
   # reader, so both files have to be on hand rather than one side being imagined in a string literal
   [string] $EngineJsonPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\Json.cs'),
   [string] $EnginePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.cs'),
-  [string] $EngineBpPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Breakpoints.cs')
+  [string] $EngineBpPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Breakpoints.cs'),
+  # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
+  [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,6 +34,7 @@ $web = Get-Content -Raw -LiteralPath $WebViewPath
 $engine = Get-Content -Raw -LiteralPath $EngineJsonPath
 $engineSrc = Get-Content -Raw -LiteralPath $EnginePath
 $bpSrc = Get-Content -Raw -LiteralPath $EngineBpPath
+$ctl = Get-Content -Raw -LiteralPath $ControllerPath
 
 function Get-Method {
   param([string] $Signature, [string] $From)
@@ -280,6 +283,122 @@ Check 'the old planted-line RemoveAll is gone' ($src -notmatch 'RemoveAll\(b => 
 # The host fix assumes the engine keeps the shared INT3 planted for the survivor. That is the ref-count in
 # DebugEngine.Breakpoints.cs; this pins it structurally. It is engine behaviour, NOT exercised here.
 Check 'the engine only unplants a shared INT3 when nothing else references it' ($bpSrc -match 'stillReferenced' -and $bpSrc -match 'b\.Owner == found\.Owner && b\.Rvas\.Contains\(rva\)') ''
+
+Write-Host ''
+Write-Host 'teardown: "stopped" has to be a check, not a claim'
+# Task 51d2f1e4. Stop() used to discard the WaitForExit result, swallow the Kill and set Idle in a finally
+# regardless, so a debugger that reported "stopped" could still own a live process. The decision table below
+# is the REAL DebugSessionController.NotifyStopped, brace-matched out of the shipped file and run against a
+# fake pad; Stop() itself drives a real OS process and is not reachable from here, so what this suite can say
+# about it is structural, and the checks below are worded to claim only that.
+
+$ctlMethods = @(
+  (Get-Method 'public static void Register(IDebugSessionTarget target)' $ctl),
+  (Get-Method 'public static void Unregister(IDebugSessionTarget target)' $ctl),
+  (Get-Method 'public static void NotifyStopped(IDebugSessionTarget target)' $ctl),
+  (Get-Method 'public static void SetState(IDebugSessionTarget sender, DebugControllerState state)' $ctl)
+) -join "`n"
+
+$ctlTypes = @"
+using System;
+
+$(Get-Method 'public enum DebugControllerState' $ctl)
+
+$(Get-Method 'public interface IDebugSessionTarget' $ctl)
+
+// A pad that answers IsSessionIdle however the test needs. It implements the REAL interface above, so if
+// that interface grows a member this stub stops compiling rather than drifting.
+public sealed class FakePad : IDebugSessionTarget {
+    public bool Idle; public bool Throws;
+    public bool IsReady { get { return true; } }
+    public bool IsSessionIdle { get { if (Throws) throw new InvalidOperationException("disposed"); return Idle; } }
+    public void CmdStart() { } public void CmdContinue() { } public void CmdPause() { }
+    public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
+    public void CmdStop() { } public void CmdRunToCursor(string spec) { }
+}
+
+public static class Ctl {
+    private static readonly object _gate = new object();
+    private static IDebugSessionTarget _target;
+    private static DebugControllerState _state = DebugControllerState.Idle;
+    public static DebugControllerState State { get { lock (_gate) return _state; } }
+    public static void Reset() { lock (_gate) { _target = null; _state = DebugControllerState.Idle; } }
+$ctlMethods
+}
+"@
+Add-Type -TypeDefinition $ctlTypes -Language CSharp | Out-Null
+
+function NewPad { param([bool] $idle, [bool] $throws = $false)
+  $p = New-Object FakePad; $p.Idle = $idle; $p.Throws = $throws; $p
+}
+# put the controller in a LIVE state owned by $pad, the way a running session leaves it
+function LiveSession { param($pad)
+  [Ctl]::Reset(); [Ctl]::Register($pad); [Ctl]::SetState($pad, [DebugControllerState]::Running)
+}
+
+# 1. the healthy path: teardown confirmed, nothing else live -> Idle, Start re-enabled
+$pad = NewPad $false
+LiveSession $pad
+$pad.Idle = $true                                  # Stop() confirmed the process dead and published Idle
+[Ctl]::NotifyStopped($pad)
+Check 'a confirmed teardown returns the controller to Idle' ([Ctl]::State -eq [DebugControllerState]::Idle) ([Ctl]::State)
+
+# 2. THE CASE ONLY THE CALLER-SIDE GUARD CATCHES, which is why it is worth having: the closing pad's Stop()
+#    could not confirm its process dead (so it still reads non-idle), AND the user has already reopened a pad,
+#    which is idle and perfectly healthy. The current-target guard looks at that FRESH pad, sees idle, and
+#    would re-enable Start while the old process is still alive - the close->reopen->restart race. Only
+#    looking at the CALLER withholds Idle here. Deleting the caller-side guard fails this check and no other.
+$dying = NewPad $false
+$reopened = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($dying); [Ctl]::SetState($dying, [DebugControllerState]::Running)
+[Ctl]::Register($reopened)                         # user reopened the pad before teardown finished
+[Ctl]::NotifyStopped($dying)                       # the old pad's Stop() returned false
+Check 'a reopened pad cannot publish Idle for a teardown that never confirmed' ([Ctl]::State -ne [DebugControllerState]::Idle) ([Ctl]::State)
+
+# 3. the same unconfirmed teardown with no reopen. Both guards cover this one, so it is a behaviour check
+#    rather than a claim about either guard - it is the ordinary "Stop() failed" close.
+$pad = NewPad $false
+LiveSession $pad
+[Ctl]::NotifyStopped($pad)                         # Stop() returned false: state never went Idle
+Check 'an unconfirmed teardown leaves Start disabled on a plain close' ([Ctl]::State -ne [DebugControllerState]::Idle) ([Ctl]::State)
+
+# 4. THE PRE-EXISTING GUARD, on its own, so #2 did not quietly kill it: the caller IS idle (its teardown
+#    confirmed), and the only reason to withhold Idle is the fresh pad that is live. Deleting the
+#    current-target guard fails this check.
+$old = NewPad $true
+$fresh = NewPad $false
+[Ctl]::Reset(); [Ctl]::Register($old); [Ctl]::Register($fresh)
+[Ctl]::SetState($fresh, [DebugControllerState]::Running)
+[Ctl]::NotifyStopped($old)
+Check 'an old teardown completing does not stomp a freshly started session' ([Ctl]::State -eq [DebugControllerState]::Running) ([Ctl]::State)
+
+# 5. no pad registered at all: nothing can be stranded, so Idle
+$gone = NewPad $true
+LiveSession $gone
+[Ctl]::Unregister($gone)
+[Ctl]::NotifyStopped($gone)
+Check 'with no registered pad left the controller drops to Idle' ([Ctl]::State -eq [DebugControllerState]::Idle) ([Ctl]::State)
+
+# 6. a disposed pad that throws must not be read as a confirmation either way
+$throwing = NewPad $false $true
+LiveSession $throwing
+[Ctl]::NotifyStopped($throwing)
+Check 'a throwing pad is not taken as proof its session ended' ([Ctl]::State -ne [DebugControllerState]::Idle) ([Ctl]::State)
+
+Write-Host ''
+Write-Host 'Stop() answers "is it dead?" with a check (structural: it drives a real process)'
+$stop = Get-Method 'public bool Stop()'
+Check 'Stop reports an outcome instead of returning void' ($src -match 'public bool Stop\(\)' -and $src -notmatch 'public void Stop\(\)') ''
+Check 'the teardown ends on a confirmation, not on a finally that always fires' ($stop -notmatch 'finally') ''
+Check 'Idle is published only under that confirmation' ($stop -match 'if \(dead\) SetState\(DebugSessionState\.Idle\)') ''
+Check 'and the unconfirmed case is reported rather than reported as Idle' ($stop -match 'else LogReceived') ''
+# The old code had `try { _proc.Kill(); } catch { }` - a failed kill vanished silently and Idle went out anyway.
+Check 'a failed Kill is surfaced, not swallowed by an empty catch' ($stop -notmatch 'catch \{ \}' -and $stop -match 'kill failed') ''
+Check 'the WaitForExit after the Kill is bounded' ($stop -match '_proc\.WaitForExit\(3000\)') ''
+# "cannot tell" is the case that used to read as success. It must read as NOT dead.
+$confirm = Get-Method 'private bool ProcessConfirmedDead()'
+Check 'a HasExited that throws answers NOT dead' ($confirm -match 'catch' -and $confirm -match 'return false;') ''
+Check 'the confirmation is IsRunning''s own predicate, HasExited' ($confirm -match 'return p\.HasExited;') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

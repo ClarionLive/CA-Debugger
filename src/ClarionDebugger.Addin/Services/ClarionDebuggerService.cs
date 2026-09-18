@@ -380,19 +380,43 @@ namespace ClarionDebugger.Services
             _proc.BeginErrorReadLine();
         }
 
+        /// <summary>True when the engine process is CONFIRMED gone — no process at all, or the OS says this
+        /// one has exited. A HasExited that throws answers FALSE: "cannot tell" must never be reported as
+        /// "dead", which is the whole point of the postcondition below.</summary>
+        private bool ProcessConfirmedDead()
+        {
+            var p = _proc;
+            if (p == null) return true;
+            try { return p.HasExited; }
+            catch (Exception ex)
+            {
+                LogReceived?.Invoke("[stop] cannot confirm engine exit: " + ex.Message);
+                return false;
+            }
+        }
+
         /// <summary>
-        /// Authoritative teardown barrier. When this returns, the engine/target process is GONE and State is
-        /// Idle — every code path (graceful quit, forced kill, or already-dead) guarantees both before return.
-        /// Prefers a clean engine-side quit (which also kills the target); on timeout it Kills and confirms the
-        /// process actually exited via WaitForExit (bounded so a wedged process can't hang the teardown thread
-        /// forever). Always drives State=Idle synchronously at the end — the async _proc.Exited / "exited" path
-        /// that also sets Idle is idempotent (SetState's `changed` guard), so the double-set is harmless.
+        /// Teardown barrier. Prefers a clean engine-side quit (which also kills the target); on timeout it Kills
+        /// and waits. It then ASKS whether the process is dead rather than assuming the above worked, and
+        /// returns that answer: true means <see cref="IsRunning"/> is confirmed false and State is Idle.
+        ///
+        /// A false return means the engine process could NOT be confirmed dead inside the bounded waits. On that
+        /// path State is deliberately NOT driven to Idle: publishing Idle over a live process is what would
+        /// re-enable Start (the toolbar and pad both reach Idle through DebugSessionController, which reads this
+        /// state via IDebugSessionTarget.IsSessionIdle) and let a new session launch against a target still owned
+        /// by the old process. _proc.Exited stays subscribed and drives Idle if and when the process does die.
+        /// Callers that need the guarantee must check the result; callers that ignore it are no worse off than
+        /// before, because the state they would have seen as Idle now simply stays where it was.
+        ///
+        /// Known remaining path that reports Idle without a process check: the engine's "exited" event (the
+        /// DEBUGGEE finished), handled in OnJson, sets Idle while the engine process itself may still be alive
+        /// for a short window. That is a separate lifecycle from this one and is not addressed here.
         ///
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
         /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
         /// synchronously but there is no live process to wait on, so it returns immediately).
         /// </summary>
-        public void Stop()
+        public bool Stop()
         {
             try
             {
@@ -400,22 +424,30 @@ namespace ClarionDebugger.Services
                 {
                     // A successful pipe write does NOT prove the engine consumed 'quit', so verify exit and fall
                     // back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
-                    // (Kill only requests termination) before we declare teardown complete.
+                    // (Kill only requests termination).
                     bool exited = SendCommand("quit") && _proc.WaitForExit(1500);
                     if (!exited && IsRunning)
                     {
-                        try { _proc.Kill(); } catch { }
-                        try { _proc.WaitForExit(3000); } catch { } // bounded — don't hang forever on a wedged process
+                        // Escalate deliberately: wait -> kill -> verify. A Kill that throws is information the
+                        // caller needs (the handle may be denied, or the process already reaped), so it is
+                        // surfaced instead of swallowed. Neither failure decides the outcome on its own — the
+                        // check below does.
+                        try { _proc.Kill(); }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] kill failed: " + ex.Message); }
+                        try { _proc.WaitForExit(3000); }   // bounded — don't hang forever on a wedged process
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] wait after kill failed: " + ex.Message); }
                     }
                 }
             }
-            catch { }
-            finally
-            {
-                // Authoritative: once Stop() returns, the session is over. Synchronous so a teardown driver
-                // (Dispose -> NotifyStopped) sees Idle deterministically without waiting on the async Exited.
-                SetState(DebugSessionState.Idle);
-            }
+            catch (Exception ex) { LogReceived?.Invoke("[stop] teardown error: " + ex.Message); }
+
+            // The postcondition, asked as a question. Nothing above is trusted to have worked: this single check
+            // is what decides whether the session may be reported over.
+            bool dead = ProcessConfirmedDead();
+            if (dead) SetState(DebugSessionState.Idle);
+            else LogReceived?.Invoke("[stop] engine process did not exit within the teardown timeout — "
+                                   + "session NOT reported idle, Start stays disabled until it does");
+            return dead;
         }
 
         // ------------------------------------------------------------------ execution control
