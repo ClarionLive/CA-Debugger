@@ -144,7 +144,10 @@
   .vtype { color:var(--green); font-size:11px; margin-left:6px; }
   .veq { color:var(--fg-dim); margin:0 5px; }
   .vval { color:var(--orange); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block; vertical-align:bottom; }
-  .vval.num { color:var(--num); } .vval.pending { color:#6f6f6f; font-style:italic; }
+  .vval.num { color:var(--num); }
+  /* Two kinds of waiting, one treatment: .pending is "asked, reply on its way", .idle is "nothing can
+     answer this yet". Both are placeholders, so neither should read as a value. */
+  .vval.pending, .vval.idle { color:#6f6f6f; font-style:italic; }
   /* a read that failed (never leave a row on "…"); and a real value that carries a caveat */
   .vval.unavail { color:#c98a8a; font-style:italic; }
   .vval.noted { border-bottom:1px dotted #8a8a5a; }
@@ -502,6 +505,12 @@
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
   let paused=false;
+  // Run state as the host last reported it ('idle' until a session starts). The Watch list needs it to tell
+  // "asking, waiting for an answer" apart from "nothing can answer yet": a watch sent with no live session
+  // is REGISTERED by the host and answered at the first pause (ClarionDebuggerWebView: `watch` adds to
+  // _watched and only calls WatchOrExplain when already Paused), so a row showing the pending "…" before
+  // then would be claiming a reply is on its way when none is.
+  let runState='idle';
   // CLARION DATA NAMES ARE CASE-INSENSITIVE. PUB:PUB_NAME and Pub:Pub_Name are one variable, and the
   // engine echoes whatever spelling it was ASKED for — so a watch typed into the box in one case and the
   // same field's row in the Variables tree in another are two spellings of one name. The host's watch set
@@ -661,6 +670,11 @@
     el.className = m.exists ? 'path' : 'path missing';
     el.textContent = targetPath;
     el.title = m.exists ? 'Click to show in File Explorer' : 'Not on disk yet — build the app. Click to show its folder.';
+    // Now that we know WHICH app this is, bring back its saved Watch list. This is the only place that can
+    // do it: the page is built before the host has resolved a target, so restoring at startup would either
+    // guess or key the list globally. A target that goes null (project closed) deliberately leaves the list
+    // alone — the rows still describe the app you were just debugging.
+    restoreWatchesFor(targetPath);
   }
   $('exePath').onclick=function(){ if(targetPath) send('revealexe'); };
 
@@ -870,6 +884,12 @@
   // pad only reflects run-state in the indicator dot/text + the location bar.
   function setRunState(state){
     paused = state==='paused';
+    const wasPaused = runState==='paused';
+    runState = state || 'idle';
+    // Deliberately NOT re-rendering the whole Watch list — that would blank the last values a row holds,
+    // which is exactly what a developer wants to read after the target exits. But a row still showing "…"
+    // when the pause that would have answered it is over IS a lie, so settle just those cells.
+    if(wasPaused && runState!=='paused') settleWaitingCells();
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
@@ -883,10 +903,95 @@
     else if(state==='running'){ $('locbar').textContent='Running — use the target, or Pause to break in.'; }
   }
 
+  // ---- the Watch list survives closing Clarion (ticket 08adccc7) ----
+  // Stored per TARGET EXE, not globally: the watch list is a list of names in ONE application's data, and
+  // showing another app's names would be worse than not persisting at all. Same idiom as caDbgKeys /
+  // caDbgTheme / caDbgLayout — localStorage, JSON, every read and write inside try/catch, so a private
+  // window, a cleared store or a malformed value costs the feature and nothing else.
+  // One declaration each so a test can extract the real limits rather than restate them.
+  const WATCH_STORE='caDbgWatches';
+  const WATCH_MAX=200;
+  const WATCH_TARGETS=25;
+  // Windows paths are case-insensitive, so the key is lower-cased — otherwise the same app reached through a
+  // differently-cased path would get its own list.
+  const targetKey = p => (p==null?'':String(p)).toLowerCase();
+  let restoredForTarget=null;   // the target key the in-memory list belongs to; null = nothing restored yet
+  // A REMOVAL made while no target is resolved (closing a solution pushes an EMPTY target) cannot be
+  // written anywhere, and it is the one change a later merge cannot reproduce: the restore would read the
+  // stored list and put the deleted name back, which is the ticket's own acceptance criterion failing. An
+  // ADD needs no flag — the merge keeps it and the save that follows writes the union.
+  let untargetedRemoval=false;
+  function loadWatchStore(){
+    try{ const s=JSON.parse(localStorage.getItem(WATCH_STORE)||'null');
+      return (s && s.byTarget && typeof s.byTarget==='object') ? s : {v:1,byTarget:{}}; }
+    catch(e){ return {v:1,byTarget:{}}; }
+  }
+  function saveWatches(){
+    // No target resolved yet = nothing to key the list to. The names stay in memory and are written as soon
+    // as a target arrives (see restoreWatchesFor's first-resolution merge), so nothing typed is lost.
+    if(!targetPath) return;
+    try{
+      const store=loadWatchStore();
+      const mine=targetKey(targetPath);
+      store.byTarget[mine] = { names:Array.from(watched.keys()).slice(0,WATCH_MAX), at:Date.now() };
+      // Keep the store bounded: a developer who opens many apps should not grow it forever. Oldest by last
+      // save is evicted — and the target we just wrote is EXCLUDED from the candidates rather than trusted
+      // to sort newest: two saves inside one millisecond tie on `at`, and a stable sort would then evict the
+      // entry we are in the middle of writing.
+      const keys=Object.keys(store.byTarget).filter(k=>k!==mine);
+      if(keys.length>WATCH_TARGETS-1)
+        keys.sort((a,b)=>(store.byTarget[b].at||0)-(store.byTarget[a].at||0))
+            .slice(WATCH_TARGETS-1).forEach(k=>{ delete store.byTarget[k]; });
+      localStorage.setItem(WATCH_STORE, JSON.stringify(store));
+      untargetedRemoval=false;
+    }catch(e){}
+  }
+  // Called when the host tells us which EXE we are debugging. Two cases, deliberately different:
+  //  * FIRST resolution of this pad session (restoredForTarget === null): MERGE the stored names with
+  //    anything already typed, because a watch added before the target arrived was meant for this app.
+  //  * A LATER change to a different target: REPLACE, because the in-memory list belongs to the old app and
+  //    carrying it over is the cross-app leak this feature must not cause.
+  function restoreWatchesFor(path){
+    const key=targetKey(path);
+    if(!key) return;
+    // The SAME target re-resolving (a solution closed and reopened) is not a restore — but it is the moment
+    // to write a removal that had nowhere to go while no target was resolved.
+    if(key===restoredForTarget){ if(untargetedRemoval) saveWatches(); return; }
+    const first = restoredForTarget===null;
+    restoredForTarget = key;
+    let names=[];
+    try{ const e=loadWatchStore().byTarget[key]; if(e && Array.isArray(e.names)) names=e.names; }catch(err){}
+    // A removal made before any target resolved means the stored list is stale in a way merging cannot fix:
+    // it would put the deleted name back. What is on screen is the truth in that case.
+    if(first && untargetedRemoval) names=[];
+    if(!first){
+      // Replacing one app's list with another's: tell the host to stop watching the old names and drop their
+      // cached values. Without this they stay in the host's watch set and repopulate `values` at the next
+      // pause, where a hover tip over a same-named variable in the NEW app could quote the OLD app's value —
+      // a row-less version of exactly the cross-app leak this per-target key exists to prevent.
+      watched.forEach((meta,n)=>{ send('unwatch',n); values.delete(nameKey(n)); });
+      watched.clear();
+    }
+    let added=0;
+    names.slice(0,WATCH_MAX).forEach(n=>{
+      if(typeof n!=='string' || !n || watchedKey(n)) return;
+      // Deliberately NOT addWatchSilent(): that renders and saves per name, which would rebuild the list
+      // once per restored watch and write the store N times. One render and one save follow the loop.
+      watched.set(n,{}); added++;
+      // Register the name with the host even though no session may be running: it adds the name to its
+      // watch set and answers at the first pause. The row says so rather than showing the pending "…".
+      send('watch',n);
+    });
+    if(added || !first) renderWatchList();
+    // A merge on first resolution can leave names that were never stored under this target — write them now.
+    // Unconditional (not `watched.size`), so an empty list after an untargeted removal is written too.
+    if(first) saveWatches();
+  }
+
   // ---- add a watch (from any of the 4 mechanisms) ----
   function addWatchSilent(name){
     if(!name || watchedKey(name)) return false;
-    watched.set(name,{}); renderWatchList(); send('watch',name);
+    watched.set(name,{}); renderWatchList(); send('watch',name); saveWatches();
     return true;
   }
   function addWatch(name){
@@ -950,7 +1055,42 @@
     // module+line FIRST so the host's minimal JSON parser reads them before the (untrusted) proc name
     send('breakonprocentry', JSON.stringify({ module:procCtx.module, line:procCtx.line, name:procCtx.name })); };
   function removeWatch(name){ const k=watchedKey(name);
-    if(k && watched.delete(k)){ renderWatchList(); send('unwatch',k); } }
+    // saveWatches() on removal too, or a name you deleted comes back at the next startup. With no target
+    // resolved there is nowhere to write it, so remember that a removal is outstanding — see untargetedRemoval.
+    if(k && watched.delete(k)){ renderWatchList(); send('unwatch',k);
+      if(!targetPath) untargetedRemoval=true; saveWatches(); } }
+
+  // The value cell of a Watch row that has no value yet — and which KIND of waiting it is. "…" (pending)
+  // promises a reply is on its way, which is only true once a session exists: a restored row at startup has
+  // registered its name with the host but will not be answered until the first pause, so showing the
+  // ellipsis there is the "row sits on … forever" failure 50414e39 and 0128a37e both removed. applyValue
+  // overwrites either state the moment a value lands. Its own function so a test can ask it directly —
+  // renderWatchList builds rows with innerHTML, which the pad's test DOM does not parse.
+  // One home for the "nothing can answer this yet" wording, because it is written in three places (this
+  // renderer, the settle sweep, and the hover tip's check) and a reword in one of them would silently
+  // break the others.
+  const WATCH_IDLE_TEXT='(pause to read)';
+  const WATCH_IDLE_TITLE='No debug session yet — this reads at the first pause.';
+  function watchWaitingHtml(){
+    // PENDING only while PAUSED. A watch added while the target runs is registered by the host and answered
+    // at the next pause, not now — so "…" there would promise a reply that only a pause can bring, and if
+    // the target exits without pausing the row keeps it forever. The idle text is true in every other
+    // state, and settleWaitingCells() converts any "…" left behind when a pause ends.
+    return runState==='paused'
+      ? '<span class="vval pending">…</span>'
+      : '<span class="vval idle" title="'+WATCH_IDLE_TITLE+'">'+WATCH_IDLE_TEXT+'</span>';
+  }
+  // A pause ending leaves any still-unanswered "…" claiming a reply is coming when nothing can send one.
+  // Rewrite ONLY those cells — never a cell holding a value, which is exactly what a developer wants to read
+  // after the target exits. Same narrow form as armPendingSweep.
+  function settleWaitingCells(){
+    document.querySelectorAll('.vval.pending').forEach(v=>{
+      if(v.textContent!=='…') return;
+      v.classList.remove('pending'); v.classList.add('idle');
+      v.textContent=WATCH_IDLE_TEXT;
+      v.title=WATCH_IDLE_TITLE;
+    });
+  }
 
   function renderWatchList(){
     const list=$('watchList'); list.innerHTML='';
@@ -958,7 +1098,7 @@
     watched.forEach((meta,name)=>{
       const row=document.createElement('div'); row.className='row watchrow'; row.dataset.name=name;
       row.innerHTML='<span class="ar wch" title="Show full value">▸</span><span class="vname">'+esc(name)+'</span>'
-        +'<span class="vtype"></span><span class="veq">=</span><span class="vval pending">…</span>'
+        +'<span class="vtype"></span><span class="veq">=</span>'+watchWaitingHtml()
         +'<span class="rmw" title="Remove">✕</span>';
       const detail=document.createElement('div'); detail.className='wdetail'; detail.dataset.detail=name; detail.style.display='none';
       const toggle=e=>{ if(e&&e.target.closest('.rmw,.vval.editable,.vedit')) return;
@@ -1017,7 +1157,11 @@
     // rows keyed in another, instead of leaving them on "…" for the rest of the session.
     document.querySelectorAll('[data-name="'+cssEsc(name)+'" i]').forEach(row=>{
       const v=row.querySelector('.vval'); if(!v) return;
-      v.classList.remove('pending','unavail','noted'); v.removeAttribute('title');
+      // 'idle' belongs in this list as much as 'pending': a restored row is answered at the first pause
+      // WITHOUT being re-rendered, so leaving the class on would show a real value in the grey-italic
+      // placeholder styling (and suppress .num) for the rest of the session. Every waiting state this page
+      // can put on a cell must be cleared here — the next one added will be forgotten otherwise.
+      v.classList.remove('pending','idle','unavail','noted'); v.removeAttribute('title');
       // Rows are REUSED across stops, so every reply must first strip the previous one's edit metadata.
       // setEditMeta only ever ADDS (it early-returns when this reply carries no va), and wireEdit keeps an
       // existing pencil — so without this a row that resolved to thread A's instance would keep A's va and
@@ -1406,7 +1550,10 @@
       +'<span class="vtype">'+esc(s.typeName||(s.size!=null?'size '+s.size:''))+'</span>';
     if(!isGroup){
       row.dataset.name=name;
-      row.innerHTML+='<span class="veq">=</span><span class="vval pending">…</span><span class="pin">'+STAR+'</span>';
+      // Same waiting vocabulary as the Watch panel: `globals` is pushed from CmdStart, i.e. while the target
+      // is launching, so a hard-coded "…" here claimed a reply was on its way for the whole first run,
+      // before any pause existed to answer it.
+      row.innerHTML+='<span class="veq">=</span>'+watchWaitingHtml()+'<span class="pin">'+STAR+'</span>';
       row.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(name); };
       wireSel(row);
     }
@@ -2003,7 +2150,12 @@
     const name=el.dataset.name||''; const known=values.get(nameKey(name));
     const type=(tEl&&tEl.textContent.trim()) || (known&&known.type) || '';
     let val=(vEl&&vEl.textContent.trim()) || (known&&known.value) || '';
-    if(!val || val==='…') val = known&&known.value ? known.value : '(not watched — ☆ to add)';
+    // '…' (asking) and the idle text (nothing can answer yet) are both WAITING, not values — a tip that
+    // quotes either as the variable's value is the row's own lie repeated one level out. Tested by CLASS,
+    // not by matching the wording, so rewording the cell cannot silently break this.
+    const waitingCell = !!(vEl && (vEl.classList.contains('pending') || vEl.classList.contains('idle')));
+    if(!val || waitingCell)
+      val = known&&known.value ? known.value : '(not watched — ☆ to add)';
     tipTarget={name,type,val};
     $('dtName').textContent=name; $('dtType').textContent=type;
     // carry the caveat into the tip: without it a shared-template or not-yet-used value reads as this

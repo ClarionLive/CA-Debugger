@@ -71,6 +71,7 @@ function buildVarTree() { } function collectSyms() { return []; } function build
 function buildSource() { } function clearSrc() { } function onVarSet() { } function setLayoutDirty() { }
 function refreshWatchClipping() { }
 function renderWatchList() { }   // builds rows with innerHTML; not what these checks are about
+function saveWatches() { }       // localStorage persistence; covered by test-pad-watch-persist.js
 
 // ---- the page's own code ---------------------------------------------------------------------------
 const FNS = ['esc', 'send', 'resetThreadState',
