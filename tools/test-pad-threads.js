@@ -81,7 +81,7 @@ function saveWatches() { }       // localStorage persistence; covered by test-pa
 // ---- the page's own code ---------------------------------------------------------------------------
 const FNS = ['esc', 'send', 'resetThreadState',
   'dtParseInt', 'fieldPart', 'fmtClarionDate', 'fmtClarionTime', 'dtDefault', 'dtModeFor', 'dtApply', 'dtCycle',
-  'clearEditMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
+  'clearEditMeta', 'clearValueMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
   'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',

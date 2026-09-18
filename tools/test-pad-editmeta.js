@@ -61,7 +61,7 @@ const dtModes = {};
 // editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
 // this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
 const NEEDED = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-                'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+                'clearEditMeta','clearValueMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
                 'applyValue','showTipFor'];
 const missing = [];
 const src = NEEDED.map(n => {
@@ -95,7 +95,10 @@ function siblings(row){ return row.children.map(c => c.classList.toString().spli
 function state(row){
   const v = row.querySelector('.vval');
   const btn = row.querySelector('.vedit-btn');
-  return { text: v.textContent, cls: v.classList.toString(), va: v.dataset.va, pencil: !!btn, title: v.title };
+  return { text: v.textContent, cls: v.classList.toString(), va: v.dataset.va, pencil: !!btn, title: v.title,
+           // the DATE/TIME view-as family: the tag handle, and the cached raw the tag re-renders from
+           vas: !!v._vas, raw: v.dataset.raw, dtname: v.dataset.dtname, dtmode: v.dataset.dtmode,
+           vasTitle: v._vas ? v._vas.title : undefined };
 }
 const THREAD_A = { va: '0x847A76', typeCode: '0x18', size: 41, places: 0 };
 
@@ -155,12 +158,22 @@ function numericScenario(label, name, resolved, typeName, meta, rawTooltip){
   check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
   // the dotted 'noted' underline is meaningless without the explanation behind it
   check('note survives dtApply in the tooltip', s.title === NOTE, 'title=' + JSON.stringify(s.title));
+  // A no-va reply still CARRIES A VALUE (found:true), so the view-as tag belongs on the row — what must
+  // not survive is a raw from the PREVIOUS reply. dtApply re-derives it, so this asserts it is current,
+  // not that it is absent.
+  check('view-as tag kept on a valued reply, raw refreshed from it', s.vas && s.raw === String(resolved),
+        'raw=' + s.raw);
 
   applyValue(name, false, null, null, false, { error: ERR });
   s = state(row);
   console.log('   after a failed read:    ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
   check('edit pencil removed', !s.pencil, 'siblings=[' + siblings(row) + ']');
   check('engine reason in the tooltip', s.title === ERR, 'title=' + JSON.stringify(s.title));
+  // 77f84ca5: the miss branch used to return before dtApply, leaving the tag and its cached raw behind.
+  check('view-as tag gone — nothing left to click', !s.vas && siblings(row) === 'vval',
+        'siblings=[' + siblings(row) + ']');
+  check('cached raw/dtname/dtmode gone', s.raw === undefined && s.dtname === undefined && s.dtmode === undefined,
+        'raw=' + s.raw + ' dtname=' + s.dtname + ' dtmode=' + s.dtmode);
 }
 numericScenario('5) LONG row (dtApply inserts .vas between the cell and the pencil)',
                 'JOB:JOBID', '4711', 'LONG', { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 }, '');
@@ -215,6 +228,85 @@ console.log('8) an OPEN Watch detail panel follows the row when the read fails')
         'detail=' + JSON.stringify(DETAIL.textContent));
   check('detail shows the unavailable state', DETAIL.textContent === '(unavailable)');
   DETAIL = null;
+}
+
+// ---- 77f84ca5: every READER of the DATE/TIME view-as state, after a reply that resolved to nothing ----
+// The cell keeps that state in two places — the .vas tag (a live element with a click handler) and
+// dataset.raw/dtname/dtmode (what the handler re-renders from). Six things read it, and a row-shaped
+// assertion only reaches some of them, so each one gets its own check here.
+console.log('9) a failed read leaves the view-as state with no reader able to resurrect the old value');
+{
+  const name = 'TIT:PUBDATE';
+  const OLD = '80000', OLD_TEXT = '2020-01-09';
+  const row = makeRow(name);
+  applyValue(name, true, OLD, 'ULONG', true, { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 });
+  let s = state(row);
+  check('precondition: the row really is carrying view-as state', s.vas && s.raw === OLD && s.text === OLD_TEXT,
+        JSON.stringify({ vas: s.vas, raw: s.raw, text: s.text }));
+  const tagBefore = row.querySelector('.vas');
+
+  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  s = state(row);
+  console.log('   ' + JSON.stringify(s) + '  siblings=[' + siblings(row) + ']');
+
+  // reader 1 — the row's value cell, reached by CLICKING the tag (dtCycle). This is the reported symptom:
+  // the click re-rendered the cell from the stale raw and put the previous stop's value back on a row the
+  // engine had just said it could not read.
+  check('no tag left in the row to click', !row.querySelector('.vas') && siblings(row) === 'vval',
+        'siblings=[' + siblings(row) + ']');
+  // and the handler is inert even if something still holds the old tag: dtCycle re-reads the cell, and the
+  // cell no longer has a raw to render. Drives the REAL dtCycle, through the real tag's own onclick.
+  tagBefore.onclick({ stopPropagation(){} });
+  check('clicking a detached tag cannot resurrect the value',
+        state(row).text === '(unavailable)', 'text=' + JSON.stringify(state(row).text));
+
+  // reader 2 — the tag's own title, which quoted the old thread's raw number independently of the cell
+  check('no tag title quoting the old raw', state(row).vasTitle === undefined);
+
+  // reader 3 — the edit path. beginEdit pre-fills its editor from dataset.raw; it is fenced off by
+  // dataset.va, which clearEditMeta drops, so this asserts BOTH the guard and the value behind it.
+  check('edit metadata gone, so the editor is refused', state(row).va === undefined && !state(row).pencil);
+  check('and the raw it would have pre-filled from is gone', state(row).raw === undefined, 'raw=' + state(row).raw);
+
+  // reader 4 — the cell tooltip, which dtApply owns for an ordinary value
+  check('tooltip is the engine reason, not a raw hint', state(row).title === 'THR$GetInstance returned no instance');
+
+  // reader 5 — the `values` cache, read by the hover tip and by the tip's Copy Value action. It has NO
+  // DOM row behind it on a source identifier, so no row-shaped assertion above can reach it.
+  const token = new El('span'); token.dataset.name = name;   // a source identifier: no .vval child
+  showTipFor(token);
+  console.log('   source-identifier tip: ' + JSON.stringify($('dtVal').textContent));
+  check('source tip (no row) quotes neither the raw nor the formatted old value',
+        !$('dtVal').textContent.includes(OLD) && !$('dtVal').textContent.includes(OLD_TEXT),
+        'tip=' + JSON.stringify($('dtVal').textContent));
+
+  // reader 6 — an OPEN Watch detail panel, which keeps showing whatever it was last given
+  DETAIL = new El('div'); DETAIL.classList.add('wdetail'); DETAIL.dataset.detail = name; DETAIL.style.display = '';
+  row.classList.add('watchrow');
+  applyValue(name, true, OLD, 'ULONG', true, { va: '0x847B40', typeCode: '0x12', size: 4, places: 0 });
+  applyValue(name, false, null, null, false, { error: 'THR$GetInstance returned no instance' });
+  console.log('   open detail: ' + JSON.stringify(DETAIL.textContent));
+  check('open detail shows the unavailable state, not the old value', DETAIL.textContent === '(unavailable)',
+        'detail=' + JSON.stringify(DETAIL.textContent));
+  DETAIL = null;
+}
+
+// ---- 77f84ca5: one function owns clear-on-reuse, so the thread-switch path cannot drift from it ----
+// The defect was two call sites clearing different SUBSETS of the same state. Pin the shared owner
+// directly: whatever invalidateThreadScopedState and applyValue disagree about, they cannot disagree
+// about this.
+console.log('10) clearValueMeta clears BOTH families, so its two callers cannot diverge');
+{
+  const row = makeRow('JOB:JOBID');
+  applyValue('JOB:JOBID', true, '4711', 'LONG', true, { va: '0x847B20', typeCode: '0x11', size: 4, places: 0 });
+  const v = row.querySelector('.vval');
+  check('precondition: both families present', !!v.dataset.va && !!v._vas && v.dataset.raw === '4711');
+  clearValueMeta(v);
+  check('edit family cleared', v.dataset.va === undefined && !v._vedit && !v.classList.contains('editable'));
+  check('view-as family cleared', !v._vas && v.dataset.raw === undefined && v.dataset.dtname === undefined
+        && v.dataset.dtmode === undefined);
+  check('and the tag is out of the row, not just unhooked', siblings(row) === 'vval',
+        'siblings=[' + siblings(row) + ']');
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');

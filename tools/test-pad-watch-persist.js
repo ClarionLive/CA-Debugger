@@ -62,6 +62,7 @@ function logLine() { }
 const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS', 'WATCH_IDLE_TEXT', 'WATCH_IDLE_TITLE',
 
   'nameKey', 'watchedKey', 'targetKey', 'loadWatchStore', 'saveWatches', 'applyValue', 'cssEsc',
+  'clearEditMeta', 'clearValueMeta',
   'restoreWatchesFor', 'addWatchSilent', 'addWatch', 'removeWatch', 'watchWaitingHtml',
   'settleWaitingCells', 'setRunState'];
 const missing = [];
