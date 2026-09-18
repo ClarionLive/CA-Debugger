@@ -25,6 +25,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib-extract.ps1')
 
 # ─────────────────────────────────────────────────────────────────────── parent: fan the scenarios out
 
@@ -50,18 +51,12 @@ $ctrl = Get-Content -Raw -LiteralPath $ControllerPath
 function Get-Block {
   param([string] $Signature, [string] $From)
   if (-not $From) { $From = $web }
-  $i = $From.IndexOf($Signature, [StringComparison]::Ordinal)
-  if ($i -lt 0) {
+  $block = Get-CSharpBlock $Signature $From
+  if ($null -eq $block) {
     Write-Host "  FAIL  absent from this version of the add-in: $Signature"
     exit 1
   }
-  $depth = 0; $started = $false
-  for ($j = $i; $j -lt $From.Length; $j++) {
-    $c = $From[$j]
-    if ($c -eq '{') { $depth++; $started = $true }
-    elseif ($c -eq '}') { $depth--; if ($started -and $depth -eq 0) { return $From.Substring($i, $j - $i + 1) } }
-  }
-  throw "unterminated: $Signature"
+  return $block
 }
 
 # A field/const declaration is not brace-delimited, so read to its terminating semicolon instead. This is how
@@ -69,14 +64,12 @@ function Get-Block {
 function Get-Statement {
   param([string] $Signature, [string] $From)
   if (-not $From) { $From = $web }
-  $i = $From.IndexOf($Signature, [StringComparison]::Ordinal)
-  if ($i -lt 0) {
+  $stmt = Get-CSharpStatement $Signature $From
+  if ($null -eq $stmt) {
     Write-Host "  FAIL  absent from this version of the add-in: $Signature"
     exit 1
   }
-  $j = $From.IndexOf(';', $i)
-  if ($j -lt 0) { throw "unterminated: $Signature" }
-  return $From.Substring($i, $j - $i + 1)
+  return $stmt
 }
 
 $script:failures = 0

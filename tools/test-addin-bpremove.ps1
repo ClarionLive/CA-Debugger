@@ -27,13 +27,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib-extract.ps1')
 $web = Get-Content -Raw -LiteralPath $WebViewPath
 
 function Get-Method {
   param([string] $Signature, [string] $From)
   if (-not $From) { $From = $web }
-  $i = $From.IndexOf($Signature, [StringComparison]::Ordinal)
-  if ($i -lt 0) {
+  $block = Get-CSharpBlock $Signature $From
+  if ($null -eq $block) {
     # Pointed at a version that predates the method under test: say so plainly instead of throwing
     # halfway through, which reads like a broken test rather than the before/after proof it is.
     Write-Host "  FAIL  absent from this version of the add-in: $Signature"
@@ -41,13 +42,7 @@ function Get-Method {
     Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
     exit 1
   }
-  $depth = 0; $started = $false
-  for ($j = $i; $j -lt $From.Length; $j++) {
-    $c = $From[$j]
-    if ($c -eq '{') { $depth++; $started = $true }
-    elseif ($c -eq '}') { $depth--; if ($started -and $depth -eq 0) { return $From.Substring($i, $j - $i + 1) } }
-  }
-  throw "unterminated: $Signature"
+  return $block
 }
 
 $methods = @(

@@ -2023,41 +2023,24 @@ namespace ClarionDebugger.Terminal
             return sb.ToString();
         }
 
-        // minimal extractor for the flat {action,data} messages from the page
-        /// <summary>Read one field out of a message from the page.
+        /// <summary>Read one field out of a message from the page. Null when the field is absent, is JSON
+        /// <c>null</c>, or the message is not a well-formed object.
         /// <para>
-        /// RULE FOR EVERY PAYLOAD THIS READS: a field whose content is user-typed or comes from the
-        /// debuggee goes LAST. This takes the FIRST <c>"key":</c> it finds anywhere in the text, so a
-        /// string value containing <c>"tid":123</c> or <c>"line":9</c> is read as that field when it sits
-        /// ahead of the real one. The page's own senders say the same thing where they build their
-        /// payloads — breakonprocentry puts module+line ahead of the procedure name, editvar puts tid
-        /// ahead of the value the user typed — and any new payload must do the same.
+        /// THERE IS NO LONGER A RULE ABOUT FIELD ORDER. This used to scan for <c>"key":</c> with no idea
+        /// where strings began or ended, so a value containing <c>"line":9</c> could impersonate a field,
+        /// and payloads were expected to put untrusted content LAST to work around it — a convention the
+        /// comment that used to sit here instructed every new payload to follow. That was never a boundary:
+        /// it held only while every sender remembered, and it would fail silently the first time one did
+        /// not. Field order is now irrelevant to correctness, and a new payload may order its members
+        /// however reads best.
+        /// </para>
+        /// <para>
+        /// See <see cref="JsonMessageReader"/> for what replaced it, and for why the debuggee's own names
+        /// are the untrusted input that made it necessary.
         /// </para></summary>
         private static string JsonVal(string json, string key)
         {
-            string search = "\"" + key + "\":";
-            int i = json.IndexOf(search, StringComparison.Ordinal);
-            if (i < 0) return null;
-            i += search.Length;
-            while (i < json.Length && json[i] == ' ') i++;
-            if (i >= json.Length) return null;
-            if (json[i] == 'n') return null; // null
-            if (json[i] == '"')
-            {
-                i++;
-                var sb = new StringBuilder();
-                while (i < json.Length)
-                {
-                    char c = json[i];
-                    if (c == '\\' && i + 1 < json.Length) { char n = json[i + 1]; sb.Append(n == 'n' ? '\n' : n == 't' ? '\t' : n == 'r' ? '\r' : n); i += 2; continue; }
-                    if (c == '"') break;
-                    sb.Append(c); i++;
-                }
-                return sb.ToString();
-            }
-            int s = i;
-            while (i < json.Length && json[i] != ',' && json[i] != '}') i++;
-            return json.Substring(s, i - s).Trim();
+            return JsonMessageReader.ReadField(json, key);
         }
 
         protected override void Dispose(bool disposing)
