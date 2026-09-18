@@ -45,10 +45,23 @@ const localStorage = {
 const watched = new Map();
 const values = new Map();
 let paused = false, runState = 'idle', targetPath = null;
+// The page's own `let`s do not leak out of eval(), so the ones its functions assign are declared HERE
+// beside the rest of the page state rather than left as implicit sloppy-mode globals.
+let restoredForTarget = null, untargetedRemoval = false;
 let renders = 0;
+// collaborators applyValue reaches for that these checks do not exercise
+function clearEditMeta() { }
+function setEditMeta() { }
+function wireEdit() { }
+function dtApply() { }
+function applyNote() { }
+function tidAccepted() { return true; }
+function armPendingSweep() { }
+function logLine() { }
 
-const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS',
-  'nameKey', 'sessionLive', 'watchedKey', 'targetKey', 'loadWatchStore', 'saveWatches',
+const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS', 'WATCH_IDLE_TEXT', 'WATCH_IDLE_TITLE',
+
+  'nameKey', 'watchedKey', 'targetKey', 'loadWatchStore', 'saveWatches', 'applyValue', 'cssEsc',
   'restoreWatchesFor', 'addWatchSilent', 'addWatch', 'removeWatch', 'watchWaitingHtml',
   'settleWaitingCells', 'setRunState'];
 const missing = [];
@@ -79,9 +92,10 @@ if (missing.length) {
 // them back out deliberately. Read from the page, never restated here — a test that hard-codes 200 keeps
 // passing after someone changes the page to 20.
 var LIM = {};
-eval(src + ';LIM = { WATCH_STORE: WATCH_STORE, WATCH_MAX: WATCH_MAX, WATCH_TARGETS: WATCH_TARGETS, nameKey: nameKey };');
+eval(src + ';LIM = { WATCH_STORE: WATCH_STORE, WATCH_MAX: WATCH_MAX, WATCH_TARGETS: WATCH_TARGETS, nameKey: nameKey, IDLE_TEXT: WATCH_IDLE_TEXT, IDLE_TITLE: WATCH_IDLE_TITLE };');
 // Named differently from the page's own identifiers so an eval'd stub can never collide with them.
 const KEY = LIM.WATCH_STORE, MAX_NAMES = LIM.WATCH_MAX, MAX_TARGETS = LIM.WATCH_TARGETS;
+const WATCH_IDLE_TEXT = LIM.IDLE_TEXT, WATCH_IDLE_TITLE = LIM.IDLE_TITLE;
 // the page's own key function, so a check cannot disagree with it about what one name is
 const keyOf = LIM.nameKey;
 
@@ -112,13 +126,14 @@ function reset(mode) {
   STORE = {}; storageMode = mode || 'ok';
   watched.clear(); values.clear();
   targetPath = null; runState = 'idle'; paused = false;
-  restoredForTarget = null;
+  restoredForTarget = null; untargetedRemoval = false;
   clearSent(); TOASTS.length = 0; resetDom();
 }
 // a fresh pad session against the same store: memory cleared, store kept
 function restart() {
   watched.clear(); values.clear();
-  targetPath = null; runState = 'idle'; restoredForTarget = null;
+  // a restart keeps the store but forgets everything in memory, including an outstanding removal
+  targetPath = null; runState = 'idle'; restoredForTarget = null; untargetedRemoval = false;
   clearSent(); resetDom();
 }
 
@@ -284,6 +299,54 @@ clearSent();
 targetPath = OTHER; restoreWatchesFor(OTHER);
 ok(sent('unwatch').indexOf('ORD:TOTAL') >= 0, "the host is told to drop the old app's name", JSON.stringify(sent('unwatch')));
 ok(!values.has(keyOf('ORD:TOTAL')), 'and its cached value is gone, so no tip can quote it');
+
+section('13) a restored row ANSWERED at the first pause looks like a value, not a placeholder');
+// The gap that let the real defect through: nothing here ever answered a restored row, so the `idle`
+// class never being cleared went unnoticed. A restored row is not re-rendered at a pause — applyValue
+// rewrites it in place — so this is the feature's main path, not an edge.
+reset();
+targetPath = APP; restoreWatchesFor(APP); addWatchSilent('CUS:NAME');
+restart(); targetPath = APP; restoreWatchesFor(APP);
+const cell = new El('span'); cell.className = 'vval idle'; cell.textContent = WATCH_IDLE_TEXT; cell.title = WATCH_IDLE_TITLE;
+const row = new El('div'); row.dataset.name = 'CUS:NAME'; row.appendChild(cell);
+const typeCell = new El('span'); typeCell.className = 'vtype'; row.appendChild(typeCell);
+doc.body.appendChild(row);
+setRunState('paused');
+applyValue('CUS:NAME', true, "'Del Castillo'", 'STRING', false, null);
+ok(cell.className.indexOf('idle') < 0, 'the placeholder class is gone once a value lands', JSON.stringify(cell.className));
+ok(cell.textContent === "'Del Castillo'", 'and the row shows the value', JSON.stringify(cell.textContent));
+ok(!cell.title, 'the placeholder tooltip is gone too', JSON.stringify(cell.title || ''));
+
+section('14) a removal made while no target is resolved still sticks');
+// Closing a solution pushes an EMPTY target. A removal then has nowhere to be written, and a later restore
+// of the SAME app would put the name back — the ticket's own acceptance criterion failing.
+reset();
+targetPath = APP; restoreWatchesFor(APP);
+addWatchSilent('A:ONE'); addWatchSilent('A:TWO');
+targetPath = null;                       // the solution closed
+removeWatch('A:ONE');
+targetPath = APP; restoreWatchesFor(APP);   // the same app resolves again
+ok(storedNames(APP).indexOf('A:ONE') < 0, 'the removal reached the store', JSON.stringify(storedNames(APP)));
+restart(); targetPath = APP; restoreWatchesFor(APP);
+ok(rowsOnScreen().map(r => r.name).indexOf('A:ONE') < 0, 'and it is still gone after a restart',
+  JSON.stringify(rowsOnScreen().map(r => r.name)));
+
+section('15) eviction never drops the app you are using');
+reset();
+// FREEZE the clock. Every entry then ties on `at`, which is the condition that matters: a stable
+// descending sort keeps insertion order, so an eviction that does not exclude the current target deletes
+// the entry it is in the middle of writing. Without the freeze this check passes or fails on whether the
+// millisecond happened to tick during the loop — it reported no failure against the unfixed code for
+// exactly that reason.
+const realNow = Date.now;
+Date.now = () => 1700000000000;
+for (let i = 0; i < MAX_TARGETS + 5; i++) { restart(); targetPath = 'C:\\a' + i + '.exe'; restoreWatchesFor(targetPath); addWatchSilent('K:' + i); }
+Date.now = realNow;
+const lastPath = 'C:\\a' + (MAX_TARGETS + 4) + '.exe';
+ok(storedNames(lastPath).length === 1, 'the target just written survived its own eviction pass',
+  JSON.stringify(storedNames(lastPath)));
+ok(Object.keys(readStore().byTarget).length <= MAX_TARGETS, 'and the bound still holds',
+  String(Object.keys(readStore().byTarget).length));
 
 console.log('\n' + (fails ? fails + ' of ' + checks + ' CHECKS FAILED' : 'ALL ' + checks + ' CHECKS PASSED'));
 process.exit(fails ? 1 : 0);
