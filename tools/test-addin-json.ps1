@@ -159,10 +159,12 @@ $wireMethods = @(
   (Get-Method 'public static string Str(string s)' $engine),
   (Get-Method 'public static string BpSet(UserBreakpoint bp)' $engine),
   (Get-Method 'public static string BpDel(UserBreakpoint bp)' $engine),
+  (Get-Method 'public static string BpList(List<UserBreakpoint> bps)' $engine),
   (Get-Method 'private static void AppendBpProps(StringBuilder sb, UserBreakpoint bp)' $engine)
 ) -join "`n"
 $hostMethods = @(
   (Get-Method 'private static DebugBreakpoint ParseBpFields(string json, string module)'),
+  (Get-Method 'private static List<DebugBreakpoint> ParseBpList(string json)'),
   (Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)'),
   (Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)'),
   (Get-Method 'private static string GetStr(string json, string key)'),
@@ -269,6 +271,75 @@ $solo = New-Object System.Collections.ArrayList
 HostBpSet $solo ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 42 44)))
 $soloLegacy = ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 42 44))) -replace ',"requestedLine":\d+', ''
 Check 'a single breakpoint is still removed by an old engine echo' ((HostBpDel $solo $soloLegacy).Count -eq 0) ''
+
+Write-Host ''
+Write-Host 'the same absent-vs-zero promise on the bp-set and bp-list paths, not only bp-del'
+# bp-del has always taken this care - GetIntOrNull, plus a documented planted-line fallback for an engine
+# build older than the protocol change. ParseBpFields, which is what BOTH bp-set and bp-list decode
+# through, did not: it read requestedLine with GetInt, and GetInt answers 0 for an absent field. Against an
+# engine that omits requestedLine EVERY parsed breakpoint in a module then held RequestedLine 0 and so
+# compared EQUAL to every other one under SameBpIdentity - distinct breakpoints collapsed into a single
+# host row and the pane disagreed with what the engine had armed.
+#
+# The legacy echoes below are derived the way the bp-del ones above are: the REAL writer's output with the
+# one member an older build would not have emitted taken back out. Framing, module, planted line and every
+# property are still exactly what the engine produces today.
+
+function Legacy { param([string] $Json) $Json -replace ',"requestedLine":-?\d+', '' }
+
+$setA = Legacy ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 10 11)))
+$setB = Legacy ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 20 22)))
+Check 'the legacy bp-set echoes really carry no requestedLine' (($setA -notmatch 'requestedLine') -and ($setB -notmatch 'requestedLine')) $setA
+# CONTROL: the rest of the echo is intact, so a pass below cannot come from an unparseable fixture.
+Check 'they still carry their module and planted line' ((([BpHost]::GetStr($setA, 'module')) -eq 'clbrws011.clw') -and ([BpHost]::GetInt($setA, 'line') -eq 11)) $setA
+
+$legacyRows = New-Object System.Collections.ArrayList
+HostBpSet $legacyRows $setA
+HostBpSet $legacyRows $setB
+Check 'two distinct breakpoints from an engine with no requestedLine stay 2 host rows' ($legacyRows.Count -eq 2) (Lines $legacyRows)
+Check 'and each row keeps the planted line the engine reported (11 and 22)' `
+  ($legacyRows.Count -eq 2 -and $legacyRows[0].Line -eq 11 -and $legacyRows[1].Line -eq 22) (Lines $legacyRows)
+# The honest cost, stated the same way the bp-del fallback states its own: an engine that cannot name the
+# requested line cannot tell two gutter lines that snapped to ONE record apart, so those still merge.
+$sharedPlant = New-Object System.Collections.ArrayList
+HostBpSet $sharedPlant (Legacy ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 10 11))))
+HostBpSet $sharedPlant (Legacy ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 12 11))))
+Check 'two legacy echoes that SHARE a planted line still merge (known fallback cost)' ($sharedPlant.Count -eq 1) (Lines $sharedPlant)
+
+# 0 is a REAL requested line - an unresolved raw (--rva) breakpoint has one - which is the entire reason
+# bp-del reads this field with GetIntOrNull. So an ABSENT requested line must not compare equal to a
+# present 0 either. This case is what a 0/-1 sentinel would get wrong while the case above still passed.
+$raw0 = [BpWire]::BpSet((EngineBp 'clbrws011.clw' 0 13))
+Check 'the raw-breakpoint echo really carries a present requestedLine of 0' ([BpHost]::GetIntOrNull($raw0, 'requestedLine') -eq 0) $raw0
+$mixed = New-Object System.Collections.ArrayList
+HostBpSet $mixed $setA      # requestedLine ABSENT, planted 11
+HostBpSet $mixed $raw0      # requestedLine 0 PRESENT, planted 13
+Check 'an absent requested line is not a requested line of 0' ($mixed.Count -eq 2) (Lines $mixed)
+
+Write-Host ''
+Write-Host 'bp-list decodes through the same reader, so it inherits the same promise'
+$ul = New-Object 'System.Collections.Generic.List[UserBreakpoint]'
+$ul.Add((EngineBp 'clbrws011.clw' 10 11))
+$ul.Add((EngineBp 'clbrws011.clw' 20 22))
+$legacyList = Legacy ([BpWire]::BpList($ul))
+Check 'the legacy bp-list echo carries no requestedLine for either breakpoint' ($legacyList -notmatch 'requestedLine') $legacyList
+$parsedList = [BpHost]::ParseBpList($legacyList)
+Check 'a 2-breakpoint legacy bp-list parses as 2 entries' ($parsedList.Count -eq 2) "$($parsedList.Count) entry(ies)"
+Check 'the two entries are not the same breakpoint under the identity key' `
+  ($parsedList.Count -eq 2 -and -not [BpHost]::SameBpIdentity($parsedList[0], $parsedList[1])) (Lines $parsedList)
+# What the pane is handed for the gutter marker. 0 would put the marker on line 0 of the file.
+Check 'each entry reports the line it was planted on, never 0' `
+  ($parsedList.Count -eq 2 -and $parsedList[0].RequestedLine -eq 11 -and $parsedList[1].RequestedLine -eq 22) (Lines $parsedList)
+
+Write-Host ''
+Write-Host 'and the promise is kept in the reader and the identity key themselves'
+$parseBody = Get-Method 'private static DebugBreakpoint ParseBpFields(string json, string module)'
+Check 'ParseBpFields preserves ABSENCE (GetIntOrNull, never GetInt, for requestedLine)' `
+  (($parseBody -match 'GetIntOrNull\(json, "requestedLine"\)') -and ($parseBody -notmatch 'GetInt\(json, "requestedLine"\)')) ''
+$identBody = Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)'
+Check 'SameBpIdentity falls back to the planted line when a requested line is absent' ($identBody -match 'a\.Line == b\.Line') ''
+Check 'and it compares requested lines through the nullable carrier, not the 0-defaulting accessor' `
+  ($identBody -match 'RequestedLineOrNull') ''
 
 Write-Host ''
 Write-Host 'the real handler arms use these same keys, so the mirror above cannot drift'

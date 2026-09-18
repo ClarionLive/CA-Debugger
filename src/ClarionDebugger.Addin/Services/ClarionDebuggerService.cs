@@ -74,7 +74,37 @@ namespace ClarionDebugger.Services
     public sealed class DebugBreakpoint
     {
         public string Module;
-        public int RequestedLine;
+
+        private int? _requestedLine;
+
+        /// <summary>The line the user asked for, or null when the engine's echo carried no
+        /// <c>requestedLine</c> member AT ALL (a build older than that protocol change).
+        /// <para>
+        /// ABSENT IS NOT 0. 0 is a real requested line — an unresolved raw (--rva) breakpoint has one —
+        /// which is exactly why <c>bp-del</c> has always read this field with <c>GetIntOrNull</c>. Reading it
+        /// with <c>GetInt</c> gave every breakpoint in a module the same requested line of 0 against an older
+        /// engine, and <see cref="ClarionDebuggerService.SameBpIdentity"/> then merged them all into one pane
+        /// row. Host-built entries (the IDE gutter, a pending entry the pad adds before the engine confirms)
+        /// always know the line they asked for, so only a parsed echo can leave this null.
+        /// </para></summary>
+        public int? RequestedLineOrNull
+        {
+            get { return _requestedLine; }
+            set { _requestedLine = value; }
+        }
+
+        /// <summary>The requested line when there is one, else the PLANTED line — the best line this
+        /// breakpoint can be shown or re-specified by. Every display, gutter and spec-building reader wants
+        /// this; nothing may use it for IDENTITY, which goes through
+        /// <see cref="ClarionDebuggerService.SameBpIdentity"/> so an absent requested line falls back
+        /// explicitly instead of comparing as 0. Assigning it records the line AS PRESENT, which is what a
+        /// host-built entry means.</summary>
+        public int RequestedLine
+        {
+            get { return _requestedLine ?? Line; }
+            set { _requestedLine = value; }
+        }
+
         public int Line;            // line actually planted (snapped to nearest code record)
         public string Path;         // full .clw path from the IDE gutter bookmark (null if unknown)
 
@@ -1309,14 +1339,22 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>Build a breakpoint (location + advanced properties) from a single bp-set / bp-list
-        /// JSON object. Shared so bp-set and bp-list decode identically.</summary>
+        /// JSON object. Shared so bp-set and bp-list decode identically — which is also why the
+        /// absent-vs-zero care below only has to be taken once: this is the single place either event's
+        /// <c>requestedLine</c> is read, so no caller can bypass it.
+        /// <para>
+        /// GetIntOrNull, not GetInt, for the same reason the bp-del arm uses it: GetInt answers 0 for an
+        /// absent field, and 0 is a real requested line. Against an engine build that omits
+        /// <c>requestedLine</c>, GetInt gave every breakpoint in a module an identity of (module, 0) and
+        /// SameBpIdentity merged them into one pane row.
+        /// </para></summary>
         private static DebugBreakpoint ParseBpFields(string json, string module)
         {
             return new DebugBreakpoint
             {
                 Module = module,
                 Line = GetInt(json, "line"),
-                RequestedLine = GetInt(json, "requestedLine"),
+                RequestedLineOrNull = GetIntOrNull(json, "requestedLine"),
                 Condition = GetStr(json, "condition"),
                 HitMode = GetStr(json, "hitMode"),
                 HitValue = GetInt(json, "hitValue"),
@@ -1328,10 +1366,26 @@ namespace ClarionDebugger.Services
         /// <summary>Whether a bp-set echo names a breakpoint the host already lists. Identity is
         /// (module, requested line): the planted line is where the engine SNAPPED the breakpoint, and
         /// two distinct gutter lines can snap to the same record, so keying identity on it merges two
-        /// breakpoints into one row and loses one of them.</summary>
+        /// breakpoints into one row and loses one of them.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one. When either is absent — an engine
+        /// build older than that protocol change, which reports no <c>requestedLine</c> — this falls back to
+        /// the planted line, exactly as <see cref="BpDelMatches"/> does and for the same reason: an old
+        /// engine cannot say which of two gutter lines that snapped to one record it means, so the planted
+        /// line is all there is to key on. That fallback still merges two breakpoints sharing a record, which
+        /// is the pre-existing cost of talking to an old engine; what it does NOT do is merge every
+        /// breakpoint in the module, which is what comparing an absent line as 0 did.
+        /// </para>
+        /// <para>
+        /// Both sides come from the same engine build in a live session, so both-present and both-absent are
+        /// the reachable cases; the mixed case is defined rather than left to a 0 default, and is asserted in
+        /// tools/test-addin-json.ps1 against a present requested line of 0.
+        /// </para></summary>
         internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)
         {
-            return a.Module == b.Module && a.RequestedLine == b.RequestedLine;
+            if (a.Module != b.Module) return false;
+            int? ra = a.RequestedLineOrNull, rb = b.RequestedLineOrNull;
+            return (ra.HasValue && rb.HasValue) ? ra.Value == rb.Value : a.Line == b.Line;
         }
 
         /// <summary>Which host entries one bp-del removes. The engine deletes exactly one logical
