@@ -49,11 +49,20 @@ let renders = 0;
 
 const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS',
   'nameKey', 'sessionLive', 'watchedKey', 'targetKey', 'loadWatchStore', 'saveWatches',
-  'restoreWatchesFor', 'addWatchSilent', 'addWatch', 'removeWatch', 'watchWaitingHtml', 'setRunState'];
+  'restoreWatchesFor', 'addWatchSilent', 'addWatch', 'removeWatch', 'watchWaitingHtml',
+  'settleWaitingCells', 'setRunState'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
-  catch (e) { try { return pad.extractConst(html, n); } catch (e2) { missing.push(n); return 'function ' + n + '(){}'; } }
+  catch (e) {
+    try { return pad.extractConst(html, n); }
+    catch (e2) {
+      missing.push(n);
+      // A missing CONST must be stubbed as a var, not as a function: `function WATCH_STORE(){}` collides
+      // with any outer binding of that name and turns --allow-missing into a SyntaxError.
+      return /^[A-Z0-9_]+$/.test(n) ? ('var ' + n + ' = undefined;') : ('function ' + n + '(){}');
+    }
+  }
 }).join('\n');
 // A function this suite cannot find is a HARD FAILURE, not a stub. Stubbing lets the whole run pass
 // vacuously — which is what it did against the pre-fix page, reporting zero failures while testing
@@ -70,8 +79,11 @@ if (missing.length) {
 // them back out deliberately. Read from the page, never restated here — a test that hard-codes 200 keeps
 // passing after someone changes the page to 20.
 var LIM = {};
-eval(src + ';LIM = { WATCH_STORE: WATCH_STORE, WATCH_MAX: WATCH_MAX, WATCH_TARGETS: WATCH_TARGETS };');
-const WATCH_STORE = LIM.WATCH_STORE, WATCH_MAX = LIM.WATCH_MAX, WATCH_TARGETS = LIM.WATCH_TARGETS;
+eval(src + ';LIM = { WATCH_STORE: WATCH_STORE, WATCH_MAX: WATCH_MAX, WATCH_TARGETS: WATCH_TARGETS, nameKey: nameKey };');
+// Named differently from the page's own identifiers so an eval'd stub can never collide with them.
+const KEY = LIM.WATCH_STORE, MAX_NAMES = LIM.WATCH_MAX, MAX_TARGETS = LIM.WATCH_TARGETS;
+// the page's own key function, so a check cannot disagree with it about what one name is
+const keyOf = LIM.nameKey;
 
 // renderWatchList builds its rows with innerHTML, which this test DOM does not parse — so the rows are
 // read from `watched` (the list the page renders FROM) and the value cell is asked for directly via
@@ -84,13 +96,18 @@ function renderWatchList() { renders++; }   // counted, not exercised; see the n
 
 function rowsOnScreen() { return Array.from(watched.keys()).map(name => ({ name })); }
 function waitingCell() {
-  const html = watchWaitingHtml();
+  // `|| ''` so a --allow-missing run against a page without watchWaitingHtml FAILS its checks cleanly
+  // instead of throwing: the flag exists to show these checks failing on the old page, and a crash halts
+  // the run at the first section instead of reporting the rest.
+  const html = watchWaitingHtml() || '';
   const cls = (html.match(/class=\"([^\"]+)\"/) || [, ''])[1];
   const title = (html.match(/title=\"([^\"]+)\"/) || [, ''])[1];
   const text = (html.match(/>([^<]*)<\/span>/) || [, ''])[1];
   return { cls, text, title, html };
 }
-function valueCell() { return waitingCell(); }
+// NOTE: this is the page's waiting-cell RENDERING, not a specific row's cell — renderWatchList builds rows
+// with innerHTML, which this DOM does not parse, so there is no per-row cell to read. Named accordingly:
+// an earlier version took a `name` it silently ignored, which read as a per-row check and was not one.
 function reset(mode) {
   STORE = {}; storageMode = mode || 'ok';
   watched.clear(); values.clear();
@@ -125,7 +142,7 @@ restart();
 targetPath = APP; restoreWatchesFor(APP);           // the next pad session
 let names = rowsOnScreen().map(r => r.name);
 ok(names.length === 2 && names.indexOf('CUS:NAME') >= 0, 'both names came back', JSON.stringify(names));
-let c = valueCell('CUS:NAME');
+let c = waitingCell();
 ok(c && c.cls.indexOf('pending') < 0, 'the row is NOT pending', c && JSON.stringify(c.cls));
 ok(c && c.text !== '…', 'it does not show the pending ellipsis', c && JSON.stringify(c.text));
 ok(c && c.cls.indexOf('idle') >= 0 && /pause/i.test(c.text), 'it says a pause is needed', c && c.text);
@@ -135,10 +152,19 @@ ok(sent('watch').indexOf('CUS:NAME') >= 0, 'the host was told the name, so the f
 section('2) with a session live, a new watch is pending — the other kind of waiting');
 setRunState('paused');
 addWatchSilent('CUS:ID');
-c = valueCell('CUS:ID');
+c = waitingCell();
 ok(c && c.cls.indexOf('pending') >= 0 && c.text === '…', 'a watch added while paused shows pending', c && c.text);
-c = valueCell('CUS:NAME');
-ok(c && c.cls.indexOf('pending') >= 0, 'and rows re-rendered under a live session are pending too', c && c.cls);
+// ...but ONLY while paused. A target that is merely RUNNING answers nothing until it next pauses, so a
+// row rendered then must not claim a reply is on its way — this is the check whose absence let an
+// "any live session is pending" mutation pass.
+setRunState('running');
+c = waitingCell();
+ok(c && c.cls.indexOf('pending') < 0 && /pause/i.test(c.text),
+  'while merely RUNNING a value-less row still says a pause is needed', c && c.text);
+setRunState('launching');
+c = waitingCell();
+ok(c && c.cls.indexOf('pending') < 0, 'and while launching', c && c.cls);
+setRunState('paused');
 
 section('3) a removal stays removed');
 reset();
@@ -193,17 +219,17 @@ ok(TOASTS.some(t => /already watched/i.test(t)), 'and the user is told, not give
 
 section('8) a hostile stored value cannot break startup');
 reset();
-STORE[WATCH_STORE] = '{not json at all';
+STORE[KEY] = '{not json at all';
 targetPath = APP; restoreWatchesFor(APP);
-ok(rowsOnScreen().length === 0 && renders >= 0, 'malformed JSON restores nothing and does not throw');
+ok(rowsOnScreen().length === 0, 'malformed JSON restores nothing and does not throw');
 reset();
-STORE[WATCH_STORE] = JSON.stringify({ v: 1, byTarget: { [APP.toLowerCase()]: { names: ['GOOD:ONE', 42, null, { x: 1 }, ''] } } });
+STORE[KEY] = JSON.stringify({ v: 1, byTarget: { [APP.toLowerCase()]: { names: ['GOOD:ONE', 42, null, { x: 1 }, ''] } } });
 targetPath = APP; restoreWatchesFor(APP);
 names = rowsOnScreen().map(r => r.name);
 ok(names.length === 1 && names[0] === 'GOOD:ONE', 'non-string entries are skipped, the good one is kept', JSON.stringify(names));
 // a name is rendered as TEXT, never as markup
 reset();
-STORE[WATCH_STORE] = JSON.stringify({ v: 1, byTarget: { [APP.toLowerCase()]: { names: ['<img src=x onerror=1>'] } } });
+STORE[KEY] = JSON.stringify({ v: 1, byTarget: { [APP.toLowerCase()]: { names: ['<img src=x onerror=1>'] } } });
 targetPath = APP; restoreWatchesFor(APP);
 const rawName = Array.from(watched.keys())[0];
 ok(rawName === '<img src=x onerror=1>', 'the raw name is kept as data', JSON.stringify(rawName));
@@ -223,14 +249,41 @@ ok(!threw && rowsOnScreen().length === 0, 'a store that cannot be read restores 
 section('10) the store stays bounded');
 reset();
 targetPath = APP; restoreWatchesFor(APP);
-for (let i = 0; i < 260; i++) watched.set('N:' + i, {});
+for (let i = 0; i < MAX_NAMES + 60; i++) watched.set('N:' + i, {});
 saveWatches();
-let stored = JSON.parse(STORE[WATCH_STORE]).byTarget[APP.toLowerCase()].names;
-ok(stored.length === WATCH_MAX, 'at most WATCH_MAX names per target are stored', stored.length + ' of ' + WATCH_MAX);
+// readStore(): tolerate an absent/garbage store so a deliberate --allow-missing run reports FAILures
+// rather than dying here — the page's own limits are absent in that run, so there is no key to read.
+function readStore() { try { return JSON.parse(STORE[KEY] || 'null') || { byTarget: {} }; } catch (e) { return { byTarget: {} }; } }
+function storedNames(p) { const e = readStore().byTarget[String(p).toLowerCase()]; return (e && e.names) || []; }
+let stored = storedNames(APP);
+ok(stored.length === MAX_NAMES, 'at most MAX_NAMES names per target are stored', stored.length + ' of ' + MAX_NAMES);
 reset();
 for (let i = 0; i < 30; i++) { restart(); targetPath = 'C:\\app' + i + '.exe'; restoreWatchesFor(targetPath); addWatchSilent('K:' + i); }
-const targets = Object.keys(JSON.parse(STORE[WATCH_STORE]).byTarget).length;
-ok(targets <= WATCH_TARGETS, 'at most WATCH_TARGETS targets are kept', targets + ' of ' + WATCH_TARGETS);
+const targets = Object.keys(readStore().byTarget).length;
+ok(targets <= MAX_TARGETS, 'at most MAX_TARGETS targets are kept', targets + ' of ' + MAX_TARGETS);
+
+section('11) a "…" left behind when the pause ends is settled, values are not');
+reset();
+targetPath = APP; restoreWatchesFor(APP);
+setRunState('paused');
+// two cells as renderWatchList would leave them: one still asking, one already answered
+const asking = new El('span'); asking.className = 'vval pending'; asking.textContent = '…'; doc.body.appendChild(asking);
+const answered = new El('span'); answered.className = 'vval'; answered.textContent = "'USA'"; doc.body.appendChild(answered);
+setRunState('running');                     // the pause is over; nothing will answer that row now
+ok(asking.className.indexOf('pending') < 0 && /pause/i.test(asking.textContent),
+  'the unanswered cell stops claiming a reply is coming', JSON.stringify(asking.textContent));
+ok(answered.textContent === "'USA'", 'a cell holding a value is left alone', JSON.stringify(answered.textContent));
+ok(/first pause/i.test(asking.title || ''), 'and it explains itself', JSON.stringify(asking.title || ''));
+
+section('12) replacing one app with another stops watching the old names');
+reset();
+targetPath = APP; restoreWatchesFor(APP);
+addWatchSilent('ORD:TOTAL');
+values.set(keyOf('ORD:TOTAL'), { value: '42' });
+clearSent();
+targetPath = OTHER; restoreWatchesFor(OTHER);
+ok(sent('unwatch').indexOf('ORD:TOTAL') >= 0, "the host is told to drop the old app's name", JSON.stringify(sent('unwatch')));
+ok(!values.has(keyOf('ORD:TOTAL')), 'and its cached value is gone, so no tip can quote it');
 
 console.log('\n' + (fails ? fails + ' of ' + checks + ' CHECKS FAILED' : 'ALL ' + checks + ' CHECKS PASSED'));
 process.exit(fails ? 1 : 0);

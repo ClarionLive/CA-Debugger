@@ -884,11 +884,12 @@
   // pad only reflects run-state in the indicator dot/text + the location bar.
   function setRunState(state){
     paused = state==='paused';
+    const wasPaused = runState==='paused';
     runState = state || 'idle';
-    // Deliberately NOT re-rendering the Watch list here. A value-less row's waiting text is true in every
-    // state that has not answered it yet ("pause to read" holds while idle AND while running), and
-    // re-rendering on a state change would blank the last values a row holds — which is exactly what a
-    // developer wants to read after the target exits.
+    // Deliberately NOT re-rendering the whole Watch list — that would blank the last values a row holds,
+    // which is exactly what a developer wants to read after the target exits. But a row still showing "…"
+    // when the pause that would have answered it is over IS a lie, so settle just those cells.
+    if(wasPaused && runState!=='paused') settleWaitingCells();
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
@@ -948,7 +949,14 @@
     restoredForTarget = key;
     let names=[];
     try{ const e=loadWatchStore().byTarget[key]; if(e && Array.isArray(e.names)) names=e.names; }catch(err){}
-    if(!first) watched.clear();
+    if(!first){
+      // Replacing one app's list with another's: tell the host to stop watching the old names and drop their
+      // cached values. Without this they stay in the host's watch set and repopulate `values` at the next
+      // pause, where a hover tip over a same-named variable in the NEW app could quote the OLD app's value —
+      // a row-less version of exactly the cross-app leak this per-target key exists to prevent.
+      watched.forEach((meta,n)=>{ send('unwatch',n); values.delete(nameKey(n)); });
+      watched.clear();
+    }
     let added=0;
     names.slice(0,WATCH_MAX).forEach(n=>{
       if(typeof n!=='string' || !n || watchedKey(n)) return;
@@ -1039,9 +1047,26 @@
   // overwrites either state the moment a value lands. Its own function so a test can ask it directly —
   // renderWatchList builds rows with innerHTML, which the pad's test DOM does not parse.
   function watchWaitingHtml(){
-    return sessionLive()
+    // PENDING only while PAUSED. A watch added while the target runs is registered by the host and answered
+    // at the next pause, not now — so "…" there would promise a reply that only a pause can bring, and if
+    // the target exits without pausing the row keeps it forever. "(pause to read)" is true in every other
+    // state, and settleWaitingCells() converts any "…" left behind when a session ends.
+    return runState==='paused'
       ? '<span class="vval pending">…</span>'
       : '<span class="vval idle" title="No debug session yet — this reads at the first pause.">(pause to read)</span>';
+  }
+  // A session ending leaves any still-unanswered "…" claiming a reply is coming when nothing can send one.
+  // Rewrite ONLY those cells — never a cell holding a value, which is exactly what a developer wants to read
+  // after the target exits. Same narrow form as armPendingSweep.
+  function settleWaitingCells(){
+    const idle=watchWaitingHtml();
+    document.querySelectorAll('.vval.pending').forEach(v=>{
+      if(v.textContent!=='…') return;
+      v.classList.remove('pending'); v.classList.add('idle');
+      v.textContent='(pause to read)';
+      v.title='No debug session yet — this reads at the first pause.';
+    });
+    return idle;   // returned so a test can compare the two renderings without rebuilding a row
   }
 
   function renderWatchList(){
@@ -2095,7 +2120,10 @@
     const name=el.dataset.name||''; const known=values.get(nameKey(name));
     const type=(tEl&&tEl.textContent.trim()) || (known&&known.type) || '';
     let val=(vEl&&vEl.textContent.trim()) || (known&&known.value) || '';
-    if(!val || val==='…') val = known&&known.value ? known.value : '(not watched — ☆ to add)';
+    // '…' (asking) and '(pause to read)' (nothing can answer yet) are both WAITING, not values — a tip
+    // that quotes either as the variable's value is the row's own lie repeated one level out.
+    if(!val || val==='…' || val==='(pause to read)')
+      val = known&&known.value ? known.value : '(not watched — ☆ to add)';
     tipTarget={name,type,val};
     $('dtName').textContent=name; $('dtType').textContent=type;
     // carry the caveat into the tip: without it a shared-template or not-yet-used value reads as this
