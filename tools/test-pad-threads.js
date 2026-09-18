@@ -77,6 +77,7 @@ const FNS = ['esc', 'send', 'resetThreadState',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
   'onThreads', 'onThreadSelected', 'onEngineError', 'rearmCurrentThread', 'beginThreadSwitch', 'invalidateThreadScopedState',
+  'viewingOtherThread', 'editThreadSuffix',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
   'buildStack', 'renderStack', 'onMessage'];
 const missing = [];
@@ -400,6 +401,49 @@ console.log('\n7c) a write names the thread its address was read on');
   // the host reads the FIRST "key": it finds anywhere in the text, and `value` is the one field the user
   // typed — a value containing its own "tid" must not be the one that gets read
   check('tid appears before the user-typed value', !!wrote && wrote.data.indexOf('"tid"') < wrote.data.indexOf('"value"'));
+}
+
+console.log('\n7e) an edit on another thread is allowed, and says whose copy it writes');
+{
+  // The Owner's ruling: allow it — it is real data for that thread, and refusing would remove a
+  // legitimate capability — but nothing on screen said WHICH thread's copy a commit would write. No
+  // prompt: the naming has to be in the affordance and in the confirmation, not in a dialog.
+  resetAll();
+  onThreads(THREADS_EVENT);
+  const row = makeRow('PUB:PUB_NAME', { watch: true });
+
+  applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  const plainTitle = row.querySelector('.vedit-btn').title;
+  console.log('   on the stopped thread: ' + JSON.stringify(plainTitle));
+  check('no thread noise in the ordinary case', plainTitle === 'Edit value', plainTitle);
+  clearSent(); TOASTS.length = 0;
+  beginEdit(cell(row)); commitActiveEdit('New Moon Books');
+  check('…and no thread named on the commit either', !TOASTS.some(t => /Thread|tid/.test(t)),
+        TOASTS.join('|') || '(silent)');
+  check('the write still goes out', sentActions().includes('editvar'));
+
+  // now switch to the browse thread and let its own value arrive
+  onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  onMessage(JSON.stringify({ type: 'watch', name: 'PUB:PUB_NAME', found: true, value: "'New Moon Books'",
+                             typeName: 'STRING(41)', threaded: true, va: '0x9A1000', typeCode: '0x18',
+                             size: 41, tid: BROWSE_TID }));
+  const otherTitle = row.querySelector('.vedit-btn').title;
+  console.log('   viewing another thread: ' + JSON.stringify(otherTitle));
+  check('editing is still OFFERED on a non-stopped thread', !!row.querySelector('.vedit-btn')
+        && state(row).va === '0x9A1000');
+  check('the pencil names whose copy it writes', otherTitle === "Edit value — writes Thread 2's copy", otherTitle);
+
+  clearSent(); TOASTS.length = 0;
+  beginEdit(cell(row));
+  check('the open editor names it too', (cell(row).children.find(c => c.classList.contains('vedit')) || {}).title
+        === "Editing — writes Thread 2's copy");
+  commitActiveEdit('Binnet & Hardley');
+  console.log('   on commit: ' + JSON.stringify(TOASTS));
+  check('the commit says whose copy was written', TOASTS.some(t => t.includes("Thread 2's copy")), TOASTS.join('|'));
+  check('…and names the field, so it is checkable', TOASTS.some(t => t.includes('PUB:PUB_NAME')), TOASTS.join('|'));
+  const wrote = SENT.find(s => s.action === 'editvar');
+  check('the write carries that thread', !!wrote && JSON.parse(wrote.data).tid === BROWSE_TID);
+  check('no confirmation was asked for', sentActions().filter(a => a === 'editvar').length === 1);
 }
 
 console.log('\n7d) an engine error answers a switch that is in flight');

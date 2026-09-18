@@ -15,6 +15,12 @@
     /* Panel title. Its own token because neither --blue nor --accent-hi reads well on the
        titlebar in BOTH themes: --accent-hi is muddy on dark, --blue is near-navy on light. */
     --hdr:#6cb6f0;
+    /* CAUTION. Its own token because the states it paints — which thread the panels are showing, a
+       frame recovered by raw stack scanning — are the ones that must never be hard to read, and no
+       existing token works in both themes: --orange is a red on light (reads as an error, not a
+       caution) and --yellow only clears 4.4:1 on the light panel. Measured against the surfaces it
+       actually sits on: 7.9:1 on the dark panel, 6.1:1 on the light one. */
+    --warn:#e2b341; --warn-bg:#e2b3411f; --warn-border:#e2b34166;
   }
   body.light {
     --bg:#ffffff; --panel:#f3f3f3; --titlebar:#e9e9ec; --border:#d3d3d6;
@@ -25,6 +31,9 @@
     --input:#ffffff; --cur:#fff6c8; --popup:#ffffff; --popup-border:#c4c4c8; --btnhover:#0000000d;
     --name:#0b5cad;
     --hdr:#1668c9;
+    /* The dark theme's amber is 1.8:1 on this panel — invisible, which is what the Owner reported.
+       A dark amber instead: same family, 6.1:1 on the panel and 6.8:1 on white. */
+    --warn:#8a4b00; --warn-bg:#8a4b0014; --warn-border:#8a4b0059;
   }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; }
@@ -44,7 +53,7 @@
   body.paused #btnRtc { opacity:1; pointer-events:auto; }
   .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
   .dot { width:8px; height:8px; border-radius:50%; background:#888; }
-  .runstate.paused .dot { background:#e2b341; box-shadow:0 0 6px #e2b34188; }
+  .runstate.paused .dot { background:var(--warn); box-shadow:0 0 6px var(--warn-border); }
   .runstate.running .dot { background:#4ec9b0; box-shadow:0 0 6px #4ec9b088; }
   .runstate.idle .dot { background:#888; }
 
@@ -159,7 +168,7 @@
   .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
   .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .pin svg, .dact svg { display:block; }
-  .row:hover .pin { opacity:1; } .pin:hover { color:#e2b341; } .pin.pinned { opacity:1; color:#e2b341; }
+  .row:hover .pin { opacity:1; } .pin:hover { color:var(--warn); } .pin.pinned { opacity:1; color:var(--warn); }
   .rmw { margin-left:auto; width:20px; text-align:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .row:hover .rmw { opacity:1; } .rmw:hover { color:#f48771; }
 
@@ -184,8 +193,10 @@
   .frame .floc { color:var(--fg-dim); font-size:11px; } .frame .file { color:var(--blue); } .frame .ln { color:var(--num); }
   .frame .kind { margin-left:auto; color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 5px; }
   .frame.unknown .fn { color:var(--fg-dim); font-style:italic; }
-  .frame.uncertain { opacity:.55; }
-  .frame .unc { flex:none; color:var(--orange); font-size:11px; cursor:help; }
+  /* De-emphasise the UNCERTAIN frame's text, never its marker: a row-wide opacity took the ⚠ down to
+     2.7:1 in both themes, so the one glyph saying "this frame may be stale" was the hardest thing to see. */
+  .frame.uncertain .fn, .frame.uncertain .floc, .frame.uncertain .kind { opacity:.55; }
+  .frame .unc { flex:none; color:var(--warn); font-size:11px; cursor:help; }
 
   /* ---- thread picker (Call Stack header) ----
      The engine stops the PROCESS: every thread is frozen and any of them can be read. Which one the
@@ -200,7 +211,7 @@
   .thsel .thsel-ic { flex:none; }
   .thsel .thsel-ar { color:var(--fg-dim); font-size:9px; }
   /* viewing a thread other than the one the engine stopped on — amber everywhere it shows */
-  .thsel.other { border-color:#e2b341; color:#e2b341; background:#e2b3411a; }
+  .thsel.other { border-color:var(--warn); color:var(--warn); background:var(--warn-bg); }
   .thpick { display:none; margin:2px 8px 4px; border:1px solid var(--popup-border); border-radius:4px; background:var(--popup); overflow:hidden; }
   .thpick.show { display:block; }
   .thpick .thhdr { padding:4px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
@@ -215,15 +226,15 @@
   .throw .thproc.none { color:var(--fg-dim); font-style:italic; }
   .throw .thloc { color:var(--fg-dim); font-size:11px; }
   .throw .thstate { color:var(--fg-dim); font-size:10px; border:1px solid #ffffff1f; border-radius:3px; padding:0 4px; }
-  .throw .thstop { margin-left:auto; flex:none; color:#e2b341; font-size:9px; font-weight:700; letter-spacing:.5px; }
+  .throw .thstop { margin-left:auto; flex:none; color:var(--warn); font-size:9px; font-weight:700; letter-spacing:.5px; }
   /* the banner: while the panels show a thread the engine did NOT stop on, say so where the data is */
   .thwarn { display:none; align-items:center; gap:8px; margin:3px 8px 0; padding:4px 9px; border-radius:4px;
-            background:#e2b3411f; border:1px solid #e2b34166; color:#e2b341; font-size:11px; }
+            background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn); font-size:11px; }
   .thwarn.show { display:flex; }
-  .thwarn .thback { margin-left:auto; flex:none; border:1px solid #e2b34166; border-radius:3px; padding:0 6px; cursor:pointer; }
-  .thwarn .thback:hover { background:#e2b3413d; color:var(--fg-bright); }
+  .thwarn .thback { margin-left:auto; flex:none; border:1px solid var(--warn-border); border-radius:3px; padding:0 6px; cursor:pointer; }
+  .thwarn .thback:hover { background:var(--warn-border); color:var(--fg-bright); }
   /* …and again in the toolbar, because the Call Stack panel can be collapsed or hidden entirely */
-  #thBadgeTop { display:none; color:#e2b341; font-size:11px; border:1px solid #e2b34166; border-radius:9px; padding:0 7px; }
+  #thBadgeTop { display:none; color:var(--warn); font-size:11px; border:1px solid var(--warn-border); border-radius:9px; padding:0 7px; }
   body.viewing-other #thBadgeTop { display:inline-block; }
 
   .bpitem { border-bottom:1px solid transparent; }
@@ -264,7 +275,7 @@
   .bp .bpcfg { flex:none; margin-left:auto; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
   .bp .bpcfg:hover { color:#fff; background:#3a3a3a; opacity:1; }
   .bp .badge { flex:none; font-size:10px; line-height:1; padding:1px 4px; border-radius:3px; background:var(--btnhover,#2d2d2d); cursor:help; }
-  .bp .badge.cond { color:#c586c0; } .bp .badge.hits { color:var(--num,#b5cea8); } .bp .badge.trace { color:#4fc1ff; } .bp .badge.cnt { color:#e2b341; }
+  .bp .badge.cond { color:#c586c0; } .bp .badge.hits { color:var(--num,#b5cea8); } .bp .badge.trace { color:#4fc1ff; } .bp .badge.cnt { color:var(--warn); }
   .bp.has-adv .chk.on { background:#c586c0; border-color:#c586c0; }        /* conditional/hit-count bp dot */
   .bp.is-trace .chk.on { background:#4fc1ff; border-color:#4fc1ff; }       /* tracepoint dot (overrides) */
   .bpedit { padding:6px 10px 8px 14px; border-bottom:1px solid var(--border); background:var(--bg); display:flex; flex-direction:column; gap:5px; font-size:11.5px; }
@@ -300,7 +311,7 @@
   .console .chdr .cact:hover { opacity:1; color:#fff; background:#3a3a3a; }
   #copyLog { margin-left:auto; }
   .console .chdr .sec-x { margin-left:6px; }
-  .clog .hit { color:#73c991; } .clog .pause { color:#e2b341; } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; } .clog .trace { color:#4fc1ff; }
+  .clog .hit { color:#73c991; } .clog .pause { color:var(--warn); } .clog .info { color:var(--fg-dim); } .clog .cmd { color:var(--name); } .clog .err { color:#f48771; } .clog .trace { color:#4fc1ff; }
 
   .datatip { position:fixed; z-index:50; background:var(--popup); border:1px solid var(--popup-border); border-radius:5px; box-shadow:0 6px 20px #0007; padding:6px 10px; font-size:12px; display:none; align-items:flex-start; gap:8px; max-width:560px; }
   .datatip.show { display:flex; }
@@ -342,7 +353,7 @@
   .kb-label { flex:none; width:88px; color:var(--fg); }
   .kb-chip { flex:1; min-width:0; font-family:"Cascadia Code",Consolas,monospace; font-size:12px; background:var(--input); border:1px solid var(--popup-border); border-radius:4px; padding:3px 8px; color:var(--num); min-height:25px; display:flex; align-items:center; }
   .kb-chip.unbound { color:#6f6f6f; font-style:italic; font-family:inherit; }
-  .kb-chip.capturing { color:#e2b341; border-color:#e2b341; font-family:inherit; }
+  .kb-chip.capturing { color:var(--warn); border-color:var(--warn); font-family:inherit; }
   .kb-act { flex:none; background:var(--accent); color:#fff; border:none; border-radius:4px; padding:4px 10px; font-size:12px; cursor:pointer; }
   .kb-act:hover { background:var(--accent-hi); }
   .kb-act.ghost { background:transparent; color:var(--fg-dim); border:1px solid var(--popup-border); }
@@ -1044,6 +1055,7 @@
     const raw=cell.dataset.raw;
     const inp=document.createElement('input'); inp.className='vedit';
     inp.value = (raw!=null && /^-?\d+$/.test(raw)) ? raw : stripEditQuotes(old);
+    const suffix=editThreadSuffix(); if(suffix) inp.title='Editing'+suffix;
     cell.textContent=''; cell.appendChild(inp); inp.focus(); inp.select();
     let finished=false;
     function done(commit){
@@ -1054,8 +1066,17 @@
       // text, and `value` is the one field here the user typed — it could otherwise carry its own "tid".
       // The tid names the thread this address was read on, so the engine can refuse a write whose thread
       // is no longer the selected one instead of writing another thread's memory.
-      if(commit) send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size,
-                                                 places:meta.places, tid:(selTid==null?null:selTid), value:inp.value}));
+      if(commit){
+        send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size,
+                                        places:meta.places, tid:(selTid==null?null:selTid), value:inp.value}));
+        // Say whose copy was written, rather than asking first — the Owner did not want a prompt per edit,
+        // and an edit on a THREADed variable is legitimate on any thread. Silent when the selection is the
+        // stopped thread, which is nearly always, so this never becomes noise in the ordinary case.
+        if(viewingOtherThread()){
+          const r=cell.parentElement, nm=(r && r.dataset) ? (r.dataset.name||'') : '';
+          toast('Wrote '+threadName(threadRowFor(selTid), selTid)+"'s copy"+(nm?' of '+nm:''));
+        }
+      }
     }
     activeEdit={cell:cell, cancel:function(){ done(false); }};
     inp.onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); done(true); } else if(e.key==='Escape'){ e.preventDefault(); done(false); } };
@@ -1072,7 +1093,10 @@
     // keyed off a handle on the cell (like dtApply's ._vas) so clearEditMeta can find this exact pencil
     // again regardless of what else gets inserted next to the cell afterwards
     if(!cell._vedit){
-      const btn=document.createElement('span'); btn.className='vedit-btn'; btn.title='Edit value'; btn.textContent='✎';
+      const btn=document.createElement('span'); btn.className='vedit-btn';
+      // Names the thread only while one other than the stopped thread is selected. The pencil is rebuilt
+      // on every switch (clearEditMeta removes it, the next reply re-adds it), so this stays current.
+      btn.title='Edit value'+editThreadSuffix(); btn.textContent='✎';
       btn.onclick=e=>{ e.stopPropagation(); beginEdit(cell); };
       cell._vedit=btn;
       cell.insertAdjacentElement('afterend', btn);
@@ -1452,10 +1476,23 @@
     });
   }
 
+  // True while the panels are showing a thread the engine did NOT stop on. The one condition behind every
+  // "which thread am I looking at" cue, so they cannot disagree — and behind the edit affordance naming
+  // the thread, which must stay silent in the ordinary single-thread case.
+  function viewingOtherThread(){ return selTid!=null && stopTid!=null && selTid!==stopTid; }
+
+  // What an edit is about to write, in the developer's own terms. A THREADed variable has one copy per
+  // thread, so while another thread is selected a commit writes THAT thread's copy — legitimate, and the
+  // reason we allow it, but it must not be silent. Empty when the selection is the stopped thread: there
+  // is nothing to disambiguate, and naming a thread there would be noise in the common case.
+  function editThreadSuffix(){
+    return viewingOtherThread() ? (" — writes " + threadName(threadRowFor(selTid), selTid) + "'s copy") : '';
+  }
+
   function renderThreadUi(){
     const t=threadRowFor(selTid);
     const chip=$('thSel'), txt=$('thSelText');
-    const other = (selTid!=null && stopTid!=null && selTid!==stopTid);
+    const other = viewingOtherThread();
     if(txt){
       let label;
       if(threadSwitching) label='switching…';

@@ -17,6 +17,7 @@ const extract = name => pad.extract(html, name);
 const El = pad.El;
 
 // ---- scenario state: this test drives ONE row at a time, so the document stub is deliberately tiny ----
+let selTid = null, stopTid = null;   // no thread selection in this suite: editThreadSuffix() -> ''
 let ROW = null;
 let DETAIL = null;          // an OPEN Watch detail panel, when a scenario registers one
 const document = {
@@ -45,8 +46,11 @@ const STAR = '*';
 const dtModes = {};
 
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
+// editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
+// this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
 const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','applyNote','wireEdit','applyValue','showTipFor'].map(n => {
+             'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+             'applyValue','showTipFor'].map(n => {
   try { return extract(n); }
   catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
 }).join('\n');

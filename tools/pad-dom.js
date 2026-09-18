@@ -63,9 +63,15 @@ class ClassList {
 class El {
   constructor(tag) {
     this.tag = tag; this.classList = new ClassList(); this.dataset = {}; this.children = [];
-    this.parentElement = null; this.textContent = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100;
+    this.parentElement = null; this._text = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100;
     this.style = {}; this._html = '';
   }
+  // Setting textContent REMOVES the children, as it does in a real DOM. The page relies on exactly that:
+  // the in-place value editor does `cell.textContent=''; cell.appendChild(input)` to open and
+  // `cell.textContent=old` to close, so a mini-DOM that kept the children left a dead <input> behind and
+  // a second edit on the same cell drove the FIRST editor's handlers.
+  set textContent(v) { this.children.forEach(c => { c.parentElement = null; }); this.children = []; this._text = String(v); }
+  get textContent() { return this._text; }
   getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }; }
   addEventListener() { }
   focus() { }      // the in-place value editor focuses and selects itself when it opens
