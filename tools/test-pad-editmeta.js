@@ -8,11 +8,19 @@
 // Runs the REAL clearEditMeta/setEditMeta/wireEdit/applyValue out of debugger.html against a minimal DOM.
 // Point it at a pre-fix copy of the page and steps 2 and 3 fail - that is the before/after proof.
 //
-//   node tools/test-pad-editmeta.js [path/to/debugger.html]
+//   node tools/test-pad-editmeta.js [path/to/debugger.html] [--allow-missing]
 // Exit code 0 = all checks passed.
 // The mini-DOM and the page-function extractor are shared with the pad's other tests (tools/pad-dom.js).
+//
+// --allow-missing stubs out any page function this file cannot find, instead of refusing to run. It exists
+// ONLY for the deliberate pre-fix run described above, where clearEditMeta genuinely does not exist yet.
+// Without it a missing target is a HARD FAILURE: silently stubbing a renamed function turns every check
+// that depends on it into a vacuous pass that still exits 0.
 const pad = require('./pad-dom');
-const html = pad.readPage(process.argv[2]);
+const argv = process.argv.slice(2);
+const ALLOW_MISSING = argv.includes('--allow-missing');
+const pagePath = argv.find(a => !a.startsWith('--'));
+const html = pad.readPage(pagePath);
 const extract = name => pad.extract(html, name);
 const El = pad.El;
 
@@ -52,12 +60,27 @@ const dtModes = {};
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
 // editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
 // this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
-const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
-             'applyValue','showTipFor'].map(n => {
+const NEEDED = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
+                'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+                'applyValue','showTipFor'];
+const missing = [];
+const src = NEEDED.map(n => {
   try { return extract(n); }
-  catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
+  catch (e) { missing.push(n); return 'function ' + n + '(){}'; }
 }).join('\n');
+if (missing.length) {
+  // A stub answers every call with `undefined`, so the checks that exercise it stop testing the page and
+  // start testing the stub — and still exit 0. Refuse to run rather than report a pass nobody can trust.
+  const what = missing.length + ' of ' + NEEDED.length + ' page function(s) not found in ' +
+               (pagePath || pad.DEFAULT_PAGE) + ': ' + missing.join(', ');
+  if (!ALLOW_MISSING) {
+    console.log('  FAIL  ' + what);
+    console.log('        Renamed or moved? Update NEEDED in this file. Testing a pre-fix page on purpose?');
+    console.log('        Re-run with --allow-missing, which stubs them and says so.');
+    process.exit(1);
+  }
+  console.log('   (note: --allow-missing — stubbed ' + what + ')');
+}
 eval(src);
 
 // ---- scenario ----

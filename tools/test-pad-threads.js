@@ -13,10 +13,15 @@
 // Runs the REAL functions out of debugger.html against the shared mini-DOM (tools/pad-dom.js). Point it at
 // a pre-fix copy of the page and every thread check fails — that is the before/after proof.
 //
-//   node tools/test-pad-threads.js [path/to/debugger.html]
+//   node tools/test-pad-threads.js [path/to/debugger.html] [--allow-missing]
 // Exit code 0 = all checks passed.
+// --allow-missing stubs page functions this suite cannot find instead of refusing to run; it is only for
+// the deliberate pre-fix comparison above.
 const pad = require('./pad-dom');
-const html = pad.readPage(process.argv[2]);
+const argv = process.argv.slice(2);
+const ALLOW_MISSING = argv.includes('--allow-missing');
+const pagePath = argv.find(a => !a.startsWith('--'));
+const html = pad.readPage(pagePath);
 const El = pad.El;
 
 // ---- scope the page's functions run in -------------------------------------------------------------
@@ -89,7 +94,19 @@ const src = FNS.map(n => {
   try { return pad.extract(html, n); }
   catch (e) { missing.push(n); return 'function ' + n + '(){}'; }
 }).join('\n');
-if (missing.length) console.log('   (note: absent from this page — pre-fix? ' + missing.join(', ') + ')');
+// A function this suite cannot find is a HARD FAILURE, not a stub: a stub returns undefined for every
+// call, so the checks that drive it pass vacuously and the run still exits 0.
+if (missing.length) {
+  const what = missing.length + ' of ' + FNS.length + ' page function(s) not found in ' +
+               (pagePath || pad.DEFAULT_PAGE) + ': ' + missing.join(', ');
+  if (!ALLOW_MISSING) {
+    console.log('  FAIL  ' + what);
+    console.log('        Renamed or moved? Update FNS in this file. Testing a pre-fix page on purpose?');
+    console.log('        Re-run with --allow-missing, which stubs them and says so.');
+    process.exit(1);
+  }
+  console.log('   (note: --allow-missing — stubbed ' + what + ')');
+}
 eval(src);
 
 // ---- reaching into the page's in-place editor from a test ----
