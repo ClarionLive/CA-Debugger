@@ -107,6 +107,54 @@ Write-Host '4) the target process is identified by pid, never by name (337b3222 
     Check 'a pid that no longer exists is not the target' ($null -eq (Get-EngineTargetProcess $s))
 }.Invoke()
 
+Write-Host '5) every harness that launches the engine cleans up THROUGH this lifecycle'
+# Section 4 proves the identity check is right. It says nothing about whether the harnesses use it, and a
+# harness that resolves a pid itself gets no benefit from it: the third recorded instance of "a pid is not
+# an identity" in this repo was a NEW harness doing `Get-Process -Id $targetPid; $p.Kill()` in its finally
+# block, one wave after the same defect was fixed here.
+#
+# The harness list is SCANNED rather than typed out, so a harness added tomorrow is covered tomorrow and not
+# whenever someone remembers to list it. A harness is a script that names the engine BINARY - the scan cannot
+# key on the word "interactive" because this file contains it while launching nothing.
+# Get-Process is detected through the PowerShell PARSER, not a text match: test-watch-threaded.ps1 mentions
+# `Get-Process clbrws` in a comment explaining why it must not do that, and a comment is not a call.
+{
+    function Get-CalledCommands([string]$path) {
+        $tok = $null; $err = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tok, [ref]$err)
+        if ($err.Count) { return @('<unparseable>') }
+        $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        return @($calls | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
+    }
+
+    $all = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' | Sort-Object Name)
+    $harnesses = @($all | Where-Object { (Get-Content -Raw -LiteralPath $_.FullName) -match 'ClarionDbg\.exe' })
+    # A number, not "every": if a fourth harness appears this says so instead of quietly covering three.
+    Check 'exactly 3 scripts here launch the engine binary' ($harnesses.Count -eq 3) (($harnesses.Name) -join ', ')
+
+    foreach ($h in $harnesses) {
+        $text = Get-Content -Raw -LiteralPath $h.FullName
+        $cmds = Get-CalledCommands $h.FullName
+        Check "$($h.Name) dot-sources engine-session.ps1" ($text -match 'engine-session\.ps1')
+        Check "$($h.Name) launches through New-EngineSession" ($cmds -contains 'New-EngineSession')
+        Check "$($h.Name) cleans the debuggee up through Stop-EngineTarget" ($cmds -contains 'Stop-EngineTarget')
+        # THE RULE. Get-EngineTargetProcess is the one place a pid is turned into a process, because it is
+        # the only place that also checks the name and the start time.
+        Check "$($h.Name) never resolves a pid to a process itself" ($cmds -notcontains 'Get-Process') `
+            (($cmds | Where-Object { $_ -eq 'Get-Process' }) -join ', ')
+    }
+
+    # CONTROL: the rule is worth nothing if the scan cannot see a violation. engine-session.ps1 is the one
+    # file that MAY call Get-Process, so it doubles as proof that the detector fires at all.
+    $own = Get-CalledCommands (Join-Path $PSScriptRoot 'engine-session.ps1')
+    Check 'the detector does see a real Get-Process call (engine-session.ps1, the one place allowed)' `
+        ($own -contains 'Get-Process')
+    # ... and that it does NOT fire on the comment that merely names it.
+    $watch = Join-Path $PSScriptRoot 'test-watch-threaded.ps1'
+    Check 'and it does not fire on a comment that only mentions Get-Process' `
+        (((Get-Content -Raw -LiteralPath $watch) -match 'Get-Process') -and ((Get-CalledCommands $watch) -notcontains 'Get-Process'))
+}.Invoke()
+
 Write-Host ''
 if ($script:fails) { Write-Host "$($script:fails) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

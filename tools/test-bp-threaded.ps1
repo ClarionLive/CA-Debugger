@@ -10,9 +10,13 @@
 # A single-hit test passes while the stale-cache defect is fully present, so the run is deliberately
 # structured as: many hits -> explicit pause -> watch (cross-check) -> resume -> many more hits.
 #
-# Cleanup is scoped to the pid the ENGINE reported (@JSON {"event":"loaded","pid":N}), never
-# Get-Process <basename>, so a developer's own copy of the target is never killed. (Same defect this
-# repo is fixing in tools/test-watch-threaded.ps1 under 337b3222 item 9 -- not repeated here.)
+# The launch, the output pump and the cleanup come from engine-session.ps1, shared with
+# test-interactive.ps1 and test-watch-threaded.ps1. This file used to carry its own copy, and the copy got
+# the cleanup wrong in the way a copy does: it killed whatever `Get-Process -Id $targetPid` returned, with
+# no check of the process NAME or of its start time. A pid is not an identity -- Windows recycles them --
+# so if the debuggee exited before the finally block ran, that killed an unrelated developer process. The
+# shared Get-EngineTargetProcess verifies pid AND name AND "started after this session did" in one place
+# (337b3222 item 9); Stop-EngineTarget is the only thing here that signals the debuggee.
 #
 #   e.g. tools\test-bp-threaded.ps1
 #        tools\test-bp-threaded.ps1 -Name AUT:AU_LNAME -MenuItem "2/5" -Verbose2
@@ -42,6 +46,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\engine-session.ps1"
 
 Add-Type @"
 using System; using System.Runtime.InteropServices; using System.Text;
@@ -80,27 +85,24 @@ Write-Host "bp     : $bpArg"
 Write-Host "trace  : $traceMsg"
 Write-Host ""
 
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName  = $Engine
-$psi.Arguments = "break `"$Target`" --bp `"$bpArg`" --interactive --json"
-$psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-$psi.UseShellExecute = $false
-$psi.WorkingDirectory = Split-Path $Target
-
-$proc = New-Object System.Diagnostics.Process; $proc.StartInfo = $psi
-$sink = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-$h1 = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $sink -Action { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add($EventArgs.Data) } }
-$h2 = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived  -MessageData $sink -Action { if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add("STDERR: " + $EventArgs.Data) } }
-[void]$proc.Start(); $proc.BeginOutputReadLine(); $proc.BeginErrorReadLine()
+$session = New-EngineSession -Engine $Engine -Target $Target -BreakArgs "--bp `"$bpArg`"" `
+                             -WorkingDirectory (Split-Path $Target) -CaptureStdErr
+$proc = $session.Proc
 
 # --- collected evidence -------------------------------------------------------------------------
-$script:cursor    = 0
-$script:targetPid = 0
+# The debuggee pid is learned by Read-EngineLines, from the engine's own output, and read back off the
+# session. Nothing here derives it from a process name.
+$script:announcedPid = $false
 $script:events    = New-Object System.Collections.ArrayList   # ordered: @{Kind;Value;HitCount;Raw}
 $script:watchLine = $null
 
+function TargetPid { if ($null -eq $session.TargetPid) { 0 } else { [int]$session.TargetPid } }
+
 function Note([string]$l) {
-    if ($script:targetPid -eq 0 -and $l -match '"event":"loaded","pid":(\d+)') { $script:targetPid = [int]$matches[1]; Write-Host "## target pid = $($script:targetPid) (from the engine, not by name)" }
+    if (-not $script:announcedPid -and $null -ne $session.TargetPid) {
+        $script:announcedPid = $true
+        Write-Host "## target pid = $($session.TargetPid) (from the engine, not by name)"
+    }
     if ($l -match '"event":"trace"') {
         $v = if ($l -match 'value=\[([^\]]*)\]') { $matches[1] } else { '<unparsed>' }
         $hc = if ($l -match '"hitCount":(\d+)') { [int]$matches[1] } else { -1 }
@@ -111,14 +113,15 @@ function Note([string]$l) {
     elseif ($l -match '"event":"watch"' -and $l -match [regex]::Escape($Name)) { $script:watchLine = $l; [void]$script:events.Add(@{ Kind='watch'; Raw=$l }) }
 }
 
+function Show([string]$l) {
+    if ($null -eq $l) { return }
+    if ($Verbose2) { if ($l.Length -gt 400) { Write-Host ($l.Substring(0,400) + '...[trunc]') } else { Write-Host $l } }
+    elseif ($l -match '"event":"(trace|paused|watch|bp-error|error)"') { if ($l.Length -gt 300) { Write-Host ($l.Substring(0,300)+'...') } else { Write-Host $l } }
+    elseif ($l -match '^\s+threaded ') { Write-Host $l }   # NoteThreadedEmulation diagnostics
+}
+
 function Drain {
-    while ($script:cursor -lt $sink.Count) {
-        $l = $sink[$script:cursor]; $script:cursor++
-        Note $l
-        if ($Verbose2) { if ($l.Length -gt 400) { Write-Host ($l.Substring(0,400) + '...[trunc]') } else { Write-Host $l } }
-        elseif ($l -match '"event":"(trace|paused|watch|bp-error|error)"') { if ($l.Length -gt 300) { Write-Host ($l.Substring(0,300)+'...') } else { Write-Host $l } }
-        elseif ($l -match '^\s+threaded ') { Write-Host $l }   # NoteThreadedEmulation diagnostics
-    }
+    foreach ($l in (Read-EngineLines $session)) { Note $l; Show $l }
 }
 
 function Run-For([int]$sec, [string]$what) {
@@ -128,22 +131,16 @@ function Run-For([int]$sec, [string]$what) {
     Drain
 }
 
+# The stop wait is the shared one: it pumps through the same Read-EngineLines, so a line cannot be
+# consumed by one waiter and missed by the other. Note/Show still see every line.
 function Wait-Paused([int]$t) {
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    while ($sw.Elapsed.TotalSeconds -lt $t) {
-        $before = $script:events.Count
-        Drain
-        for ($i = $before; $i -lt $script:events.Count; $i++) { if ($script:events[$i].Kind -eq 'paused') { return $true } }
-        if ($proc.HasExited) { return $false }
-        Start-Sleep -Milliseconds 120
-    }
-    return $false
+    return (Wait-EnginePaused $session $t -OnLine { param($l) Note $l; Show $l })
 }
 
 function Poke-Menu([string]$path) {
-    if ($script:targetPid -eq 0) { Write-Host "!! no target pid yet -- cannot poke"; return }
+    if ((TargetPid) -eq 0) { Write-Host "!! no target pid yet -- cannot poke"; return }
     for ($i = 0; $i -lt 40; $i++) {
-        $r = [Poke]::Menu($script:targetPid, $path)
+        $r = [Poke]::Menu((TargetPid), $path)
         if ($r) { Write-Host "## menu $path -> $r"; return }
         Drain; Start-Sleep -Milliseconds 250
     }
@@ -181,24 +178,19 @@ try {
 
     # LEG 2 -- hits AFTER a stop and a resume. Anything cached at hit time in leg 1 is now a resume old.
     $leg2Start = $script:events.Count
-    [void][Poke]::Wake($script:targetPid)
+    [void][Poke]::Wake((TargetPid))
     Run-For 2 "LEG 2: settling after the resume"
     Run-Leg "LEG 2: more tracepoint hits, after a pause and a resume"
     $leg2End = $script:events.Count
 }
 finally {
-    try { $proc.StandardInput.WriteLine("quit") } catch {}
-    $proc.WaitForExit(8000) | Out-Null
-    if (-not $proc.HasExited) { $proc.Kill(); Write-Host "!! engine force-killed" }
+    Stop-EngineSession $session
     Start-Sleep -Milliseconds 400; Drain
-    # pid-scoped, never by base name
-    if ($script:targetPid -ne 0) {
-        $p = Get-Process -Id $script:targetPid -ErrorAction SilentlyContinue
-        if ($p) { Write-Host "!! killing leftover target pid $($script:targetPid)"; $p.Kill() }
-    }
-    Unregister-Event -SourceIdentifier $h1.Name
-    Unregister-Event -SourceIdentifier $h2.Name
-    if ($LogFile) { [IO.File]::WriteAllLines($LogFile, [string[]]$sink.ToArray()) }
+    # The ONLY thing here that signals the debuggee: pid AND name AND started-after-this-session, checked
+    # in one shared place. A recycled pid is not this run's target and is left alone.
+    Stop-EngineTarget $session
+    Remove-EngineSession $session
+    if ($LogFile) { [IO.File]::WriteAllLines($LogFile, [string[]]$session.Sink.ToArray()) }
 }
 
 # --- verdict ------------------------------------------------------------------------------------
