@@ -1,3 +1,8 @@
+// Was DebugEngine.Eval.cs until 337b3222. The old name meant "func-eval": this file used to hijack the
+// paused thread to CALL THR$GetInstance. 992d3e4 replaced that with read-only emulation, so no evaluation
+// of any kind happens here any more — it resolves a name and reads memory, which is the Watch panel's job
+// and nothing else's. Two comments elsewhere still cite the old filename; they are cited to the PM rather
+// than edited here, because this branch does not own those lines.
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
