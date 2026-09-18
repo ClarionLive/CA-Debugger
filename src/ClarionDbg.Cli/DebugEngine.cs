@@ -142,6 +142,11 @@ namespace ClarionDbg.Cli
         private LoadedModule _exe;           // module 0 — the launched image
 
         private IntPtr _hProcess = IntPtr.Zero;
+        // The debuggee's pid, from CREATE_PROCESS. INVARIANT: valid exactly when _hProcess is non-zero —
+        // the two are assigned together from the same PROCESS_INFORMATION, on the only path that has one.
+        // ProcessId() enforces that rather than trusting it, because a pid left behind for a process we no
+        // longer hold reads as a live process, which is the same defect class as a sentinel thread id.
+        private uint _pid;
         private bool _seenInitialBreak;
         public int Hits { get; private set; }
 
@@ -244,7 +249,15 @@ namespace ClarionDbg.Cli
         /// This list must contain only verbs the pause loop's switch actually handles. It once also named
         /// pause/break/runtocursor — which the switch does NOT implement — so those reset the selection and
         /// then fell through to "unknown command": a verb that did nothing silently discarded the user's
-        /// `thread &lt;tid&gt;` for the rest of the stop. They are rejected explicitly instead, below.</summary>
+        /// `thread &lt;tid&gt;` for the rest of the stop. They are rejected explicitly instead, below.
+        ///
+        /// THIS IS THE ONE OWNER of the resume-verb set. There were three hand-maintained copies: this, the
+        /// pause-loop switch, and the running-state switch (the pad held a fourth until a9f3407). The
+        /// running-state switch now asks this method instead of listing them again, leaving TWO sites — this
+        /// one, and the pause-loop switch, whose labels dispatch to different handlers and so cannot be a
+        /// list. `ClarionDbg protocolcheck` asserts the set both ways: every verb the pause loop dispatches
+        /// is accepted, and the verbs the running-state switch implements itself (pause/break in particular)
+        /// are rejected, because this is consulted BEFORE that switch and a wrong accept diverts them.</summary>
         private static bool IsResumeVerb(string verb)
         {
             switch (verb)
@@ -259,6 +272,9 @@ namespace ClarionDbg.Cli
                     return false;
             }
         }
+
+        /// <summary>Test seam for <see cref="IsResumeVerb"/>.</summary>
+        internal static bool IsResumeVerbForTest(string verb) { return IsResumeVerb(verb); }
 
         // ---------------------------------------------------------------- the absent-tid rule, in ONE place
         //
@@ -421,7 +437,10 @@ namespace ClarionDbg.Cli
                 throw new InvalidOperationException("CreateProcess failed, win32 error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
             Console.WriteLine($"launched {Path.GetFileName(_exePath)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
+            // Assigned together, from the same PROCESS_INFORMATION, on the only path that has one:
+            // CreateProcess either filled `pi` or threw above. See the invariant on _pid.
             _hProcess = pi.hProcess;
+            _pid = pi.dwProcessId;
 
             var buf = new byte[1024];
             bool running = true;
@@ -844,6 +863,21 @@ namespace ClarionDbg.Cli
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 string verb = parts[0].ToLowerInvariant();
+                // A resume verb while the target is already running. Decided HERE rather than by a third
+                // copy of the verb list in the switch below, so the set has one owner (IsResumeVerb).
+                //
+                // This is ahead of the switch, so it changes control flow, not just shape: a verb diverted
+                // here never reaches its case. That is safe only because IsResumeVerb accepts EXACTLY the
+                // verbs that fell to the "only valid while paused" case and nothing else — in particular it
+                // rejects pause/break, which this switch DOES implement and which must still reach it.
+                // `ClarionDbg protocolcheck` asserts both halves of that, including the non-resume verbs
+                // this switch handles, because getting it wrong looks identical on the happy path.
+                if (IsResumeVerb(verb))
+                {
+                    EmitError("target is running — " + verb + " is only valid while paused");
+                    continue;
+                }
+
                 switch (verb)
                 {
                     case "bp":
@@ -869,11 +903,11 @@ namespace ClarionDbg.Cli
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
                         break;
-                    case "continue": case "c": case "g":
-                    case "step": case "stepinto": case "s": case "i":
-                    case "stepover": case "next": case "n":
-                    case "stepout": case "out": case "finish": case "o":
-                    case "stepi": case "si": case "nexti": case "ni":
+                    // The resume verbs USED TO BE LISTED HERE, as a third hand-maintained copy of the set.
+                    // They are now recognised by IsResumeVerb ahead of this switch — one owner, so adding a
+                    // verb in one place cannot leave another place stale. They still produce exactly this
+                    // error; only who decides they are resume verbs has changed. The read verbs below are
+                    // NOT a duplicated set and stay where they are.
                     case "mem": case "regs": case "stack": case "bt": case "where": case "watch":
                     case "locals": case "vars":
                     case "moduledata": case "moddata":

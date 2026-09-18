@@ -78,6 +78,7 @@ namespace ClarionDbg.Cli
                 failures.Add("empty object: stamping produced malformed JSON");
 
             CheckHandBuiltTidEmitters(failures);
+            CheckResumeVerbs(failures);
             CheckStepGuards(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
@@ -90,8 +91,9 @@ namespace ClarionDbg.Cli
                                   + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
                                   + "descendants offer no edit metadata (the expand path is a known gap — "
                                   + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
-                                  + "can touch the shared template; and Step Over's ESP gate and its "
-                                  + "prologue bypass each hold with the other one out of the way.");
+                                  + "can touch the shared template; the resume-verb set has one owner across "
+                                  + "its 2 remaining sites; and Step Over's ESP gate and its prologue bypass "
+                                  + "each hold with the other one out of the way.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -159,6 +161,67 @@ namespace ClarionDbg.Cli
             CheckNoSentinelRows(failures, "threads", rows, known);
             string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
             CheckNoSentinelRows(failures, "threadscan", scan, known);
+        }
+
+        /// <summary>
+        /// The resume-verb set has ONE owner, and IsResumeVerb is it.
+        ///
+        /// The set used to exist in THREE hand-maintained copies: IsResumeVerb, the pause-loop switch, and
+        /// the running-state switch (the pad held a fourth until a9f3407 removed it). Adding a verb to one
+        /// left the others stale, and the recorded symptom was silent — the pad sat under a stale "viewing
+        /// thread N" banner because a verb nobody had told the other list about did not reset the selection.
+        ///
+        /// TWO sites remain and that number is checkable against the code: IsResumeVerb, which OWNS the set,
+        /// and the pause-loop switch, whose case labels must dispatch to a handler and so cannot be a list.
+        /// The running-state switch no longer holds a copy — it asks IsResumeVerb. "Every resume site" would
+        /// pass silently when a third copy appeared; "two sites" does not.
+        ///
+        /// The REJECTIONS below are not padding. IsResumeVerb is now consulted ahead of the running-state
+        /// switch, so a verb it wrongly accepts is diverted and never reaches its own case. pause/break is
+        /// the dangerous one: that switch implements it, and it once WAS in this list, where it reset the
+        /// selection and then fell through to "unknown command".
+        /// </summary>
+        private static void CheckResumeVerbs(List<string> failures)
+        {
+            // The set, spelled out: 5 commands, 18 spellings. The pause loop dispatches every one of these.
+            string[] resume =
+            {
+                "continue", "c", "g",
+                "step", "stepinto", "s", "i",
+                "stepover", "next", "n",
+                "stepout", "out", "finish", "o",
+                "stepi", "si", "nexti", "ni",
+            };
+            if (resume.Length != 18)
+                failures.Add("resume verbs: this check claims 18 spellings but lists " + resume.Length);
+            foreach (var v in resume)
+                if (!DebugEngine.IsResumeVerbForTest(v))
+                    failures.Add("resume verbs: '" + v + "' is dispatched by the pause loop as a resume verb "
+                                 + "but IsResumeVerb rejects it — it will not reset the thread selection, and "
+                                 + "the pad keeps a stale 'viewing thread N' banner");
+
+            // Verbs the RUNNING-STATE switch implements itself. IsResumeVerb is consulted before that switch,
+            // so accepting any of these would divert it from the case that handles it.
+            string[] handledWhileRunning = { "pause", "break", "bp", "sym", "thread", "quit", "q", "kill" };
+            foreach (var v in handledWhileRunning)
+                if (DebugEngine.IsResumeVerbForTest(v))
+                    failures.Add("resume verbs: '" + v + "' is handled by the running-state switch, but "
+                                 + "IsResumeVerb accepts it — it would be diverted and never reach its case");
+
+            // Verbs that are paused-only but NOT resume verbs: they must still fall to the switch's own
+            // "only valid while paused" case, not the hoisted one. Same error text today, but they are a
+            // different set and must not be absorbed into this one.
+            string[] pausedOnlyReads = { "mem", "regs", "stack", "watch", "locals", "moduledata", "disasm",
+                                         "setval", "threads", "threadscan", "framelocals", "libstate", "expand" };
+            foreach (var v in pausedOnlyReads)
+                if (DebugEngine.IsResumeVerbForTest(v))
+                    failures.Add("resume verbs: the read verb '" + v + "' is not a resume verb, but "
+                                 + "IsResumeVerb accepts it — it would reset the thread selection");
+
+            // And an unknown verb must still reach `default` rather than be swallowed as a resume.
+            if (DebugEngine.IsResumeVerbForTest("runtocursor") || DebugEngine.IsResumeVerbForTest("frobnicate"))
+                failures.Add("resume verbs: an unimplemented verb was accepted — it would reset the selection "
+                             + "and then report 'unknown command', silently discarding the user's thread <tid>");
         }
 
         /// <summary>

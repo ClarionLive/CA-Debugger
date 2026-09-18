@@ -393,12 +393,14 @@ namespace ClarionDbg.Cli
                 ? DateTime.FromFileTimeUtc(c).ToLocalTime() : default(DateTime);
         }
 
-        /// <summary>The debuggee's pid, for the window enumeration. One accessor rather than two call sites
-        /// asking the OS the same question, so the source of the answer can change in one place.</summary>
-        private uint ProcessId() { return GetProcessId(_hProcess); }
-
-        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint GetProcessId(IntPtr hProcess);
+        /// <summary>The debuggee's pid, for the window enumeration.
+        ///
+        /// Read from the CREATE_PROCESS PROCESS_INFORMATION the debugger already has, not asked back from
+        /// the OS: a `GetProcessId` P/Invoke here was re-deriving a value the engine was handed at launch
+        /// and had been throwing away (it was only ever printed). Returns 0 when there is no target, so a
+        /// pid can never be reported for a process we no longer hold — the invariant on _pid, enforced here
+        /// rather than assumed at the two call sites.</summary>
+        private uint ProcessId() { return _hProcess == IntPtr.Zero ? 0u : _pid; }
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetThreadTimes(IntPtr hThread, out long creation, out long exit,
