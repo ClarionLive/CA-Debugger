@@ -10,71 +10,24 @@
 //
 //   node tools/test-pad-editmeta.js [path/to/debugger.html]
 // Exit code 0 = all checks passed.
-const fs = require('fs');
-const path = process.argv[2] || require('path').join(__dirname, '..', 'src', 'ClarionDebugger.Addin', 'Terminal', 'debugger.html');
-const html = fs.readFileSync(path, 'utf8');
+// The mini-DOM and the page-function extractor are shared with the pad's other tests (tools/pad-dom.js).
+const pad = require('./pad-dom');
+const html = pad.readPage(process.argv[2]);
+const extract = name => pad.extract(html, name);
+const El = pad.El;
 
-// ---- pull out a top-level `function NAME(` declaration by brace matching
-function extract(name) {
-  const sig = 'function ' + name + '(';
-  const i = html.indexOf(sig);
-  if (i < 0) throw new Error('not found: ' + name);
-  let depth = 0, started = false;
-  for (let j = i; j < html.length; j++) {
-    const c = html[j];
-    if (c === '{') { depth++; started = true; }
-    else if (c === '}') { depth--; if (started && depth === 0) return html.slice(i, j + 1); }
-  }
-  throw new Error('unterminated: ' + name);
-}
-
-// ---- minimal DOM ----
-class ClassList {
-  constructor(){ this.s = new Set(); }
-  add(...c){ c.forEach(x=>this.s.add(x)); }
-  remove(...c){ c.forEach(x=>this.s.delete(x)); }
-  contains(c){ return this.s.has(c); }
-  toggle(c, on){ if(on===undefined) on = !this.s.has(c); on ? this.s.add(c) : this.s.delete(c); return on; }
-  toString(){ return [...this.s].join(' '); }
-}
-class El {
-  constructor(tag){ this.tag = tag; this.classList = new ClassList(); this.dataset = {}; this.children = [];
-    this.parentElement = null; this.textContent = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100;
-    this.style = {}; }
-  getBoundingClientRect(){ return { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }; }
-  addEventListener(){}
-  querySelector(sel){
-    const want = sel.replace('.', '');
-    for (const c of this.children) { if (c.classList.contains(want)) return c;
-      const d = c.querySelector(sel); if (d) return d; }
-    return null;
-  }
-  append(c){ c.parentElement = this; this.children.push(c); }
-  get nextElementSibling(){
-    if (!this.parentElement) return null;
-    const i = this.parentElement.children.indexOf(this);
-    return this.parentElement.children[i + 1] || null;
-  }
-  insertAdjacentElement(where, el){
-    const p = this.parentElement; const i = p.children.indexOf(this);
-    p.children.splice(where === 'afterend' ? i + 1 : i, 0, el); el.parentElement = p; return el;
-  }
-  remove(){ const p = this.parentElement; if (!p) return; p.children.splice(p.children.indexOf(this), 1); this.parentElement = null; }
-  removeAttribute(a){ delete this.attrs[a]; if (a === 'title') this.title = undefined; }
-  set className(v){ this.classList = new ClassList(); String(v).split(/\s+/).filter(Boolean).forEach(c=>this.classList.add(c)); }
-  get className(){ return this.classList.toString(); }
-  get title(){ return this.attrs.title; }
-  set title(v){ if (v === undefined) delete this.attrs.title; else this.attrs.title = v; }
-}
-
+// ---- scenario state: this test drives ONE row at a time, so the document stub is deliberately tiny ----
+let selTid = null, stopTid = null;   // no thread selection in this suite: editThreadSuffix() -> ''
 let ROW = null;
 let DETAIL = null;          // an OPEN Watch detail panel, when a scenario registers one
 const document = {
   createElement: t => new El(t),
   querySelectorAll: sel => (sel.startsWith('[data-name=') && ROW) ? [ROW] : [],
   querySelector: sel => {
-    const m = /^\.wdetail\[data-detail="(.*)"\]$/.exec(sel);
-    if (m && DETAIL && DETAIL.dataset.detail === m[1]) return DETAIL;
+    // `[… i]` — the page looks the panel up case-insensitively, because Clarion names are
+    // case-insensitive and the reply carries whatever spelling was asked for.
+    const m = /^\.wdetail\[data-detail="(.*)"(\s+i)?\]$/.exec(sel);
+    if (m && DETAIL && DETAIL.dataset.detail.toLowerCase() === m[1].toLowerCase()) return DETAIL;
     return null;
   },
 };
@@ -86,6 +39,8 @@ const window = { innerWidth: 1200, innerHeight: 800 };
 let tipTarget = null, tipTimer = null;
 // deps applyValue touches that are not under test
 const values = new Map();
+// Clarion data names are case-insensitive; the page keys this cache through nameKey (see debugger.html).
+const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
 const beginEdit = () => {};
 const STAR = '*';
@@ -95,8 +50,11 @@ const STAR = '*';
 const dtModes = {};
 
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
+// editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
+// this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
 const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','wireEdit','applyValue','showTipFor'].map(n => {
+             'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+             'applyValue','showTipFor'].map(n => {
   try { return extract(n); }
   catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
 }).join('\n');

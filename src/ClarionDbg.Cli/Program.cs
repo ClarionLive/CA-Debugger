@@ -32,6 +32,7 @@ namespace ClarionDbg.Cli
                     case "poolback": return PoolBack(args);
                     case "scanmissingnames": return ScanMissingNames(args);
                     case "surveymissingnames": return SurveyMissingNames(args);
+                    case "protocolcheck": return ProtocolCheck(args);
                     default: Usage(); return 1;
                 }
             }
@@ -42,9 +43,19 @@ namespace ClarionDbg.Cli
             }
         }
 
+        /// <summary>protocolcheck - assert the engine/pad tid contract (task 0128a37e). Exit 0 = pass.</summary>
+        private static int ProtocolCheck(string[] args)
+        {
+            return ClarionDbg.Cli.ProtocolCheck.Run();
+        }
+
         private static void Usage()
         {
             Console.WriteLine("ClarionDbg — Clarion TSWD debug-info tool");
+            Console.WriteLine();
+            Console.WriteLine("  ClarionDbg protocolcheck");
+            Console.WriteLine("      Assert the engine/pad wire contract: a thread-scoped event carries \"tid\" when the");
+            Console.WriteLine("      thread is known and OMITS it when it is not (never a 0/-1 sentinel). Exit 0 = pass.");
             Console.WriteLine();
             Console.WriteLine("  ClarionDbg dump <exe>");
             Console.WriteLine("      Parse the EXE and report PE info, TSWD TOC, modules, and line-table validation.");

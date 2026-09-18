@@ -48,6 +48,10 @@ namespace ClarionDebugger.Services
         public string Sym;
         /// <summary>x86 registers as hex strings keyed by name (eax..eflags), or null.</summary>
         public Dictionary<string, string> Regs;
+        /// <summary>The thread the engine stopped on, or null from an engine that doesn't name it. Lets the
+        /// pad mark the stopped thread from the stop itself, rather than only from the 'threads' reply that
+        /// follows it — which can fail or be overtaken.</summary>
+        public uint? Tid;
         /// <summary>Full path to the source module, resolved via the active .red redirection (or null).</summary>
         public string ResolvedPath;
     }
@@ -111,6 +115,37 @@ namespace ClarionDebugger.Services
         public string Func;      // containing function for no-source/runtime code (e.g. clarun.dll!Cla$PushLong)
     }
 
+    /// <summary>One thread of the paused target, as the engine's 'threads' command reports it.
+    /// <para>
+    /// <see cref="Proc"/>/<see cref="Module"/>/<see cref="Line"/> describe the TOPMOST CLARION FRAME on the
+    /// thread's stack, not its raw EIP: with the app idle, every UI thread sits in win32u!NtUserGetMessage,
+    /// so an EIP-derived label would name the same syscall for all of them and the list would be unreadable.
+    /// </para></summary>
+    public sealed class DebugThread
+    {
+        /// <summary>The Win32 thread id — a DWORD, so it is carried unsigned all the way to the page.</summary>
+        public uint Tid;
+        /// <summary>The Clarion thread number when the RTL can give it, else null. Never invented.</summary>
+        public int? ClarionThread;
+        public string Proc;            // topmost Clarion procedure, or null
+        public string Module;          // that frame's .clw, or null
+        public int Line;
+        /// <summary>"clarion" (EIP in mapped Clarion code) | "rtl" | "syscall" | "unknown".</summary>
+        public string State;
+        public int ClarionFrames;      // how many Clarion frames the stack walk found
+        public bool Stopped;           // this is the thread the engine stopped on
+        public bool Selected;          // this is the thread the read paths currently target
+    }
+
+    /// <summary>The engine's thread inventory for the current stop: which thread it stopped on, which one
+    /// the read paths are currently pointed at, and the list itself (stopped thread first).</summary>
+    public sealed class DebugThreadList
+    {
+        public uint StoppedTid;
+        public uint SelectedTid;
+        public List<DebugThread> Threads = new List<DebugThread>();
+    }
+
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
     public sealed class DebugWatch
     {
@@ -126,6 +161,9 @@ namespace ClarionDebugger.Services
         public bool OutOfScope;     // a known frame local, but execution is paused outside its procedure
         public string Error;        // resolved by name but unreadable (e.g. a THREADed instance the RTL wouldn't yield)
         public string Note;         // a real but qualified value (e.g. a THREADed variable this thread hasn't used yet)
+        /// <summary>The thread this value was read on, or null from an engine that doesn't stamp replies.
+        /// The pad drops a reply whose Tid isn't the thread it is currently showing.</summary>
+        public uint? Tid;
     }
 
     /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
@@ -175,11 +213,21 @@ namespace ClarionDebugger.Services
         public event Action<string, int, string> BreakpointError;  // module, line, error
         public event Action<string, int, string, int> Traced;      // tracepoint fired: module, line, interpolated message, hit count
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
-        public event Action<List<DebugStackFrame>> StackReceived;  // resolved call stack
-        public event Action<string, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON)
+        // Thread-scoped replies carry the tid they were read on (null from an engine that predates the
+        // per-event stamp). The pad uses it to DROP a reply for a thread it is no longer showing: a thread
+        // switch leaves the previous thread's replies in flight, and painting one into the new thread's
+        // panels would show one thread's values under another thread's name.
+        public event Action<List<DebugStackFrame>, uint?> StackReceived;  // resolved call stack (frames, tid)
+        public event Action<string, string, uint?> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
-        public event Action<string, string> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON)
-        public event Action<string, string, string> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON)
+        public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
+        public event Action<string, string, string, uint?> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON, tid)
+        public event Action<Dictionary<string, string>, uint?> RegsReceived; // standalone regs reply (regs, tid)
+        public event Action<DebugThreadList> ThreadsReceived;      // thread inventory for the current stop
+        // 'thread <tid>' result. The tid is the thread that was ASKED FOR (null when the request was
+        // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
+        // the selection it had and asks 'threads' for the authoritative one.
+        public event Action<uint?, bool, string> ThreadSelected;
         public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
@@ -419,6 +467,22 @@ namespace ClarionDebugger.Services
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
 
+        /// <summary>Request the thread inventory for the current stop (paused only); via ThreadsReceived.</summary>
+        public bool RequestThreads() { return SendCommand("threads"); }
+
+        /// <summary>Point the engine's READ paths (stack, framelocals, moduledata, watch, regs, libstate,
+        /// disasm) at <paramref name="tid"/> for the rest of this stop; result via ThreadSelected. Resume-type
+        /// commands always act on the STOPPED thread and reset this, and the engine drops the selection at
+        /// every new stop — the pad never has to carry it across stops.</summary>
+        public bool SelectThread(uint tid)
+        {
+            return tid > 0 && SendCommand("thread " + tid.ToString(CultureInfo.InvariantCulture));
+        }
+
+        /// <summary>Re-read the selected thread's registers (paused only); via RegsReceived. The 'paused'
+        /// event carries the STOPPED thread's registers, so this is how the pane follows a thread switch.</summary>
+        public bool RequestRegs() { return SendCommand("regs"); }
+
         /// <summary>Request the paused thread's RTL "Library State" (ERROR/EVENT/FIELD/…) — the engine
         /// EMULATES each ClaRUN getter read-only (no code runs in the debuggee, so this is safe at any
         /// stop, including inside TakeEvent). Result arrives via LibStateReceived keyed by
@@ -479,14 +543,20 @@ namespace ClarionDebugger.Services
         /// <paramref name="places"/>). Valid only while paused. The value is base64-encoded so any text (with
         /// spaces) survives the line/space-split stdin protocol; va and type code are validated as hex to block
         /// command injection. Result arrives via <see cref="VariableSet"/>.</summary>
-        public bool SetVariable(string vaHex, string typeCodeHex, int size, int places, string value)
+        public bool SetVariable(string vaHex, string typeCodeHex, int size, int places, string value, uint? tid = null)
         {
             if (State != DebugSessionState.Paused) return false;
             if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
             if (string.IsNullOrEmpty(typeCodeHex) || !Regex.IsMatch(typeCodeHex, "^0x[0-9A-Fa-f]+$")) return false;
             if (size <= 0 || size > 4096) return false;
             string b64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value ?? string.Empty));
-            return SendCommand("setval " + vaHex + " " + typeCodeHex + " " + size + " " + places + " " + b64);
+            string cmd = "setval " + vaHex + " " + typeCodeHex + " " + size + " " + places + " " + b64;
+            // Optional trailing arg: the thread the address was read on. An address is only meaningful on
+            // the thread whose instance it came from, so the engine can refuse a write whose thread is no
+            // longer the selected one instead of writing another thread's memory. Trailing so an engine
+            // that doesn't know about it is unaffected.
+            if (tid.HasValue) cmd += " " + tid.Value.ToString(CultureInfo.InvariantCulture);
+            return SendCommand(cmd);
         }
 
         /// <summary>Send a raw command line to the engine's stdin. False if no session / stdin closed.
@@ -711,11 +781,11 @@ namespace ClarionDebugger.Services
                 case "stack":
                     var frames = ParseStack(json);
                     foreach (var f in frames) f.ResolvedPath = ResolveModulePath(f.Module);
-                    StackReceived?.Invoke(frames);
+                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"));
                     break;
 
                 case "moduledata":
-                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"));
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
                     break;
 
                 case "expanded":
@@ -723,11 +793,23 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "framelocals":
-                    FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"));
+                    FrameLocalsReceived?.Invoke(GetStr(json, "reqId"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
                     break;
 
                 case "libstate":
-                    LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"));
+                    LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
+                    break;
+
+                case "threads":
+                    var tl = ParseThreads(json);
+                    if (tl != null) ThreadsReceived?.Invoke(tl);
+                    break;
+
+                case "threadselected":
+                    // The tid is the thread that was ASKED FOR, and a malformed request carries none at all
+                    // — passed through as null rather than 0, because 0 would be a sentinel the pad reads
+                    // as a real thread id. Absent is the only way to say "unknown".
+                    ThreadSelected?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "ok"), GetStr(json, "error"));
                     break;
 
                 case "watch":
@@ -745,8 +827,9 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "regs":
-                    // standalone regs reply — surface as a log line for now (paused carries regs too)
-                    LogReceived?.Invoke(line);
+                    // Standalone regs reply. The 'paused' event carries the stopped thread's registers, so
+                    // this arrives when the pane has to follow something else — a thread switch.
+                    RegsReceived?.Invoke(ParseRegs(json), GetUIntOrNull(json, "tid"));
                     break;
 
                 case "error":
@@ -885,18 +968,57 @@ namespace ClarionDebugger.Services
                     Gap = GetInt(json, "gap"),
                     Exact = GetBool(json, "exact"),
                     Sym = GetStr(json, "sym"),
+                    Tid = GetUIntOrNull(json, "tid"),
                 };
-                // regs block: {"eax":"0x...",...} — flat unique keys, extract directly
-                if (json.Contains("\"regs\":{"))
-                {
-                    p.Regs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var reg in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" })
-                    {
-                        string v = GetStr(json, reg);
-                        if (v != null) p.Regs[reg] = v;
-                    }
-                }
+                p.Regs = ParseRegs(json);
                 return p;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>The x86 register block of a 'paused' or a standalone 'regs' event: {"eax":"0x...",...}
+        /// — flat unique keys, extracted directly. Null when the event carries no register block.</summary>
+        private static Dictionary<string, string> ParseRegs(string json)
+        {
+            if (string.IsNullOrEmpty(json) || json.IndexOf("\"regs\":{", StringComparison.Ordinal) < 0) return null;
+            var regs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var reg in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" })
+            {
+                string v = GetStr(json, reg);
+                if (v != null) regs[reg] = v;
+            }
+            return regs;
+        }
+
+        /// <summary>The engine's thread inventory ('threads' event). The top-level stopped/selected tids are
+        /// read from the text BEFORE the array, so a row's own "stopped":true can't be mistaken for them.</summary>
+        private static DebugThreadList ParseThreads(string json)
+        {
+            try
+            {
+                var list = new DebugThreadList();
+                int arr = json.IndexOf("\"threads\":[", StringComparison.Ordinal);
+                string head = arr > 0 ? json.Substring(0, arr) : json;
+                list.StoppedTid = GetUIntOrNull(head, "stopped") ?? 0u;
+                list.SelectedTid = GetUIntOrNull(head, "selected") ?? 0u;
+                foreach (Match m in Regex.Matches(ExtractArrayBalanced(json, "threads"), "\\{[^{}]*\\}"))
+                {
+                    string t = m.Value;
+                    if (!t.Contains("\"tid\":")) continue;
+                    list.Threads.Add(new DebugThread
+                    {
+                        Tid = GetUIntOrNull(t, "tid") ?? 0u,
+                        ClarionThread = GetIntOrNull(t, "clarionThread"),
+                        Proc = GetStr(t, "proc"),
+                        Module = GetStr(t, "module"),
+                        Line = GetInt(t, "line"),
+                        State = GetStr(t, "state"),
+                        ClarionFrames = GetInt(t, "clarionFrames"),
+                        Stopped = GetBool(t, "stopped"),
+                        Selected = GetBool(t, "selected"),
+                    });
+                }
+                return list;
             }
             catch { return null; }
         }
@@ -988,6 +1110,10 @@ namespace ClarionDebugger.Services
             try
             {
                 var w = new DebugWatch { Name = GetStr(json, "name"), Found = GetBool(json, "found") };
+                // The thread this name was resolved on. Carried on BOTH outcomes: a miss for the thread the
+                // pad has stopped showing must be dropped just as firmly as a hit, or a late "(not found)"
+                // from the previous thread wipes a row that the new thread answered correctly.
+                w.Tid = GetUIntOrNull(json, "tid");
                 if (!w.Found)
                 {
                     w.OutOfScope = GetBool(json, "outOfScope");
@@ -1199,6 +1325,78 @@ namespace ClarionDebugger.Services
         {
             var m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*(-?\\d+)");
             return m.Success ? int.Parse(m.Groups[1].Value) : 0;
+        }
+        /// <summary>An integer field of THIS object that may legitimately be absent or JSON null — "0" is a
+        /// real value for some of these (a Clarion thread number the RTL couldn't give is null, NOT 0), so
+        /// GetInt's zero-for-absent answer can't be used to tell the two apart.</summary>
+        private static int? GetIntOrNull(string json, string key)
+        {
+            string tok = ScanNumberToken(json, key);
+            int v;
+            return (tok != null && int.TryParse(tok, NumberStyles.Integer, CultureInfo.InvariantCulture, out v))
+                ? (int?)v : null;
+        }
+
+        /// <summary>A Win32 thread id field. Thread ids are DWORDs: a real one can exceed Int32.MaxValue, and
+        /// reading it as a signed int would return null for it — which the pad reads as "no tid", i.e. an
+        /// UNSCOPED reply that it then accepts. That is the absent-means-unknown rule broken from the other
+        /// side: a reply the engine did stamp would be taken as one it didn't, for one thread in two.</summary>
+        private static uint? GetUIntOrNull(string json, string key)
+        {
+            string tok = ScanNumberToken(json, key);
+            uint v;
+            return (tok != null && uint.TryParse(tok, NumberStyles.Integer, CultureInfo.InvariantCulture, out v))
+                ? (uint?)v : null;
+        }
+
+        /// <summary>The raw digits of a numeric field belonging to THIS object, or null when it is absent,
+        /// JSON null, or not a number.
+        /// <para>
+        /// Only the object's OWN keys count: nested arrays and objects (a stack's frames, a moduledata item
+        /// list, a string value that happens to contain the same text) are skipped, so an event's "tid" can
+        /// never be picked up from something buried in its payload. Getting that wrong would mean dropping
+        /// replies as "another thread's", which is exactly the failure this field exists to prevent.
+        /// </para></summary>
+        private static string ScanNumberToken(string json, string key)
+        {
+            if (string.IsNullOrEmpty(json)) return null;
+            string quoted = "\"" + key + "\"";
+            int depth = 0; bool inStr = false, esc = false;
+            for (int i = 0; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (inStr)
+                {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    if (depth == 1 && i + quoted.Length <= json.Length
+                        && string.CompareOrdinal(json, i, quoted, 0, quoted.Length) == 0)
+                    {
+                        int p = i + quoted.Length;
+                        while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
+                        if (p < json.Length && json[p] == ':')
+                        {
+                            p++;
+                            while (p < json.Length && char.IsWhiteSpace(json[p])) p++;
+                            int s = p;
+                            if (p < json.Length && json[p] == '-') p++;
+                            int digits = p;
+                            while (p < json.Length && char.IsDigit(json[p])) p++;
+                            // present but not a number (JSON null, or a bare '-') — same answer as absent
+                            return p > digits ? json.Substring(s, p - s) : null;
+                        }
+                    }
+                    inStr = true; continue;
+                }
+                if (c == '{' || c == '[') depth++;
+                else if (c == '}' || c == ']') depth--;
+            }
+            return null;
         }
         private static bool GetBool(string json, string key)
         {

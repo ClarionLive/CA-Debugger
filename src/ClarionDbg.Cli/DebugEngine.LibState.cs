@@ -82,16 +82,16 @@ namespace ClarionDbg.Cli
         {
             string reqId = parts.Length > 1 ? parts[1] : "0";
             var rt = RuntimeModule();
-            if (rt == null) { EmitLibStateError(reqId, "RTL not dynamically linked (no ClaRUN.dll) — Library State needs a DLL-runtime build"); return; }
-            if (_hProcess == IntPtr.Zero) { EmitLibStateError(reqId, "no running process"); return; }
-            if (hThread == IntPtr.Zero)   { EmitLibStateError(reqId, "no thread handle for the paused thread"); return; }
+            if (rt == null) { EmitLibStateError(tid, reqId, "RTL not dynamically linked (no ClaRUN.dll) — Library State needs a DLL-runtime build"); return; }
+            if (_hProcess == IntPtr.Zero) { EmitLibStateError(tid, reqId, "no running process"); return; }
+            if (hThread == IntPtr.Zero)   { EmitLibStateError(tid, reqId, "no thread handle for thread " + tid); return; }
 
             uint teb = GetTebBase(hThread);
-            if (teb == 0) { EmitLibStateError(reqId, "could not resolve the thread's TEB"); return; }
+            if (teb == 0) { EmitLibStateError(tid, reqId, "could not resolve the thread's TEB"); return; }
 
             RtlEmulator emu;
             try { emu = BuildEmulator(rt, tid, teb); }
-            catch (Exception ex) { EmitLibStateError(reqId, "could not build the RTL emulator: " + ex.Message); return; }
+            catch (Exception ex) { EmitLibStateError(tid, reqId, "could not build the RTL emulator: " + ex.Message); return; }
 
             var rows = new List<string>();
             foreach (var g in LibGetters)
@@ -136,7 +136,7 @@ namespace ClarionDbg.Cli
                 rows.Add(LibStateRow(g.Group, g.Name, value, kind, ok));
             }
 
-            EmitLibStateRows(reqId, rows);
+            EmitLibStateRows(tid, reqId, rows);
         }
 
         /// <summary>Build the read-only emulator over the runtime DLL: debuggee reads via ReadBlock, TLS via
@@ -213,22 +213,18 @@ namespace ClarionDbg.Cli
                  + ",\"value\":" + Json.Str(value) + ",\"kind\":" + Json.Str(k) + "}";
         }
 
-        private void EmitLibStateRows(string reqId, List<string> rows)
+        private void EmitLibStateRows(uint tid, string reqId, List<string> rows)
         {
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
-                    + ",\"items\":[" + string.Join(",", rows) + "]}");
-            else
-                foreach (var r in rows) Console.WriteLine("  " + r);
+            EmitThreadEvent(tid, "{\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
+                + ",\"items\":[" + string.Join(",", rows) + "]}");
+            if (!EmitJson) foreach (var r in rows) Console.WriteLine("  " + r);
         }
 
-        private void EmitLibStateError(string reqId, string error)
+        private void EmitLibStateError(uint tid, string reqId, string error)
         {
-            if (EmitJson)
-                Console.WriteLine("@JSON {\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
-                    + ",\"error\":" + Json.Str(error) + ",\"items\":[]}");
-            else
-                Console.WriteLine("  libstate: " + error);
+            EmitThreadEvent(tid, "{\"event\":\"libstate\",\"reqId\":" + Json.Str(reqId)
+                + ",\"error\":" + Json.Str(error) + ",\"items\":[]}");
+            if (!EmitJson) Console.WriteLine("  libstate: " + error);
         }
     }
 }
