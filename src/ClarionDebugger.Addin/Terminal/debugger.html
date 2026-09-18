@@ -20,7 +20,7 @@
        existing token works in both themes: --orange is a red on light (reads as an error, not a
        caution) and --yellow only clears 4.4:1 on the light panel. Measured against the surfaces it
        actually sits on: 7.9:1 on the dark panel, 6.1:1 on the light one. */
-    --warn:#e2b341; --warn-bg:#e2b3411f; --warn-border:#e2b34166;
+    --warn:#e2b341; --warn-bg:#e2b3411f; --warn-border:#e2b34166; --warn-wash:#e2b3413d;
   }
   body.light {
     --bg:#ffffff; --panel:#f3f3f3; --titlebar:#e9e9ec; --border:#d3d3d6;
@@ -33,7 +33,7 @@
     --hdr:#1668c9;
     /* The dark theme's amber is 1.8:1 on this panel — invisible, which is what the Owner reported.
        A dark amber instead: same family, 6.1:1 on the panel and 6.8:1 on white. */
-    --warn:#8a4b00; --warn-bg:#8a4b0014; --warn-border:#8a4b0059;
+    --warn:#8a4b00; --warn-bg:#8a4b0014; --warn-border:#8a4b0059; --warn-wash:#8a4b003d;
   }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; }
@@ -232,7 +232,10 @@
             background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn); font-size:11px; }
   .thwarn.show { display:flex; }
   .thwarn .thback { margin-left:auto; flex:none; border:1px solid var(--warn-border); border-radius:3px; padding:0 6px; cursor:pointer; }
-  .thwarn .thback:hover { background:var(--warn-border); color:var(--fg-bright); }
+  /* Its own token at the alpha this hover was designed with. Reusing --warn-border here silently made the
+     wash heavier and took the hover text from 7.4:1 to 5.4:1 — still legible, but a change nobody asked for
+     riding inside a colour substitution is how a design drifts. */
+  .thwarn .thback:hover { background:var(--warn-wash); color:var(--fg-bright); }
   /* …and again in the toolbar, because the Call Stack panel can be collapsed or hidden entirely */
   #thBadgeTop { display:none; color:var(--warn); font-size:11px; border:1px solid var(--warn-border); border-radius:9px; padding:0 7px; }
   body.viewing-other #thBadgeTop { display:inline-block; }
@@ -1379,6 +1382,17 @@
     applyAll();
   }
 
+  // Visibility drives watching for a TREE row: a row nobody can see is not worth re-reading at every stop.
+  // The guard asks watchedKey, not watched.has — with an exact match a row scrolling out of view sends
+  // `unwatch` for a name the Watch panel still holds under another SPELLING, and the host drops it
+  // case-insensitively, after which that row is never answered again. Reachable by scrolling alone, with no
+  // thread switch involved. Returns whether it sent anything, so the decision can be tested on its own.
+  function syncRowWatch(name, visible){
+    if(watchedKey(name)) return false;      // the Watch panel owns this name; its own lifetime governs it
+    send(visible?'watch':'unwatch', name);
+    return true;
+  }
+
   // Render a data symbol / field row recursively. GROUPs expand; scalar leaves carry data-name (watched
   // by name → value arrives via applyValue) plus pin-to-watch. Returns a {setVisible} cascade handle.
   function renderSymRow(tree, s, depth){
@@ -1408,10 +1422,7 @@
     }
     return { el: row, setVisible(b){
       row.style.display=b?'':'none';
-      // watchedKey, not has(): with an exact match a tree row scrolling out of view sends `unwatch` for a
-      // name the Watch panel still holds under another spelling, and the host drops it case-insensitively
-      // — after which the Watch row is never answered again. That is reachable by scrolling alone.
-      if(!isGroup){ if(!watchedKey(name)) send(b?'watch':'unwatch', name); return; }
+      if(!isGroup){ syncRowWatch(name, b); return; }
       if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
       else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; row.querySelector('.ar').textContent='▸'; }
     } };
