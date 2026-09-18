@@ -223,9 +223,17 @@ namespace ClarionDbg.Cli
             var v = new ThreadView { Tid = _selectedTid };
             v.HThread = OpenThreadForContext(_selectedTid);
             v.Owned = v.HThread != IntPtr.Zero;
-            var c = NewContext();
-            v.HaveCtx = v.HThread != IntPtr.Zero && Native.GetThreadContext(v.HThread, ref c);
-            v.Ctx = c;
+            // Once the handle is open, this method owns it until it returns. A throw from GetThreadContext
+            // between those two points would otherwise strand it: the caller's finally releases the view it
+            // was RETURNED, and on a throw it is never returned one. Not reachable in practice — which is
+            // exactly why it would have leaked quietly if it ever became reachable.
+            try
+            {
+                var c = NewContext();
+                v.HaveCtx = v.HThread != IntPtr.Zero && Native.GetThreadContext(v.HThread, ref c);
+                v.Ctx = c;
+            }
+            catch { v.Release(); throw; }
             return v;
         }
 
@@ -653,9 +661,16 @@ namespace ClarionDbg.Cli
 
                 // Everything below reads the SELECTED thread. Ordinarily that IS the stopped thread and this
                 // opens nothing; after `thread <tid>` it is another thread's frozen context.
-                var view = AcquireView(tid, hThread, ref ctx, haveCtx);
+                //
+                // AcquireView is INSIDE the try that owns Release(). It used to sit above it, where a throw
+                // would have escaped the command loop entirely and taken the pause with it, instead of being
+                // reported by the catch below. Note this alone does NOT close the handle-leak window the
+                // review found: a throw part-way through AcquireView never returns a view for the finally to
+                // release, so AcquireView is made exception-safe on its own side too.
+                ThreadView view = null;
                 try
                 {
+                    view = AcquireView(tid, hThread, ref ctx, haveCtx);
                 switch (verb)
                 {
                     case "continue": case "c": case "g":
@@ -802,8 +817,8 @@ namespace ClarionDbg.Cli
                 {
                     // Closes only a handle WE opened for a non-stopped selection; the stopped thread's
                     // handle belongs to the caller. Runs on the resume paths too, which return out of the
-                    // switch above.
-                    view.Release();
+                    // switch above. Null only if AcquireView threw, and it releases its own handle then.
+                    if (view != null) view.Release();
                 }
             }
         }

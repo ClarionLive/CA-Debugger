@@ -69,7 +69,13 @@ namespace ClarionDbg.Cli
             var probes = ProbeAllThreads(stoppedTid);
             string probeName = parts != null && parts.Length > 1 ? parts[1] : null;
             if (probeName != null) ProbeNameOnEachThread(probeName, probes);
-            FillWindowEvidence(probes, GetProcessId(_hProcess));
+            // Guarded the same way the pause path guards it (PickPauseThread). Window evidence is
+            // best-effort on BOTH paths: it is a display column here and a tiebreak there, and neither is
+            // worth losing the command — or the session — to a window-manager hiccup. The reason is shown
+            // rather than swallowed, so a genuine defect in the walk is not indistinguishable from an app
+            // with no windows up.
+            try { FillWindowEvidence(probes, ProcessId()); }
+            catch (Exception ex) { Console.WriteLine("  (window evidence unavailable: " + ex.GetType().Name + ")"); }
 
             Console.WriteLine($"  threadscan (read-only diagnostic; runs no target code): {probes.Count} live thread(s), stopped tid={stoppedTid}");
             Console.WriteLine("    seq  tid    stopped  state     eip        image            clfr  wins      top Clarion frame                     Cla$THREAD  created");
@@ -173,6 +179,11 @@ namespace ClarionDbg.Cli
         private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hwnd);
+        // GetClassName sits outside the originally blessed user32 set above, and that was queried in review
+        // rather than assumed. BLESSED by the PM on 2026-09-17 (ticket ab4b3fcf item 10): it is
+        // message-free, answered kernel-side from the window's own class, and its result is used only for
+        // threadscan's display string. Recorded here so the next reader finds the decision instead of
+        // re-litigating it — and so that a future addition to this block is still an explicit decision.
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
         private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder buf, int max);
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
@@ -182,7 +193,13 @@ namespace ClarionDbg.Cli
         private const uint GW_HWNDNEXT = 2;
         private const uint GW_CHILD = 5;
         private const int WIN_MAX_DEPTH = 4;      // frame -> MDI client -> child window -> its controls
-        private const int WIN_MAX = 400;          // hard cap: never walk a pathological window tree forever
+        // Hard cap: never walk a pathological window tree forever. PER ROOT, not per enumeration — and the
+        // name says so now. As a whole-enumeration budget it changed the ANSWER, not just the cost: a first
+        // root with a large control tree could exhaust it before the browse's thread was reached, so that
+        // thread got no window evidence, no CrossRank, and the pause silently fell through from the
+        // `window-z` rule to `newest`. A cap that decides which thread you stop on is not a safety valve.
+        // Per root, one pathological root can only cost itself.
+        private const int WIN_MAX_PER_ROOT = 400;
 
         /// <summary>Walk the debuggee's window tree with GetWindow, so every window carries its TRUE
         /// z-order rank among its siblings (GW_CHILD gives the topmost child, GW_HWNDNEXT descends the
@@ -198,13 +215,20 @@ namespace ClarionDbg.Cli
                 if (p == pid) roots.Add(h);
                 return true;
             }, IntPtr.Zero);
-            for (int i = 0; i < roots.Count; i++) WalkWindow(list, roots[i], IntPtr.Zero, pid, i, 0);
+            for (int i = 0; i < roots.Count; i++)
+            {
+                int before = list.Count;
+                WalkWindow(list, roots[i], IntPtr.Zero, pid, i, 0, before + WIN_MAX_PER_ROOT);
+                if (list.Count - before >= WIN_MAX_PER_ROOT)
+                    Console.WriteLine($"  (window walk: root {i} hit the {WIN_MAX_PER_ROOT}-window cap — its "
+                                      + "tree is truncated; later roots are unaffected)");
+            }
             return list;
         }
 
-        private void WalkWindow(List<WinInfo> list, IntPtr h, IntPtr parent, uint pid, int sib, int depth)
+        private void WalkWindow(List<WinInfo> list, IntPtr h, IntPtr parent, uint pid, int sib, int depth, int budget)
         {
-            if (h == IntPtr.Zero || depth > WIN_MAX_DEPTH || list.Count >= WIN_MAX) return;
+            if (h == IntPtr.Zero || depth > WIN_MAX_DEPTH || list.Count >= budget) return;
             uint p; uint t = GetWindowThreadProcessId(h, out p);
             if (p != pid) return;
             uint pp = 0, ptid = 0;
@@ -219,8 +243,8 @@ namespace ClarionDbg.Cli
                 Sib = sib, Depth = depth, Cls = cls.ToString(), Text = txt.ToString(),
             });
             int i = 0;
-            for (IntPtr c = GetWindow(h, GW_CHILD); c != IntPtr.Zero && list.Count < WIN_MAX; c = GetWindow(c, GW_HWNDNEXT))
-                WalkWindow(list, c, h, pid, i++, depth + 1);
+            for (IntPtr c = GetWindow(h, GW_CHILD); c != IntPtr.Zero && list.Count < budget; c = GetWindow(c, GW_HWNDNEXT))
+                WalkWindow(list, c, h, pid, i++, depth + 1, budget);
         }
 
         /// <summary>Attribute the debuggee's windows to the probed threads. The signal that matters is
@@ -320,7 +344,9 @@ namespace ClarionDbg.Cli
 
             foreach (var f in frames)
             {
-                if (f.Module == null && f.Proc == null) continue;   // frame 0 in un-mapped code
+                // One test, not two: `Module == null && Proc == null` was sitting immediately above
+                // `Module == null`, which subsumes it — the first could never decide anything the second
+                // did not already decide. Frame 0 in un-mapped code is caught by this line too.
                 if (f.Module == null) continue;                     // not TSWD-resolved: not a Clarion frame
                 p.ClarionFrames++;
                 if (f.Uncertain) p.FramesUncertain = true;
@@ -366,6 +392,10 @@ namespace ClarionDbg.Cli
             return GetThreadTimes(hThread, out c, out e, out k, out u)
                 ? DateTime.FromFileTimeUtc(c).ToLocalTime() : default(DateTime);
         }
+
+        /// <summary>The debuggee's pid, for the window enumeration. One accessor rather than two call sites
+        /// asking the OS the same question, so the source of the answer can change in one place.</summary>
+        private uint ProcessId() { return GetProcessId(_hProcess); }
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
         private static extern uint GetProcessId(IntPtr hProcess);
@@ -604,7 +634,7 @@ namespace ClarionDbg.Cli
             // indistinguishable from "the app has no windows up", and every pause would quietly fall through
             // to `newest` with nothing in the log to say why. The reason rides along in the rule name.
             string windowFailure = null;
-            try { FillWindowEvidence(candidates, GetProcessId(_hProcess)); }
+            try { FillWindowEvidence(candidates, ProcessId()); }
             catch (Exception ex) { windowFailure = ex.GetType().Name; }
 
             ThreadProbe best = null;
