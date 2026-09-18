@@ -1,4 +1,4 @@
-# Negative tests for the cross-addin reflection hooks into ClarionAssistant.
+﻿# Negative tests for the cross-addin reflection hooks into ClarionAssistant.
 #
 # A reflection hook with no negative test is unverified by construction. The happy path - ClarionAssistant
 # loaded, correct build, everything binds - is the one case that CANNOT go wrong quietly. Every failure here

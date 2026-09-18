@@ -1,4 +1,4 @@
-# Paced interactive smoke test for the Phase 2 engine.
+﻿# Paced interactive smoke test for the Phase 2 engine.
 # Launches ClarionDbg break --interactive, waits for the paused event, then issues
 # step / stepover / stepout / continue with real delays, printing all output.
 #

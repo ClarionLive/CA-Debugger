@@ -1,4 +1,4 @@
-# Shared machinery for the interactive engine harnesses (test-interactive.ps1, test-watch-threaded.ps1).
+﻿# Shared machinery for the interactive engine harnesses (test-interactive.ps1, test-watch-threaded.ps1).
 #
 # Both launch `ClarionDbg break <target> --interactive --json`, pump its stdout through a synchronized
 # sink, and wait for a "paused" event. test-watch-threaded.ps1 used to carry its own compressed copy of
