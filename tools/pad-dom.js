@@ -42,11 +42,18 @@ function extractConst(html, name) {
 function dataKey(attr) { return attr.replace(/^data-/, '').replace(/-([a-z])/g, (_, c) => c.toUpperCase()); }
 function parseSel(sel) {
   const out = { classes: [], attrs: [] };
-  const re = /\.([A-Za-z0-9_-]+)|\[([A-Za-z0-9_-]+)(?:\s*=\s*"((?:[^"\\]|\\.)*)")?\]/g;
+  // `[attr="value" i]` — the CSS case-insensitive attribute flag. The page uses it to resolve a row keyed
+  // in one spelling from a reply carrying another, so a mini-DOM that ignored the flag would match
+  // case-sensitively and report a bug that is not there (or hide one that is).
+  const re = /\.([A-Za-z0-9_-]+)|\[([A-Za-z0-9_-]+)(?:\s*=\s*"((?:[^"\\]|\\.)*)")?(\s+[iI])?\]/g;
   let m;
   while ((m = re.exec(sel))) {
     if (m[1]) out.classes.push(m[1]);
-    else out.attrs.push({ name: m[2], value: m[3] === undefined ? null : m[3].replace(/\\(.)/g, '$1') });
+    else out.attrs.push({
+      name: m[2],
+      value: m[3] === undefined ? null : m[3].replace(/\\(.)/g, '$1'),
+      ci: !!m[4],
+    });
   }
   return out;
 }
@@ -63,9 +70,15 @@ class ClassList {
 class El {
   constructor(tag) {
     this.tag = tag; this.classList = new ClassList(); this.dataset = {}; this.children = [];
-    this.parentElement = null; this.textContent = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100;
+    this.parentElement = null; this._text = ''; this.attrs = {}; this.scrollWidth = 10; this.clientWidth = 100;
     this.style = {}; this._html = '';
   }
+  // Setting textContent REMOVES the children, as it does in a real DOM. The page relies on exactly that:
+  // the in-place value editor does `cell.textContent=''; cell.appendChild(input)` to open and
+  // `cell.textContent=old` to close, so a mini-DOM that kept the children left a dead <input> behind and
+  // a second edit on the same cell drove the FIRST editor's handlers.
+  set textContent(v) { this.children.forEach(c => { c.parentElement = null; }); this.children = []; this._text = String(v); }
+  get textContent() { return this._text; }
   getBoundingClientRect() { return { left: 0, top: 0, right: 100, bottom: 20, width: 100, height: 20 }; }
   addEventListener() { }
   focus() { }      // the in-place value editor focuses and selects itself when it opens
@@ -75,7 +88,9 @@ class El {
     if (!p.classes.every(c => this.classList.contains(c))) return false;
     return p.attrs.every(a => {
       const v = this.dataset[dataKey(a.name)];
-      return a.value === null ? v !== undefined : v === a.value;
+      if (a.value === null) return v !== undefined;
+      if (v === undefined) return false;
+      return a.ci ? String(v).toLowerCase() === a.value.toLowerCase() : v === a.value;
     });
   }
   walk(fn) { for (const c of this.children) { fn(c); c.walk(fn); } }

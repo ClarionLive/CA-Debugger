@@ -550,7 +550,7 @@ namespace ClarionDebugger.Terminal
                     case "stepout": CmdStepOut(); break;
                     case "stop": CmdStop(); break;
                     case "watch":
-                        if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) _svc.Watch(data); }
+                        if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
                     case "expand":   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
@@ -591,7 +591,7 @@ namespace ClarionDebugger.Terminal
                         // are watched purely because they are visible, which the page's own Watch list
                         // doesn't know about — and those rows are on screen showing the old thread's values.
                         if (_svc.State == DebugSessionState.Paused)
-                            foreach (var name in _watched) _svc.Watch(name);
+                            foreach (var name in _watched) WatchOrExplain(name);
                         break;
                     case "editvar": EditVar(data); break;
                     case "jump": Jump(data); break;
@@ -1190,7 +1190,7 @@ namespace ClarionDebugger.Terminal
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
                 // so this also tells the page which thread the panels it is about to receive belong to.
                 _svc.RequestThreads();
-                foreach (var name in _watched) _svc.Watch(name);
+                foreach (var name in _watched) WatchOrExplain(name);
 
                 // 'stepi' = a single machine-instruction step driven from the Disassembly view. Keep the
                 // panel refresh above, but DON'T jump the editor to the .clw — that activates the source
@@ -1281,6 +1281,30 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append("]}");
             Post(sb.ToString());
+        }
+
+        /// <summary>Ask the engine for a name's value, and ANSWER THE PAGE when we cannot.
+        /// <para>
+        /// <see cref="ClarionDebuggerService.Watch"/> refuses a name it cannot put on the wire — the engine
+        /// protocol is line- and space-split, so a name containing a space or a quote would arrive as a
+        /// second command — and it refuses silently. Nothing is sent, so no reply can ever come, and the
+        /// row that asked sits on "…" for the rest of the session looking like it is still loading. The
+        /// engine emits an outcome for every watch it receives; this makes the ones it never receives
+        /// behave the same way, as the miss they are.
+        /// </para>
+        /// No tid: this answer is not from any thread, and an unstamped reply is unscoped, which the page
+        /// accepts whatever it is currently showing.</summary>
+        private void WatchOrExplain(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return;
+            string why = null;
+            if (!ClarionDebuggerService.IsValidWatchName(name))
+                why = "not a data name the debugger can read — letters, digits and _ : $ . only, up to 128 characters";
+            else if (!_svc.Watch(name))
+                why = "the engine did not accept the request";
+            if (why == null) return;
+            Post("{\"type\":\"watch\",\"name\":" + Str(name) + ",\"found\":false,\"outOfScope\":false,\"error\":"
+                + Str(why) + "}");
         }
 
         private void OnStack(List<DebugStackFrame> frames, uint? tid)

@@ -17,14 +17,17 @@ const extract = name => pad.extract(html, name);
 const El = pad.El;
 
 // ---- scenario state: this test drives ONE row at a time, so the document stub is deliberately tiny ----
+let selTid = null, stopTid = null;   // no thread selection in this suite: editThreadSuffix() -> ''
 let ROW = null;
 let DETAIL = null;          // an OPEN Watch detail panel, when a scenario registers one
 const document = {
   createElement: t => new El(t),
   querySelectorAll: sel => (sel.startsWith('[data-name=') && ROW) ? [ROW] : [],
   querySelector: sel => {
-    const m = /^\.wdetail\[data-detail="(.*)"\]$/.exec(sel);
-    if (m && DETAIL && DETAIL.dataset.detail === m[1]) return DETAIL;
+    // `[… i]` — the page looks the panel up case-insensitively, because Clarion names are
+    // case-insensitive and the reply carries whatever spelling was asked for.
+    const m = /^\.wdetail\[data-detail="(.*)"(\s+i)?\]$/.exec(sel);
+    if (m && DETAIL && DETAIL.dataset.detail.toLowerCase() === m[1].toLowerCase()) return DETAIL;
     return null;
   },
 };
@@ -36,6 +39,8 @@ const window = { innerWidth: 1200, innerHeight: 800 };
 let tipTarget = null, tipTimer = null;
 // deps applyValue touches that are not under test
 const values = new Map();
+// Clarion data names are case-insensitive; the page keys this cache through nameKey (see debugger.html).
+const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
 const cssEsc = s => s.replace(/["\\]/g, '\\$&');
 const beginEdit = () => {};
 const STAR = '*';
@@ -45,8 +50,11 @@ const STAR = '*';
 const dtModes = {};
 
 // clearEditMeta exists only in the FIXED page; running this against the pre-fix one is the before/after proof
+// editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
+// this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
 const src = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-             'clearEditMeta','setEditMeta','applyNote','wireEdit','applyValue','showTipFor'].map(n => {
+             'clearEditMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+             'applyValue','showTipFor'].map(n => {
   try { return extract(n); }
   catch (e) { console.log('   (note: ' + n + ' absent — pre-fix page)'); return 'function ' + n + '(){}'; }
 }).join('\n');
