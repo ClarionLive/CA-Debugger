@@ -143,10 +143,16 @@ namespace ClarionDbg.Cli
                 // 1. the shared template — unconditional, needs nothing resolved
                 if (Overlaps(wLo, wHi, tmplLo, tmplSpan))
                 {
+                    // Point at the first byte of THIS WRITE that actually lands in the template — which
+                    // is the start only when the write begins inside it. Testing `va` alone here was a
+                    // leftover of the start-only era: a write straddling in from below would report "has no
+                    // instance of it" even for a thread that has one. A refusal that misdescribes why is a
+                    // small lie at the worst possible moment.
+                    uint hitVa = va >= tmplLo ? va : tmplLo;
                     uint ownBase;
-                    string where = m.HasThreadedData && va >= tmplLo && va < tmplLo + tmplSpan
-                                   && TryInstanceBase(m, selectedTid, out ownBase)
-                        ? " — thread " + selectedTid + "'s own copy is at 0x" + (va - tmplLo + ownBase).ToString("X")
+                    string where = m.HasThreadedData && TryInstanceBase(m, selectedTid, out ownBase)
+                        ? " — thread " + selectedTid + "'s own copy of that byte is at 0x"
+                          + (hitVa - tmplLo + ownBase).ToString("X")
                         : " and thread " + selectedTid + " has no instance of it";
                     reason = "not written: " + Range(va, len) + " touches the shared " + m.Name
                            + " template, not one thread's data" + where;
