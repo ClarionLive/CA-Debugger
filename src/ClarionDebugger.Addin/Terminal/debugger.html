@@ -1844,6 +1844,12 @@
 
   // "…" means a reply is on its way. If the engine never answers for this thread (it exited between the
   // list and the click; the read failed with no event at all), the row must stop pretending to load.
+  //
+  // The row's cell is not the only thing showing that "…": invalidateThreadScopedState blanks every OPEN
+  // Watch .wdetail panel to "…" as well, and a panel is only ever refilled by a REPLY (applyValue). So a
+  // name that is never answered used to resolve on the row while its expanded panel sat on "…" for the
+  // rest of the session — the two halves of the same watch disagreeing, and the panel the more prominent
+  // of them. Whatever this sweep writes on the cell it must write on the panel too.
   const PENDING_SWEEP_MS=4000;
   function armPendingSweep(gen, tid){
     setTimeout(()=>{
@@ -1854,6 +1860,13 @@
         v.classList.remove('pending'); v.classList.add('unavail');
         v.textContent='(no reply)'; v.title='No reply from thread '+tid+' for this name.';
         delete v._pendGen; n++;
+        // Same selector and same open-check applyValue uses for its own two detail updates (the `i` flag
+        // because the panel may be keyed in a different spelling from the reply).
+        const r=v.parentElement, nm=(r&&r.dataset)?(r.dataset.name||''):'';
+        if(nm){
+          const det=document.querySelector('.wdetail[data-detail="'+cssEsc(nm)+'" i]');
+          if(det && det.style.display!=='none') det.textContent=v.textContent;
+        }
       });
       if(stackPendingTid===tid){ stackPendingTid=null; renderStack(); }
       if(n) logLine('err','thread '+tid+': '+n+' value(s) got no reply');

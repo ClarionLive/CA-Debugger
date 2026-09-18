@@ -724,22 +724,42 @@ console.log('\n10) a row is never left on "…" when no reply can come');
 {
   resetAll();
   onThreads(THREADS_EVENT);
-  const answered = makeRow('PUB:PUB_NAME');
+  const answered = makeRow('PUB:PUB_NAME', { watch: true });
   const never = makeRow('PUB:CITY');                       // collapsed tree row: nobody is watching it
+  // An EXPANDED Watch panel is a second face of the same row, and only a REPLY ever refills it — so it is
+  // the half the sweep used to leave behind. A CLOSED one next to it proves the sweep respects the same
+  // open-check applyValue does, rather than writing into hidden panels.
+  const openDet = new El('div'); openDet.classList.add('wdetail');
+  openDet.dataset.detail = 'PUB:PUB_NAME'; openDet.style.display = '';
+  answered.parentElement.append(openDet);
+  const shutDet = new El('div'); shutDet.classList.add('wdetail');
+  shutDet.dataset.detail = 'PUB:CITY'; shutDet.style.display = 'none'; shutDet.textContent = 'stale';
+  never.parentElement.append(shutDet);
+
   applyValue('PUB:PUB_NAME', true, "'Algodata'", 'STRING(41)', true, A_INSTANCE);
+  check('(setup) the open detail shows the value', openDet.textContent === "'Algodata'", openDet.textContent);
 
   onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
   check('(setup) both rows read "…" right after the switch',
         state(answered).text === '…' && state(never).text === '…');
+  check('(setup) and the open detail was blanked to "…" too', openDet.textContent === '…', openDet.textContent);
 
   await sleep(PENDING_SWEEP_MS + 40);
   const a = state(answered), n = state(never);
   console.log('   answered-before: ' + JSON.stringify(a) + '\n   never-answered:  ' + JSON.stringify(n));
+  console.log('   open detail: ' + JSON.stringify(openDet.textContent) +
+              '   closed detail: ' + JSON.stringify(shutDet.textContent));
   check('a row that had a value and got no reply stops pretending to load',
         a.text === '(no reply)' && a.cls.includes('unavail') && !a.cls.includes('pending'));
   check('…and says which thread did not answer', (a.title || '').includes(String(BROWSE_TID)), a.title);
   check('a row nobody asked about is left alone', n.text === '…' && n.cls.includes('pending'));
   check('the console records it', LOGGED.some(l => l.includes('got no reply')), LOGGED.join('|'));
+  // ab4b3fcf item 11: the panel used to sit on "…" for the rest of the session while its own row said
+  // "(no reply)" — the two halves of one watch disagreeing.
+  check('the OPEN detail stops pretending to load, with the row', openDet.textContent === '(no reply)',
+        'detail=' + JSON.stringify(openDet.textContent));
+  check('a CLOSED detail is not written into', shutDet.textContent === 'stale',
+        'detail=' + JSON.stringify(shutDet.textContent));
 }
 
 console.log('\n11) the sweep never fires over a newer switch, nor once the target has resumed');
