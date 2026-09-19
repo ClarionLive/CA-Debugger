@@ -266,6 +266,13 @@ Write-Host '6) a POKE is a signal too, so it goes through the same identity chec
     # The pid argument of a window poke must be a variable this file assigned from the shared resolver, not a
     # pid expression. Read through the PARSER: these are method invocations, not commands, so section 5's
     # command scan cannot see them at all.
+    #
+    # TWO KNOWN BLIND SPOTS, so the site COUNT below is the real anchor rather than this scan:
+    #   1. Get-ResolvedPidVars matches the ASSIGNMENT text, not dataflow. A variable assigned from the
+    #      resolver and later RE-assigned from a bare pid still passes.
+    #   2. $POKE_METHODS is a fixed name list. A future [Poke]::Click would be invisible to this scan.
+    # Both are caught by the asserted number of poke sites failing, not by the scan noticing the new shape —
+    # which is why that count is asserted as an exact number and must be updated deliberately.
     $POKE_METHODS = @('Menu', 'Wake', 'Poke')
     function Get-PokePidArgs([string]$path) {
         $tok = $null; $err = $null

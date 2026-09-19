@@ -98,7 +98,7 @@ namespace ClarionDbg.Cli
                                   + "each hold with the other one out of the way; and a breakpoint hit "
                                   + "supersedes an in-flight step only when it PAUSES — both pausing routes "
                                   + "cancel the step, and a silently-resumed hit leaves the session, its "
-                                  + "temp INT3s and its call-entry anchor untouched; and all 5 mutating "
+                                  + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
                                   + "test seams REFUSE an attached engine, with OnUserBpForTest also "
                                   + "refusing the --once and interactive engines, while all of them still "
                                   + "work with no target.");
@@ -487,6 +487,13 @@ namespace ClarionDbg.Cli
             // any public path; it is set directly here. 0x1234 is not a handle this process owns, so every
             // write an UNGUARDED handler would attempt through it fails — running the pre-fix code to watch
             // this check fail touches nothing. A rename of the field fails loudly instead of passing quietly.
+            //
+            // THIS DEPENDS ON DebugEngine HAVING NO DISPOSER, and that is not an accident to be discovered
+            // later: there is no Dispose and no finalizer, so nothing ever calls CloseHandle(_hProcess) on
+            // these throwaway engines and the fake 0x1234 is never handed to the OS. If a Dispose or
+            // finalizer is ever added that closes _hProcess, this check starts closing an arbitrary handle
+            // belonging to the protocolcheck process itself. Give the fake engines a real-but-harmless
+            // handle (e.g. a duplicate of the current process) before adding one.
             var hProcField = typeof(DebugEngine).GetField("_hProcess",
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
             if (hProcField == null)
@@ -520,6 +527,8 @@ namespace ClarionDbg.Cli
                             e => e.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
             refusesAttached("CancelStepForTest", null, e => e.CancelStepForTest());
             refusesAttached("ArmPrologueBypassForTest", null, e => e.ArmPrologueBypassForTest(0x1000));
+            refusesAttached("RegisterThreadedModuleForTest", null,
+                            e => e.RegisterThreadedModuleForTest("t.dll", 0x00400000, 0x1000, 0x2000));
 
             // The other two caller choices, ISOLATED from the attached-target guard above: this engine has NO
             // target, so only the --once / interactive refusal can stop it. Pre-fix, the --once arm reached
@@ -549,6 +558,7 @@ namespace ClarionDbg.Cli
                 CaptureConsole(() => ok.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
                 ok.ArmPrologueBypassForTest(0x1000);
                 ok.CancelStepForTest();
+                ok.RegisterThreadedModuleForTest("t.dll", 0x00500000, 0x1000, 0x2000);
             }
             catch (Exception ex)
             {
