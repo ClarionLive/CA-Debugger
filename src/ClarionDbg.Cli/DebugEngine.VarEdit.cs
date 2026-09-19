@@ -236,6 +236,11 @@ namespace ClarionDbg.Cli
         internal void RegisterThreadedModuleForTest(string name, uint loadBase, uint cwtlsLo, uint cwtlsHi,
                                                     uint iatRva = 4)
         {
+            // Sixth mutating seam, and the reason it is guarded like the other five: what it registers is the
+            // .cwtls range that ThreadedWriteAllowed consults, so a fake range on an ATTACHED engine could let
+            // a real write past the shared-template refusal. An invariant that covers five of six mutating
+            // seams reads to the next person as optional, which is worse than not having one.
+            RefuseSeamIfAttached("RegisterThreadedModuleForTest");
             _modules.Add(new LoadedModule
             {
                 Name = name, LoadBase = loadBase, Size = 0x200000,

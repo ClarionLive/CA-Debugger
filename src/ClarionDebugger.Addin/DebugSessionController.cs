@@ -137,11 +137,25 @@ namespace ClarionDebugger
         ///     re-enabling Start now that the old engine has actually died (close→reopen completion path).
         /// If the current target reports a LIVE session (a fresh pad already started its own), we leave its state
         /// alone — the old teardown completing must not stomp a new live session.
+        ///
+        /// The CALLER is checked too, which is what <paramref name="target"/> is for. "Stopped" is a claim about
+        /// the pad making it, and ClarionDebuggerService.Stop() no longer publishes Idle when it could not
+        /// confirm the engine process dead — so a caller that still reports a live session is telling us its
+        /// teardown did not finish. Publishing Idle on that word would re-enable Start against a target still
+        /// owned by the old process, which is the close→reopen→restart race this controller exists to prevent.
+        /// The cost is deliberate and one-sided: after a teardown that never confirmed, Start stays disabled
+        /// until the pad is closed and reopened (Unregister clears _target, and the next Register then reads
+        /// Idle). A disabled Start after a failed kill is a far cheaper wrong answer than an enabled one.
         /// </summary>
         public static void NotifyStopped(IDebugSessionTarget target)
         {
             lock (_gate)
             {
+                // The teardown that is reporting in must actually be over. A pad whose Stop() could not confirm
+                // the process dead still reads non-idle, and its word for "stopped" is not good enough.
+                try { if (target != null && !target.IsSessionIdle) return; }
+                catch { }   // a throwing target can't be confirmed live either way — fall through to the check below
+
                 bool currentIsIdle;
                 try { currentIsIdle = _target == null || _target.IsSessionIdle; }
                 catch { currentIsIdle = _target == null; } // a throwing target can't be confirmed live — only Idle if none
@@ -186,7 +200,9 @@ namespace ClarionDebugger
 
         /// <summary>Run to the active Monaco editor's cursor line. Entry point for ClarionAssistant's editor
         /// context menu, reached by reflection. Frozen contract: public static void RunToCursor(), a silent
-        /// no-op unless Paused with a ready pad. A null spec makes the pad resolve the live Monaco cursor.</summary>
+        /// no-op unless Paused with a ready pad. A null spec makes the pad resolve the live Monaco cursor.
+        /// This is the one forwarder reached from OUTSIDE this addin, so it is the one with no guarantee
+        /// about the calling thread; <see cref="Invoke"/> marshals for all of them.</summary>
         public static void RunToCursor() { Invoke(t => t.CmdRunToCursor(null), allowed: IsPaused); }
 
         public static void Pause()
@@ -207,6 +223,27 @@ namespace ClarionDebugger
             DebugControllerState s;
             lock (_gate) { t = _target; s = _state; }
             if (t == null) return;
+
+            // THREAD GUARD. Every target method is UI-thread code: they drive WebView2, and CmdRunToCursor
+            // mutates the transient-breakpoint list with no lock of its own. The forwarders above are public
+            // and RunToCursor is reached by REFLECTION from ClarionAssistant, so nothing here can assume the
+            // caller is on the pad's thread.
+            //
+            // Marshal rather than reject. Every forwarder is void by frozen contract, so a refusal is
+            // unobservable to the caller — an off-thread context-menu command would just look like the
+            // debugger ignoring the user, which is the silent failure this whole ticket is about.
+            //
+            // Re-entering Invoke on the pad's thread re-reads the target and re-runs the guards THERE, so a
+            // state change while the post was in flight is still honoured; on that pass InvokeRequired is
+            // false and it falls through, so this cannot recurse.
+            var ctl = t as System.Windows.Forms.Control;
+            if (ctl != null && ctl.IsHandleCreated && ctl.InvokeRequired)
+            {
+                try { ctl.BeginInvoke((Action)(() => Invoke(action, requireReady, allowed))); }
+                catch (Exception ex) { Debug.WriteLine("[DebugSessionController] marshal failed: " + ex.Message); }
+                return;
+            }
+
             if (allowed != null && !allowed(s)) return;       // state-guard: stale-enabled click => no-op
             if (requireReady && !SafeIsReady(t)) return;
             try { action(t); }

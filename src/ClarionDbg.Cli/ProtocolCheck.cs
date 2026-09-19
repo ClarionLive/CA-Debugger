@@ -60,29 +60,575 @@ namespace ClarionDbg.Cli
             }
 
             // 3. Sentinels must not appear anywhere, including the -1 an int cast could produce.
+            //
+            // This check used to search the stamped output for the literal `"tid":-1` — which a uint tid can
+            // never produce, so it passed without asserting anything: `(uint)-1` stamps as 4294967295, a
+            // number the pad would have read as a real thread. The assertion is now the same one the rest of
+            // the file makes, that NO tid member is written at all, and it is made against the value that
+            // actually reaches the writer.
             string neg = DebugEngine.WithTidForTest(shapes[0], unchecked((uint)-1));
-            if (neg.IndexOf("\"tid\":-1", StringComparison.Ordinal) >= 0)
-                failures.Add("paused: a -1 sentinel reached the wire");
+            if (HasTopLevelTid(neg))
+                failures.Add("paused: a -1 sentinel reached the wire as " + unchecked((uint)-1)
+                             + " — an unknown tid must be an absent member");
+            if (neg != shapes[0])
+                failures.Add("paused: a -1 tid must leave the event untouched, got " + neg);
 
             // 4. A thread-scoped event with no payload is still well-formed JSON when stamped.
             if (DebugEngine.WithTidForTest("{}", 42) != "{\"tid\":42}")
                 failures.Add("empty object: stamping produced malformed JSON");
 
+            CheckHandBuiltTidEmitters(failures);
+            CheckResumeVerbs(failures);
+            CheckStepGuards(failures);
+            CheckBpHitVsStep(failures);
+            CheckSeamsRefuseLiveTarget(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
 
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
             {
-                Console.WriteLine($"protocolcheck: {shapes.Length} event shapes OK - a known tid is stamped, "
+                Console.WriteLine($"protocolcheck: {shapes.Length} spliced event shapes + all 4 hand-built "
+                                  + "emitters OK - a known tid is stamped, "
                                   + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
                                   + "descendants offer no edit metadata (the expand path is a known gap — "
-                                  + "see HandleExpandCommand, ticket cc3ac96e); and no write, of any length, "
-                                  + "can touch the shared template.");
+                                  + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
+                                  + "can touch the shared template; the resume-verb set has one owner across "
+                                  + "its 2 remaining sites; Step Over's ESP gate and its prologue bypass "
+                                  + "each hold with the other one out of the way; and a breakpoint hit "
+                                  + "supersedes an in-flight step only when it PAUSES — both pausing routes "
+                                  + "cancel the step, and a silently-resumed hit leaves the session, its "
+                                  + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
+                                  + "test seams REFUSE an attached engine, with OnUserBpForTest also "
+                                  + "refusing the --once and interactive engines, while all of them still "
+                                  + "work with no target.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
             return 1;
+        }
+
+        /// <summary>
+        /// The absent-tid rule, asserted against the FOUR hand-built emitters — the ones WithTid never saw.
+        ///
+        /// WithTid splices whole events and so was the only tid writer the checks above could reach. The
+        /// emitters in DebugEngine.Threads.cs build their JSON by hand, which is why all three recorded
+        /// breakages of this rule happened on one of them: `threadselected` carried a second, duplicated copy
+        /// of the rule, and `LogPauseChoice` carried none at all and wrote a top-level `"tid":` whatever the
+        /// value was — including the 0 that LastResortThread returns when there is no main thread.
+        ///
+        /// These run the REAL builders through internal seams, not copies of their shapes. A check written
+        /// against a hand-written copy asserts only that two hand-written strings agree, which is exactly the
+        /// evidence that was missing when this rule was broken three times in one day.
+        ///
+        /// Each emitter is checked three ways: a known tid IS written (the CONTROL — without it, a builder
+        /// that dropped the member entirely would pass the other two for the wrong reason), and both unknown
+        /// values (0 and the (uint)-1 that an int cast produces) write no member.
+        ///
+        /// FOUR is a count that can be checked against the code: threadselected, the pause-choice console
+        /// event, the `threads` rows and the `threadscan` rows. If a fifth hand-built emitter appears, this
+        /// check does not grow to meet it — add it here, and see the rule holder's note in DebugEngine.cs.
+        /// </summary>
+        private static void CheckHandBuiltTidEmitters(List<string> failures)
+        {
+            const uint known = 116932;
+            const uint minusOne = unchecked((uint)-1);
+
+            // --- 1. threadselected: a top-level tid, so the pad's own extraction rule applies directly.
+            string sel = DebugEngine.ThreadSelectedJsonForTest(known, true, null);
+            if (!HasTopLevelTid(sel) || sel.IndexOf("\"tid\":116932", StringComparison.Ordinal) < 0)
+                failures.Add("threadselected control: a KNOWN tid was not written at all — " + sel);
+            foreach (var bad in new[] { 0u, minusOne })
+            {
+                string r = DebugEngine.ThreadSelectedJsonForTest(bad, false, "unknown or exited thread");
+                if (HasTopLevelTid(r))
+                    failures.Add("threadselected: tid " + bad + " emitted a tid member — " + r);
+                if (r.IndexOf("\"error\":", StringComparison.Ordinal) < 0)
+                    failures.Add("threadselected: a refusal with an unknown tid dropped its error text — " + r);
+            }
+
+            // --- 2. the pause-choice console event: the emitter that was writing the member unconditionally.
+            string pc = DebugEngine.PauseChoiceJsonForTest("pause: thread 116932 chosen by window-z", known);
+            if (!HasTopLevelTid(pc))
+                failures.Add("pause-choice control: a KNOWN tid was not written at all — " + pc);
+            foreach (var bad in new[] { 0u, minusOne })
+            {
+                // tid 0 is REACHABLE here: LastResortThread returns _mainTid, else breakTid, else 0.
+                string r = DebugEngine.PauseChoiceJsonForTest("pause: thread 0 chosen by main", bad);
+                if (HasTopLevelTid(r))
+                    failures.Add("pause-choice: tid " + bad + " emitted a tid member — the pad would read it "
+                                 + "as a real thread: " + r);
+                if (r.IndexOf("\"text\":", StringComparison.Ordinal) < 0)
+                    failures.Add("pause-choice: the log text was lost when the tid was absent — " + r);
+            }
+
+            // --- 3+4. threads rows and threadscan rows: PER-ROW tids, one nesting level down.
+            //     HasTopLevelTid deliberately ignores those (a row's tid is not the event's own), so they are
+            //     checked by counting the member instead — which is also how a sentinel would show up.
+            string rows = DebugEngine.ThreadsJsonForTest(known, known, new[] { known, 0u, minusOne });
+            CheckNoSentinelRows(failures, "threads", rows, known);
+            string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
+            CheckNoSentinelRows(failures, "threadscan", scan, known);
+        }
+
+        /// <summary>
+        /// The resume-verb set has ONE owner, and IsResumeVerb is it.
+        ///
+        /// The set used to exist in THREE hand-maintained copies: IsResumeVerb, the pause-loop switch, and
+        /// the running-state switch (the pad held a fourth until a9f3407 removed it). Adding a verb to one
+        /// left the others stale, and the recorded symptom was silent — the pad sat under a stale "viewing
+        /// thread N" banner because a verb nobody had told the other list about did not reset the selection.
+        ///
+        /// TWO sites remain and that number is checkable against the code: IsResumeVerb, which OWNS the set,
+        /// and the pause-loop switch, whose case labels must dispatch to a handler and so cannot be a list.
+        /// The running-state switch no longer holds a copy — it asks IsResumeVerb. "Every resume site" would
+        /// pass silently when a third copy appeared; "two sites" does not.
+        ///
+        /// The REJECTIONS below are not padding. IsResumeVerb is now consulted ahead of the running-state
+        /// switch, so a verb it wrongly accepts is diverted and never reaches its own case. pause/break is
+        /// the dangerous one: that switch implements it, and it once WAS in this list, where it reset the
+        /// selection and then fell through to "unknown command".
+        /// </summary>
+        private static void CheckResumeVerbs(List<string> failures)
+        {
+            // The set, spelled out: 5 commands, 18 spellings. The pause loop dispatches every one of these.
+            string[] resume =
+            {
+                "continue", "c", "g",
+                "step", "stepinto", "s", "i",
+                "stepover", "next", "n",
+                "stepout", "out", "finish", "o",
+                "stepi", "si", "nexti", "ni",
+            };
+            if (resume.Length != 18)
+                failures.Add("resume verbs: this check claims 18 spellings but lists " + resume.Length);
+            foreach (var v in resume)
+                if (!DebugEngine.IsResumeVerbForTest(v))
+                    failures.Add("resume verbs: '" + v + "' is dispatched by the pause loop as a resume verb "
+                                 + "but IsResumeVerb rejects it — it will not reset the thread selection, and "
+                                 + "the pad keeps a stale 'viewing thread N' banner");
+
+            // Verbs the RUNNING-STATE switch implements itself. IsResumeVerb is consulted before that switch,
+            // so accepting any of these would divert it from the case that handles it.
+            string[] handledWhileRunning = { "pause", "break", "bp", "sym", "thread", "quit", "q", "kill" };
+            foreach (var v in handledWhileRunning)
+                if (DebugEngine.IsResumeVerbForTest(v))
+                    failures.Add("resume verbs: '" + v + "' is handled by the running-state switch, but "
+                                 + "IsResumeVerb accepts it — it would be diverted and never reach its case");
+
+            // Verbs that are paused-only but NOT resume verbs: they must still fall to the switch's own
+            // "only valid while paused" case, not the hoisted one. Same error text today, but they are a
+            // different set and must not be absorbed into this one.
+            string[] pausedOnlyReads = { "mem", "regs", "stack", "watch", "locals", "moduledata", "disasm",
+                                         "setval", "threads", "threadscan", "framelocals", "libstate", "expand" };
+            foreach (var v in pausedOnlyReads)
+                if (DebugEngine.IsResumeVerbForTest(v))
+                    failures.Add("resume verbs: the read verb '" + v + "' is not a resume verb, but "
+                                 + "IsResumeVerb accepts it — it would reset the thread selection");
+
+            // And an unknown verb must still reach `default` rather than be swallowed as a resume.
+            if (DebugEngine.IsResumeVerbForTest("runtocursor") || DebugEngine.IsResumeVerbForTest("frobnicate"))
+                failures.Add("resume verbs: an unimplemented verb was accepted — it would reset the selection "
+                             + "and then report 'unknown command', silently discarding the user's thread <tid>");
+        }
+
+        /// <summary>
+        /// The three Step Over guards from ticket f83d5eec, each isolated with the others intact.
+        ///
+        /// These are impractical to produce against a live debuggee — not impossible, and the difference is
+        /// worth stating in a file whose job is keeping claims honest. A Step Over reaches the ESP gate only
+        /// on StepMachine's documented "couldn't plant — fall through and keep instruction-stepping" path,
+        /// which needs a return address the debugger cannot write a byte to; that is reachable in principle
+        /// (a read-only or guarded page at a return site) and simply does not arise in a normal run.
+        ///
+        /// Isolation is the point, not coverage. A guard that is only ever exercised alongside another guard
+        /// covering the same case is a DEAD guard whose test still passes — this repo shipped exactly that
+        /// (armPendingSweep's `!isPaused` clause, dead to its test because a real resume also bumped the
+        /// switch generation). So each case below moves ONE input and leaves the rest where a real step
+        /// would have them.
+        /// </summary>
+        private static void CheckStepGuards(List<string> failures)
+        {
+            // ---- guard 1: THE ESP GATE, isolated from the bypass (bypass OFF, everything else real).
+            // A candidate 0x40 below the starting frame is deeper than ESP_SLACK (0x10) allows.
+            const uint startEsp = 0x0012F000;
+            if (DebugEngine.PassesEspGateForTest(false, startEsp - 0x40, startEsp))
+                failures.Add("esp gate: a stop 0x40 deeper than the step start passed the gate with the "
+                             + "prologue bypass OFF — Step Over would stop inside the callee");
+            // CONTROL: the gate must still admit a legitimate stop, or Step Over stops nowhere at all.
+            if (!DebugEngine.PassesEspGateForTest(false, startEsp, startEsp))
+                failures.Add("esp gate control: a stop at the starting frame depth was refused");
+            if (!DebugEngine.PassesEspGateForTest(false, startEsp - 0x10, startEsp))
+                failures.Add("esp gate control: a stop exactly ESP_SLACK deep was refused — the slack exists "
+                             + "because a single ENTER opcode can reserve the frame in one instruction");
+
+            // ---- guard 2: THE BYPASS, isolated from the gate (gate FAILING, so only the bypass can pass).
+            // This is the prologue case the bypass exists for: ESP has legitimately dropped past the slack
+            // because the procedure's own `sub esp,N` ran, and the stop is still in that same procedure.
+            if (!DebugEngine.PassesEspGateForTest(true, startEsp - 0x40, startEsp))
+                failures.Add("prologue bypass: a stop in the starting procedure's own frame was refused — "
+                             + "the prologue's `sub esp,N` drops ESP before any nested call happens");
+
+            // ---- guard 3: THE PROCEDURE BOUND on the bypass.
+            // The bypass is armed by _startAtProcEntry AND the candidate resolving to the same symbol. The
+            // defect being guarded was the first half alone: armed once in BeginStep, never cleared, so the
+            // gate was skipped for every stop in the session INCLUDING one in a different procedure. That
+            // conjunction lives in PrologueBypassApplies, which needs a live module to resolve a symbol; what
+            // IS assertable here is that a false bypass leaves the gate in charge — which is case 1 above,
+            // and is what a different-procedure candidate produces. Stated so the claim is not overread:
+            // this file asserts the CONSEQUENCE of the bound, not the symbol comparison itself.
+
+            // ---- guard 4: THE PROLOGUE PREDICATE — "below the procedure's own first line record".
+            // A record table for one procedure at 0x1000 whose first own statement is at 0x1040, with the
+            // next procedure at 0x2000. The old test (rva - entry <= 0x100) called everything up to 0x1100
+            // "at entry"; the new one stops at 0x1040.
+            var table = new List<AddrRec>
+            {
+                new AddrRec(0x0800, 10, 0),   // the PREVIOUS procedure's records
+                new AddrRec(0x0900, 11, 0),
+                new AddrRec(0x1040, 20, 1),   // this procedure's first own statement
+                new AddrRec(0x1080, 21, 1),
+                new AddrRec(0x2010, 30, 2),   // the NEXT procedure's
+            };
+            uint first = DebugEngine.FirstRecordRvaInProc(table, 0x1000, 0x2000);
+            if (first != 0x1040)
+                failures.Add("prologue predicate: the procedure's first own record resolved to 0x"
+                             + first.ToString("X") + ", expected 0x1040 — a record BELOW the entry belongs "
+                             + "to the previous procedure");
+
+            // THE CASE THE OLD PROLOGUE_WINDOW TEST GOT WRONG: 0x1080 is 0x80 into the procedure, inside a
+            // 0x100 window, but it is a real statement of the BODY. It must not read as prologue. Asserted
+            // through the predicate the engine actually uses, not re-derived from `first` — a check that
+            // only restates a value another check already pinned is a dead check that always passes.
+            if (DebugEngine.IsPrologueRva(0x1080, first))
+                failures.Add("prologue predicate: 0x1080 is a statement of the procedure body but still "
+                             + "counted as prologue — this is the 256-byte hole PROLOGUE_WINDOW left open");
+            // CONTROL: an address genuinely in the prologue still is one, or the fix broke what it fixed.
+            if (!DebugEngine.IsPrologueRva(0x1008, first))
+                failures.Add("prologue predicate control: 0x1008 sits below the procedure's first statement "
+                             + "and must still count as prologue");
+            // A procedure with no first record of its own is never "in the prologue", whatever the RVA.
+            if (DebugEngine.IsPrologueRva(0x1008, 0))
+                failures.Add("prologue predicate: a procedure with no line record of its own still armed "
+                             + "the bypass — there is nothing to measure against, so the ESP gate must hold");
+
+            // A procedure with NO line record of its own gets NO bypass: 0x2010 belongs to the next
+            // procedure, so there is nothing to measure against and the safe answer is the ESP gate.
+            uint none = DebugEngine.FirstRecordRvaInProc(table, 0x1800, 0x2000);
+            if (none != 0)
+                failures.Add("prologue predicate: a procedure with no record of its own claimed 0x"
+                             + none.ToString("X") + " — that record is the NEXT procedure's");
+            // ... and with no following symbol, the same record IS this procedure's. Without this control
+            // the check above would pass for a builder that always returned 0.
+            if (DebugEngine.FirstRecordRvaInProc(table, 0x1800, 0) != 0x2010)
+                failures.Add("prologue predicate control: with no following symbol, the last record belongs "
+                             + "to the procedure that precedes it");
+
+            // ---- guard 5: CancelStep CLEARS the bypass. It was set once in BeginStep and never cleared,
+            // so it survived into the next step session. Asserted directly: arm it, cancel, read it back.
+            var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            eng.ArmPrologueBypassForTest(0x1000);
+            if (!eng.PrologueBypassArmedForTest)
+                failures.Add("cancel-step control: the bypass could not be armed, so the reset below "
+                             + "asserts nothing");
+            eng.CancelStepForTest();
+            if (eng.PrologueBypassArmedForTest)
+                failures.Add("cancel-step: the prologue bypass survived CancelStep — the next step session "
+                             + "starts with its ESP gate already disabled");
+            if (eng.PrologueBypassEntryRvaForTest != 0)
+                failures.Add("cancel-step: the bypass flag cleared but its procedure bound did not, leaving "
+                             + "the next session bounded to a procedure it never started in");
+        }
+
+        /// <summary>
+        /// A breakpoint hit that does NOT pause leaves an in-flight step exactly as it was; a hit that DOES
+        /// pause supersedes it.
+        ///
+        /// OnUserBp used to call CancelStep unconditionally, BEFORE the advanced-breakpoint gate decided
+        /// whether the hit pauses at all. On the silent-resume path that left <c>_mode = StepMode.None</c>,
+        /// every call-skip temp INT3 restored and the temp re-arms dropped — so on the next trap
+        /// OnSingleStep's step-2 guard (<c>_mode != StepMode.None</c>) was false, StepMachine never ran, and
+        /// nothing stopped the target. The user's Step Over silently became a Continue while the pad still
+        /// showed Running.
+        ///
+        /// 465a3873 is what made it common rather than theoretical: a condition over THREADed data used to
+        /// return indeterminate and PAUSE, so the silent-resume path was nearly unreachable; it now evaluates
+        /// and false is an ordinary answer.
+        ///
+        /// Each case moves ONE thing and leaves the rest where a real step would have them. The silent-resume
+        /// case asserts its three consequences separately — the session, the temp bytes and the call-entry
+        /// anchor are three different repairs, and a half-applied fix must name which half is missing. The
+        /// two PAUSING cases exist because CancelStep has to be reachable from BOTH pausing routes: a plain
+        /// breakpoint that never enters the gate, and an advanced one whose gate said pause. A fix that
+        /// handled only one of those would pass the other's case.
+        /// </summary>
+        private static void CheckBpHitVsStep(List<string> failures)
+        {
+            // Not a multiple of 4, so Windows never assigns it: OpenThread fails, haveCtx stays false, and
+            // no thread on this machine is touched. Everything asserted below is engine bookkeeping.
+            const uint tid = 0xFFFFFFF1;
+            const uint loadBase = 0x00400000;
+            const uint va = 0x00401100;   // where the breakpoint is planted, and where the hit arrives
+            const uint prevVa = 0x00401000;   // the previous trap's EIP, the call-entry detector's anchor
+            const uint tempVa = 0x00402000;   // the step's one call-skip temp INT3
+
+            // ---- case 1: THE RULE. A hit-count rule that is not yet satisfied resumes SILENTLY.
+            var eng = NewEngine();
+            var bp = eng.ArmUserBpForTest(loadBase, va, null, "eq", 99, null);
+            eng.ArmStepSessionForTest(tid, prevVa, tempVa);
+            uint rc = 0;
+            string log = CaptureConsole(() => { rc = eng.OnUserBpForTest(tid, va); });
+
+            // CONTROLS first: without these the case could pass because nothing ran at all.
+            if (bp.HitCount != 1)
+                failures.Add("bp-hit control: the hit-count gate never ran (HitCount " + bp.HitCount
+                             + ", expected 1) — this case did not reach the silent-resume path, so its "
+                             + "assertions prove nothing");
+            if (log.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) >= 0)
+                failures.Add("bp-hit control: an unmet hit-count rule reported a breakpoint hit — it must "
+                             + "resume silently");
+            if (rc != Native.DBG_CONTINUE)
+                failures.Add("bp-hit control: the silent-resume path returned 0x" + rc.ToString("X")
+                             + ", not DBG_CONTINUE");
+
+            if (!eng.StepInFlightForTest)
+                failures.Add("bp-hit: a hit that resumed SILENTLY cancelled the in-flight step — "
+                             + "OnSingleStep's `_mode != StepMode.None` guard is now false, StepMachine "
+                             + "never runs, and the user's Step Over has become a Continue");
+            if (eng.TempBpCountForTest != 1)
+                failures.Add("bp-hit: a silently-resumed hit restored the step's call-skip temp INT3 ("
+                             + eng.TempBpCountForTest + " left, expected 1) — the skipped call's return "
+                             + "address is no longer covered, so the step has nothing left to stop on");
+            if (eng.PrevVaForTest != va)
+                failures.Add("bp-hit: a silently-resumed hit left the call-entry anchor at 0x"
+                             + eng.PrevVaForTest.ToString("X") + " instead of the hit address 0x"
+                             + va.ToString("X") + " — StepMachine's `ret > _prevVa && ret - _prevVa <= "
+                             + "CALL_WINDOW` test can read the re-arm trap as a call entry and plant a temp "
+                             + "INT3 at a bogus return address");
+            if (!eng.HasUserBpRearmForTest(tid, va))
+                failures.Add("bp-hit: the user-breakpoint re-plant for this thread was lost on the "
+                             + "silent-resume path — the breakpoint stops firing after its first hit");
+
+            // ---- case 2: PAUSING ROUTE A — a plain breakpoint, which never enters the gate at all.
+            var plain = NewEngine();
+            plain.ArmUserBpForTest(loadBase, va, null, null, 0, null);
+            plain.ArmStepSessionForTest(tid, prevVa, tempVa);
+            string plainLog = CaptureConsole(() => { plain.OnUserBpForTest(tid, va); });
+            if (plainLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
+                failures.Add("bp-hit control: a plain breakpoint did not report a hit, so this case never "
+                             + "reached the pausing route it is asserting about");
+            if (plain.StepInFlightForTest)
+                failures.Add("bp-hit: a PLAIN breakpoint hit pauses, and a pausing hit must supersede the "
+                             + "in-flight step — the session survived, so the next trap drives StepMachine "
+                             + "while the user is stopped at a breakpoint");
+            if (plain.TempBpCountForTest != 0)
+                failures.Add("bp-hit: a plain breakpoint hit left " + plain.TempBpCountForTest
+                             + " call-skip temp INT3(s) planted in the target");
+            if (!plain.HasUserBpRearmForTest(tid, va))
+                failures.Add("bp-hit: cancelling the step on a plain hit also dropped the user-breakpoint "
+                             + "re-plant — it is IsTemp=false and CancelStep must leave it alone");
+
+            // ---- case 3: PAUSING ROUTE B — an advanced breakpoint whose gate SAID pause. A fix that moved
+            // CancelStep into the plain-breakpoint branch only would pass case 2 and fail here.
+            var gated = NewEngine();
+            var gbp = gated.ArmUserBpForTest(loadBase, va, null, "eq", 1, null);   // first hit satisfies =1
+            gated.ArmStepSessionForTest(tid, prevVa, tempVa);
+            string gatedLog = CaptureConsole(() => { gated.OnUserBpForTest(tid, va); });
+            if (gbp.HitCount != 1 || gatedLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
+                failures.Add("bp-hit control: a hit-count rule of =1 did not pause on its first hit "
+                             + "(HitCount " + gbp.HitCount + ") — this case is not testing the gated "
+                             + "pausing route");
+            if (gated.StepInFlightForTest)
+                failures.Add("bp-hit: an ADVANCED breakpoint whose gate said PAUSE did not supersede the "
+                             + "in-flight step — CancelStep is reachable from the plain route only");
+            if (gated.TempBpCountForTest != 0)
+                failures.Add("bp-hit: a gated pausing hit left " + gated.TempBpCountForTest
+                             + " call-skip temp INT3(s) planted in the target");
+
+            // ---- case 4: the TRACEPOINT, which is what the pipeline actually reported. A tracepoint NEVER
+            // pauses, and it LOGS, so the log itself proves the non-pausing path was taken rather than the
+            // breakpoint simply not matching. The message carries no {token}, so nothing is read from a
+            // target that is not there.
+            var trace = NewEngine();
+            trace.ArmUserBpForTest(loadBase, va, null, null, 0, "step-in-flight probe");
+            trace.ArmStepSessionForTest(tid, prevVa, tempVa);
+            string traceLog = CaptureConsole(() => { trace.OnUserBpForTest(tid, va); });
+            if (traceLog.IndexOf("[TRACE] pc001.clw:100: step-in-flight probe", StringComparison.Ordinal) < 0)
+                failures.Add("bp-hit control: the tracepoint never logged — this case did not reach the "
+                             + "non-pausing path: " + traceLog.Replace("\r\n", " | "));
+            if (traceLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) >= 0)
+                failures.Add("bp-hit control: a tracepoint reported a breakpoint hit — a tracepoint logs "
+                             + "and resumes, it never pauses");
+            if (!trace.StepInFlightForTest)
+                failures.Add("bp-hit: a TRACEPOINT hit cancelled the in-flight step — a tracepoint never "
+                             + "pauses, so it must never supersede a step");
+            if (trace.PrevVaForTest != va)
+                failures.Add("bp-hit: a tracepoint hit left the call-entry anchor at 0x"
+                             + trace.PrevVaForTest.ToString("X") + " instead of 0x" + va.ToString("X"));
+        }
+
+        /// <summary>
+        /// The mutating test seams must be safe by CONSTRUCTION, not by convention.
+        ///
+        /// OnUserBpForTest drives the REAL hit handler, whose body can SetThreadContext, WriteProcessMemory,
+        /// block in PausedWait reading stdin, and on the --once arm TerminateProcess the target. Its safety
+        /// used to rest entirely on three CALLER choices — a tid Windows never assigns, once:false,
+        /// interactive:false — documented in comments at the one call site and enforced nowhere. A rule held
+        /// by the caller is a convention (ticket a39d9477); the seam is the writer, so the refusal lives
+        /// there and this asserts it from outside.
+        ///
+        /// Each arm is checked on its OWN engine so one refusal cannot be the reason the next one throws,
+        /// and the no-target ISOLATION case below is what keeps "refuses when attached" distinguishable from
+        /// "refuses always".
+        /// </summary>
+        private static void CheckSeamsRefuseLiveTarget(List<string> failures)
+        {
+            // Nothing but a real Attach/Launch sets _hProcess, so an attached engine cannot be built through
+            // any public path; it is set directly here. 0x1234 is not a handle this process owns, so every
+            // write an UNGUARDED handler would attempt through it fails — running the pre-fix code to watch
+            // this check fail touches nothing. A rename of the field fails loudly instead of passing quietly.
+            //
+            // THIS DEPENDS ON DebugEngine HAVING NO DISPOSER, and that is not an accident to be discovered
+            // later: there is no Dispose and no finalizer, so nothing ever calls CloseHandle(_hProcess) on
+            // these throwaway engines and the fake 0x1234 is never handed to the OS. If a Dispose or
+            // finalizer is ever added that closes _hProcess, this check starts closing an arbitrary handle
+            // belonging to the protocolcheck process itself. Give the fake engines a real-but-harmless
+            // handle (e.g. a duplicate of the current process) before adding one.
+            var hProcField = typeof(DebugEngine).GetField("_hProcess",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (hProcField == null)
+            {
+                failures.Add("seam-guard control: DebugEngine._hProcess was not found, so this check cannot "
+                             + "build an attached engine and is asserting nothing");
+                return;
+            }
+
+            // `prepare` runs BEFORE the fake handle goes in, so an arm can set up the state its seam needs
+            // (OnUserBp reads the armed-byte map) without that setup being the thing that refuses.
+            Action<string, Action<DebugEngine>, Action<DebugEngine>> refusesAttached = (name, prepare, call) =>
+            {
+                var eng = NewEngine();
+                if (prepare != null) prepare(eng);
+                hProcField.SetValue(eng, new IntPtr(0x1234));
+                string outcome = null;
+                CaptureConsole(() => { outcome = SeamOutcome(() => call(eng)); });
+                if (outcome != null)
+                    failures.Add("seam-guard: " + name + " " + outcome + " against an ATTACHED engine — the "
+                                 + "seam must refuse rather than rely on the caller passing a tid Windows "
+                                 + "never assigns");
+            };
+
+            refusesAttached("OnUserBpForTest",
+                            e => e.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null),
+                            e => e.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
+            refusesAttached("ArmUserBpForTest", null,
+                            e => e.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null));
+            refusesAttached("ArmStepSessionForTest", null,
+                            e => e.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
+            refusesAttached("CancelStepForTest", null, e => e.CancelStepForTest());
+            refusesAttached("ArmPrologueBypassForTest", null, e => e.ArmPrologueBypassForTest(0x1000));
+            refusesAttached("RegisterThreadedModuleForTest", null,
+                            e => e.RegisterThreadedModuleForTest("t.dll", 0x00400000, 0x1000, 0x2000));
+
+            // The other two caller choices, ISOLATED from the attached-target guard above: this engine has NO
+            // target, so only the --once / interactive refusal can stop it. Pre-fix, the --once arm reached
+            // TerminateProcess and the interactive arm never returned at all.
+            foreach (var arm in new[] { "once", "interactive" })
+            {
+                var eng = new DebugEngine("protocolcheck", null, null, null, null,
+                                          arm == "once", 0, arm == "interactive");
+                eng.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);
+                string outcome = null;
+                CaptureConsole(() => { outcome = SeamOutcome(() => eng.OnUserBpForTest(0xFFFFFFF1, 0x00401100)); });
+                if (outcome != null)
+                    failures.Add("seam-guard: OnUserBpForTest " + outcome + " on a " + arm + " engine — the "
+                                 + (arm == "once" ? "pausing route calls TerminateProcess"
+                                                  : "pausing route blocks in PausedWait reading stdin")
+                                 + ", so the seam must refuse this engine");
+            }
+
+            // ISOLATION for all of the above: with no target and neither flag set, the same seams must still
+            // WORK. Without this the guards would be indistinguishable from seams that refuse everything,
+            // and CheckBpHitVsStep above would be running against nothing.
+            try
+            {
+                var ok = NewEngine();
+                ok.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);
+                ok.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000);
+                CaptureConsole(() => ok.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
+                ok.ArmPrologueBypassForTest(0x1000);
+                ok.CancelStepForTest();
+                ok.RegisterThreadedModuleForTest("t.dll", 0x00500000, 0x1000, 0x2000);
+            }
+            catch (Exception ex)
+            {
+                failures.Add("seam-guard control: the seams refused an engine with NO target and neither "
+                             + "flag set (" + ex.GetType().Name + ": " + ex.Message + ") — the guard is too "
+                             + "broad and every seam-driven check above is now asserting nothing");
+            }
+        }
+
+        /// <summary>How a seam call ENDED: null when it refused with InvalidOperationException, otherwise a
+        /// description. The bounded join is part of the assertion rather than defensiveness — one of the
+        /// caller choices the seam used to trust was interactive:false, and an interactive engine that
+        /// reaches PausedWait spins forever on an empty command queue, so "never returned" has to be
+        /// reportable instead of hanging the whole check.</summary>
+        private static string SeamOutcome(Action body)
+        {
+            string outcome = "returned without refusing";
+            var t = new System.Threading.Thread(() =>
+            {
+                try { body(); }
+                catch (InvalidOperationException) { outcome = null; }
+                catch (Exception ex) { outcome = "threw " + ex.GetType().Name + ": " + ex.Message; }
+            });
+            t.IsBackground = true;
+            t.Start();
+            if (!t.Join(3000)) return "never returned (still running after 3s)";
+            return outcome;
+        }
+
+        /// <summary>An engine with no target: every path below is bookkeeping, and the memory access it
+        /// attempts fails harmlessly on a null process handle.</summary>
+        private static DebugEngine NewEngine()
+        {
+            return new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+        }
+
+        /// <summary>Run <paramref name="body"/> with stdout captured, and hand back what it printed. The
+        /// engine's hit reporting is console output, so it is EVIDENCE here — which route a hit took is
+        /// visible in the log and nowhere else in its state.</summary>
+        private static string CaptureConsole(Action body)
+        {
+            var prev = Console.Out;
+            var buf = new System.IO.StringWriter();
+            Console.SetOut(buf);
+            try { body(); }
+            finally { Console.SetOut(prev); }
+            return buf.ToString();
+        }
+
+        /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
+        /// Feeding the builder a known tid alongside 0 and (uint)-1 in the SAME event is the point: it
+        /// asserts the rule is applied per row, not decided once for the whole event.</summary>
+        private static void CheckNoSentinelRows(List<string> failures, string name, string json, uint known)
+        {
+            if (Count(json, "\"tid\":" + known) != 1)
+                failures.Add(name + " control: the one known tid was not written exactly once — " + json);
+            int zero = Count(json, "\"tid\":0,") + Count(json, "\"tid\":0}");
+            if (zero != 0)
+                failures.Add(name + ": " + zero + " row(s) wrote a 0 tid — a row the pad would attribute to a "
+                             + "real thread it will never match");
+            if (Count(json, "\"tid\":" + unchecked((uint)-1)) != 0)
+                failures.Add(name + ": a row wrote the (uint)-1 sentinel — " + json);
+        }
+
+        /// <summary>Occurrences of <paramref name="needle"/> in <paramref name="hay"/>.</summary>
+        private static int Count(string hay, string needle)
+        {
+            int n = 0, i = 0;
+            while ((i = hay.IndexOf(needle, i, StringComparison.Ordinal)) >= 0) { n++; i += needle.Length; }
+            return n;
         }
 
         /// <summary>

@@ -74,7 +74,37 @@ namespace ClarionDebugger.Services
     public sealed class DebugBreakpoint
     {
         public string Module;
-        public int RequestedLine;
+
+        private int? _requestedLine;
+
+        /// <summary>The line the user asked for, or null when the engine's echo carried no
+        /// <c>requestedLine</c> member AT ALL (a build older than that protocol change).
+        /// <para>
+        /// ABSENT IS NOT 0. 0 is a real requested line — an unresolved raw (--rva) breakpoint has one —
+        /// which is exactly why <c>bp-del</c> has always read this field with <c>GetIntOrNull</c>. Reading it
+        /// with <c>GetInt</c> gave every breakpoint in a module the same requested line of 0 against an older
+        /// engine, and <see cref="ClarionDebuggerService.SameBpIdentity"/> then merged them all into one pane
+        /// row. Host-built entries (the IDE gutter, a pending entry the pad adds before the engine confirms)
+        /// always know the line they asked for, so only a parsed echo can leave this null.
+        /// </para></summary>
+        public int? RequestedLineOrNull
+        {
+            get { return _requestedLine; }
+            set { _requestedLine = value; }
+        }
+
+        /// <summary>The requested line when there is one, else the PLANTED line — the best line this
+        /// breakpoint can be shown or re-specified by. Every display, gutter and spec-building reader wants
+        /// this; nothing may use it for IDENTITY, which goes through
+        /// <see cref="ClarionDebuggerService.SameBpIdentity"/> so an absent requested line falls back
+        /// explicitly instead of comparing as 0. Assigning it records the line AS PRESENT, which is what a
+        /// host-built entry means.</summary>
+        public int RequestedLine
+        {
+            get { return _requestedLine ?? Line; }
+            set { _requestedLine = value; }
+        }
+
         public int Line;            // line actually planted (snapped to nearest code record)
         public string Path;         // full .clw path from the IDE gutter bookmark (null if unknown)
 
@@ -209,7 +239,8 @@ namespace ClarionDebugger.Services
         public event Action<DebugPause> Paused;
         public event Action<string> Resumed;                       // resume mode: continue/step/stepover/stepout
         public event Action<DebugBreakpoint> BreakpointSet;
-        public event Action<string, int> BreakpointRemoved;        // module, line
+        public event Action<string, int> BreakpointRemoved;        // module, requested line (planted line
+                                                                  // only from a pre-requestedLine engine)
         public event Action<string, int, string> BreakpointError;  // module, line, error
         public event Action<string, int, string, int> Traced;      // tracepoint fired: module, line, interpolated message, hit count
         public event Action<List<DebugBreakpoint>> BreakpointListReceived;
@@ -379,19 +410,43 @@ namespace ClarionDebugger.Services
             _proc.BeginErrorReadLine();
         }
 
+        /// <summary>True when the engine process is CONFIRMED gone — no process at all, or the OS says this
+        /// one has exited. A HasExited that throws answers FALSE: "cannot tell" must never be reported as
+        /// "dead", which is the whole point of the postcondition below.</summary>
+        private bool ProcessConfirmedDead()
+        {
+            var p = _proc;
+            if (p == null) return true;
+            try { return p.HasExited; }
+            catch (Exception ex)
+            {
+                LogReceived?.Invoke("[stop] cannot confirm engine exit: " + ex.Message);
+                return false;
+            }
+        }
+
         /// <summary>
-        /// Authoritative teardown barrier. When this returns, the engine/target process is GONE and State is
-        /// Idle — every code path (graceful quit, forced kill, or already-dead) guarantees both before return.
-        /// Prefers a clean engine-side quit (which also kills the target); on timeout it Kills and confirms the
-        /// process actually exited via WaitForExit (bounded so a wedged process can't hang the teardown thread
-        /// forever). Always drives State=Idle synchronously at the end — the async _proc.Exited / "exited" path
-        /// that also sets Idle is idempotent (SetState's `changed` guard), so the double-set is harmless.
+        /// Teardown barrier. Prefers a clean engine-side quit (which also kills the target); on timeout it Kills
+        /// and waits. It then ASKS whether the process is dead rather than assuming the above worked, and
+        /// returns that answer: true means <see cref="IsRunning"/> is confirmed false and State is Idle.
+        ///
+        /// A false return means the engine process could NOT be confirmed dead inside the bounded waits. On that
+        /// path State is deliberately NOT driven to Idle: publishing Idle over a live process is what would
+        /// re-enable Start (the toolbar and pad both reach Idle through DebugSessionController, which reads this
+        /// state via IDebugSessionTarget.IsSessionIdle) and let a new session launch against a target still owned
+        /// by the old process. _proc.Exited stays subscribed and drives Idle if and when the process does die.
+        /// Callers that need the guarantee must check the result; callers that ignore it are no worse off than
+        /// before, because the state they would have seen as Idle now simply stays where it was.
+        ///
+        /// Known remaining path that reports Idle without a process check: the engine's "exited" event (the
+        /// DEBUGGEE finished), handled in OnJson, sets Idle while the engine process itself may still be alive
+        /// for a short window. That is a separate lifecycle from this one and is not addressed here.
         ///
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
         /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
         /// synchronously but there is no live process to wait on, so it returns immediately).
         /// </summary>
-        public void Stop()
+        public bool Stop()
         {
             try
             {
@@ -399,22 +454,30 @@ namespace ClarionDebugger.Services
                 {
                     // A successful pipe write does NOT prove the engine consumed 'quit', so verify exit and fall
                     // back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
-                    // (Kill only requests termination) before we declare teardown complete.
+                    // (Kill only requests termination).
                     bool exited = SendCommand("quit") && _proc.WaitForExit(1500);
                     if (!exited && IsRunning)
                     {
-                        try { _proc.Kill(); } catch { }
-                        try { _proc.WaitForExit(3000); } catch { } // bounded — don't hang forever on a wedged process
+                        // Escalate deliberately: wait -> kill -> verify. A Kill that throws is information the
+                        // caller needs (the handle may be denied, or the process already reaped), so it is
+                        // surfaced instead of swallowed. Neither failure decides the outcome on its own — the
+                        // check below does.
+                        try { _proc.Kill(); }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] kill failed: " + ex.Message); }
+                        try { _proc.WaitForExit(3000); }   // bounded — don't hang forever on a wedged process
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] wait after kill failed: " + ex.Message); }
                     }
                 }
             }
-            catch { }
-            finally
-            {
-                // Authoritative: once Stop() returns, the session is over. Synchronous so a teardown driver
-                // (Dispose -> NotifyStopped) sees Idle deterministically without waiting on the async Exited.
-                SetState(DebugSessionState.Idle);
-            }
+            catch (Exception ex) { LogReceived?.Invoke("[stop] teardown error: " + ex.Message); }
+
+            // The postcondition, asked as a question. Nothing above is trusted to have worked: this single check
+            // is what decides whether the session may be reported over.
+            bool dead = ProcessConfirmedDead();
+            if (dead) SetState(DebugSessionState.Idle);
+            else LogReceived?.Invoke("[stop] engine process did not exit within the teardown timeout — "
+                                   + "session NOT reported idle, Start stays disabled until it does");
+            return dead;
         }
 
         // ------------------------------------------------------------------ execution control
@@ -728,11 +791,18 @@ namespace ClarionDebugger.Services
                     var bp = ParseBpFields(json, GetStr(json, "module"));
                     lock (_breakpoints)
                     {
+                        // Identity is the line the USER asked for, not the record the engine snapped to:
+                        // two gutter lines can snap to one planted line and they are two breakpoints, not
+                        // one. Keying this on Line collapsed them into a single pane row.
                         DebugBreakpoint known = null;
                         foreach (var b in _breakpoints)
-                            if (b.Module == bp.Module && b.Line == bp.Line) { known = b; break; }
+                            if (SameBpIdentity(b, bp)) { known = b; break; }
                         if (known == null) _breakpoints.Add(bp);
-                        else CopyBpProps(bp, known);   // refresh props/hit count on a re-confirm (properties edit)
+                        else
+                        {
+                            known.Line = bp.Line;      // a re-plant can snap the same requested line elsewhere
+                            CopyBpProps(bp, known);    // refresh props/hit count on a re-confirm (properties edit)
+                        }
                     }
                     BreakpointSet?.Invoke(bp);
                     break;
@@ -740,9 +810,13 @@ namespace ClarionDebugger.Services
                 case "bp-del":
                     string delMod = GetStr(json, "module");
                     int delLine = GetInt(json, "line");
+                    // The engine removed exactly ONE logical breakpoint and names it by its requested line.
+                    // GetIntOrNull, not GetInt: absent must stay distinguishable from 0, because 0 is a real
+                    // RequestedLine for an unresolved raw breakpoint.
+                    int? delRequested = GetIntOrNull(json, "requestedLine");
                     lock (_breakpoints)
-                        _breakpoints.RemoveAll(b => b.Module == delMod && b.Line == delLine);
-                    BreakpointRemoved?.Invoke(delMod, delLine);
+                        _breakpoints.RemoveAll(b => BpDelMatches(b, delMod, delRequested, delLine));
+                    BreakpointRemoved?.Invoke(delMod, delRequested ?? delLine);
                     break;
 
                 case "bp-error":
@@ -1265,20 +1339,77 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>Build a breakpoint (location + advanced properties) from a single bp-set / bp-list
-        /// JSON object. Shared so bp-set and bp-list decode identically.</summary>
+        /// JSON object. Shared so bp-set and bp-list decode identically — which is also why the
+        /// absent-vs-zero care below only has to be taken once: this is the single place either event's
+        /// <c>requestedLine</c> is read, so no caller can bypass it.
+        /// <para>
+        /// GetIntOrNull, not GetInt, for the same reason the bp-del arm uses it: GetInt answers 0 for an
+        /// absent field, and 0 is a real requested line. Against an engine build that omits
+        /// <c>requestedLine</c>, GetInt gave every breakpoint in a module an identity of (module, 0) and
+        /// SameBpIdentity merged them into one pane row.
+        /// </para></summary>
         private static DebugBreakpoint ParseBpFields(string json, string module)
         {
             return new DebugBreakpoint
             {
                 Module = module,
                 Line = GetInt(json, "line"),
-                RequestedLine = GetInt(json, "requestedLine"),
+                RequestedLineOrNull = GetIntOrNull(json, "requestedLine"),
                 Condition = GetStr(json, "condition"),
                 HitMode = GetStr(json, "hitMode"),
                 HitValue = GetInt(json, "hitValue"),
                 Trace = GetStr(json, "trace"),
                 HitCount = GetInt(json, "hitCount")
             };
+        }
+
+        /// <summary>Whether a bp-set echo names a breakpoint the host already lists. Identity is
+        /// (module, requested line): the planted line is where the engine SNAPPED the breakpoint, and
+        /// two distinct gutter lines can snap to the same record, so keying identity on it merges two
+        /// breakpoints into one row and loses one of them.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one. When either is absent — an engine
+        /// build older than that protocol change, which reports no <c>requestedLine</c> — this falls back to
+        /// the planted line, exactly as <see cref="BpDelMatches"/> does and for the same reason: an old
+        /// engine cannot say which of two gutter lines that snapped to one record it means, so the planted
+        /// line is all there is to key on. That fallback still merges two breakpoints sharing a record, which
+        /// is the pre-existing cost of talking to an old engine; what it does NOT do is merge every
+        /// breakpoint in the module, which is what comparing an absent line as 0 did.
+        /// </para>
+        /// <para>
+        /// Both sides come from the same engine build in a live session, so both-present and both-absent are
+        /// the reachable cases; the mixed case is defined rather than left to a 0 default, and is asserted in
+        /// tools/test-addin-json.ps1 against a present requested line of 0.
+        /// </para></summary>
+        internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)
+        {
+            if (a.Module != b.Module) return false;
+            int? ra = a.RequestedLineOrNull, rb = b.RequestedLineOrNull;
+            return (ra.HasValue && rb.HasValue) ? ra.Value == rb.Value : a.Line == b.Line;
+        }
+
+        /// <summary>Which host entries one bp-del removes. The engine deletes exactly one logical
+        /// breakpoint and names it by <c>requestedLine</c>, so this matches that one and leaves any
+        /// neighbour sharing its planted line alone. Only when the echo carries NO requestedLine — an
+        /// engine build older than this protocol change — does it fall back to the planted line, which
+        /// can still match several: that is the old behaviour, kept deliberately so an old engine keeps
+        /// deleting something rather than silently deleting nothing.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one, exactly as in
+        /// <see cref="SameBpIdentity"/>, which was written to mirror this function. Reading the entry's line
+        /// through the substituting <c>RequestedLine</c> getter instead compared the entry's PLANTED line
+        /// against the echo's REQUESTED one whenever the entry came from an engine build that reports no
+        /// <c>requestedLine</c> — which both removes a row the engine did not delete (the two lines happen to
+        /// be equal) and leaves the named one behind (they happen not to be). A stale entry from an earlier
+        /// session is enough to reach that mix. So the absent case falls back to the planted line here too:
+        /// over-broad, and the documented cost of an old echo, rather than silently wrong.
+        /// </para></summary>
+        internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)
+        {
+            if (b.Module != module) return false;
+            int? rb = b.RequestedLineOrNull;
+            return (requestedLine.HasValue && rb.HasValue) ? rb.Value == requestedLine.Value
+                                                           : b.Line == plantedLine;
         }
 
         /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an

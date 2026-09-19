@@ -164,7 +164,9 @@ namespace ClarionDbg.Cli
                 }
             }
             Console.WriteLine($"bp: removed {canon}:{found.Line}");
-            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(canon, found.Line));
+            // Echo the whole breakpoint, not just its planted line: `canon` IS found.Module here, and the
+            // host needs found.RequestedLine to know which of the lines sharing this planted record went.
+            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(found));
         }
 
         /// <summary>Plant breakpoints already bound to this exact image (used when a pre-loaded
@@ -268,7 +270,6 @@ namespace ClarionDbg.Cli
                 Native.SetThreadContext(hThread, ref ctx);
             }
             _rearm[tid] = new Rearm { Va = va, IsTemp = false };
-            CancelStep(); // a real BP hit supersedes any in-flight step (drops temp re-arms, not this one)
 
             // Advanced breakpoints: evaluate condition / hit count / tracepoint BEFORE reporting a hit.
             // A non-pausing outcome (condition false, hit-count unmet, or tracepoint logged) resumes
@@ -277,8 +278,24 @@ namespace ClarionDbg.Cli
             var ubp = FindBpAt(m, rva);
             if (ubp != null && (ubp.Condition != null || ubp.HitMode != null || ubp.Trace != null))
             {
-                if (!ShouldPauseAtBp(ubp))
+                // tid + hThread go in because a condition or a {NAME} token may name THREADed (.cwtls) data,
+                // which has one instance PER THREAD: the answer is only meaningful for the thread that hit.
+                // Both are already in hand here — hThread is the handle opened above for this hit.
+                if (!ShouldPauseAtBp(ubp, tid, hThread))
                 {
+                    // A SILENTLY RESUMED hit does NOT supersede an in-flight step: the step session is left
+                    // exactly as it was, so CancelStep is deliberately not called here (it lives on the
+                    // pausing routes below). It used to run unconditionally above this decision, which set
+                    // _mode = StepMode.None, restored every call-skip temp INT3 and dropped the temp
+                    // re-arms — so OnSingleStep's `_mode != StepMode.None` guard was false on the next trap,
+                    // StepMachine never ran, and the user's Step Over became a Continue with the pad still
+                    // showing Running.
+                    //
+                    // Re-anchor the call-entry detector on the hit address. StepMachine tests
+                    // `ret > _prevVa && ret - _prevVa <= CALL_WINDOW`; a _prevVa still holding a pre-hit EIP
+                    // can make the re-arm trap below read as a call entry and plant a temp INT3 at a bogus
+                    // return address. Same assignment, same reason, as the caller-resume path in OnTempBp.
+                    _prevVa = va;
                     if (haveCtx)
                     {
                         Native.GetThreadContext(hThread, ref ctx);
@@ -290,6 +307,11 @@ namespace ClarionDbg.Cli
                 }
                 EmitBpSet(ubp); // pausing — push the updated live hit count to the breakpoints pane
             }
+
+            // Past every non-pausing outcome, so this hit PAUSES — and a hit that pauses supersedes any
+            // in-flight step. Both pausing routes reach here: a plain breakpoint that never entered the gate
+            // above (no condition / hit count / tracepoint), and an advanced one whose gate said pause.
+            CancelStep(); // drops temp re-arms; the IsTemp=false re-arm set above is not one of them
 
             ReportHit(m, rva, va, ref ctx, haveCtx);
 
@@ -404,6 +426,84 @@ namespace ClarionDbg.Cli
 
             if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
+        }
+
+        // ------------------------------------------------------------------ test seams for the hit handler
+        //
+        // OnUserBp runs end to end with NO debuggee. An invalid tid makes OpenThread fail, so haveCtx is
+        // false and no context is read or written; the byte restore becomes a WriteProcessMemory on a null
+        // handle, which fails harmlessly. "NO debuggee" is not left to the caller to remember: every seam
+        // here that mutates state or drives the handler calls RefuseSeamIfAttached first, and
+        // OnUserBpForTest additionally refuses the --once and interactive engines whose pausing route would
+        // terminate a process or block on stdin. What is left is precisely the bookkeeping these seams assert — the
+        // step session, the re-arm entry and the call-entry anchor — driven through the REAL OnUserBp rather
+        // than a copy of its decision order, because the order IS the thing under test.
+        //
+        // A live harness cannot readily produce this case: it needs a step already in flight on the same
+        // thread at the moment a breakpoint whose gate says "do not pause" fires, which depends on where the
+        // debuggee happens to call and how fast the user types.
+
+        /// <summary>Refuse a test seam that MUTATES engine state, or drives a handler that writes to the
+        /// debuggee, whenever a target is actually attached. With no target every such write lands on a null
+        /// handle and fails harmlessly; with one attached the same call patches, retargets or terminates a
+        /// real process. The engine already spells "there is no target" as <c>_hProcess == IntPtr.Zero</c>
+        /// (DebugEngine.LibState.cs, DebugEngine.cs RequestPause) — this is that test inverted, so the seam
+        /// cannot be misused instead of merely being documented as not-to-be-misused.</summary>
+        private void RefuseSeamIfAttached(string seam)
+        {
+            if (_hProcess != IntPtr.Zero)
+                throw new InvalidOperationException(seam + ": refuses to run against an attached debuggee");
+        }
+
+        internal uint OnUserBpForTest(uint tid, uint va)
+        {
+            RefuseSeamIfAttached("OnUserBpForTest");
+            // The two remaining caller choices the seam used to trust. Both arms live on OnUserBp's PAUSING
+            // route, which any plain breakpoint reaches: --once calls TerminateProcess, and interactive
+            // blocks in PausedWait on a command queue nothing is feeding.
+            if (_once)
+                throw new InvalidOperationException(
+                    "OnUserBpForTest: refuses a --once engine — the pausing route calls TerminateProcess");
+            if (_interactive)
+                throw new InvalidOperationException(
+                    "OnUserBpForTest: refuses an interactive engine — the pausing route blocks in PausedWait");
+            return OnUserBp(tid, va);
+        }
+
+        /// <summary>Register a mapped image (once) plus one armed user breakpoint at <paramref name="va"/>,
+        /// with the original byte already recorded in the armed-byte map — the state a real
+        /// EXCEPTION_BREAKPOINT arrives in. Advanced properties go through the shipped
+        /// <see cref="ApplyBpProps"/>, so "no properties" means what the engine means by it.</summary>
+        internal UserBreakpoint ArmUserBpForTest(uint loadBase, uint va, string condition, string hitMode,
+                                                 int hitValue, string trace)
+        {
+            // MUTATES _modules/_bps/_armed. Against a live target the fake armed byte below would later be
+            // written into the real process by the un-patch path.
+            RefuseSeamIfAttached("ArmUserBpForTest");
+            var owner = ModuleAt(va);
+            if (owner == null)
+            {
+                owner = new LoadedModule { Name = "protocolcheck.exe", LoadBase = loadBase, Size = 0x200000 };
+                _modules.Add(owner);
+            }
+            var bp = new UserBreakpoint
+            {
+                Module = "pc001.clw", ModuleIdx = -1, Owner = owner, RequestedLine = 100, Line = 100,
+            };
+            bp.Rvas.Add(va - owner.LoadBase);
+            ApplyBpProps(bp, condition, hitMode, hitValue, trace);
+            _bps.Add(bp);
+            _armed[va] = 0x90;   // the byte the 0xCC replaced
+            return bp;
+        }
+
+        /// <summary>Is there a pending re-plant for this thread at this VA, and is it the USER-breakpoint
+        /// kind (<c>IsTemp = false</c>) that CancelStep must never drop? Without it the breakpoint silently
+        /// stops firing after its first hit.</summary>
+        internal bool HasUserBpRearmForTest(uint tid, uint va)
+        {
+            Rearm r;
+            return _rearm.TryGetValue(tid, out r) && r.Va == va && !r.IsTemp;
         }
     }
 }

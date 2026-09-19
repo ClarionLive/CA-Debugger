@@ -15,7 +15,11 @@ const fs = require('fs');
 const path = require('path');
 
 const DEFAULT_PAGE = path.join(__dirname, '..', 'src', 'ClarionDebugger.Addin', 'Terminal', 'debugger.html');
-function readPage(p) { return fs.readFileSync(p || DEFAULT_PAGE, 'utf8'); }
+// One owner for "which page is this run reading". A harness that names the page in a failure message
+// needs the resolved path as well as its contents, and every suite writing `p || pad.DEFAULT_PAGE` for
+// itself is a second place the default can drift from this one.
+function resolvePage(p) { return p || DEFAULT_PAGE; }
+function readPage(p) { return fs.readFileSync(resolvePage(p), 'utf8'); }
 
 // ---- pull out a top-level `function NAME(` declaration by brace matching
 function extract(html, name) {
@@ -83,6 +87,7 @@ class El {
   addEventListener() { }
   focus() { }      // the in-place value editor focuses and selects itself when it opens
   select() { }
+  scrollIntoView() { }   // buildSource scrolls the current source line into view after it renders
   matches(sel) {
     const p = parseSel(sel);
     if (!p.classes.every(c => this.classList.contains(c))) return false;
@@ -148,4 +153,4 @@ function makeDocument() {
   return doc;
 }
 
-module.exports = { El, ClassList, extract, extractConst, parseSel, makeDocument, readPage, DEFAULT_PAGE };
+module.exports = { El, ClassList, extract, extractConst, parseSel, makeDocument, readPage, resolvePage, DEFAULT_PAGE };

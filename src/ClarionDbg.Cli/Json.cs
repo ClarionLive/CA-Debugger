@@ -192,9 +192,15 @@ namespace ClarionDbg.Cli
               .Append(",\"hitCount\":").Append(bp.HitCount);
         }
 
-        public static string BpDel(string module, int line)
+        /// <summary>The bp-del echo. Takes the breakpoint rather than a bare line so it cannot be written
+        /// without BOTH identities: several logical breakpoints can share one planted <c>line</c> (distinct
+        /// gutter lines that snapped to the same record), so <c>line</c> alone does not say WHICH one went,
+        /// and a host keying on it drops the survivors too. Mirrors what BpSet already carries.</summary>
+        public static string BpDel(UserBreakpoint bp)
         {
-            return "{\"event\":\"bp-del\",\"module\":" + Str(module) + ",\"line\":" + line + "}";
+            return "{\"event\":\"bp-del\",\"module\":" + Str(bp.Module)
+                 + ",\"requestedLine\":" + bp.RequestedLine
+                 + ",\"line\":" + bp.Line + "}";
         }
 
         /// <summary>Result of an edit-variable-value write: the address, whether it landed, the re-read
