@@ -350,6 +350,8 @@ namespace ClarionDbg.Cli
 
         internal void ArmPrologueBypassForTest(uint entryRva)
         {
+            // MUTATES the step-start state a live BeginStep/StepMachine reads.
+            RefuseSeamIfAttached("ArmPrologueBypassForTest");
             _startAtProcEntry = true;
             _startSymEntryRva = entryRva;
             _startSymModule = null;   // no module needed: the seam below reads the armed flag, not the bound
@@ -359,7 +361,9 @@ namespace ClarionDbg.Cli
 
         internal uint PrologueBypassEntryRvaForTest { get { return _startSymEntryRva; } }
 
-        internal void CancelStepForTest() { CancelStep(); }
+        /// <summary>CancelStep RESTORES every recorded temp byte through WriteProcessMemory, so against a
+        /// live target this seam writes into the debuggee.</summary>
+        internal void CancelStepForTest() { RefuseSeamIfAttached("CancelStepForTest"); CancelStep(); }
 
         /// <summary>Arm an IN-FLIGHT step session the way BeginStep leaves one: a mode, the stepping thread,
         /// the previous trap's EIP (<c>_prevVa</c> — the call-entry detector's anchor) and one call-skip temp
@@ -367,6 +371,9 @@ namespace ClarionDbg.Cli
         /// what a breakpoint hit does to a session that is ALREADY in flight, which is a separate claim.</summary>
         internal void ArmStepSessionForTest(uint tid, uint prevVa, uint tempVa)
         {
+            // MUTATES the in-flight step session. Against a live target the invented temp entry below makes
+            // the next CancelStep write 0x90 into the debuggee at an address it never patched.
+            RefuseSeamIfAttached("ArmStepSessionForTest");
             _mode = StepMode.Over;
             _stepTid = tid;
             _prevVa = prevVa;

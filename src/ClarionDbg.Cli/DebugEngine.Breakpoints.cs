@@ -432,7 +432,10 @@ namespace ClarionDbg.Cli
         //
         // OnUserBp runs end to end with NO debuggee. An invalid tid makes OpenThread fail, so haveCtx is
         // false and no context is read or written; the byte restore becomes a WriteProcessMemory on a null
-        // handle, which fails harmlessly. What is left is precisely the bookkeeping these seams assert — the
+        // handle, which fails harmlessly. "NO debuggee" is not left to the caller to remember: every seam
+        // here that mutates state or drives the handler calls RefuseSeamIfAttached first, and
+        // OnUserBpForTest additionally refuses the --once and interactive engines whose pausing route would
+        // terminate a process or block on stdin. What is left is precisely the bookkeeping these seams assert — the
         // step session, the re-arm entry and the call-entry anchor — driven through the REAL OnUserBp rather
         // than a copy of its decision order, because the order IS the thing under test.
         //
@@ -440,7 +443,32 @@ namespace ClarionDbg.Cli
         // thread at the moment a breakpoint whose gate says "do not pause" fires, which depends on where the
         // debuggee happens to call and how fast the user types.
 
-        internal uint OnUserBpForTest(uint tid, uint va) { return OnUserBp(tid, va); }
+        /// <summary>Refuse a test seam that MUTATES engine state, or drives a handler that writes to the
+        /// debuggee, whenever a target is actually attached. With no target every such write lands on a null
+        /// handle and fails harmlessly; with one attached the same call patches, retargets or terminates a
+        /// real process. The engine already spells "there is no target" as <c>_hProcess == IntPtr.Zero</c>
+        /// (DebugEngine.LibState.cs, DebugEngine.cs RequestPause) — this is that test inverted, so the seam
+        /// cannot be misused instead of merely being documented as not-to-be-misused.</summary>
+        private void RefuseSeamIfAttached(string seam)
+        {
+            if (_hProcess != IntPtr.Zero)
+                throw new InvalidOperationException(seam + ": refuses to run against an attached debuggee");
+        }
+
+        internal uint OnUserBpForTest(uint tid, uint va)
+        {
+            RefuseSeamIfAttached("OnUserBpForTest");
+            // The two remaining caller choices the seam used to trust. Both arms live on OnUserBp's PAUSING
+            // route, which any plain breakpoint reaches: --once calls TerminateProcess, and interactive
+            // blocks in PausedWait on a command queue nothing is feeding.
+            if (_once)
+                throw new InvalidOperationException(
+                    "OnUserBpForTest: refuses a --once engine — the pausing route calls TerminateProcess");
+            if (_interactive)
+                throw new InvalidOperationException(
+                    "OnUserBpForTest: refuses an interactive engine — the pausing route blocks in PausedWait");
+            return OnUserBp(tid, va);
+        }
 
         /// <summary>Register a mapped image (once) plus one armed user breakpoint at <paramref name="va"/>,
         /// with the original byte already recorded in the armed-byte map — the state a real
@@ -449,6 +477,9 @@ namespace ClarionDbg.Cli
         internal UserBreakpoint ArmUserBpForTest(uint loadBase, uint va, string condition, string hitMode,
                                                  int hitValue, string trace)
         {
+            // MUTATES _modules/_bps/_armed. Against a live target the fake armed byte below would later be
+            // written into the real process by the un-patch path.
+            RefuseSeamIfAttached("ArmUserBpForTest");
             var owner = ModuleAt(va);
             if (owner == null)
             {

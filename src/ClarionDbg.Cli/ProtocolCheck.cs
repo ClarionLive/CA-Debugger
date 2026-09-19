@@ -81,6 +81,7 @@ namespace ClarionDbg.Cli
             CheckResumeVerbs(failures);
             CheckStepGuards(failures);
             CheckBpHitVsStep(failures);
+            CheckSeamsRefuseLiveTarget(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
 
@@ -97,7 +98,10 @@ namespace ClarionDbg.Cli
                                   + "each hold with the other one out of the way; and a breakpoint hit "
                                   + "supersedes an in-flight step only when it PAUSES — both pausing routes "
                                   + "cancel the step, and a silently-resumed hit leaves the session, its "
-                                  + "temp INT3s and its call-entry anchor untouched.");
+                                  + "temp INT3s and its call-entry anchor untouched; and all 5 mutating "
+                                  + "test seams REFUSE an attached engine, with OnUserBpForTest also "
+                                  + "refusing the --once and interactive engines, while all of them still "
+                                  + "work with no target.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -461,6 +465,117 @@ namespace ClarionDbg.Cli
             if (trace.PrevVaForTest != va)
                 failures.Add("bp-hit: a tracepoint hit left the call-entry anchor at 0x"
                              + trace.PrevVaForTest.ToString("X") + " instead of 0x" + va.ToString("X"));
+        }
+
+        /// <summary>
+        /// The mutating test seams must be safe by CONSTRUCTION, not by convention.
+        ///
+        /// OnUserBpForTest drives the REAL hit handler, whose body can SetThreadContext, WriteProcessMemory,
+        /// block in PausedWait reading stdin, and on the --once arm TerminateProcess the target. Its safety
+        /// used to rest entirely on three CALLER choices — a tid Windows never assigns, once:false,
+        /// interactive:false — documented in comments at the one call site and enforced nowhere. A rule held
+        /// by the caller is a convention (ticket a39d9477); the seam is the writer, so the refusal lives
+        /// there and this asserts it from outside.
+        ///
+        /// Each arm is checked on its OWN engine so one refusal cannot be the reason the next one throws,
+        /// and the no-target ISOLATION case below is what keeps "refuses when attached" distinguishable from
+        /// "refuses always".
+        /// </summary>
+        private static void CheckSeamsRefuseLiveTarget(List<string> failures)
+        {
+            // Nothing but a real Attach/Launch sets _hProcess, so an attached engine cannot be built through
+            // any public path; it is set directly here. 0x1234 is not a handle this process owns, so every
+            // write an UNGUARDED handler would attempt through it fails — running the pre-fix code to watch
+            // this check fail touches nothing. A rename of the field fails loudly instead of passing quietly.
+            var hProcField = typeof(DebugEngine).GetField("_hProcess",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (hProcField == null)
+            {
+                failures.Add("seam-guard control: DebugEngine._hProcess was not found, so this check cannot "
+                             + "build an attached engine and is asserting nothing");
+                return;
+            }
+
+            // `prepare` runs BEFORE the fake handle goes in, so an arm can set up the state its seam needs
+            // (OnUserBp reads the armed-byte map) without that setup being the thing that refuses.
+            Action<string, Action<DebugEngine>, Action<DebugEngine>> refusesAttached = (name, prepare, call) =>
+            {
+                var eng = NewEngine();
+                if (prepare != null) prepare(eng);
+                hProcField.SetValue(eng, new IntPtr(0x1234));
+                string outcome = null;
+                CaptureConsole(() => { outcome = SeamOutcome(() => call(eng)); });
+                if (outcome != null)
+                    failures.Add("seam-guard: " + name + " " + outcome + " against an ATTACHED engine — the "
+                                 + "seam must refuse rather than rely on the caller passing a tid Windows "
+                                 + "never assigns");
+            };
+
+            refusesAttached("OnUserBpForTest",
+                            e => e.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null),
+                            e => e.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
+            refusesAttached("ArmUserBpForTest", null,
+                            e => e.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null));
+            refusesAttached("ArmStepSessionForTest", null,
+                            e => e.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
+            refusesAttached("CancelStepForTest", null, e => e.CancelStepForTest());
+            refusesAttached("ArmPrologueBypassForTest", null, e => e.ArmPrologueBypassForTest(0x1000));
+
+            // The other two caller choices, ISOLATED from the attached-target guard above: this engine has NO
+            // target, so only the --once / interactive refusal can stop it. Pre-fix, the --once arm reached
+            // TerminateProcess and the interactive arm never returned at all.
+            foreach (var arm in new[] { "once", "interactive" })
+            {
+                var eng = new DebugEngine("protocolcheck", null, null, null, null,
+                                          arm == "once", 0, arm == "interactive");
+                eng.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);
+                string outcome = null;
+                CaptureConsole(() => { outcome = SeamOutcome(() => eng.OnUserBpForTest(0xFFFFFFF1, 0x00401100)); });
+                if (outcome != null)
+                    failures.Add("seam-guard: OnUserBpForTest " + outcome + " on a " + arm + " engine — the "
+                                 + (arm == "once" ? "pausing route calls TerminateProcess"
+                                                  : "pausing route blocks in PausedWait reading stdin")
+                                 + ", so the seam must refuse this engine");
+            }
+
+            // ISOLATION for all of the above: with no target and neither flag set, the same seams must still
+            // WORK. Without this the guards would be indistinguishable from seams that refuse everything,
+            // and CheckBpHitVsStep above would be running against nothing.
+            try
+            {
+                var ok = NewEngine();
+                ok.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);
+                ok.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000);
+                CaptureConsole(() => ok.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
+                ok.ArmPrologueBypassForTest(0x1000);
+                ok.CancelStepForTest();
+            }
+            catch (Exception ex)
+            {
+                failures.Add("seam-guard control: the seams refused an engine with NO target and neither "
+                             + "flag set (" + ex.GetType().Name + ": " + ex.Message + ") — the guard is too "
+                             + "broad and every seam-driven check above is now asserting nothing");
+            }
+        }
+
+        /// <summary>How a seam call ENDED: null when it refused with InvalidOperationException, otherwise a
+        /// description. The bounded join is part of the assertion rather than defensiveness — one of the
+        /// caller choices the seam used to trust was interactive:false, and an interactive engine that
+        /// reaches PausedWait spins forever on an empty command queue, so "never returned" has to be
+        /// reportable instead of hanging the whole check.</summary>
+        private static string SeamOutcome(Action body)
+        {
+            string outcome = "returned without refusing";
+            var t = new System.Threading.Thread(() =>
+            {
+                try { body(); }
+                catch (InvalidOperationException) { outcome = null; }
+                catch (Exception ex) { outcome = "threw " + ex.GetType().Name + ": " + ex.Message; }
+            });
+            t.IsBackground = true;
+            t.Start();
+            if (!t.Join(3000)) return "never returned (still running after 3s)";
+            return outcome;
         }
 
         /// <summary>An engine with no target: every path below is bookkeeping, and the memory access it
