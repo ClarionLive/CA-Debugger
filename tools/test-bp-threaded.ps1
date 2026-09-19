@@ -16,7 +16,12 @@
 # no check of the process NAME or of its start time. A pid is not an identity -- Windows recycles them --
 # so if the debuggee exited before the finally block ran, that killed an unrelated developer process. The
 # shared Get-EngineTargetProcess verifies pid AND name AND "started after this session did" in one place
-# (337b3222 item 9); Stop-EngineTarget is the only thing here that signals the debuggee.
+# (337b3222 item 9).
+#
+# THE POKES ARE SIGNALS TOO. EnumWindows keyed on a bare pid posts WM_COMMAND / WM_NULL into whatever process
+# owns that pid at that instant, so "Stop-EngineTarget is the only thing here that signals the debuggee" was
+# never true of this file. Both poke sites below resolve through the shared Get-EngineTargetPid immediately
+# before posting, and skip - out loud - when the target cannot be verified.
 #
 #   e.g. tools\test-bp-threaded.ps1
 #        tools\test-bp-threaded.ps1 -Name AUT:AU_LNAME -MenuItem "2/5" -Verbose2
@@ -59,7 +64,9 @@ public static class Poke {
  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
- // pid is the one the ENGINE reported, so this can only ever reach the process under test.
+ // Both of these reach EVERY visible window owned by `pid` at the moment they run, and nothing more: a pid
+ // is all they have. Verifying that the pid is still this run's debuggee is the CALLER's job, and the two
+ // call sites below do it through Get-EngineTargetPid immediately before calling in.
  public static string Menu(int pid,string path){ string res=null; EnumWindows((h,l)=>{ uint p; GetWindowThreadProcessId(h,out p); if(p!=pid||!IsWindowVisible(h)) return true; var m=GetMenu(h); if(m==IntPtr.Zero) return true; var ps=path.Split('/'); var sm=GetSubMenu(m,int.Parse(ps[0])); uint id = sm==IntPtr.Zero?0:GetMenuItemID(sm,int.Parse(ps[1])); if(id!=0){ PostMessage(h,0x111,(IntPtr)id,IntPtr.Zero); res="WM_COMMAND id="+id+" hwnd=0x"+h.ToString("X"); return false;} return true; },IntPtr.Zero); return res; }
  public static int Wake(int pid){ int n=0; EnumWindows((h,l)=>{ uint p; GetWindowThreadProcessId(h,out p); if(p==pid && IsWindowVisible(h)){ PostMessage(h,0,IntPtr.Zero,IntPtr.Zero); n++; } return true; },IntPtr.Zero); return n; }
 }
@@ -96,6 +103,8 @@ $script:announcedPid = $false
 $script:events    = New-Object System.Collections.ArrayList   # ordered: @{Kind;Value;HitCount;Raw}
 $script:watchLine = $null
 
+# Reporting only. The pid to SIGNAL comes from Get-EngineTargetPid, which re-checks name and start time;
+# this one is for the console line and the log, where a bare pid does no harm.
 function TargetPid { if ($null -eq $session.TargetPid) { 0 } else { [int]$session.TargetPid } }
 
 function Note([string]$l) {
@@ -138,13 +147,19 @@ function Wait-Paused([int]$t) {
 }
 
 function Poke-Menu([string]$path) {
-    if ((TargetPid) -eq 0) { Write-Host "!! no target pid yet -- cannot poke"; return }
+    $verified = 0
     for ($i = 0; $i -lt 40; $i++) {
-        $r = [Poke]::Menu((TargetPid), $path)
+        # Re-resolved on EVERY pass, immediately before the PostMessage: this loop runs for up to ten seconds
+        # and the debuggee can exit inside it, at which point the pid it held is Windows' to give away.
+        $pokePid = Get-EngineTargetPid $session
+        if ($null -eq $pokePid) { Drain; Start-Sleep -Milliseconds 250; continue }
+        $verified++
+        $r = [Poke]::Menu($pokePid, $path)
         if ($r) { Write-Host "## menu $path -> $r"; return }
         Drain; Start-Sleep -Milliseconds 250
     }
-    Write-Host "!! menu $path never posted"
+    if ($verified -eq 0) { Write-Host "!! no verifiable debuggee process -- menu $path never posted (nothing signalled)" }
+    else { Write-Host "!! menu $path never posted ($verified verified attempt(s))" }
 }
 
 function Run-Leg([string]$label) {
@@ -178,7 +193,10 @@ try {
 
     # LEG 2 -- hits AFTER a stop and a resume. Anything cached at hit time in leg 1 is now a resume old.
     $leg2Start = $script:events.Count
-    [void][Poke]::Wake((TargetPid))
+    # Same rule as the menu poke: verify first, and say so when there is nothing to wake.
+    $wakePid = Get-EngineTargetPid $session
+    if ($null -ne $wakePid) { [void][Poke]::Wake($wakePid) }
+    else { Write-Host '## wake skipped -- no verifiable debuggee process' }
     Run-For 2 "LEG 2: settling after the resume"
     Run-Leg "LEG 2: more tracepoint hits, after a pause and a resume"
     $leg2End = $script:events.Count

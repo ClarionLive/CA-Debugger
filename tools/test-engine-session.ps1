@@ -225,6 +225,111 @@ Write-Host '5) every harness that launches the engine cleans up THROUGH this lif
         (((Get-Content -Raw -LiteralPath $watch) -match 'Get-Process') -and ((Get-CalledCommands $watch) -notcontains 'Get-Process'))
 }.Invoke()
 
+Write-Host '6) a POKE is a signal too, so it goes through the same identity check'
+# EnumWindows keyed on a bare pid posts WM_COMMAND / WM_NULL to every visible window that pid owns AT THAT
+# INSTANT. Commit a29b613 removed the bare-pid KILL path but left the poke sites resolving nothing: if the
+# debuggee exited and Windows recycled its pid, the harness typed into an unrelated developer's GUI.
+#
+# Section 5's rule is about resolving a pid to a PROCESS. This one is about the pid a harness hands to a
+# window poke, which is a different thing to get wrong and was got wrong separately.
+{
+    $hasResolver = $null -ne (Get-Command Get-EngineTargetPid -ErrorAction SilentlyContinue)
+    Check 'Get-EngineTargetPid exists as the one shared answer to "which pid may I signal?"' $hasResolver
+    if ($hasResolver) {
+        $me = Get-Process -Id $PID
+        $s = New-FakeSession
+        Check 'with no pid reported there is no pid to signal' ($null -eq (Get-EngineTargetPid $s))
+
+        $s.TargetPid = $PID
+        $s.TargetName = $me.ProcessName
+        $s.StartedAt = $me.StartTime.AddSeconds(-1)
+        Check 'a verified target answers with its pid, as an int' `
+            ((Get-EngineTargetPid $s) -eq $PID -and (Get-EngineTargetPid $s) -is [int]) (Get-EngineTargetPid $s)
+
+        # It must refuse for EVERY reason Get-EngineTargetProcess refuses, or a poke site would be verifying
+        # less than the cleanup does.
+        $s.TargetName = 'something-else'
+        Check 'a recycled pid now holding a different name is not signallable' ($null -eq (Get-EngineTargetPid $s))
+        $s.TargetName = $me.ProcessName
+        $s.StartedAt = $me.StartTime.AddSeconds(60)
+        Check 'a process older than the session is not signallable' ($null -eq (Get-EngineTargetPid $s))
+        $s.StartedAt = $me.StartTime.AddSeconds(-1)
+        $s.TargetPid = 999999
+        Check 'a pid nothing is using is not signallable' ($null -eq (Get-EngineTargetPid $s))
+    } else {
+        # Pointed at a copy of engine-session.ps1 that predates the resolver. Say so and go on to the
+        # structural scan, which is the half that reports on the harnesses' own poke sites.
+        Write-Host '  ....  behavioural checks skipped: this engine-session.ps1 has no Get-EngineTargetPid'
+    }
+
+    # ---- and every poke site in every harness goes through it ----------------------------------------
+    # The pid argument of a window poke must be a variable this file assigned from the shared resolver, not a
+    # pid expression. Read through the PARSER: these are method invocations, not commands, so section 5's
+    # command scan cannot see them at all.
+    $POKE_METHODS = @('Menu', 'Wake', 'Poke')
+    function Get-PokePidArgs([string]$path) {
+        $tok = $null; $err = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tok, [ref]$err)
+        if ($err.Count) { return @('<unparseable>') }
+        $calls = $ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+            $POKE_METHODS -contains $n.Member.Value
+        }, $true)
+        return @($calls | ForEach-Object {
+            if ($_.Arguments -and $_.Arguments.Count -ge 1) { $_.Arguments[0].Extent.Text } else { '<no arguments>' }
+        })
+    }
+    # Which variables in a file hold a resolver's answer. $x = Get-EngineTargetPid ... or Get-EngineTargetProcess ...
+    function Get-ResolvedPidVars([string]$text) {
+        return @([regex]::Matches($text, '\$(\w+)\s*=\s*\(?\s*Get-EngineTarget(?:Pid|Process)\b') |
+                 ForEach-Object { $_.Groups[1].Value })
+    }
+    # A poke argument is acceptable as $var or $var.Id, where $var came from a resolver in the same file.
+    function Test-PokeArg([string]$arg, [string[]]$vars) {
+        if ($arg -notmatch '^\$(\w+)(\.Id)?$') { return $false }
+        return ($vars -contains $matches[1])
+    }
+
+    $pokers = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' | Sort-Object Name |
+                Where-Object { (Get-PokePidArgs $_.FullName).Count -gt 0 })
+    # A number, not "every": a harness that grows a third poke site says so here.
+    $allArgs = @($pokers | ForEach-Object { Get-PokePidArgs $_.FullName })
+    Check 'exactly 4 window-poke sites across the harnesses, in 2 files' `
+        ($allArgs.Count -eq 4 -and $pokers.Count -eq 2) `
+        (($pokers.Name) -join ', ')
+
+    foreach ($f in $pokers) {
+        $text = Get-Content -Raw -LiteralPath $f.FullName
+        $vars = Get-ResolvedPidVars $text
+        foreach ($arg in (Get-PokePidArgs $f.FullName)) {
+            Check "$($f.Name): the poke pid $arg comes from the shared resolver" (Test-PokeArg $arg $vars) `
+                ("resolved-pid variables in this file: " + (($vars | ForEach-Object { '$' + $_ }) -join ', '))
+        }
+    }
+
+    # CONTROL: the detector is worth nothing if it cannot see the shape this section exists to ban. The
+    # pre-fix line is the fixture, so this fails the day the detector stops firing on it.
+    $banned = Join-Path ([IO.Path]::GetTempPath()) ('poke-detector-' + [Guid]::NewGuid().ToString('N') + '.ps1')
+    Set-Content -LiteralPath $banned -Encoding ASCII -Value @(
+        'function TargetPid { 42 }',
+        '$r = [Poke]::Menu((TargetPid), $path)',
+        '[void][Poke]::Wake((TargetPid))'
+    )
+    try {
+        $bannedArgs = Get-PokePidArgs $banned
+        $bannedVars = Get-ResolvedPidVars (Get-Content -Raw -LiteralPath $banned)
+        Check 'CONTROL: the detector finds both poke sites in the pre-fix shape' ($bannedArgs.Count -eq 2) `
+            ($bannedArgs -join ', ')
+        Check 'CONTROL: ...and rejects a bare pid expression as the poke argument' `
+            (@($bannedArgs | Where-Object { Test-PokeArg $_ $bannedVars }).Count -eq 0) ($bannedArgs -join ', ')
+        # ...and it accepts the resolved shape, so it is not simply rejecting everything.
+        Check 'CONTROL: ...and accepts a pid that came from the resolver' `
+            ((Test-PokeArg '$pokePid' @('pokePid')) -and (Test-PokeArg '$cp.Id' @('cp')))
+    } finally { Remove-Item -LiteralPath $banned -Force -ErrorAction SilentlyContinue }
+}.Invoke()
+
 Write-Host ''
 if ($script:fails) { Write-Host "$($script:fails) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

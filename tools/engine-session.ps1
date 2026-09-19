@@ -139,6 +139,22 @@ function Get-EngineTargetProcess {
     return $p
 }
 
+# The pid a harness may SIGNAL, re-verified at the moment of use, or $null when the target cannot be
+# verified right now.
+#
+# EnumWindows keyed on a bare pid reaches whatever process owns that pid AT THAT INSTANT. If the debuggee
+# exits and Windows recycles its pid between one poke and the next, a harness posting WM_COMMAND or WM_NULL
+# by the pid the engine once reported is posting into an unrelated GUI process - the same "a pid is not an
+# identity" defect as the old cleanup, on the signalling side rather than the killing side. So the rule lives
+# here, next to Stop-EngineTarget's copy of it, and a poke site calls this IMMEDIATELY before it pokes rather
+# than caching an answer.
+function Get-EngineTargetPid {
+    param($Session)
+    $p = Get-EngineTargetProcess $Session
+    if ($null -eq $p) { return $null }
+    return [int]$p.Id
+}
+
 function Stop-EngineSession {
     param($Session, [int]$QuitWaitMs = 8000)
     try { $Session.Proc.StandardInput.WriteLine('quit') } catch { }
