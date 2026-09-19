@@ -107,6 +107,76 @@ Write-Host '4) the target process is identified by pid, never by name (337b3222 
     Check 'a pid that no longer exists is not the target' ($null -eq (Get-EngineTargetProcess $s))
 }.Invoke()
 
+Write-Host '4b) a start time that cannot be READ is an identity failure, not a detail to skip'
+# ISOLATED on purpose. In section 4 the StartTime guard sits behind the name check and in front of its own
+# comparison, so a SWALLOWED read failure hides between them: pid and name still agreed, and the helper
+# returned the process. Everything below agrees except that the start time cannot be read.
+#
+# Get-Process is shadowed for the length of this block only - no real process can be made to fail a
+# StartTime read on demand - and the CONTROLS are what say the shadow is in effect and that nothing else
+# about the stand-in is why it gets rejected.
+#
+# WHAT THIS DOES AND DOES NOT PROVE, said plainly. It passes against the version that swallowed the read
+# failure in a catch block, because that catch was DEAD: a .NET getter that throws does not raise a catchable
+# error from PowerShell in either edition - the read answers $null - so what rejected the process was
+# `$null -lt <date>` evaluating True. This case pins the OUTCOME so that it is no longer an accident of null
+# coercion; it fails against a helper that swallows the failure and returns the process, which is what the
+# guard is there to prevent. Run under both $ErrorActionPreference values because the helper is dot-sourced
+# into whatever the harness has set (test-bp-threaded.ps1 sets 'Stop') and neither may behave differently.
+{
+    if (-not ('FakeStartTimeProc' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+// The shape Get-EngineTargetProcess reads off a process, with a StartTime that can be made unreadable the
+// way the real one is when the process is protected or has already exited.
+public class FakeStartTimeProc {
+    public int Id { get; set; }
+    public string ProcessName { get; set; }
+    public bool Readable { get; set; }
+    public DateTime Started { get; set; }
+    public DateTime StartTime {
+        get {
+            if (!Readable) throw new System.ComponentModel.Win32Exception(5);   // Access is denied
+            return Started;
+        }
+    }
+}
+'@
+    }
+
+    function Get-Process { param([int]$Id, $ErrorAction) return $script:fakeProc }
+
+    $script:fakeProc = New-Object FakeStartTimeProc
+    $script:fakeProc.Id = 4242
+    $script:fakeProc.ProcessName = 'clbrws'
+    $script:fakeProc.Started = (Get-Date)
+    $script:fakeProc.Readable = $true
+
+    $s = New-FakeSession                 # target C:\apps\clbrws.exe, so TargetName is 'clbrws'
+    $s.TargetPid = 4242
+    $s.StartedAt = (Get-Date).AddMinutes(-5)
+
+    Check 'CONTROL: the stand-in IS accepted while its start time is readable' `
+        ($null -ne (Get-EngineTargetProcess $s)) 'rejected - the shadowed lookup is not in effect'
+    $s.TargetName = 'something-else'
+    Check 'CONTROL: and it is still rejected on a name mismatch' ($null -eq (Get-EngineTargetProcess $s))
+    $s.TargetName = 'clbrws'
+
+    # THE RULE: now the ONLY thing wrong is that the start time cannot be read.
+    $script:fakeProc.Readable = $false
+    foreach ($eap in 'Continue', 'Stop') {
+        $ErrorActionPreference = $eap
+        $r = Get-EngineTargetProcess $s
+        $ErrorActionPreference = 'Continue'
+        Check "a process whose StartTime cannot be read is NOT the target (ErrorActionPreference $eap)" `
+            ($null -eq $r) 'returned a process Stop-EngineTarget would then Kill()'
+    }
+
+    # ...and the guard is not simply rejecting everything now: readable again, accepted again.
+    $script:fakeProc.Readable = $true
+    Check 'CONTROL: a readable start time is accepted again afterwards' ($null -ne (Get-EngineTargetProcess $s))
+}.Invoke()
+
 Write-Host '5) every harness that launches the engine cleans up THROUGH this lifecycle'
 # Section 4 proves the identity check is right. It says nothing about whether the harnesses use it, and a
 # harness that resolves a pid itself gets no benefit from it: the third recorded instance of "a pid is not

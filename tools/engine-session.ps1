@@ -120,7 +120,22 @@ function Get-EngineTargetProcess {
     # Windows recycles pids. A pid that now belongs to a process with a different name, or to one that
     # was already running before this session started, is not the process this run launched.
     if ($Session.TargetName -and $p.ProcessName -ne $Session.TargetName) { return $null }
-    try { if ($p.StartTime -lt $Session.StartedAt) { return $null } } catch { }
+    # Failing to READ the start time is an IDENTITY FAILURE, and it is refused EXPLICITLY.
+    #
+    # A .NET property getter that throws does NOT raise a catchable error from PowerShell - in both editions,
+    # and whatever $ErrorActionPreference is set to, the read simply answers $null (a protected process such
+    # as pid 4 reads exactly this way). So the `catch { }` that used to sit here never fired, and what
+    # actually rejected such a process was `$null -lt <date>` happening to evaluate True. The right answer by
+    # accident: nothing in the file said that was the mechanism, and a change to -ge, or to comparing .Ticks,
+    # would have turned it into "return the process" with no test and no comment objecting.
+    #
+    # Both shapes are now refused in their own right, and fail CLOSED, because Stop-EngineTarget is what this
+    # answer arms: not killing a stray debuggee is a nuisance, killing a developer's unrelated process is
+    # data loss.
+    $started = $null
+    try { $started = $p.StartTime } catch { return $null }
+    if ($null -eq $started) { return $null }
+    if ($started -lt $Session.StartedAt) { return $null }
     return $p
 }
 
