@@ -1393,11 +1393,23 @@ namespace ClarionDebugger.Services
         /// neighbour sharing its planted line alone. Only when the echo carries NO requestedLine — an
         /// engine build older than this protocol change — does it fall back to the planted line, which
         /// can still match several: that is the old behaviour, kept deliberately so an old engine keeps
-        /// deleting something rather than silently deleting nothing.</summary>
+        /// deleting something rather than silently deleting nothing.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one, exactly as in
+        /// <see cref="SameBpIdentity"/>, which was written to mirror this function. Reading the entry's line
+        /// through the substituting <c>RequestedLine</c> getter instead compared the entry's PLANTED line
+        /// against the echo's REQUESTED one whenever the entry came from an engine build that reports no
+        /// <c>requestedLine</c> — which both removes a row the engine did not delete (the two lines happen to
+        /// be equal) and leaves the named one behind (they happen not to be). A stale entry from an earlier
+        /// session is enough to reach that mix. So the absent case falls back to the planted line here too:
+        /// over-broad, and the documented cost of an old echo, rather than silently wrong.
+        /// </para></summary>
         internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)
         {
             if (b.Module != module) return false;
-            return requestedLine.HasValue ? b.RequestedLine == requestedLine.Value : b.Line == plantedLine;
+            int? rb = b.RequestedLineOrNull;
+            return (requestedLine.HasValue && rb.HasValue) ? rb.Value == requestedLine.Value
+                                                           : b.Line == plantedLine;
         }
 
         /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an

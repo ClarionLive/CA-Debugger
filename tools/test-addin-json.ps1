@@ -320,6 +320,44 @@ HostBpSet $mixed $setA      # requestedLine ABSENT, planted 11
 HostBpSet $mixed $raw0      # requestedLine 0 PRESENT, planted 13
 Check 'an absent requested line is not a requested line of 0' ($mixed.Count -eq 2) (Lines $mixed)
 
+# ...and the SAME mixed case through the OTHER predicate. SameBpIdentity was changed to read the nullable
+# carrier explicitly; BpDelMatches - the function it was written to MIRROR - went on reading
+# b.RequestedLine, the substituting getter that answers the PLANTED line when the requested one is absent.
+# So a bp-del that names a requested line compared it against a planted one, and that is wrong in both
+# directions. Both rows below are the REAL writer's output with the one member an older build would not have
+# emitted taken back out, the same derivation the fixtures above use.
+$legacyRow10 = Legacy ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 8 10)))   # absent requested, planted 10
+Check 'CONTROL: the legacy row carries no requested line and a planted line of 10' `
+  (($legacyRow10 -notmatch 'requestedLine') -and ([BpHost]::GetInt($legacyRow10, 'line') -eq 10)) $legacyRow10
+
+# DIRECTION 1, the damaging one: a bp-del for a DIFFERENT breakpoint (requested 10, planted 12). Reading the
+# substituting getter made the legacy row's planted 10 compare equal to the echo's requested 10, so the row
+# vanished from the pane while its breakpoint was still armed in the engine.
+$rowsFalsePos = New-Object System.Collections.ArrayList
+HostBpSet $rowsFalsePos $legacyRow10
+$fpSurv = HostBpDel $rowsFalsePos ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 10 12)))
+Check 'a bp-del naming requested 10 does NOT remove a legacy row merely PLANTED on 10' `
+  ($fpSurv.Count -eq 1) (Lines $fpSurv)
+
+# DIRECTION 2: the breakpoint the echo really does name (planted 11, as the legacy row is). With no
+# requested line on the row there is nothing else to key on, so the documented planted-line fallback is what
+# has to fire - the same fallback SameBpIdentity uses, and the same reason: deleting something the engine
+# says it deleted beats deleting nothing.
+$rowsFalseNeg = New-Object System.Collections.ArrayList
+HostBpSet $rowsFalseNeg $setA                                    # absent requested, planted 11
+$fnSurv = HostBpDel $rowsFalseNeg ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 10 11)))
+Check 'and it DOES remove the legacy row planted where the echo says it deleted (11)' `
+  ($fnSurv.Count -eq 0) (Lines $fnSurv)
+
+# ISOLATION: neither direction above may come from the predicate having stopped comparing requested lines at
+# all. Both rows here HAVE requested lines, and only the named one goes.
+$bothPresent = New-Object System.Collections.ArrayList
+HostBpSet $bothPresent ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 10 11)))
+HostBpSet $bothPresent ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 12 11)))
+$bpSurv = HostBpDel $bothPresent ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 10 11)))
+Check 'with requested lines on BOTH sides it still removes only the one named' `
+  ($bpSurv.Count -eq 1 -and $bpSurv[0].RequestedLine -eq 12) (Lines $bpSurv)
+
 Write-Host ''
 Write-Host 'bp-list decodes through the same reader, so it inherits the same promise'
 $ul = New-Object 'System.Collections.Generic.List[UserBreakpoint]'
@@ -344,6 +382,13 @@ $identBody = Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, 
 Check 'SameBpIdentity falls back to the planted line when a requested line is absent' ($identBody -match 'a\.Line == b\.Line') ''
 Check 'and it compares requested lines through the nullable carrier, not the 0-defaulting accessor' `
   ($identBody -match 'RequestedLineOrNull') ''
+# The predicate SameBpIdentity mirrors has to read the carrier for the same reason: b.RequestedLine answers
+# the PLANTED line when the requested one is absent, so reading it compares one kind of line against another.
+$delBody = Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)'
+Check 'BpDelMatches reads the nullable carrier too, not the substituting getter' `
+  (($delBody -match 'RequestedLineOrNull') -and ($delBody -notmatch 'b\.RequestedLine ==')) ''
+Check 'and it requires a requested line on BOTH sides before comparing them' `
+  ($delBody -match 'requestedLine\.HasValue && rb\.HasValue') ''
 
 Write-Host ''
 Write-Host 'the real handler arms use these same keys, so the mirror above cannot drift'
