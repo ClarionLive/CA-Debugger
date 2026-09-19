@@ -28,7 +28,11 @@ param(
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
-  [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html')
+  [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
+  # the captured host output tools/test-pad-source.js drives the page with. Regenerate with the switch below
+  # after a deliberate change to SendSource; the checks at the end of this file fail while it is stale.
+  [string] $HostSourceFixture = (Join-Path $PSScriptRoot 'fixtures\host-source-messages.json'),
+  [switch] $UpdateHostSourceFixture
 )
 
 . (Join-Path $PSScriptRoot 'lib-extract.ps1')
@@ -361,11 +365,18 @@ Write-Host 'a stop with no source file still TELLS the page so, instead of sayin
 # load-bearing, because run-to-cursor is sent as curFile + ':' + line.
 #
 # The page half is covered behaviourally by tools/test-pad-source.js, which runs the real buildSource. What
-# belongs here is the HOST's half of the contract: there is a message on every path. Asserted against the
-# shipped method body, brace-matched out, and the signature prefix matches the pre-fix arity too so an older
-# add-in fails these checks rather than aborting the suite.
+# belongs here is the HOST's half: the message the page half is fed. Both were verified independently once -
+# this suite counted one Post() CALL SITE and the page suite used a hand-written empty-lines message - and
+# two hand-written fixtures on either side of a contract verify nothing, because they cannot contradict each
+# other. A host change that put a placeholder line in that array would have shipped with both suites green.
+#
+# So SendSource is brace-matched out, COMPILED and RUN below, and its real output is what the page suite
+# reads. The signature prefix matches the pre-fix arity too, so an older add-in fails these checks rather
+# than aborting the suite.
 $sendSource = Get-Method 'private void SendSource(' $web
-Check 'SendSource posts exactly one source message' ((([regex]::Matches($sendSource, 'Post\(')).Count) -eq 1) `
+# Named for what it checks: one call site is not the same claim as one message, and it would not catch a
+# Post inside a loop. The message COUNT is asserted behaviourally further down, on both paths.
+Check 'SendSource has exactly 1 Post() call site' ((([regex]::Matches($sendSource, 'Post\(')).Count) -eq 1) `
   ((([regex]::Matches($sendSource, 'Post\(')).Count).ToString() + ' Post() call(s)')
 # THE RULE: no path out of SendSource that skips the message. An early `return;` is exactly how the old one
 # left the page holding the last stop's listing.
@@ -373,6 +384,102 @@ Check 'and has no early return that would skip it' ($sendSource -notmatch 'retur
 Check 'it still reads the file when there is one' ($sendSource -match 'File\.ReadAllLines') ''
 # ...and the caller hands it the module, so the message can name the stop when the path does not resolve.
 Check 'the pause handler passes the module as well as the path' ($web -match 'SendSource\(p\.Module, p\.ResolvedPath, p\.Proc, p\.Line\)') ''
+
+# ---- the shipped writer, actually run ---------------------------------------------------------------
+# Post becomes a recorder, so "how many messages" and "what was in them" are answers from the real method
+# rather than inferences from its text. Str comes out of the same file for the same reason.
+$sendSourceStatic = $sendSource -replace 'private void SendSource', 'public static void SendSource'
+$hostProbeSrc = @"
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+public static class HostSourceProbe {
+  public static List<string> Posts = new List<string>();
+  private static void Post(string json) { Posts.Add(json); }
+  $sendSourceStatic
+  $(Get-Method 'private static string Str(string s)' $web)
+}
+"@
+Add-Type -TypeDefinition $hostProbeSrc -Language CSharp | Out-Null
+
+# The no-source case: a module and a line, and no path that resolves.
+$noSourceModule = 'clbrws026.clw'
+$noSourceLine = 7
+[HostSourceProbe]::Posts.Clear()
+[HostSourceProbe]::SendSource($noSourceModule, $null, 'MAIN', $noSourceLine)
+$noSourceCount = [HostSourceProbe]::Posts.Count
+Check 'running it with no readable path posts exactly 1 message' ($noSourceCount -eq 1) `
+  ("$noSourceCount message(s)")
+$noSource = if ($noSourceCount -ge 1) { [HostSourceProbe]::Posts[0] } else { '' }
+# THE RULE, from the writer's own output: no source means NO lines. A placeholder line here is what the page
+# would render under the new stop's header, which is the whole failure 4891ed2 set out to close.
+Check 'and its lines array is EMPTY, so buildSource is the only thing that can write a listing' `
+  ($noSource -match '"lines":\[\]') $noSource
+Check 'and `file` carries the MODULE name, the only name the stop has left' `
+  ($noSource -match ('"file":"' + [regex]::Escape($noSourceModule) + '"')) $noSource
+Check 'and startLine is 0 with current on the stop line' `
+  ($noSource -match '"startLine":0' -and $noSource -match ('"current":' + $noSourceLine + '[,}]')) $noSource
+
+# The with-source case, for the other half of the fixture: a real file on disk, deterministic contents so
+# the captured message is reproducible.
+$withSourceFile = 'clbrws011.clw'
+$withSourceLine = 42
+$tmpDir = Join-Path ([IO.Path]::GetTempPath()) ('host-source-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $tmpDir | Out-Null
+$withSource = ''
+try {
+  $tmpClw = Join-Path $tmpDir $withSourceFile
+  Set-Content -LiteralPath $tmpClw -Encoding ASCII `
+    -Value (1..60 | ForEach-Object { '  line ' + $_ + ' of ' + $withSourceFile })
+  [HostSourceProbe]::Posts.Clear()
+  [HostSourceProbe]::SendSource($withSourceFile, $tmpClw, 'BROWSEPUBLISHERS', $withSourceLine)
+  $withCount = [HostSourceProbe]::Posts.Count
+  Check 'running it with a readable .clw posts exactly 1 message too' ($withCount -eq 1) "$withCount message(s)"
+  $withSource = if ($withCount -ge 1) { [HostSourceProbe]::Posts[0] } else { '' }
+} finally {
+  Remove-Item -Recurse -Force -LiteralPath $tmpDir -ErrorAction SilentlyContinue
+}
+# 25 lines centred on the stop (+/-12) is the window the page suite renders and counts.
+Check 'and that message carries the 25-line window around the stop' `
+  (((([regex]::Matches($withSource, '"  line ')).Count) -eq 25) -and ($withSource -match '"startLine":30')) `
+  ((([regex]::Matches($withSource, '"  line ')).Count).ToString() + ' line(s)')
+
+# ---- and the page suite is fed exactly these two strings --------------------------------------------
+# This is the cross-boundary pin. tools/test-pad-source.js reads this file and hands the strings to the real
+# page functions; this check says the file still holds what the shipped writer produces. Change the writer
+# and this fails until the fixture is regenerated (-UpdateHostSourceFixture), and regenerating it is what
+# makes the page suite see the change. Neither side can be edited into agreement on its own.
+function Format-JsonString {
+  param([string] $S)
+  if ($S -match '[\x00-\x1f]') { throw 'a captured message contains a control character; the fixture writer would have to escape it' }
+  '"' + (($S -replace '\\', '\\') -replace '"', '\"') + '"'
+}
+if ($UpdateHostSourceFixture) {
+  $fixtureDir = Split-Path -Parent $HostSourceFixture
+  if (-not (Test-Path -LiteralPath $fixtureDir)) { New-Item -ItemType Directory -Path $fixtureDir | Out-Null }
+  $note = 'GENERATED by tools/test-addin-json.ps1 -UpdateHostSourceFixture from the REAL SendSource in ' +
+          'src/ClarionDebugger.Addin/Terminal/ClarionDebuggerWebView.cs. Do not hand-edit: ' +
+          'test-addin-json.ps1 re-runs the shipped writer and fails when these strings are not what it ' +
+          'produces, and tools/test-pad-source.js feeds them to the real page functions.'
+  $body = "{" + [Environment]::NewLine +
+          '  "note": ' + (Format-JsonString $note) + ',' + [Environment]::NewLine +
+          '  "noSource": ' + (Format-JsonString $noSource) + ',' + [Environment]::NewLine +
+          '  "withSource": ' + (Format-JsonString $withSource) + [Environment]::NewLine +
+          "}" + [Environment]::NewLine
+  Set-Content -LiteralPath $HostSourceFixture -Value $body -Encoding ASCII -NoNewline
+  Write-Host ("  ....  wrote " + $HostSourceFixture)
+}
+if (-not (Test-Path -LiteralPath $HostSourceFixture)) {
+  Check 'the page suite fixture holds the host output captured above' $false `
+    ("missing: $HostSourceFixture - regenerate with -UpdateHostSourceFixture")
+} else {
+  $fx = Get-Content -Raw -LiteralPath $HostSourceFixture | ConvertFrom-Json
+  Check 'the page suite is fed the no-source message this writer really produces' `
+    ($fx.noSource -ceq $noSource) ("fixture: " + $fx.noSource)
+  Check 'and the with-source message this writer really produces' `
+    ($fx.withSource -ceq $withSource) ("fixture: " + $fx.withSource)
+}
 
 Write-Host ''
 Write-Host 'teardown: "stopped" has to be a check, not a claim'
