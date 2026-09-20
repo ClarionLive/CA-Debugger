@@ -1181,6 +1181,21 @@ $bareTag = @($callLines | Where-Object { $_ -match ',\s*(WinTag|FwdTag|BwdTag)\s
 Check 'the view still issues disasm requests at all' ($callLines.Count -ge 1) "$($callLines.Count) call site(s)"
 Check 'no RequestDisasmAt still passes a bare tag constant' ($bareTag.Count -eq 0) "$($bareTag.Count) bare call(s)"
 Check 'every disasm request goes out through MakeTag' ($viaMakeTag.Count -eq $callLines.Count) "$($viaMakeTag.Count) of $($callLines.Count)"
+
+# THE LATE-OPEN SEAT MUST ASK WHOSE THREAD IT IS (Owen2, run-2 item 1). `_svc.CurrentVa` is the STOPPED
+# thread's address while the engine decodes the SELECTED one, so seating there blind paints one thread's
+# address range labelled as another's, with no current row and no banner. The inventory is the only thing
+# that reports a selection made before this view existed - and nothing used to request it, so the
+# "window-opened-late" case the code documented was unreachable.
+$lateOpen = Get-Method 'private void SeatOnLateOpen()' $disasmView
+Check 'the late-open seat asks for the thread inventory' ($lateOpen -match 'RequestThreads') ''
+# ...and neither entry point may seat on its own again, which is what stops the blind seat coming back.
+$onHandle = Get-Method 'protected override void OnHandleCreated(EventArgs e)' $disasmView
+$onActive = Get-Method 'private void OnActiveChanged()' $disasmView
+Check 'OnHandleCreated seats only through SeatOnLateOpen' `
+  (($onHandle -match 'SeatOnLateOpen') -and ($onHandle -notmatch 'RequestDisasmAt')) ''
+Check 'OnActiveChanged seats only through SeatOnLateOpen' `
+  (($onActive -match 'SeatOnLateOpen') -and ($onActive -notmatch 'RequestDisasmAt')) ''
 # BOTH epoch checks, counted — not merely "one is present". OnDisasm tests the epoch TWICE on purpose:
 # once on the reader thread, and again INSIDE the UI marshal, because the epoch can move between the two
 # and that is precisely the window a thread switch lands in. A `-match` here passed while the inner check
@@ -1237,8 +1252,15 @@ Check 'an UNSTAMPED reply is not treated as a mismatch (pre-381aabd7 engine keep
   ([DisasmTagProbe]::TidMatches($null, [uint] 116932)) 'tid=null'
 Check 'a 0 tid is a sentinel, not thread 0, so it is not a mismatch either' `
   ([DisasmTagProbe]::TidMatches([uint] 0, [uint] 116932)) 'tid=0'
-Check 'a view that does not yet know its own thread accepts a stamped reply' `
-  ([DisasmTagProbe]::TidMatches([uint] 4812, [uint] 0)) 'view selTid=0'
+# INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
+# simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
+# which the cross-model adversary reported as HIGH: that is not an absence of information, it is
+# information the view DISCARDS in order to paint something it cannot label. The two fail-open cases are
+# not symmetric - an absent tid means the ENGINE said nothing; an unknown _selTid means WE have not asked
+# yet, and the fix for not having asked is to ask (SeatOnLateOpen now calls RequestThreads), not to accept
+# whatever turns up meanwhile.
+Check 'a STAMPED reply is DROPPED while the view does not know its own thread' `
+  (-not [DisasmTagProbe]::TidMatches([uint] 4812, [uint] 0)) 'view selTid=0'
 # ...and the fail-open cases must not swallow the real mismatch they sit next to.
 Check 'CONTROL: fail-open does not extend to a genuine disagreement' `
   (-not [DisasmTagProbe]::TidMatches([uint] 1, [uint] 2)) ''
