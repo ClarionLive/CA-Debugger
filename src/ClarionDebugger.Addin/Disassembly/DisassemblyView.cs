@@ -300,17 +300,23 @@ namespace ClarionDebugger.Disassembly
         /// existed, and nothing used to request it — OnThreads was driven solely by the pad's own
         /// requests, so the "window-opened-late case" its comment described was unreachable.
         ///
-        /// The CurrentVa seat is still issued, and is now a fallback rather than a guess: against a
-        /// STAMPED engine its reply is dropped by the tid gate (we do not know our thread yet) and the
-        /// inventory drives the real seat; against an engine that stamps nothing and answers no
-        /// inventory, it is the only thing that fills the window, and there is no selection to conflict
-        /// with. Each path is correct in the regime it serves.</summary>
+        /// The CurrentVa seat below is a DEGRADATION PATH, not a second way of doing this. It is issued
+        /// AFTER the inventory and is expected to lose: against a STAMPED engine its reply is dropped by
+        /// the tid gate (we do not know our thread yet) and the inventory drives the real seat. It earns
+        /// its place only against an engine that stamps nothing AND answers no inventory, where it is the
+        /// only thing that fills the window and there is no selection for it to contradict.
+        ///
+        /// DO NOT PROMOTE IT. Moving it ahead of the inventory, making it unconditional, or "simplifying"
+        /// this method down to it re-opens the blind-seat defect in full: it seats on the STOPPED thread's
+        /// address while the engine decodes the SELECTED one. It will look like it works, because it does
+        /// — on the common path where the two are the same thread. Nothing here can assert an ordering
+        /// preference, so this comment is the guard.</summary>
         private void SeatOnLateOpen()
         {
             if (_svc == null || _svc.State != DebugSessionState.Paused) return;
-            _svc.RequestThreads();
+            _svc.RequestThreads();            // FIRST: the only thing that reports a pre-existing selection
             if (!string.IsNullOrEmpty(_svc.CurrentVa))
-                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);
+                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);   // degradation path
         }
 
         private void OnPaused(DebugPause p)
