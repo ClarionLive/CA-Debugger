@@ -60,6 +60,17 @@ namespace ClarionDbg.Cli
 
         private static ulong ThreadedBlockKey(uint tid, uint loadBase) { return ((ulong)tid << 32) | loadBase; }
 
+        /// <summary>Landing pad for the one-byte liveness probe on a cached block base. Reused rather than
+        /// allocated per call because that probe runs on EVERY THREADed field read — once per row of a
+        /// Variables pane, once per watch, and once per thread per name under `threadscan NAME`.
+        ///
+        /// Sharing a mutable buffer is only safe when nobody reads it, and nobody does: the probe wants the
+        /// COUNT ReadBlock returns, never the byte it landed. It is never handed out, never compared and
+        /// never carried across a call, so there is no stale content to inherit. (The engine also does all
+        /// of this on the debug-event thread, but that is the weaker of the two reasons and not the one to
+        /// rely on.)</summary>
+        private readonly byte[] _blockProbeByte = new byte[1];
+
         private void ClearThreadedBlockCache() { _threadedBlockCache.Clear(); }
         private void ClearThreadedBlockCache(uint tid)
         {
@@ -91,7 +102,7 @@ namespace ClarionDbg.Cli
                 // is an address the TARGET owns, not a fact we derived, and nothing here can promise the
                 // block is still mapped. If one byte will not read, drop the entry and re-emulate rather than
                 // report Ok for an address the caller would then render as a value.
-                if (ReadBlock(hit, new byte[1]) >= 1) { instanceVa = hit; return ThreadedResolve.Ok; }
+                if (ReadBlock(hit, _blockProbeByte) >= 1) { instanceVa = hit; return ThreadedResolve.Ok; }
                 _threadedBlockCache.Remove(key);
             }
 
@@ -133,7 +144,8 @@ namespace ClarionDbg.Cli
                 if (emu.WroteDebuggeeMemory)
                 {
                     reason = "not yet allocated on this thread";
-                    NoteThreadedEmulation(owner, "reporting 'not yet allocated' after a failed emulation", ex, emu);
+                    NoteThreadedEmulation(owner, "failed-emulation-reported-unallocated",
+                                          "reporting 'not yet allocated' after a failed emulation", ex, emu);
                     return ThreadedResolve.Unallocated;
                 }
                 reason = ex is RtlEmulator.NotSupported
@@ -174,10 +186,12 @@ namespace ClarionDbg.Cli
                     // is the only honest one — but say so rather than let it pass for a measurement.
                     reason = "not yet allocated on this thread";
                     if (cwtlsSize == 0)
-                        NoteThreadedEmulation(owner, "no .cwtls span to test the write against — assuming the allocate path", null, emu);
+                        NoteThreadedEmulation(owner, "no-cwtls-span",
+                                              "no .cwtls span to test the write against — assuming the allocate path",
+                                              null, emu);
                     return ThreadedResolve.Unallocated;
                 }
-                NoteThreadedEmulation(owner,
+                NoteThreadedEmulation(owner, "write-outside-block",
                     $"kept instance 0x{result:X} despite a debuggee write outside its block (0x{blockBase:X}+0x{cwtlsSize:X})",
                     null, emu);
             }
@@ -214,10 +228,22 @@ namespace ClarionDbg.Cli
         /// "not yet used on this thread" with the template's value shown as real. Mirrors Library State, which
         /// prints every getter it could not run. The emulator's own trace goes with it (capped — a block-sized
         /// REP STOS is one line, but a long call chain is not) because "wrote 0x…" is the whole question.</summary>
-        private void NoteThreadedEmulation(LoadedModule owner, string what, Exception ex, RtlEmulator emu)
+        private void NoteThreadedEmulation(LoadedModule owner, string reasonKey, string what,
+                                           Exception ex, RtlEmulator emu)
         {
+            // Once per (image, reason) per session. Every one of these fires per FIELD READ, so a
+            // conditional breakpoint over an image with no .cwtls span buries the console in identical
+            // notes — and the trace below is up to 12 lines each. What the second one adds is nothing.
+            //
+            // The key is reasonKey, a constant from the call site, NOT `what`: `what` interpolates the
+            // instance address and the block span, so keying on the message would dedup nothing at all and
+            // would look like it was working. The suffix is on the line so the reader can tell "happened
+            // once" from "happens constantly and is being suppressed" — the whole point of this reporter is
+            // that it is never silent, and dropping repeats without saying so is a quieter way of being it.
+            if (!FirstReportOf("threaded|" + owner.Name + "|" + reasonKey)) return;
+
             Console.WriteLine($"  threaded {owner.Name}: {what}"
-                              + (ex != null ? $" — {ex.GetType().Name}: {ex.Message}" : ""));
+                              + (ex != null ? $" — {ex.GetType().Name}: {ex.Message}" : "") + ONCE_SUFFIX);
             const int cap = 12;
             int n = 0;
             foreach (var t in emu.Trace)
@@ -225,6 +251,19 @@ namespace ClarionDbg.Cli
                 if (n++ == cap) { Console.WriteLine($"      emu: … ({emu.Trace.Count - cap} more)"); break; }
                 Console.WriteLine("      emu: " + t);
             }
+        }
+
+        /// <summary>Test seam driving the REAL reporter, not just the predicate under it. Whether these
+        /// notes dedup correctly is decided by how the KEY IS BUILT here, and a check that only exercised
+        /// FirstReportOf would pass just as happily against a version that keyed on the message text — which
+        /// interpolates addresses and would therefore dedup nothing while looking like it worked.
+        ///
+        /// The emulator is real but never run, so its Trace is empty and the note is one line.</summary>
+        internal void NoteThreadedEmulationForTest(string image, string reasonKey, string what)
+        {
+            var owner = new LoadedModule { Name = image };
+            var emu = new RtlEmulator(null, null, 0, 0, null, null, 0x00100000);
+            NoteThreadedEmulation(owner, reasonKey, what, null, emu);
         }
 
         // ------------------------------------------------------------------ watch (by name)

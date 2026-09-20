@@ -61,6 +61,45 @@ if (!failures && !compiled) {
   console.log('\nFAILED: ' + blocks.length + ' <script> block(s) found, none of them inline JavaScript — nothing was checked.');
   process.exit(1);
 }
+
+// ---- the retired field-order rule stays retired on the PAGE side too --------------------------------
+// The host's scanner took the first `"key":` it found anywhere in the text, so payloads were ORDERED to
+// keep untrusted fields last, and the host's doc comment instructed every future payload to keep doing
+// it. ae5b678a stage 1 replaced the scanner with JsonMessageReader and retired that instruction — and
+// tools/test-addin-json.ps1 guards the host side, checking the doc comment no longer issues it.
+//
+// Nobody guarded THIS side, and the page is where senders are written. Two comments here still said
+// order was load-bearing (the breakonprocentry payload and the editvar one) five months after it stopped
+// being true, which is the same instruction propagating into code not yet written. This is the page half
+// of that guard: it reads the raw HTML, because the rule lives in comments that no compiled function
+// carries. Naming a retired rule to say it is retired is fine - INSTRUCTING a payload to obey it is not.
+// Matched against COMMENT lines only, and each pattern is a phrasing the rule actually used - a looser
+// "must .. first" caught `must first strip the previous one's edit metadata`, which is about reuse order
+// within a reply and has nothing to do with JSON. A guard that cries wolf gets its predicate widened
+// until it means nothing.
+const ORDER_INSTRUCTIONS = [
+  [/\b(?:module\+line|tid)\s+(?:FIRST|BEFORE)\b/i, 'tells a payload to put a field first'],
+  [/takes the FIRST\s+"key"/i,                     'describes the retired first-match scanner as current'],
+  [/\bgoes LAST\b/i,                               'orders a field last'],
+  [/\bmust do the same\b/i,                        'instructs future payloads to copy the ordering'],
+  [/\bfield order\b/i,                             'treats JSON field order as a rule'],
+];
+// A line that plainly says the rule is DEAD is the fix, not a violation of it.
+const RETIRED = /retire|used to|no longer|is gone|is free|decides nothing|not carrying|must not be mistaken/i;
+const offenders = [];
+html.split('\n').forEach((text, idx) => {
+  const line = text.trim();
+  if (!line.startsWith('//') && !line.startsWith('*') && !line.startsWith('/*')) return;
+  if (RETIRED.test(line)) return;
+  for (const [re, why] of ORDER_INSTRUCTIONS) if (re.test(line)) offenders.push((idx + 1) + ': ' + why + ' -> ' + line);
+});
+if (offenders.length) {
+  console.log('\n' + offenders.length + ' comment(s) still treat JSON field order as load-bearing.');
+  console.log('The host reads by key (JsonMessageReader); order decides nothing. Say so, or say nothing.');
+  for (const o of offenders) console.log('  FAIL  ' + o);
+  process.exit(1);
+}
+console.log('  PASS  no comment instructs a payload to order its fields (' + page + ')');
 console.log(failures
   ? '\n' + failures + ' of ' + blocks.length + ' block(s) FAILED to parse'
   : '\nall ' + compiled + ' inline script block(s) parse OK');

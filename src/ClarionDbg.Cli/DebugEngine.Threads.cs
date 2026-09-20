@@ -26,6 +26,43 @@ namespace ClarionDbg.Cli
                                                 // default stack view: we want the Clarion frames under a
                                                 // syscall-parked top frame, not just the first few)
 
+        // ------------------------------------------------------------- once-per-session diagnostics (ec45805f)
+        //
+        // Two console diagnostics here and in DebugEngine.Watch.cs fire on a REPEATING event rather than a
+        // changing one: the window-walk cap is reported on every pause, and the THREADed-emulation notes on
+        // every hit of a conditional breakpoint over an image with no .cwtls span. Neither says anything on
+        // the hundredth time it did not say on the first, and a diagnostic that floods the console it informs
+        // is read as noise — which is the failure mode, because these exist to be NOTICED.
+        //
+        // So each one is reported once per KEY per session, and the key is a stable category, never the
+        // formatted line: the notes interpolate addresses, so keying on the text would dedup nothing.
+        //
+        // AND THE SUPPRESSION IS ANNOUNCED, not silent. The comment on NoteThreadedEmulation says these may
+        // never be silent, and dropping the repeats without saying so would quietly re-introduce exactly
+        // that — a reader could no longer tell "it happened once" from "it happens constantly". The first
+        // report says further ones for that key are suppressed; the count is not tracked, because the only
+        // decision it would change is one nobody makes from a console line.
+        //
+        // It lives in this file rather than DebugEngine.cs because both callers are diagnostic reporters in
+        // the thread/threaded-data partials, and one holder beats a copy in each.
+        private readonly HashSet<string> _reportedOnce = new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>True the FIRST time this key is seen in this session, false every time after. The caller
+        /// does the reporting, so the key and the message stay visibly separate — a key derived from the
+        /// message is a key that stops matching the moment the message interpolates anything.</summary>
+        private bool FirstReportOf(string key) { return _reportedOnce.Add(key); }
+
+        /// <summary>Test seam for the rule holder. It mutates the reported-keys set and NOTHING ELSE — no
+        /// debuggee memory, no breakpoint map, no handle — so it deliberately does not join the
+        /// attached-engine refusals in CheckSeamsRefuseLiveTarget. That set exists for seams whose real work
+        /// writes to the target, and putting a console-bookkeeping seam in it would weaken what its count
+        /// claims rather than strengthen this.</summary>
+        internal bool FirstReportOfForTest(string key) { return FirstReportOf(key); }
+
+        /// <summary>The tail every once-only diagnostic carries, so "reported once" is a fact on the line
+        /// rather than something the reader has to infer from never seeing it again.</summary>
+        private const string ONCE_SUFFIX = "  [reported once per session]";
+
         /// <summary>One thread's measured state at a stop. Nothing here is cached across stops.</summary>
         private sealed class ThreadProbe
         {
@@ -187,16 +224,23 @@ namespace ClarionDbg.Cli
             {
                 int before = list.Count;
                 WalkWindow(list, roots[i], IntPtr.Zero, pid, i, 0, before + WIN_MAX_PER_ROOT);
-                if (list.Count - before >= WIN_MAX_PER_ROOT)
+                // Once per root per session. This fires on EVERY pause otherwise, and a root whose tree was
+                // too big to walk at the first stop is still too big at the two hundredth — the line is the
+                // same line, so repeating it only buries the stop's real output.
+                if (list.Count - before >= WIN_MAX_PER_ROOT && FirstReportOf("wincap|root " + i))
                     Console.WriteLine($"  (window walk: root {i} hit the {WIN_MAX_PER_ROOT}-window cap — its "
-                                      + "tree is truncated; later roots are unaffected)");
+                                      + "tree is truncated; later roots are unaffected)" + ONCE_SUFFIX);
             }
             return list;
         }
 
-        private void WalkWindow(List<WinInfo> list, IntPtr h, IntPtr parent, uint pid, int sib, int depth, int budget)
+        /// <summary><paramref name="stopAtCount"/> is an ABSOLUTE ceiling on <paramref name="list"/>.Count,
+        /// not a remaining allowance: the caller passes `before + WIN_MAX_PER_ROOT`, so each root gets its
+        /// own cap measured from wherever the list already stood. It was called `budget`, which reads as
+        /// "how many more you may add" and would be off by every window a previous root contributed.</summary>
+        private void WalkWindow(List<WinInfo> list, IntPtr h, IntPtr parent, uint pid, int sib, int depth, int stopAtCount)
         {
-            if (h == IntPtr.Zero || depth > WIN_MAX_DEPTH || list.Count >= budget) return;
+            if (h == IntPtr.Zero || depth > WIN_MAX_DEPTH || list.Count >= stopAtCount) return;
             uint p; uint t = GetWindowThreadProcessId(h, out p);
             if (p != pid) return;
             uint pp = 0, ptid = 0;
@@ -211,8 +255,8 @@ namespace ClarionDbg.Cli
                 Sib = sib, Depth = depth, Cls = cls.ToString(), Text = txt.ToString(),
             });
             int i = 0;
-            for (IntPtr c = GetWindow(h, GW_CHILD); c != IntPtr.Zero && list.Count < budget; c = GetWindow(c, GW_HWNDNEXT))
-                WalkWindow(list, c, h, pid, i++, depth + 1, budget);
+            for (IntPtr c = GetWindow(h, GW_CHILD); c != IntPtr.Zero && list.Count < stopAtCount; c = GetWindow(c, GW_HWNDNEXT))
+                WalkWindow(list, c, h, pid, i++, depth + 1, stopAtCount);
         }
 
         /// <summary>Attribute the debuggee's windows to the probed threads. The signal that matters is
@@ -381,9 +425,13 @@ namespace ClarionDbg.Cli
 
             if (EmitJson) Console.WriteLine("@JSON " + ThreadsJson(stoppedTid, _selectedTid, probes));
 
-            Console.WriteLine($"  threads ({probes.Count}), stopped {stoppedTid}, selected {_selectedTid}:");
+            // The console line says "(unknown)" for the same reason the wire omits the member: 0 is not a
+            // thread, and printing it invites the reader to go looking for thread 0.
+            Console.WriteLine($"  threads ({probes.Count}), stopped {TidText(stoppedTid)}, "
+                              + $"selected {TidText(_selectedTid)}:");
             foreach (var p in probes)
-                Console.WriteLine($"    {(p.IsStopped ? "*" : " ")}{(p.Tid == _selectedTid ? ">" : " ")} tid {p.Tid,-6} "
+                Console.WriteLine($"    {(p.IsStopped ? "*" : " ")}"
+                    + $"{(TidIsKnown(_selectedTid) && p.Tid == _selectedTid ? ">" : " ")} tid {p.Tid,-6} "
                     + $"{p.State,-8} {(p.TopProc ?? "(no Clarion frame)")}"
                     + (p.TopModule != null ? "  " + p.TopModule + ":" + p.TopLine : "")
                     + (p.ClarionThread.HasValue ? "  [Clarion thread " + p.ClarionThread.Value + "]" : ""));
@@ -392,13 +440,25 @@ namespace ClarionDbg.Cli
         /// <summary>The `threads` event for the picker. A pure builder over already-measured probes, so
         /// `ClarionDbg protocolcheck` can assert the absent-tid rule against THIS code rather than against a
         /// hand-written copy of its shape — a fixture that is written twice is a fixture that agrees with
-        /// itself and with nothing else.</summary>
+        /// itself and with nothing else.
+        ///
+        /// The TOP-LEVEL "stopped" and "selected" are thread ids under another name, so they go through the
+        /// same writer as "tid" (ticket 3b043dfc): unknown means the member is ABSENT, and the object opens
+        /// with "event" so there is always a member for the writer's leading comma to follow. The PER-ROW
+        /// "stopped"/"selected" below share the names but are booleans about the row, and are written here.
+        ///
+        /// The row's "selected" is ANDed with the rule's own predicate rather than compared alone: with no
+        /// selection, selectedTid is 0, and a row that somehow carried a 0 tid would otherwise mark itself
+        /// as the selected thread — the sentinel-reads-as-real defect again, one level down and in a
+        /// boolean. TidIsKnown is the same predicate that decides whether the top-level member is written,
+        /// so the row cannot claim a selection the event does not state.</summary>
         private static string ThreadsJson(uint stoppedTid, uint selectedTid, List<ThreadProbe> probes)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"threads\",\"stopped\":").Append(stoppedTid)
-              .Append(",\"selected\":").Append(selectedTid)
-              .Append(",\"threads\":[");
+            sb.Append("{\"event\":\"threads\"");
+            AppendTidValuedMember(sb, TidMemberStopped, stoppedTid);
+            AppendTidValuedMember(sb, TidMemberSelected, selectedTid);
+            sb.Append(",\"threads\":[");
             for (int i = 0; i < probes.Count; i++)
             {
                 var p = probes[i];
@@ -410,7 +470,7 @@ namespace ClarionDbg.Cli
                   .Append(",\"state\":").Append(Json.Str(p.State))
                   .Append(",\"clarionFrames\":").Append(p.ClarionFrames)
                   .Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")
-                  .Append(",\"selected\":").Append(p.Tid == selectedTid ? "true" : "false");
+                  .Append(",\"selected\":").Append(TidIsKnown(selectedTid) && p.Tid == selectedTid ? "true" : "false");
                 AppendTidMember(sb, p.Tid);
                 sb.Append('}');
             }

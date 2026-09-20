@@ -1,7 +1,7 @@
 // Regression check: a pause with NO source file must not leave the PREVIOUS stop's code on screen.
 //
 // 87c66af6 moved the location caption into the source header and made the 'paused' handler always write it
-// through setSrcHeader. But the host's SendSource returned silently when the .clw path could not be
+// through setSrcLocation. But the host's SendSource returned silently when the .clw path could not be
 // resolved, so no `source` message followed that pause and $('src'), curFile and curLine kept the previous
 // stop's file, listing and highlight. The header then named location B over listing A.
 //
@@ -81,7 +81,7 @@ let lastLibState = null, lastLibError = null;
 const _flCbs = {}, _expandCbs = {};
 
 // ---- the page's own code ---------------------------------------------------------------------------
-const FNS = ['esc', 'reEsc', 'setSrcHeader', 'clearSrc', 'buildSource', 'renderBpDots', 'onMessage'];
+const FNS = ['esc', 'reEsc', 'setSrcLocation', 'clearSrc', 'buildSource', 'renderBpDots', 'onMessage'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
@@ -217,8 +217,25 @@ console.log('\n5) buildSource is the ONE writer of the listing and of curFile/cu
   const onMsg = pad.extract(html, 'onMessage');
   const pausedArm = onMsg.slice(onMsg.indexOf("case 'paused':"), onMsg.indexOf("case 'resumed':"));
   check("the 'paused' arm writes the header and nothing about the listing",
-        /setSrcHeader\(/.test(pausedArm) && !/curFile|buildSource|clearSrc/.test(pausedArm),
+        /setSrcLocation\(/.test(pausedArm) && !/curFile|buildSource|clearSrc/.test(pausedArm),
         pausedArm.replace(/\s+/g, ' ').slice(0, 90) + '...');
+
+  // ---- the idle prompt: the markup ships one, clearSrc puts one back, and they must be the SAME one ----
+  // A torn-down session has to look like one that never started. These are two different writers of
+  // #srchdrText (ec45805f item 8: setSrcLocation owns the location wording, clearSrc owns the empty
+  // state), so the shared text is the part that can silently drift - reword the markup and only a user
+  // who has actually stopped and torn down a session ever sees the other one.
+  const idleConst = /const\s+SRC_IDLE_TEXT\s*=\s*'([^']*)'/.exec(html);
+  check('the idle prompt has one home (SRC_IDLE_TEXT)', !!idleConst,
+        idleConst ? '' : 'no SRC_IDLE_TEXT constant found');
+  check('clearSrc writes the constant, not a copy of the words',
+        /srchdrText'\)\.textContent\s*=\s*SRC_IDLE_TEXT/.test(clear),
+        clear.replace(/\s+/g, ' ').slice(0, 110));
+  const markup = /<span id="srchdrText">([^<]*)<\/span>/.exec(html);
+  check('the markup ships that exact text, so startup and teardown agree',
+        !!markup && !!idleConst && markup[1] === idleConst[1],
+        markup && idleConst ? JSON.stringify(markup[1]) + ' vs ' + JSON.stringify(idleConst[1])
+                            : 'markup span or constant not found');
 }
 
 console.log('');

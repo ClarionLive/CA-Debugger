@@ -659,6 +659,19 @@ namespace ClarionDbg.Cli
                 owner = new LoadedModule { Name = "protocolcheck.exe", LoadBase = loadBase, Size = 0x200000 };
                 _modules.Add(owner);
             }
+            else if (owner.LoadBase != loadBase)
+            {
+                // The image is registered ONCE and reused, so on every call after the first this seam used
+                // to drop `loadBase` on the floor and compute the RVA from the resolved module instead. A
+                // caller that passed a different base got a breakpoint at an RVA it never asked for and was
+                // told nothing — the argument had become decoration. It is not a detail the caller may be
+                // vague about: Rvas is what the un-patch and re-arm paths work from.
+                throw new InvalidOperationException(
+                    "ArmUserBpForTest: va 0x" + va.ToString("X8") + " already resolves to " + owner.Name
+                    + " at load base 0x" + owner.LoadBase.ToString("X8") + ", but was handed 0x"
+                    + loadBase.ToString("X8") + " — the RVA would be computed from the resolved base, not "
+                    + "the one passed, so the two must agree");
+            }
             var bp = new UserBreakpoint
             {
                 Module = "pc001.clw", ModuleIdx = -1, Owner = owner, RequestedLine = 100, Line = 100,

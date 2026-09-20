@@ -24,11 +24,18 @@ param(
   [string] $EngineJsonPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\Json.cs'),
   [string] $EnginePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.cs'),
   [string] $EngineBpPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Breakpoints.cs'),
+  # the two commands that carry a thread id from the PAD back toward the engine. The direction-of-flow
+  # checks at the end of this file read them, because the safety of the tid writers' divergence is a claim
+  # about which side may ORIGINATE a thread id, and that is decided in these two methods.
+  [string] $EngineThreadsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Threads.cs'),
+  [string] $EngineVarEditPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.VarEdit.cs'),
   # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
+  # the disassembly view: its request tags carry the epoch that decides whether a reply is still wanted
+  [string] $DisasmViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
   # the captured host output tools/test-pad-source.js drives the page with. Regenerate with the switch below
   # after a deliberate change to SendSource; the checks at the end of this file fail while it is stale.
   [string] $HostSourceFixture = (Join-Path $PSScriptRoot 'fixtures\host-source-messages.json'),
@@ -42,7 +49,10 @@ $web = Get-Content -Raw -LiteralPath $WebViewPath
 $engine = Get-Content -Raw -LiteralPath $EngineJsonPath
 $engineSrc = Get-Content -Raw -LiteralPath $EnginePath
 $bpSrc = Get-Content -Raw -LiteralPath $EngineBpPath
+$engineThreadsSrc = Get-Content -Raw -LiteralPath $EngineThreadsPath
+$engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
+$disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 
 function Get-Method {
   param([string] $Signature, [string] $From)
@@ -991,6 +1001,275 @@ Check 'ParseThreads keeps an absent stopped/selected absent, with no 0 substitut
    ($parseThreads -match 'GetUIntOrNull\(head, "selected"\)') -and ($parseThreads -notmatch 'GetUIntOrNull\(head, "selected"\) \?\? 0u')) ''
 Check 'and the list carries them as nullable, so "unknown" has somewhere to live' `
   ((Get-Method 'public sealed class DebugThreadList') -match 'public uint\? StoppedTid;') ''
+Write-Host ''
+Write-Host 'the two tid writers disagree about one value, and this is the direction of flow that makes it safe'
+#
+# TICKET 3b043dfc, HOLE 3. The engine's writer treats uint.MaxValue as UNKNOWN - it is the (uint)-1 an int
+# cast produces, and the protocol names -1 forbidden - and omits the member. The add-in's TidJson does not:
+# it writes a high DWORD whole, which the check above asserts and which still passes. Two writers on one
+# wire holding two different rules.
+#
+# THE QUESTION IS NOT "WHICH VALUE IS RIGHT". It is WHICH SIDE MAY ORIGINATE A THREAD ID, because that is
+# what decides whether the permissive writer is ever the one a bad value meets first. The answer, read off
+# the code below rather than asserted:
+#
+#   THE ENGINE IS THE SOLE ORIGINATOR. Every thread id in this system came out of a Win32 debug event the
+#   engine received. The host and the page only ever ECHO one back: the page sends `selectthread` with a
+#   tid it took from a row the engine sent, and `setval` with the tid the row was read on.
+#
+#   AND BOTH ECHO PATHS FAIL CLOSED AT THE ENGINE. `thread <tid>` is refused unless the tid is in the
+#   engine's own live thread set, and `setval`'s trailing tid must equal the selected one or the write is
+#   refused rather than applied to another thread's memory. So a tid the page invents cannot become a
+#   selection and cannot steer a write - it can only produce a refusal.
+#
+# THE DIVERGENCE IS THEREFORE SAFE TODAY, and safe for a reason that is CHECKABLE rather than a fact about
+# nobody having written the feature yet: TidJson can only be handed a tid that arrived from the engine, and
+# the engine cannot emit uint.MaxValue. The load-bearing assertion is that second clause, so it is the one
+# made here, against the engine's own predicate. If TidIsKnown ever stops rejecting uint.MaxValue, the
+# add-in's permissiveness becomes live on the same day, and this fails on that day rather than later.
+#
+# THE DECISION, stated so the next person does not have to re-derive it: the add-in writer SHOULD adopt the
+# engine's rule and treat uint.MaxValue as unknown too. Not because a 0xFFFFFFFF thread id is likely, but
+# because the alternative makes one writer's correctness depend on a property of the OTHER side plus the
+# absence of a feature - which is the exact "safe by construction, not by guard" shape this ticket exists
+# to remove, and leaving it in place while fixing the engine's version of it would be inconsistent. It is
+# one clause in TidJson. It is NOT made here because ClarionDebuggerWebView.cs belongs to another helper
+# this wave; it is recorded on 3b043dfc for them, and the assertions below pin the current state exactly so
+# the change shows up as a deliberate edit to this file rather than a silent drift.
+#
+# IF YOU ARE ADDING A PAD-ORIGINATED TID PATH - a tid typed into a box, restored from a saved session,
+# computed from an int that could go negative - THE RULES INVERT AND THIS SECTION IS THE ASSUMPTION YOU
+# ARE BREAKING. The add-in becomes the writer on the permissive side of a boundary it was never told it
+# was on. Make TidJson adopt the rule first.
+
+# Check prints its Detail on a PASS as well as a FAIL, so a consequence spelled out as Detail would read
+# like something that HAD happened. These consequences are worth spelling out, so they are attached only
+# when the check is actually failing.
+function CheckWhy {
+  param([string] $Label, [bool] $Ok, [string] $Why)
+  Check $Label $Ok $(if ($Ok) { '' } else { $Why })
+}
+
+$tidIsKnown = Get-CSharpStatement 'private static bool TidIsKnown(uint tid)' $engineSrc
+Check 'the engine still has one predicate deciding whether a tid is known' ($null -ne $tidIsKnown) ''
+# The precondition the divergence rests on. Read as text because TidIsKnown is not reachable from here,
+# and named rather than pattern-guessed so a rewrite that drops the clause cannot pass by looking similar.
+CheckWhy 'THE PRECONDITION: the engine cannot originate uint.MaxValue, so TidJson never meets one' `
+  ($null -ne $tidIsKnown -and $tidIsKnown -match 'uint\.MaxValue') `
+  'TidIsKnown no longer rejects uint.MaxValue - the add-in writer is NOW the permissive side of a live boundary and must adopt the rule (3b043dfc hole 3)'
+CheckWhy 'and it still rejects 0, which is the half both writers already agree on' `
+  ($null -ne $tidIsKnown -and $tidIsKnown -match 'tid\s*!=\s*0') `
+  'the engine writer no longer treats 0 as unknown - the rule the whole protocol rests on is gone'
+
+# The divergence itself, pinned. This asserts CURRENT behaviour on purpose: it is the "documented" half of
+# the decision above, and it names its own successor so nobody reads it as approval.
+CheckWhy 'the divergence, stated: TidJson writes uint.MaxValue whole where the engine would omit it' `
+  ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') `
+  'TidJson has adopted the engine rule - good; delete this check and update the note above, on 3b043dfc'
+CheckWhy 'the two writers DO agree on 0, so this is a one-value divergence and not two rules' `
+  ([PadJsonProbe]::TidJson(0) -eq '') `
+  'TidJson now writes a 0 - the page would read it as a real thread and start dropping good replies'
+
+# The echo paths, fail-closed, read off the engine. These are what make "the engine is the sole
+# originator" a property of the code rather than a description of current habits.
+$selCmd = Get-CSharpBlock 'private void HandleThreadSelectCommand(' $engineThreadsSrc
+Check 'the engine still owns thread selection' ($null -ne $selCmd) ''
+CheckWhy 'a pad-sent tid must be one the ENGINE knows is live, or the selection is refused' `
+  ($null -ne $selCmd -and $selCmd -match '_threads\.Contains\(\s*tid\s*\)') `
+  'HandleThreadSelectCommand no longer validates against the engine live thread set - the page can now name a thread the engine never offered, so it ORIGINATES one'
+$setVal = Get-CSharpBlock 'private void HandleSetValCommand(' $engineVarEditSrc
+Check 'the engine still owns the edit-write thread check' ($null -ne $setVal) ''
+CheckWhy 'a pad-sent tid on a WRITE must equal the selected thread, or the write is refused' `
+  ($null -ne $setVal -and $setVal -match 'wantTid\s*!=\s*selectedTid') `
+  'HandleSetValCommand no longer compares the requested thread with the selected one - a stale edit could write another thread''s memory in the user''s own program'
+# And the host's own send-side gate, so "echo only" is not resting on the engine alone.
+$svcSelect = Get-Method 'public bool SelectThread(uint tid)'
+CheckWhy 'the host refuses to forward a 0 as a thread selection' ($svcSelect -match 'tid\s*>\s*0') `
+  'SelectThread would now send `thread 0` - the engine refuses it, but the host stopped holding its own half of the rule'
+Write-Host ''
+Write-Host 'a member with NO value at all is decided by the loop, and the loop always ends'
+# ec45805f item 4. A "did the value scan advance?" guard used to sit between ReadValue and the malformed
+# check: `if (i <= before && i >= json.Length) return null;`. It could not fire - ReadValue sets i = -1
+# when i is already at or past the end, so `i >= json.Length` needs a scan that advanced to exactly the
+# end, which contradicts `i <= before`. Verified as well as reasoned: the shipped reader was compiled
+# twice, once with that line instrumented and once with it removed, and fuzzed over 1.8M calls; the guard
+# never fired and the two builds never disagreed. It is gone.
+#
+# What was NOT covered here is the input that made it look necessary: a member whose value is empty, so
+# the number scan stops where it started. These pin the cases the removed line appeared to be about -
+# the answer, and that the loop TERMINATES rather than spinning on a value that never advances.
+Check 'an empty value reads as absent, and the members after it still read' `
+  (($null -eq (Read1 '{"a":,"b":1}' 'a')) -and ((Read1 '{"a":,"b":1}' 'b') -eq '1')) `
+  ("a=" + (Read1 '{"a":,"b":1}' 'a') + " b=" + (Read1 '{"a":,"b":1}' 'b'))
+Check 'an empty value as the LAST member reads as absent' ($null -eq (Read1 '{"a":}' 'a')) ''
+Check 'a stray closing bracket where a value belongs stops the walk' ($null -eq (Read1 '{"a":]}' 'b')) ''
+Check 'whitespace where a value belongs is still no value' ($null -eq (Read1 '{"a": ,"b":2}' 'a')) ''
+Check '...and the member after THAT one is still found' ((Read1 '{"a": ,"b":2}' 'b') -eq '2') (Read1 '{"a": ,"b":2}' 'b')
+# The removed guard's only plausible job was ending a loop that cannot advance, so termination is the
+# part worth sweeping. Every shape here asks for a key that is NOT present, which is the case that walks
+# the whole object instead of returning at the first match.
+#
+# STATED PLAINLY: this detects a walk that ends in the wrong PLACE, not one that never ends. A reader
+# that truly spins hangs this suite rather than failing it - and hangs the WebView message pump in the
+# product, which is worse. A bounded join was tried and is not worth its machinery here: PowerShell
+# cannot hand a script block to a foreign thread with no runspace, and the four checks above already
+# return from the value-less shapes that could reach the loop at all.
+$sweep = @('{"a":,"b":1}', '{"a":}', '{"a":]}', '{"a": }', '{"a":,}', '{"a":,,}', '{"a":', '{"a":-}')
+$walked = 0
+foreach ($s in $sweep) { [void](Read1 $s 'zzz'); $walked++ }
+Check "every value-less shape finishes its walk and reports absence ($walked shapes)" `
+  (($walked -eq $sweep.Count) -and -not ($sweep | Where-Object { $null -ne (Read1 $_ 'zzz') })) ''
+Write-Host ''
+Write-Host 'the Disassembly view keeps THREE tag-keyed requests in flight, and a tag is not a thread'
+# The view asks for a window (win), a forward extension (winf) and a backward one (winb), each keyed only
+# by its kind. Across a thread switch that is not enough to tell a reply asked for BEFORE the switch from
+# one asked for after: same kind, same shape, different thread. The tag now carries the EPOCH that asked,
+# and the engine echoes a tag verbatim, so the match is made with no protocol change.
+#
+# What a stale reply actually costs is narrower than "the wrong code" — instruction bytes are process
+# memory, shared by every thread. It re-seats the window on a thread you are no longer viewing and flags
+# that thread's instruction as current. Still wrong, and silent.
+$fmtTag = Get-Method 'private static string FormatTag(string kind, int epoch)' $disasmView
+$parseTag = Get-Method 'private static bool ParseTag(string tag, out string kind, out int epoch)' $disasmView
+$tidMatch = Get-Method 'private static bool TidMatches(uint? tid, uint selTid)' $disasmView
+$tagShim = @"
+using System;
+using System.Globalization;
+public static class DisasmTagProbe {
+  public const string WinTag = "win";
+  public const string FwdTag = "winf";
+  public const string BwdTag = "winb";
+$(($fmtTag, $parseTag, $tidMatch -join "`n") -replace 'private static', 'public static')
+}
+"@
+Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
+
+# CONTROL FIRST: a gate that rejected everything would pass every rejection below for the wrong reason.
+foreach ($kind in 'win', 'winf', 'winb') {
+  $k = ''; $e = 0
+  $tag = [DisasmTagProbe]::FormatTag($kind, 7)
+  $ok = [DisasmTagProbe]::ParseTag($tag, [ref] $k, [ref] $e)
+  Check "control: a $kind tag this view built round-trips" ($ok -and $k -eq $kind -and $e -eq 7) "$tag -> kind=$k epoch=$e"
+}
+
+# THE RULE: a reply from a superseded epoch is distinguishable, which is the whole gate.
+$k = ''; $e = 0
+[DisasmTagProbe]::ParseTag([DisasmTagProbe]::FormatTag('winf', 3), [ref] $k, [ref] $e) | Out-Null
+Check 'a winf asked for under epoch 3 does not read as the current epoch 4' ($e -ne 4) "epoch=$e"
+Check 'and it is still recognised as OURS, so it is dropped deliberately rather than ignored as foreign' ($k -eq 'winf') "kind=$k"
+
+# A BARE kind is the OLD format. It carries no epoch, so it cannot be shown to belong to the thread on
+# screen — rejecting it is the safe reading, and it is what an engine replaying an old tag would send.
+foreach ($bare in 'win', 'winf', 'winb') {
+  $k = ''; $e = 0
+  Check "a bare '$bare' tag with no epoch is not accepted" (-not [DisasmTagProbe]::ParseTag($bare, [ref] $k, [ref] $e)) ''
+}
+foreach ($bad in 'other#1', '#4', 'win#', 'win#x', 'winx#1', '', 'win#1#2') {
+  $k = ''; $e = 0
+  $got = [DisasmTagProbe]::ParseTag($bad, [ref] $k, [ref] $e)
+  Check "a malformed or foreign tag '$bad' is not ours" (-not $got) ''
+}
+
+# THE POSITIONAL HAZARD: RequestDisasmAt sends the tag in its own space-separated slot, ahead of `before`.
+# A tag containing a space would push `before` into the wrong argument and silently change the request.
+foreach ($kind in 'win', 'winf', 'winb') {
+  $tag = [DisasmTagProbe]::FormatTag($kind, 12345)
+  Check "a $kind tag never contains a space" (-not $tag.Contains(' ')) $tag
+}
+
+# The engine echoes the tag through Json.Str, so a tag needing JSON escaping would survive but is a smell.
+$tag = [DisasmTagProbe]::FormatTag('win', 0)
+Check 'a tag needs no JSON escaping' ($tag -notmatch '["\\]') $tag
+
+Write-Host ''
+Write-Host 'and the view really uses that tag everywhere, so no request can escape the gate'
+# A single RequestDisasmAt left sending a bare constant would be a hole the round-trip checks cannot see.
+# Per LINE, not per regex-across-arguments: a nested HexVa(...) closes a paren before the tag does, so an
+# [^)]* scan silently stops early and undercounts. That is how this check first passed at 3 of 7.
+$callLines = @($disasmView -split "`n" | Where-Object { $_ -match 'RequestDisasmAt\(' })
+$viaMakeTag = @($callLines | Where-Object { $_ -match 'MakeTag\(' })
+$bareTag = @($callLines | Where-Object { $_ -match ',\s*(WinTag|FwdTag|BwdTag)\s*[,)]' })
+Check 'the view has the request sites this check expects' ($callLines.Count -eq 7) "$($callLines.Count) call site(s)"
+Check 'no RequestDisasmAt still passes a bare tag constant' ($bareTag.Count -eq 0) "$($bareTag.Count) bare call(s)"
+Check 'every disasm request goes out through MakeTag' ($viaMakeTag.Count -eq $callLines.Count) "$($viaMakeTag.Count) of $($callLines.Count)"
+# BOTH epoch checks, counted — not merely "one is present". OnDisasm tests the epoch TWICE on purpose:
+# once on the reader thread, and again INSIDE the UI marshal, because the epoch can move between the two
+# and that is precisely the window a thread switch lands in. A `-match` here passed while the inner check
+# was deleted, because the outer one still satisfied it: the check claimed "gates on the epoch" and only
+# verified half of what that means. Found by mutation, and the count is the fix.
+$onDisasm = Get-Method 'private void OnDisasm(string tag, List<DebugDisasmInstr> instrs, uint? tid)' $disasmView
+$epochGates = [regex]::Matches($onDisasm, 'epoch\s*!=\s*_epoch')
+Check 'OnDisasm gates on the epoch on BOTH sides of the UI marshal' ($epochGates.Count -eq 2) "$($epochGates.Count) epoch gate(s)"
+# ...and the marshal-side gates really are inside the lambda, not stacked ahead of it.
+$marshalBody = if ($onDisasm -match '(?s)UI\(\(\)\s*=>\s*\{(.*)') { $Matches[1] } else { '' }
+Check 'the second epoch gate is INSIDE the marshal, where the race is' `
+  ($marshalBody -match 'epoch\s*!=\s*_epoch') ''
+Check 'and the tid gate is inside it too, on the same side of the race' `
+  ($marshalBody -match 'TidMatchesView\(tid\)') ''
+# The pending flags are cleared by NewEpoch, not by the replies: the dropped ones never arrive to clear
+# them, and a stuck _pendFwd would freeze forward extension for the rest of the session.
+Check 'NewEpoch clears the in-flight flags as well as retiring the replies' `
+  ((Get-Method 'private void NewEpoch()' $disasmView) -match '_pendFwd\s*=\s*_pendBwd\s*=\s*false') ''
+
+Write-Host ''
+Write-Host 'TWO gates, and each is asserted with the OTHER one intact'
+# The epoch answers "is this reply still wanted"; the tid answers "whose code is this". They are not
+# redundant: the tid catches a reply decoded for a thread we did not expect even when nothing superseded
+# it, and the epoch catches a superseded reply even when the engine would have decoded the same thread
+# either side of the move. A reply must pass BOTH, and neither overrides the other — if they disagree,
+# the only safe reading of "one of my two checks says this is not what I think it is" is to not paint it.
+#
+# Isolating each matters, because a second gate that never decides anything is exactly the dead guard
+# deleted earlier in this ticket. These cases are constructed so that ONE gate is the sole decider.
+
+# --- the TID gate alone: same epoch throughout, so the epoch gate can never be what dropped anything ---
+$k = ''; $e = 0
+$sameEpochTag = [DisasmTagProbe]::FormatTag('win', 9)
+[DisasmTagProbe]::ParseTag($sameEpochTag, [ref] $k, [ref] $e) | Out-Null
+Check 'isolating the tid gate: the epoch is current, so only the tid can decide' ($e -eq 9) "epoch=$e"
+Check 'a reply stamped for ANOTHER thread is dropped though its epoch is current' `
+  (-not [DisasmTagProbe]::TidMatches([uint] 4812, [uint] 116932)) 'reply tid 4812, view on 116932'
+Check 'CONTROL: the same reply stamped for the thread on screen is accepted' `
+  ([DisasmTagProbe]::TidMatches([uint] 116932, [uint] 116932)) 'reply tid 116932, view on 116932'
+
+# --- the EPOCH gate alone: tid identical on both, so the tid gate can never be what dropped anything ---
+Check 'isolating the epoch gate: the tid matches, so only the epoch can decide' `
+  ([DisasmTagProbe]::TidMatches([uint] 116932, [uint] 116932)) ''
+$k2 = ''; $e2 = 0
+[DisasmTagProbe]::ParseTag([DisasmTagProbe]::FormatTag('winf', 5), [ref] $k2, [ref] $e2) | Out-Null
+Check 'a superseded reply is dropped though it names the RIGHT thread' ($e2 -ne 6) "asked under 5, now 6"
+# This is the case the tid gate provably cannot see, and the reason the epoch is not redundant: a thread
+# switch away and back leaves the tid matching again, while the in-flight winf is still stale.
+Check 'and that holds even when the selection returned to the SAME thread meanwhile' `
+  (($e2 -ne 6) -and [DisasmTagProbe]::TidMatches([uint] 116932, [uint] 116932)) 'tid agrees, epoch does not'
+
+# --- absent is UNKNOWN, not a mismatch: an engine that does not stamp disasm still works ---
+Check 'an UNSTAMPED reply is not treated as a mismatch (pre-381aabd7 engine keeps working)' `
+  ([DisasmTagProbe]::TidMatches($null, [uint] 116932)) 'tid=null'
+Check 'a 0 tid is a sentinel, not thread 0, so it is not a mismatch either' `
+  ([DisasmTagProbe]::TidMatches([uint] 0, [uint] 116932)) 'tid=0'
+Check 'a view that does not yet know its own thread accepts a stamped reply' `
+  ([DisasmTagProbe]::TidMatches([uint] 4812, [uint] 0)) 'view selTid=0'
+# ...and the fail-open cases must not swallow the real mismatch they sit next to.
+Check 'CONTROL: fail-open does not extend to a genuine disagreement' `
+  (-not [DisasmTagProbe]::TidMatches([uint] 1, [uint] 2)) ''
+
+Check 'OnDisasm applies the tid gate as well as the epoch' ($onDisasm -match 'TidMatchesView\(tid\)') ''
+# NEITHER GATE MAY REPLACE THE OTHER. A tid check written in place of the marshal-side epoch check reads
+# like a strengthening and is a silent regression: it restores the exact race the second epoch check
+# exists to close, and the tid cannot see it (a switch away and back leaves the tid agreeing again).
+Check 'the tid gate was ADDED to the marshal, not substituted for the epoch check there' `
+  (($marshalBody -match 'epoch\s*!=\s*_epoch') -and ($marshalBody -match 'TidMatchesView\(tid\)')) ''
+# The service is the only place the engine's stamp can enter: an invoke that drops it leaves the view
+# gating on its own bookkeeping alone, which is what it did before this pass.
+Check 'the service passes the engine stamp to DisasmReceived, not just the tag' `
+  ($src -match 'DisasmReceived\?\.Invoke\(GetStr\(json,\s*"tag"\),\s*dlist,\s*GetUIntOrNull\(json,\s*"tid"\)\)') ''
+Check 'and the event is declared wide enough to carry it' `
+  ($src -match 'event\s+Action<string,\s*List<DebugDisasmInstr>,\s*uint\?>\s+DisasmReceived') ''
+# The tag is POSITIONAL in the stdin command, ahead of `before`. Now that tags are generated rather than
+# literal, the writer validates them so a space cannot shift `before` into the wrong argument.
+Check 'RequestDisasmAt validates the tag it is handed' `
+  ((Get-Method 'public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)') -match 'Regex\.IsMatch\(tag') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

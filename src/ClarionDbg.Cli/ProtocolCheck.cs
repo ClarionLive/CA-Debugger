@@ -78,21 +78,31 @@ namespace ClarionDbg.Cli
                 failures.Add("empty object: stamping produced malformed JSON");
 
             CheckHandBuiltTidEmitters(failures);
+            CheckTidValuedMembersUnderOtherNames(failures);
             CheckResumeVerbs(failures);
             CheckStepGuards(failures);
             CheckBpHitVsStep(failures);
             CheckSeamsRefuseLiveTarget(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
+            CheckOnceOnlyDiagnostics(failures);
 
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
             {
                 Console.WriteLine($"protocolcheck: {shapes.Length} spliced event shapes + all 4 hand-built "
                                   + "emitters OK - a known tid is stamped, "
-                                  + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
-                                  + "descendants offer no edit metadata (the expand path is a known gap — "
-                                  + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
+                                  + "an unknown tid is absent (never 0 or -1); the same rule holds under all "
+                                  + $"{DebugEngine.TidValuedMemberNamesForTest().Length} names the engine "
+                                  + "declares for a thread-id member, which puts 3 more top-level ids "
+                                  + "across 2 events under it (`threads`.stopped, `threads`.selected, "
+                                  + "`threadscan`.stopped) - each tested with the others KNOWN, so an "
+                                  + "omission is per member and not the builder giving up, while the "
+                                  + "same-named per-row booleans survive and no row claims a selection the "
+                                  + "event does not state; a vetoed row's descendants "
+                                  + "offer no edit metadata, INLINE and through `expand`, whose veto is "
+                                  + "derived from the address over the whole group's span while an "
+                                  + "ordinary group keeps its pencils; no write, of any length, "
                                   + "can touch the shared template; the resume-verb set has one owner across "
                                   + "its 2 remaining sites; Step Over's ESP gate and its prologue bypass "
                                   + "each hold with the other one out of the way; and a breakpoint hit "
@@ -101,7 +111,13 @@ namespace ClarionDbg.Cli
                                   + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
                                   + "test seams REFUSE an attached engine, with OnUserBpForTest also "
                                   + "refusing the --once and interactive engines, while all of them still "
-                                  + "work with no target.");
+                                  + "work with no target, and ArmUserBpForTest refusing a load base that "
+                                  + "disagrees with the module its va resolves to; and the repeating "
+                                  + "console diagnostics report once per (image, reason) per ENGINE, keyed "
+                                  + "on the reason CATEGORY and not on the message - which interpolates "
+                                  + "addresses, so keying on it would dedup nothing while looking like it "
+                                  + "worked - with the suppression said on the line rather than left to "
+                                  + "be inferred.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -169,6 +185,134 @@ namespace ClarionDbg.Cli
             CheckNoSentinelRows(failures, "threads", rows, known);
             string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
             CheckNoSentinelRows(failures, "threadscan", scan, known);
+        }
+
+        /// <summary>
+        /// The same rule for thread ids that are NOT called "tid" — ticket 3b043dfc, hole 1.
+        ///
+        /// `threads` writes a top-level "stopped" and "selected"; `threadscan` writes a top-level "stopped".
+        /// All three are thread ids and none of them went through the writer, because the guard that existed
+        /// was written around the NAME. They were safe only by ordering — PausedWait sets _selectedTid
+        /// before the pause loop can dispatch — while AcquireView already treats _selectedTid == 0 as a
+        /// state that happens. The engine disagreed with itself; that, not an observed failure, is the bug.
+        ///
+        /// THREE members over TWO events, and both numbers are checkable against DebugEngine's declared
+        /// TidValuedMemberNames, which this reads rather than retypes.
+        ///
+        /// Each is checked the same three ways the "tid" emitters are — the known CONTROL first, because
+        /// without it a builder that dropped the member entirely would pass the two absence cases for the
+        /// wrong reason — and then INDEPENDENTLY, one unknown at a time with the other known. A pair tested
+        /// only together cannot tell "the rule is applied per member" from "the builder gave up on both".
+        /// </summary>
+        private static void CheckTidValuedMembersUnderOtherNames(List<string> failures)
+        {
+            const uint known = 116932;
+            const uint other = 4812;
+            const uint minusOne = unchecked((uint)-1);
+            var unknowns = new[] { 0u, minusOne };
+
+            // The declared set is the engine's, read back — so "three" below cannot drift from the code.
+            string[] declared = DebugEngine.TidValuedMemberNamesForTest();
+            if (declared.Length != 3)
+                failures.Add("tid-valued names: this check covers 3 declared names but the engine declares "
+                             + declared.Length + " (" + string.Join(", ", declared) + ") — a name was added "
+                             + "without a check to hold it");
+            foreach (var n in new[] { "tid", "stopped", "selected" })
+                if (Array.IndexOf(declared, n) < 0)
+                    failures.Add("tid-valued names: the engine no longer declares \"" + n + "\"");
+
+            // The writer validates the name instead of trusting it. Falsifiable, and this is what falsifies
+            // it: a name outside the set must be refused, and every declared name must be accepted.
+            foreach (var n in declared)
+            {
+                string w = DebugEngine.AppendTidValuedMemberForTest("{\"event\":\"x\"}", n, known);
+                if (w.IndexOf("\"" + n + "\":116932", StringComparison.Ordinal) < 0)
+                    failures.Add("tid writer: the declared name \"" + n + "\" was not written — " + w);
+                foreach (var bad in unknowns)
+                    if (DebugEngine.AppendTidValuedMemberForTest("{\"event\":\"x\"}", n, bad)
+                        != "{\"event\":\"x\"}")
+                        failures.Add("tid writer: \"" + n + "\" with an unknown id " + bad + " changed the "
+                                     + "event — an unknown id must write nothing at all");
+            }
+            try
+            {
+                DebugEngine.AppendTidValuedMemberForTest("{\"event\":\"x\"}", "clarionThread", known);
+                failures.Add("tid writer: it accepted \"clarionThread\", a name outside the declared set — "
+                             + "the set is documentation, not a check");
+            }
+            catch (ArgumentException) { }
+
+            // --- the `threads` event: "stopped" and "selected", each unknown on its own.
+            string bothKnown = DebugEngine.ThreadsJsonForTest(known, other, new[] { known, other });
+            foreach (var m in new[] { "stopped", "selected" })
+                if (!HasTopLevelMember(bothKnown, m))
+                    failures.Add("threads control: a KNOWN top-level \"" + m + "\" was not written — "
+                                 + bothKnown);
+            if (bothKnown.IndexOf("\"stopped\":116932", StringComparison.Ordinal) < 0
+                || bothKnown.IndexOf("\"selected\":4812", StringComparison.Ordinal) < 0)
+                failures.Add("threads control: the two top-level ids were not the ones it was given — "
+                             + bothKnown);
+
+            foreach (var bad in unknowns)
+            {
+                string s = DebugEngine.ThreadsJsonForTest(bad, other, new[] { other });
+                if (HasTopLevelMember(s, "stopped"))
+                    failures.Add("threads: an unknown stopped tid (" + bad + ") was written as a top-level "
+                                 + "\"stopped\" — the pad would read it as the thread execution halted on: " + s);
+                if (!HasTopLevelMember(s, "selected"))
+                    failures.Add("threads: dropping an unknown \"stopped\" also dropped the KNOWN "
+                                 + "\"selected\" — the rule is per member, not per event: " + s);
+
+                string t = DebugEngine.ThreadsJsonForTest(known, bad, new[] { known });
+                if (HasTopLevelMember(t, "selected"))
+                    failures.Add("threads: an unknown selected tid (" + bad + ") was written as a top-level "
+                                 + "\"selected\" — the pad would show a thread nobody selected: " + t);
+                if (!HasTopLevelMember(t, "stopped"))
+                    failures.Add("threads: dropping an unknown \"selected\" also dropped the KNOWN "
+                                 + "\"stopped\": " + t);
+
+                // With no selection, no ROW may claim to be the selected one. A row's "selected" is a
+                // boolean derived from the same id, so an unguarded `p.Tid == selectedTid` would mark a row
+                // with a 0 tid as selected — the sentinel defect again, one level down.
+                string u = DebugEngine.ThreadsJsonForTest(known, bad, new[] { known, bad });
+                if (Count(u, "\"selected\":true") != 0)
+                    failures.Add("threads: a row marked itself selected while the event states no "
+                                 + "selection (" + bad + ") — " + u);
+
+                // And the event must still be a well-formed object with its list intact.
+                if (!s.StartsWith("{\"event\":\"threads\"", StringComparison.Ordinal)
+                    || s.IndexOf(",\"threads\":[", StringComparison.Ordinal) < 0
+                    || !s.EndsWith("]}", StringComparison.Ordinal))
+                    failures.Add("threads: omitting a top-level id left the event malformed — " + s);
+            }
+
+            // CONTROL for the row check above: a KNOWN selection must still mark exactly one row.
+            string sel = DebugEngine.ThreadsJsonForTest(known, other, new[] { known, other });
+            if (Count(sel, "\"selected\":true") != 1)
+                failures.Add("threads control: a known selection marked "
+                             + Count(sel, "\"selected\":true") + " rows, expected exactly 1 — " + sel);
+
+            // --- the `threadscan` event: one top-level "stopped", same rule.
+            string scanKnown = DebugEngine.ThreadScanJsonForTest(known, new[] { known });
+            if (!HasTopLevelMember(scanKnown, "stopped")
+                || scanKnown.IndexOf("\"stopped\":116932", StringComparison.Ordinal) < 0)
+                failures.Add("threadscan control: a KNOWN top-level \"stopped\" was not written — " + scanKnown);
+            foreach (var bad in unknowns)
+            {
+                string s = DebugEngine.ThreadScanJsonForTest(bad, new[] { known });
+                if (HasTopLevelMember(s, "stopped"))
+                    failures.Add("threadscan: an unknown stopped tid (" + bad + ") was written as a "
+                                 + "top-level \"stopped\" — " + s);
+                if (!s.StartsWith("{\"event\":\"threadscan\"", StringComparison.Ordinal)
+                    || s.IndexOf(",\"threads\":[", StringComparison.Ordinal) < 0
+                    || !s.EndsWith("]}", StringComparison.Ordinal))
+                    failures.Add("threadscan: omitting the top-level id left the event malformed — " + s);
+                // The per-row "stopped" is a BOOLEAN and must survive: dropping a top-level id must not
+                // take the row flag with it, and the two are told apart by nesting, not by name.
+                if (Count(s, "\"stopped\":true") + Count(s, "\"stopped\":false") == 0)
+                    failures.Add("threadscan: the per-row boolean \"stopped\" disappeared along with the "
+                                 + "top-level id — they share a name and nothing else: " + s);
+            }
         }
 
         /// <summary>
@@ -375,7 +519,7 @@ namespace ClarionDbg.Cli
             // ---- case 1: THE RULE. A hit-count rule that is not yet satisfied resumes SILENTLY.
             var eng = NewEngine();
             var bp = eng.ArmUserBpForTest(loadBase, va, null, "eq", 99, null);
-            eng.ArmStepSessionForTest(tid, prevVa, tempVa);
+            eng.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             uint rc = 0;
             string log = CaptureConsole(() => { rc = eng.OnUserBpForTest(tid, va); });
 
@@ -412,7 +556,7 @@ namespace ClarionDbg.Cli
             // ---- case 2: PAUSING ROUTE A — a plain breakpoint, which never enters the gate at all.
             var plain = NewEngine();
             plain.ArmUserBpForTest(loadBase, va, null, null, 0, null);
-            plain.ArmStepSessionForTest(tid, prevVa, tempVa);
+            plain.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             string plainLog = CaptureConsole(() => { plain.OnUserBpForTest(tid, va); });
             if (plainLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
                 failures.Add("bp-hit control: a plain breakpoint did not report a hit, so this case never "
@@ -432,7 +576,7 @@ namespace ClarionDbg.Cli
             // CancelStep into the plain-breakpoint branch only would pass case 2 and fail here.
             var gated = NewEngine();
             var gbp = gated.ArmUserBpForTest(loadBase, va, null, "eq", 1, null);   // first hit satisfies =1
-            gated.ArmStepSessionForTest(tid, prevVa, tempVa);
+            gated.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             string gatedLog = CaptureConsole(() => { gated.OnUserBpForTest(tid, va); });
             if (gbp.HitCount != 1 || gatedLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
                 failures.Add("bp-hit control: a hit-count rule of =1 did not pause on its first hit "
@@ -451,7 +595,7 @@ namespace ClarionDbg.Cli
             // target that is not there.
             var trace = NewEngine();
             trace.ArmUserBpForTest(loadBase, va, null, null, 0, "step-in-flight probe");
-            trace.ArmStepSessionForTest(tid, prevVa, tempVa);
+            trace.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             string traceLog = CaptureConsole(() => { trace.OnUserBpForTest(tid, va); });
             if (traceLog.IndexOf("[TRACE] pc001.clw:100: step-in-flight probe", StringComparison.Ordinal) < 0)
                 failures.Add("bp-hit control: the tracepoint never logged — this case did not reach the "
@@ -523,8 +667,8 @@ namespace ClarionDbg.Cli
                             e => e.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
             refusesAttached("ArmUserBpForTest", null,
                             e => e.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null));
-            refusesAttached("ArmStepSessionForTest", null,
-                            e => e.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
+            refusesAttached("ArmStepOverSessionForTest", null,
+                            e => e.ArmStepOverSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
             refusesAttached("CancelStepForTest", null, e => e.CancelStepForTest());
             refusesAttached("ArmPrologueBypassForTest", null, e => e.ArmPrologueBypassForTest(0x1000));
             refusesAttached("RegisterThreadedModuleForTest", null,
@@ -554,7 +698,7 @@ namespace ClarionDbg.Cli
             {
                 var ok = NewEngine();
                 ok.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);
-                ok.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000);
+                ok.ArmStepOverSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000);
                 CaptureConsole(() => ok.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
                 ok.ArmPrologueBypassForTest(0x1000);
                 ok.CancelStepForTest();
@@ -566,6 +710,30 @@ namespace ClarionDbg.Cli
                              + "flag set (" + ex.GetType().Name + ": " + ex.Message + ") — the guard is too "
                              + "broad and every seam-driven check above is now asserting nothing");
             }
+
+            // ---- and ArmUserBpForTest's loadBase must AGREE with the module the va resolves to ----------
+            // The image is registered ONCE. On every arm after the first, ModuleAt(va) already resolved and
+            // the seam dropped `loadBase` on the floor, computing the RVA from the resolved module instead
+            // — so the argument was a decoration on all but the first call, and a case arming two
+            // breakpoints under two different bases was quietly testing one. Rvas is what the un-patch and
+            // re-arm paths work from, so this is not something a caller may be vague about.
+            var lb = NewEngine();
+            lb.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);   // registers the image
+
+            // CONTROL FIRST: a second arm INSIDE that image, passing the base it was registered under, is
+            // still accepted. Without this the rule below would be met just as well by a seam that had
+            // started refusing every arm after the first.
+            string agrees = SeamOutcome(() => lb.ArmUserBpForTest(0x00400000, 0x00401200, null, null, 0, null));
+            if (agrees == null)
+                failures.Add("seam-loadbase control: a second arm passing the SAME load base was refused — "
+                             + "the agreement check is refusing everything and asserting nothing");
+
+            // THE RULE. Same registered image, a base that contradicts it.
+            string disagrees = SeamOutcome(() => lb.ArmUserBpForTest(0x00500000, 0x00401300, null, null, 0, null));
+            if (disagrees != null)
+                failures.Add("seam-loadbase: ArmUserBpForTest " + disagrees + " when handed a load base that "
+                             + "disagrees with the module its va resolves to — it must refuse, not plant at "
+                             + "an RVA computed from a base its caller never passed");
         }
 
         /// <summary>How a seam call ENDED: null when it refused with InvalidOperationException, otherwise a
@@ -608,13 +776,94 @@ namespace ClarionDbg.Cli
             return buf.ToString();
         }
 
+        /// <summary>
+        /// The once-per-session diagnostics (ticket ec45805f item 5), and specifically HOW THEY KEY.
+        ///
+        /// Two console notes fired on a repeating event rather than a changing one: the window-walk cap on
+        /// every pause, and the THREADed-emulation notes on every field read — so a conditional breakpoint
+        /// over an image with no .cwtls span buried the console in identical text, up to 13 lines each.
+        ///
+        /// The interesting half is not "does it dedup". It is WHAT IT DEDUPS ON. These notes interpolate the
+        /// instance address and the block span, so a version that keyed on the MESSAGE would dedup nothing
+        /// at all while looking exactly like a working one — a suppression that never suppresses is the same
+        /// class of unfalsifiable check as the `"tid":-1` search at the top of this file. So this drives the
+        /// REAL reporter through its seam, not the predicate underneath it, and the decisive case is two
+        /// calls with the same (image, reason) and DIFFERENT text.
+        ///
+        /// The set is also per ENGINE, and that is asserted: static state would carry a session's
+        /// suppressions into the next one, and the note that mattered would be the one nobody saw.
+        ///
+        /// The window-cap site needs real windows and is not reachable here; it shares this rule holder, and
+        /// that sharing is the whole reason there is one holder rather than a flag in each file.
+        /// </summary>
+        private static void CheckOnceOnlyDiagnostics(List<string> failures)
+        {
+            // ---- the rule holder, isolated: first sighting true, every later one false, keys independent.
+            var eng = NewEngine();
+            if (!eng.FirstReportOfForTest("k1"))
+                failures.Add("once-only control: the FIRST sighting of a key was suppressed — the "
+                             + "diagnostic would never be printed at all");
+            if (eng.FirstReportOfForTest("k1"))
+                failures.Add("once-only: a repeated key reported again — the console floods");
+            if (!eng.FirstReportOfForTest("k2"))
+                failures.Add("once-only: a DIFFERENT key was suppressed by the first one — one noisy "
+                             + "diagnostic would silence every other");
+
+            // ---- per session, not per process. A static set would hide the second session's first warning.
+            if (!NewEngine().FirstReportOfForTest("k1"))
+                failures.Add("once-only: a NEW engine inherited the previous session's suppressions — the "
+                             + "set must be per engine, or a fresh run starts already silent");
+
+            // ---- THE DECIDING CASE: same image, same reason, different TEXT reports ONCE.
+            var e2 = NewEngine();
+            string first = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "write-outside-block", "kept instance 0x11110000 despite a write outside 0x2000"));
+            string again = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "write-outside-block", "kept instance 0x99990000 despite a write outside 0x7777"));
+
+            if (first.IndexOf("app.dll", StringComparison.Ordinal) < 0
+                || first.IndexOf("0x11110000", StringComparison.Ordinal) < 0)
+                failures.Add("threaded-note control: the FIRST note did not print its image and detail — "
+                             + "got: " + first.Trim());
+            if (again.Trim().Length != 0)
+                failures.Add("threaded-note: the same (image, reason) reported twice because the text "
+                             + "differed — it is keyed on the MESSAGE, which interpolates addresses, so it "
+                             + "dedups nothing: " + again.Trim());
+
+            // ---- and the suppression is ANNOUNCED. This reporter's whole contract is that it is never
+            //      silent; dropping repeats without saying so is a quieter way of being silent.
+            if (first.IndexOf("reported once", StringComparison.OrdinalIgnoreCase) < 0)
+                failures.Add("threaded-note: the note does not say it is reported once per session, so a "
+                             + "reader cannot tell 'happened once' from 'happening constantly, suppressed'");
+
+            // ---- the key's two halves, each isolated with the other held fixed.
+            string otherReason = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "no-cwtls-span", "no .cwtls span to test the write against"));
+            if (otherReason.Trim().Length == 0)
+                failures.Add("threaded-note: a DIFFERENT reason on the same image was suppressed — the two "
+                             + "conditions are different findings and the second would never be seen");
+
+            string otherImage = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "other.dll", "write-outside-block", "kept instance 0x11110000 despite a write outside 0x2000"));
+            if (otherImage.Trim().Length == 0)
+                failures.Add("threaded-note: the SAME reason on a different image was suppressed — one bad "
+                             + "image would mask the same fault in every other");
+        }
+
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
         /// Feeding the builder a known tid alongside 0 and (uint)-1 in the SAME event is the point: it
         /// asserts the rule is applied per row, not decided once for the whole event.</summary>
         private static void CheckNoSentinelRows(List<string> failures, string name, string json, uint known)
         {
-            if (Count(json, "\"tid\":" + known) != 1)
-                failures.Add(name + " control: the one known tid was not written exactly once — " + json);
+            // The control counts the tid WITH ITS TERMINATOR, the way the zero check below already does.
+            // `"tid":116932` alone is a PREFIX: a row writing 1169320 satisfies it, so the control could
+            // pass while the value on the wire was a different thread entirely (ticket ec45805f item 3).
+            // A false pass in the control of the check that enforces the absent-tid rule hides precisely
+            // what the rule exists to catch, so it is worth the two extra Counts.
+            int knownCount = Count(json, "\"tid\":" + known + ",") + Count(json, "\"tid\":" + known + "}");
+            if (knownCount != 1)
+                failures.Add(name + " control: the one known tid was written " + knownCount
+                             + " time(s), expected exactly 1 — " + json);
             int zero = Count(json, "\"tid\":0,") + Count(json, "\"tid\":0}");
             if (zero != 0)
                 failures.Add(name + ": " + zero + " row(s) wrote a 0 tid — a row the pad would attribute to a "
@@ -689,6 +938,65 @@ namespace ClarionDbg.Cli
             if (CountVa(scalarVetoed) != 0) failures.Add("edit-veto: a vetoed scalar row still carried edit metadata");
             if (scalarVetoed.IndexOf("\"note\":", StringComparison.Ordinal) < 0)
                 failures.Add("edit-veto: a vetoed row dropped its explanation");
+
+            // ---- THE EXPAND PATH ------------------------------------------------------------------
+            // The rows above are the ones the engine builds knowing whether they are vetoed. `expand`
+            // is the path that does NOT know: until cc3ac96e the command carried only
+            // reqId/module/typeRef/addr, so an expanded node's members were always built editable —
+            // including when the node was a shared .cwtls template reached through a by-ref member or
+            // an array-of-group element. That hole was stated in this check's own success message.
+            // The engine now DERIVES the veto from the address, through the same write guard that
+            // would refuse the commit, and these are the assertions that retire the claim.
+            //
+            // A separate engine, so registering an image cannot disturb anything asserted above.
+            var xeng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            // An image at 0x400000 whose .cwtls template block is RVA 0xC8000..0xCC000 — the same
+            // layout CheckThreadedWriteGuard uses. iatRva 0 (THR$GetInstance not resolved) on purpose:
+            // it keeps this check off OpenThread, which protocolcheck has no target for and which a
+            // bare tid cannot identify anyway, while leaving the template refusal — the branch that
+            // needs nothing resolved — exactly as it ships.
+            xeng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000, iatRva: 0);
+            const uint xtid = 4812;
+
+            // CONTROL, and it carries as much weight as the rule: expanding an ORDINARY address must
+            // still produce editable members. A derive that simply vetoed everything would satisfy the
+            // rule below while silently ending in-place editing for every non-threaded group.
+            string expandOk = xeng.ExpandChildrenForTest(grp, 0x401000, "app.exe", xtid);
+            if (CountVa(expandOk) != 2)
+                failures.Add("expand-veto control: expanding an ordinary GROUP offered " + CountVa(expandOk)
+                             + " editable member(s), expected 2 — the derive over-vetoes");
+            if (expandOk.IndexOf("\"note\":", StringComparison.Ordinal) >= 0)
+                failures.Add("expand-veto control: an ordinary expanded GROUP carried a refusal note");
+
+            // THE RULE: expanding a row that sits on the shared template offers no pencil beneath it.
+            string expandVetoed = xeng.ExpandChildrenForTest(grp, 0x4C8000, "app.exe", xtid);
+            n = CountVa(expandVetoed);
+            if (n != 0)
+                failures.Add("expand-veto: expanding a shared-template row offered " + n + " editable "
+                             + "member row(s) — a pencil promising a write HandleSetValCommand will refuse");
+            if (Count(expandVetoed, "\"note\":") != 2)
+                failures.Add("expand-veto: a vetoed expanded row did not explain itself on every member — "
+                             + "the tree can be scrolled until only the member is on screen");
+
+            // THE GROUP IS AN INTERVAL, exactly as a write is. Its members are read at base+offset, so
+            // a group that STARTS below the template and reaches into it must be vetoed whole: one
+            // flag covers every member, and the member that lands on shared bytes is the one that
+            // matters. Testing only the base address would let this through.
+            //   0x4C7FFC + member SECOND at +4 = 0x4C8000, the template's first byte.
+            string straddling = xeng.ExpandChildrenForTest(grp, 0x4C7FFC, "app.exe", xtid);
+            if (CountVa(straddling) != 0)
+                failures.Add("expand-veto: a GROUP at 0x4C7FFC has a member ON the template's first byte "
+                             + "but " + CountVa(straddling) + " member row(s) were still offered a pencil");
+            // ...and the group that really does stay below it keeps its pencils: 0x4C7FF8 + 8 ends
+            // exactly at the template's first byte, which is past the last byte it touches.
+            string justBelow = xeng.ExpandChildrenForTest(grp, 0x4C7FF8, "app.exe", xtid);
+            if (CountVa(justBelow) != 2)
+                failures.Add("expand-veto control: a GROUP ending exactly at the template's first byte was "
+                             + "vetoed — it touches none of it");
+
+            // NOT COVERED HERE, and deliberately: the two notes that distinguish "this thread has no
+            // instance yet" from "it has one, at another address" both need a live THR$GetInstance
+            // emulation. The VETO is fully covered above; only its wording varies with that resolve.
         }
 
         /// <summary>
@@ -799,8 +1107,15 @@ namespace ClarionDbg.Cli
         /// <summary>Is there a "tid" member at the TOP level of this object? Deliberately ignores nested
         /// objects and arrays — a per-frame or per-row tid is not the event's own, which is the same
         /// distinction the pad's extractor makes.</summary>
-        private static bool HasTopLevelTid(string json)
+        private static bool HasTopLevelTid(string json) { return HasTopLevelMember(json, "tid"); }
+
+        /// <summary>The same question for any member name, because the thread ids that bypassed the rule
+        /// were called "stopped" and "selected" (ticket 3b043dfc). Nesting is the ONLY thing that separates
+        /// the `threads` event's top-level "stopped" — a thread id — from a row's own "stopped" boolean, so
+        /// asking the question by name alone would answer about the wrong member.</summary>
+        private static bool HasTopLevelMember(string json, string name)
         {
+            string needle = "\"" + name + "\":";
             int depth = 0;
             bool inStr = false;
             for (int i = 0; i < json.Length; i++)
@@ -809,7 +1124,8 @@ namespace ClarionDbg.Cli
                 if (inStr) { if (c == '\\') i++; else if (c == '"') inStr = false; continue; }
                 if (c == '"')
                 {
-                    if (depth == 1 && string.CompareOrdinal(json, i, "\"tid\":", 0, 6) == 0) return true;
+                    if (depth == 1 && string.CompareOrdinal(json, i, needle, 0, needle.Length) == 0)
+                        return true;
                     inStr = true; continue;
                 }
                 if (c == '{' || c == '[') depth++;
