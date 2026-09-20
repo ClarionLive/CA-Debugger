@@ -59,7 +59,8 @@ $ErrorActionPreference = 'Stop'
 
 $repo      = Split-Path -Parent $PSScriptRoot
 $engineDir = Join-Path $repo 'src\ClarionDbg.Cli'
-$ruleFile  = Join-Path $engineDir 'DebugEngine.cs'
+$ruleFileName = 'DebugEngine.cs'
+$ruleFile  = Join-Path $engineDir $ruleFileName
 
 # ProtocolCheck.cs is the CHECKER, not an emitter: it is full of member-name literals because asserting on
 # them is its job. The exclusion is earned below rather than assumed -- a file that emits nothing to the
@@ -265,6 +266,103 @@ Check 'no declared thread-id member name is written as JSON text outside the wri
 Check 'exactly 3 same-named members are per-row booleans' ($booleans.Count -eq 3) `
       "got $($booleans.Count): $(($booleans | ForEach-Object { "$($_.File):$($_.Line) $($_.Name)" }) -join ', ')"
 
+# ---------------------------------------------------------------- the hole in the check above
+#
+# Everything so far searches for the NAME. That is blind to the one shape it cannot see: a member whose
+# name is not in the literal at all, because it was assembled around a variable --
+#
+#     sb.Append(",\"").Append(someName).Append("\":").Append(tid);
+#
+# which is EXACTLY what the shared writer does, and therefore exactly what a bypass would look like if
+# someone copied it. No declared name appears anywhere in that line, so the scan above says nothing.
+#
+# Nobody would write that by accident. That is also what was said about the four breakages that have
+# already happened, so it is closed rather than argued about: a string literal consisting of NOTHING BUT
+# the punctuation around a member name is only legitimate inside the rule holder. There are exactly 2 in
+# the engine's emitting sources today -- `,\"` and `\":` in AppendTidValuedMember, and `\":` in WithTid --
+# and all of them are inside the two blocks that hold the rule.
+
+# A literal that carries JSON member punctuation and NO NAME: the name is coming from somewhere else.
+#
+# A bare `\"` is NOT in this set and must not be: Json.cs's string escaper emits one constantly, and
+# including it flagged 20 lines of the escaper as thread-id bypasses. The set is the punctuation that
+# OPENS or CLOSES a member name specifically -- a leading `,\"` or `{\"`, and the closing `\":`.
+$nameless = @(',\"', '{\"', '\":')
+
+function Get-AllowedRanges([string] $Src) {
+  # PSCustomObjects rather than nested arrays on purpose: PowerShell unrolls an array returned from a
+  # function, so @(@(a,b),@(c,d)) can arrive as four loose integers and the range test then silently
+  # matches nothing. That is how the first version of this check reported the writer's own delimiters as
+  # bypasses -- a check that fails loudly, at least, unlike the reverse.
+  $ranges = New-Object System.Collections.ArrayList
+  foreach ($sig in @('private static void AppendTidValuedMember(', 'private static string WithTid(')) {
+    $block = Get-CSharpBlock $sig $Src
+    if ($null -eq $block) { continue }
+    $at = $Src.IndexOf($block, [StringComparison]::Ordinal)
+    if ($at -ge 0) { [void] $ranges.Add([pscustomobject] @{ Start = $at; End = $at + $block.Length }) }
+  }
+  return ,$ranges.ToArray()
+}
+
+function Get-NamelessDelimiters([hashtable] $Sources, [array] $AllowedRanges) {
+  $out = New-Object System.Collections.ArrayList
+  foreach ($f in ($Sources.Keys | Sort-Object)) {
+    $src = $Sources[$f]
+    foreach ($lit in (Get-StringLiterals $src)) {
+      # the literal's CONTENT, i.e. the source text with its surrounding quotes removed
+      if ($lit.Text.Length -lt 2 -or $lit.Text[0] -ne '"') { continue }
+      $body = $lit.Text.Substring(1, $lit.Text.Length - 2)
+      if ($nameless -notcontains $body) { continue }
+      $allowed = $false
+      if ($f -eq $ruleFileName) {
+        foreach ($r in $AllowedRanges) {
+          if ($lit.Start -ge $r.Start -and $lit.Start -lt $r.End) { $allowed = $true }
+        }
+      }
+      [void] $out.Add([pscustomobject] @{
+        File = $f; Line = ($src.Substring(0, $lit.Start) -split "`n").Count; Text = $lit.Text; Allowed = $allowed
+      })
+    }
+  }
+  return $out
+}
+
+$allowedRanges = Get-AllowedRanges $ruleSrc
+Check 'both rule-holder blocks were located in DebugEngine.cs' ($allowedRanges.Count -eq 2) `
+      "found $($allowedRanges.Count) of 2 (AppendTidValuedMember, WithTid) - without them every writer line reads as a bypass"
+
+$nameless_hits = @(Get-NamelessDelimiters $sources $allowedRanges)
+$namelessBad = @($nameless_hits | Where-Object { -not $_.Allowed })
+Check 'no member name is ASSEMBLED around a variable outside the rule holder' ($namelessBad.Count -eq 0) `
+      ($(if ($namelessBad.Count) {
+           ($namelessBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ' | '
+         } else { '' }))
+# CONTROL: the writer's own delimiters must still be FOUND, or the check above passes because the walk
+# sees nothing rather than because there is nothing to see. FOUR, and the number is checkable against the
+# two rule holders: AppendTidValuedMember opens with `,\"` and closes with `\":`, WithTid opens with `{\"`
+# and closes with `\":`. (It said 3 first, from a grep that did not show WithTid's opener; the check
+# disagreed with the claim and the check was right, which is the entire argument for stating a number.)
+$namelessOk = @($nameless_hits | Where-Object { $_.Allowed })
+Check 'and the rule holder still assembles its own (4 delimiter literals)' ($namelessOk.Count -eq 4) `
+      "got $($namelessOk.Count): $(($namelessOk | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ', ')"
+
+# ---------------------------------------------------------------- the scope this check assumes
+#
+# It scans src\ClarionDbg.Cli and nothing else, which is only correct while that is where the wire is
+# written. ClarionDbg.Core carries no JSON emitter today; if one appears there, this check goes quiet
+# rather than wrong, which is the worse failure. So the assumption is asserted rather than left implicit.
+$coreDir = Join-Path $repo 'src\ClarionDbg.Core'
+$coreJson = @()
+if (Test-Path $coreDir) {
+  $coreJson = @(Get-ChildItem -Path $coreDir -Filter *.cs -File -Recurse | Where-Object {
+    $t = [IO.File]::ReadAllText($_.FullName)
+    $t.IndexOf('"@JSON', [StringComparison]::Ordinal) -ge 0 -or $t.IndexOf('\"event\":', [StringComparison]::Ordinal) -ge 0
+  })
+}
+Check 'ClarionDbg.Core writes no wire JSON, so scanning only ClarionDbg.Cli is the whole surface' `
+      ($coreJson.Count -eq 0) `
+      "$(($coreJson | ForEach-Object { $_.Name }) -join ', ') now emit(s) events - widen the scan or this check is silently partial"
+
 # ---------------------------------------------------------------- mutation self-test
 #
 # Each mutation is applied to a COPY of the real source and the scan is re-run over it. The check must go
@@ -287,12 +385,20 @@ if ($SelfTest) {
     $h = @(Invoke-Scan $mut $names)
     $b = @($h | Where-Object { -not $_.Boolean })
     $bl = @($h | Where-Object { $_.Boolean })
+    # The nameless-delimiter scan re-derives its allowed ranges from the MUTATED DebugEngine.cs, or a
+    # mutation that shifted offsets in that file would show up as a bypass for the wrong reason.
+    $nd = @(Get-NamelessDelimiters $mut (Get-AllowedRanges $mut[$ruleFileName]))
+    $ndBad = @($nd | Where-Object { -not $_.Allowed })
+    $ndOk  = @($nd | Where-Object { $_.Allowed })
     $caught = switch ($Expect) {
-      'bypass'  { $b.Count -gt 0 }
-      'boolean' { $bl.Count -ne 3 }
-      default   { $false }
+      'bypass'        { $b.Count -gt 0 }
+      'boolean'       { $bl.Count -ne 3 }
+      'nameless'      { $ndBad.Count -gt 0 }
+      'namelessCount' { $ndOk.Count -ne 4 }
+      default         { $false }
     }
-    Check "CAUGHT: $What" $caught "bypasses=$($b.Count) booleans=$($bl.Count)"
+    Check "CAUGHT: $What" $caught `
+          "bypasses=$($b.Count) booleans=$($bl.Count) assembled-outside=$($ndBad.Count) writer-delims=$($ndOk.Count)"
   }
 
   # 1. The exact defect the rule exists to stop: a new emitter types the member.
@@ -321,6 +427,21 @@ if ($SelfTest) {
     '.Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")' `
     '.Append("")' 'boolean'
 
+  # 6. THE HOLE IN EVERY CHECK ABOVE: a member whose NAME IS NEVER IN A LITERAL, assembled around a
+  #    variable the way the shared writer itself does it. Every name-based check is blind to this by
+  #    construction, which is why the delimiter rule exists at all.
+  Test-Mutation 'a member name assembled around a variable, outside the writer' 'DebugEngine.Threads.cs' `
+    'sb.Append("{\"event\":\"threads\"");' `
+    'sb.Append("{\"event\":\"threads\"").Append(",\"").Append(TidMemberStopped).Append("\":").Append(stoppedTid);' `
+    'nameless'
+
+  # 7. And the CONTROL for that rule: the writer's own 4 delimiters must still be found where they are.
+  #    Without this, mutation 6 would pass just as well against a version that found nothing anywhere.
+  Test-Mutation 'one of the writer''s own delimiters goes missing' 'DebugEngine.cs' `
+    'sb.Append(",\"").Append(name).Append("\":").Append(tid);' `
+    'sb.Append(",").Append(Json.Str(name)).Append(":").Append(tid);' `
+    'namelessCount'
+
   # 6. THE CONTROL FOR THE WALK ITSELF. A member name typed in a COMMENT must NOT be reported -- the rule
   #    holder's own comments are full of them, and a check that cries wolf on prose gets deleted.
   $mut = @{}
@@ -340,7 +461,9 @@ if ($fail -eq 0) {
   Write-Host "test-engine-tid-members: PASS ($pass checks). Every thread-id member the engine writes goes"
   Write-Host "  through AppendTidValuedMember or WithTid. The $($names.Count) declared names"
   Write-Host "  ($($names -join ', ')) appear as JSON text in $($sources.Count) engine source file(s) only as the 3"
-  Write-Host '  per-row booleans that share them; a hand-written thread-id member anywhere else fails this.'
+  Write-Host '  per-row booleans that share them; a hand-written thread-id member anywhere else fails this,'
+  Write-Host '  and so does one whose name never appears in a literal at all because it was assembled around'
+  Write-Host '  a variable -- the 4 delimiters that do that belong to the writer and are where they were.'
   exit 0
 }
 Write-Host "test-engine-tid-members: FAIL ($fail of $($fail + $pass) checks)" -ForegroundColor Red
