@@ -2,11 +2,21 @@
 # Dot-source this: . "$PSScriptRoot\lib-check.ps1"   (lib-extract.ps1 already does, so a harness that
 # dot-sources lib-extract gets these for free and needs no second line.)
 #
-# WHY THIS IS NOT IN lib-extract.ps1. Check has nothing to do with extracting C#, and lib-extract.ps1 calls
-# `Set-StrictMode -Version Latest` at top level - which a dot-source imposes on the CALLER. Putting Check
-# there would have meant the one suite with no extraction to do (test-engine-session.ps1, which scans
-# PowerShell) could not use it: adding that dot-source makes it throw and lose 8 of its 56 checks. A library
-# that changes its caller's strictness cannot also be the library everyone is required to load.
+# WHY THIS IS NOT IN lib-extract.ps1, stated as it stands TODAY rather than as it was discovered.
+#
+# lib-extract.ps1 calls `Set-StrictMode -Version Latest` at top level, and a dot-source imposes that on the
+# CALLER. When this split was made, test-engine-session.ps1 - the one suite with no C# to extract, because
+# it scans PowerShell - was not strict-clean: adding that dot-source made it throw and report ALL 48 CHECKS
+# PASSED instead of 56. That particular fault is now FIXED (its `.Count` on a scalar became `@(...).Count`)
+# and the file is strict-clean, so do not read the paragraph above as a live failure; it is the measurement
+# that prompted the layering.
+#
+# The layering stands on the reasons that OUTLIVED it:
+#   - Check has nothing to do with extracting C#. test-engine-session.ps1 would be loading a C# extractor
+#     it never calls, purely to get a Check.
+#   - A library that silently changes its caller's strictness cannot also be the library everyone is
+#     required to load. That is true whether or not any current caller trips over it, and it puts the next
+#     suite one non-strict idiom away from the same failure.
 #
 # This file therefore has NO StrictMode, NO extraction and NO dependencies, so anything can load it.
 #

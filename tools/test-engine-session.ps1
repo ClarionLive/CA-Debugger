@@ -365,7 +365,11 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
     }
 
     $pokers = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' | Sort-Object Name |
-                Where-Object { (Get-PokePidArgs $_.FullName).Count -gt 0 })
+                # @() around the call: a ONE-element result unrolls to a scalar, and `.Count` on a scalar
+                # is a convenience PowerShell withdraws under Set-StrictMode 3.0+. The count was right
+                # either way, so this is an idiom fix, not a behaviour fix - but it was the only thing
+                # making this file unloadable alongside a strict library (see tools/lib-check.ps1).
+                Where-Object { @(Get-PokePidArgs $_.FullName).Count -gt 0 })
     # A number, not "every": a harness that grows a third poke site says so here.
     $allArgs = @($pokers | ForEach-Object { Get-PokePidArgs $_.FullName })
     Check 'exactly 4 window-poke sites across the harnesses, in 2 files' `

@@ -190,6 +190,13 @@ function Explain { param([string] $Hook) [MonacoProbe]::$Hook.Explain() }
 
 # ── scenarios ─────────────────────────────────────────────────────────────────────────────────────────
 
+# CASE-INSENSITIVE ON PURPOSE, and left that way deliberately (ticket 09207c17). PowerShell's `switch` and
+# `-eq` ignore case by default, which is a REAL hazard for a token whose spelling is fixed by something
+# outside this file - a JSON wire token, an enum name, a hook signature - because a case-only drift then
+# ships a value the other side silently fails to match. That is what the -ceq sweep is for.
+# `$Scenario` is a third category: a human-typed CLI argument. Nothing on the wire carries it, nothing
+# else defines its spelling, and accepting -Scenario Absent is a convenience rather than a drift. Named
+# here so the sweep does not read it as an oversight and "fix" it into a worse tool.
 switch ($Scenario) {
 
   'absent' {
