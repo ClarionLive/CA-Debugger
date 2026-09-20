@@ -576,9 +576,21 @@ namespace ClarionDebugger.Disassembly
         /// reply is handled and the failed read is not, which is the same defect with a quieter cause.
         ///
         /// DELIBERATELY UNCONDITIONAL on the error text. Engine errors are not tagged, so this cannot tell
-        /// a disasm failure from any other; releasing a latch on an unrelated error costs one extra retry,
-        /// while HOLDING one on a disasm failure costs the pane for the rest of the stop. The asymmetry
-        /// decides it. The seat is not marked painted either way, so nothing claims to be on screen.</summary>
+        /// a disasm failure from any other, and HOLDING the latch on a real disasm failure costs the pane
+        /// for the rest of the stop.
+        ///
+        /// WHAT IT ACTUALLY COSTS, corrected — the first version of this comment said "one extra retry",
+        /// which was optimistic. NOTHING re-requests on its own, so an unrelated error arriving mid-seat
+        /// loses that seat until the next stop or selection change. That is more likely than it looks,
+        /// because a declined variable edit emits on this same channel. It is still the right trade: a lost
+        /// seat is recoverable by selecting the thread again, a held latch is not recoverable at all.
+        ///
+        /// AND IT DOES NOT RECORD A DECODE FAILURE. Setting _emptySeatTid here would make the pane announce
+        /// "the engine could not decode this thread's address" on the strength of an untagged error that may
+        /// have been about something else entirely — the same fabricated fact the coarse-seek path was just
+        /// fixed for. The pane falls back to "nothing to disassemble at this address", which is true whatever
+        /// the error was. Leaving it unset also leaves the thread eligible for a retry, which is correct:
+        /// unlike an empty reply, an error is no evidence that the address is undecodable.</summary>
         private void OnEngineError(string message) => UI(() =>
         {
             if (_seatingTid == 0 && !_awaitRegsSeat) return;   // nothing waiting; not ours to clear
@@ -685,6 +697,14 @@ namespace ClarionDebugger.Disassembly
                     // ordinary way to get one), so it is reachable through normal use, not just by a reply
                     // that never arrives. COMPLETED-BUT-UNSEATED is the honest third state: the request
                     // finished, and it seated nothing.
+                    // CAPTURED BEFORE THE RELEASE, because a WinTag reply serves TWO callers with different
+                    // meanings and only this distinguishes them. A coarse SEEK is also a WinTag request, and
+                    // on that path _seatingTid and _awaitRegsSeat are both 0. Without this, a seek to an
+                    // unmapped address came back empty and the pane announced "the engine could not decode
+                    // its CURRENT ADDRESS" — a fabricated fact, since the thread's EIP was fine and the user
+                    // had simply scrolled somewhere with nothing in it — while also latching the seat retry
+                    // off for a thread that was never being seated.
+                    bool wasSeat = _seatingTid != 0 || _awaitRegsSeat;
                     _seatingTid = 0;
                     _awaitRegsSeat = false;
                     if (instrs.Count > 0)
@@ -700,8 +720,22 @@ namespace ClarionDebugger.Disassembly
                     {
                         // Do NOT claim the seat. Remember the thread instead, so the retry SeatOnSelectedThread
                         // can now make happens once per episode rather than on every inventory that arrives.
-                        uint emptyTid = TidOf(tid);
-                        _emptySeatTid = emptyTid != 0 ? emptyTid : _selTid;
+                        // Only a SEAT may claim "this thread's code could not be decoded". A seek's empty
+                        // result says nothing about the thread's own address.
+                        if (wasSeat)
+                        {
+                            uint emptyTid = TidOf(tid);
+                            _emptySeatTid = emptyTid != 0 ? emptyTid : _selTid;
+                        }
+                        // AND RELEASE THE OLD SEAT, because this reply is about to ERASE what it described.
+                        // Not clearing it let the painted flag OUTLIVE THE PAINT: thread A painted, seat B,
+                        // B comes back empty — the screen is now empty and _seatedTid still said A. Selecting
+                        // A again then found the already-painted guard satisfied, so it would not reseat, and
+                        // the banner could claim A while nothing was on screen. The invariant this file now
+                        // rests on is "the banner reflects what is PAINTED", and a stale _seatedTid defeats it
+                        // from the other end — the flag surviving the listing rather than running ahead of it.
+                        // Ordered BEFORE the cache replacement below so no path can read the two disagreeing.
+                        _seatedTid = 0;
                     }
                     // fresh window: replace the cache and centre on EIP (the flagged instruction)
                     _instrs = SortedUnique(instrs);
@@ -710,6 +744,11 @@ namespace ClarionDebugger.Disassembly
                     _hasCur = cur != null && TryParseVa(cur.Va, out _curVa);
                     if (cur != null) { _curPath = cur.ResolvedPath; _curLine = cur.Line; _curModule = cur.Module; }
                     UpdateLocation();
+                    // The banner reads _seatedTid, which BOTH branches above have just changed — set on a
+                    // successful seat, cleared on an empty one. Re-deriving it here rather than leaving it
+                    // to the next unrelated event is the other half of the fix: a correct _seatedTid that
+                    // the banner has not re-read yet is the same defect one frame later.
+                    UpdateThreadBanner();
                     Rebuild();
                     RemapSelection(selVas);
                     _anchorRow = anchorVa != 0 ? RowOfVa(anchorVa) : (_anchorRow < _rows.Count ? _anchorRow : -1);
@@ -1074,14 +1113,22 @@ namespace ClarionDebugger.Disassembly
 
             if (_rows.Count == 0)
             {
-                // TWO DIFFERENT EMPTIES MUST NOT LOOK THE SAME. "There is nothing to show yet" and "we
-                // asked, and the engine could not read that thread's code" are different facts about the
-                // user's program, and a silently blank pane asserts the first while meaning the second.
-                // Same absent-versus-sentinel discipline the wire has, applied to the surface.
+                // THREE DIFFERENT EMPTIES, AND EACH SAYS ONLY WHAT IT CAN SUPPORT. They were one message,
+                // which asserted "no session" while often meaning something else entirely. Same
+                // absent-versus-sentinel discipline the wire has, applied to the surface — and the same
+                // rule that stopped `_emptySeatTid` being set by a coarse seek: a message is a claim, and
+                // a claim needs the state that justifies it.
+                //   1. a SEAT came back empty — the engine could not decode THAT THREAD's address. Only
+                //      set when wasSeat, so this never speaks for a seek.
+                //   2. we have a paused session and nothing is on screen — true after a seek into unmapped
+                //      memory, and after an engine error abandoned a seat. It claims nothing about why.
+                //   3. no session at all.
                 string msg = _emptySeatTid != 0
                     ? "(no code to show for " + ThreadName(_emptySeatTid)
                       + " — the engine could not decode its current address)"
-                    : "(no disassembly — start a debug session and pause)";
+                    : (_svc != null && _svc.State == DebugSessionState.Paused)
+                      ? "(nothing to disassemble at this address)"
+                      : "(no disassembly — start a debug session and pause)";
                 TextRenderer.DrawText(g, msg,
                     _font, new Point(_coarse.Width + 8, TopOffset() + 8), FgHint, TextFormatFlags.NoPadding);
                 return;
