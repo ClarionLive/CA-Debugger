@@ -8,9 +8,11 @@
 #   "measured 2026-09-20, before the @(Get-PokePidArgs ...) fix in test-engine-session.ps1's poke-site
 #    scan - dot-sourcing lib-extract.ps1 cost that suite 8 of its 56 checks, reporting ALL 48 CHECKS
 #    PASSED."
-# (That said ":380" until the code-reviewer pointed out this header states the dating rule and then breaks
-#  the companion one in its own next clause: the fix is at :372 now and :380 is an unrelated Get-Content.
-#  PIN THE SYMBOL, NOT THE LINE - a line number in a FOREIGN file is the least durable pin there is.)
+# (That named a LINE NUMBER until the code-reviewer pointed out this header states the dating rule and
+#  then breaks the companion one in its own next clause - and the first correction of it pinned two MORE
+#  line numbers in the same foreign file, so the rule was broken a third time inside the fix for the
+#  second. PIN THE SYMBOL, NOT THE LINE: a line number in someone else's file is the least durable pin
+#  there is, and naming Get-PokePidArgs costs nothing and survives every edit above it.)
 # That fault is now fixed and the file IS strict-clean, so the line above is history, not a live failure.
 # It is kept verbatim because a DATED measurement is a fact about the past and cannot rot; an UNDATED claim
 # about present code is a live assertion and goes stale the moment the code moves. This file had the second
