@@ -36,7 +36,8 @@ $ErrorActionPreference = 'Stop'
 $web = Get-Content -Raw -LiteralPath $WebViewPath
 $svc = Get-Content -Raw -LiteralPath $ServicePath
 
-# Get-Method / Check / the null renderer live in lib-extract.ps1 (dot-sourced above). This names the text a
+# Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
+# lib-check.ps1, which lib-extract dot-sources in turn. This names the text a
 # bare Get-Method reads, which each harness used to bury in its own copy's `if (-not $From)` fallback.
 Set-ExtractSource $web
 

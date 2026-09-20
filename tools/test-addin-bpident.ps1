@@ -31,7 +31,8 @@ $web = Get-Content -Raw -LiteralPath $WebViewPath
 $edt = Get-Content -Raw -LiteralPath $EditorBpPath
 $svc = Get-Content -Raw -LiteralPath $ServicePath
 
-# Get-Method / Check / ShowVal live in lib-extract.ps1 (dot-sourced above).
+# Get-Method comes from lib-extract.ps1 (dot-sourced above); Check and ShowVal from lib-check.ps1,
+# which lib-extract dot-sources in turn.
 #
 # No Set-ExtractSource here, unlike the other three harnesses: every extraction below names its source
 # explicitly ($web / $edt / $svc, three different files), so a default would be a line nothing reads. It was

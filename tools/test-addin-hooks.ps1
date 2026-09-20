@@ -48,7 +48,7 @@ if (-not $Scenario) {
 $web  = Get-Content -Raw -LiteralPath $WebViewPath
 $ctrl = Get-Content -Raw -LiteralPath $ControllerPath
 
-# Get-Method (this file called it Get-Method), Get-Statement and Check live in lib-extract.ps1, dot-sourced
+# Get-Method (this file used to call it Get-Block) and Get-Statement come from lib-extract.ps1, dot-sourced
 # above. This names the text a bare call reads, which each harness used to bury in its own `if (-not $From)`.
 Set-ExtractSource $web
 

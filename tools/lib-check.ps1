@@ -22,6 +22,15 @@
 #
 # This file therefore has NO StrictMode, NO extraction and NO dependencies, so anything can load it.
 #
+# A HOIST IS NOT FINISHED UNTIL YOU GREP FOR REDEFINITIONS OF EVERY NAME YOU HOISTED.
+# A local `function X` AFTER the dot-source silently WINS: no error, no warning, and - because these
+# helpers only shape Detail text and counters - no changed verdict either. Nothing in the harness can see
+# it. test-addin-json.ps1 kept its own ShowVal this way for one merge (found 2026-09-20 by the pipeline
+# verifier, not by any suite), rendering absence as 'null' where this file renders '(null)', in the one
+# suite whose subject is JSON. Two things made it invisible: the leftover sat one line past the end of the
+# block that removed its neighbour, and a later blanket rename turned it into the hoisted NAME, so it
+# read as deliberate. Grep for the names, not for the shape.
+#
 # Check was defined SIX times before this: four verbatim, and two that had drifted - one printing "  ok   "
 # with a " -- " separator and its own counters, one counting a separate total and treating an empty-string
 # detail as present. Two private vocabularies for "this failed" is the drift, not the line count.
