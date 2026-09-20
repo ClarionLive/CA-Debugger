@@ -59,8 +59,13 @@ $engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 
-# Get-Method / Check / the null renderer live in lib-extract.ps1 (dot-sourced above). This names the text a
-# bare Get-Method reads, which each harness used to bury in its own copy's `if (-not $From)` fallback.
+# Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
+# lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
+# carried its own ShowVal until 2026-09-20, which SHADOWED the shared one and rendered absence as 'null'
+# where lib-check renders '(null)' - in the one suite whose subject is JSON, where that distinction is the
+# reason the shared version exists.
+# This line names the text a bare Get-Method reads, which each harness used to bury in its own copy's
+# `if (-not $From)` fallback.
 Set-ExtractSource $src
 
 
@@ -82,9 +87,6 @@ $($methods -replace 'private static', 'public static')
 "@
 
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
-
-
-function ShowVal { param($v) if ($null -eq $v) { 'null' } else { [string] $v } }
 
 Write-Host 'the event''s own tid, and nothing else''s'
 $paused = '{"tid":116932,"event":"paused","reason":"breakpoint","proc":"SPLASHSCREEN","regs":{"eax":"0x0"}}'
