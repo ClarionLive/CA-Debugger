@@ -1131,6 +1131,11 @@ Write-Host 'the Disassembly view keeps THREE tag-keyed requests in flight, and a
 $fmtTag = Get-Method 'private static string FormatTag(string kind, int epoch)' $disasmView
 $parseTag = Get-Method 'private static bool ParseTag(string tag, out string kind, out int epoch)' $disasmView
 $tidMatch = Get-Method 'private static bool TidMatches(uint? tid, uint selTid)' $disasmView
+# TidMatches now READS the view's single uint? -> uint conversion instead of restating the rule, so the
+# probe needs it too. That is the POINT of the change (Owen2, 6505439): the view had four conversions
+# under two disagreeing definitions of "unstamped", and `tid ?? _selTid` seated a literal 0 while the gate
+# treated 0 as a sentinel - so the view was never marked painted. One definition now, read by both.
+$tidOf = Get-Method 'private static uint TidOf(uint? t)' $disasmView
 $tagShim = @"
 using System;
 using System.Globalization;
@@ -1138,7 +1143,7 @@ public static class DisasmTagProbe {
   public const string WinTag = "win";
   public const string FwdTag = "winf";
   public const string BwdTag = "winb";
-$(($fmtTag, $parseTag, $tidMatch -join "`n") -replace 'private static', 'public static')
+$(($fmtTag, $parseTag, $tidMatch, $tidOf -join "`n") -replace 'private static', 'public static')
 }
 "@
 Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
@@ -1267,6 +1272,41 @@ Check 'an UNSTAMPED reply is not treated as a mismatch (pre-381aabd7 engine keep
   ([DisasmTagProbe]::TidMatches($null, [uint] 116932)) 'tid=null'
 Check 'a 0 tid is a sentinel, not thread 0, so it is not a mismatch either' `
   ([DisasmTagProbe]::TidMatches([uint] 0, [uint] 116932)) 'tid=0'
+# ONE definition of "unstamped", now that TidMatches reads TidOf instead of restating the rule (Owen2,
+# 6505439). The view had FOUR uint? -> uint conversions under two disagreeing definitions: the gate treated
+# a stamped literal 0 as a sentinel while the seat assignment `tid ?? _selTid` seated it as thread 0, so
+# the view was never marked painted.
+#
+# WHAT THESE TWO DO AND DO NOT COVER, said plainly because the handover came with a mutation that does
+# NOT red them. The suggested falsification was to rewrite TidOf as `return t ?? 0u;` - but that is
+# EXACTLY EQUIVALENT to the shipped body: null gives 0, a stamped 0 unwraps to 0, and a real tid is
+# unchanged. Verified by running it; both checks stayed green, correctly. So these two pin the CONTRACT at
+# the boundary (0 and absent are the same thing to every reader of it) and they are honest, but no
+# realistic mutation of TidOf ITSELF can break them - unwrapping 0 gives 0 for free.
+# The defect was never inside TidOf. It was at the CALL SITES, which is what the third check pins.
+Check 'a stamped 0 is unstamped, exactly as an absent tid is' `
+  ([DisasmTagProbe]::TidOf([uint] 0) -eq 0 -and [DisasmTagProbe]::TidOf($null) -eq 0) ''
+# CONTROL: a TidOf that answered 0 for everything would satisfy the line above and erase every real tid.
+Check 'CONTROL: a real tid survives TidOf unchanged' ([DisasmTagProbe]::TidOf([uint] 4812) -eq 4812) ''
+# THE ONE THAT CATCHES THE DEFECT CLASS. `?? _selTid` is the exact idiom the seat used to disagree with the
+# gate on: it makes a stamped literal 0 seat as the SELECTED thread instead of reading as unstamped. Named
+# rather than counted - no magic bound on how many `.Value` unwraps a file may contain, which would break
+# on every legitimate refactor while saying nothing (the same objection that retired the hardcoded
+# request-site count earlier in this run).
+# COMMENTS STRIPPED FIRST. The raw scan found TWO hits here and both were comments saying "not
+# `tid ?? _selTid`" - the better the comment, the more likely it quotes the exact idiom being banned. Third
+# time this trap has caught a check in this repo, so the walker now lives in lib-extract.ps1.
+$disasmCode = Get-CSharpCodeOnly $disasmView
+$seatIdiom = [regex]::Matches($disasmCode, '\?\?\s*_selTid\b')
+Check 'no tid is unwrapped with `?? _selTid`, the idiom the seat and the gate disagreed on' `
+  ($seatIdiom.Count -eq 0) "$($seatIdiom.Count) site(s) in code"
+# CONTROL: the scan can see that idiom at all - otherwise the zero above is a zero nobody looked for.
+Check 'CONTROL: the idiom scan matches it in code' `
+  ([regex]::Matches((Get-CSharpCodeOnly 'uint x = tid ?? _selTid;'), '\?\?\s*_selTid\b').Count -eq 1) ''
+# ...and the stripper is what makes the zero mean something: the same idiom in a COMMENT must not count,
+# which is precisely the two hits the raw scan produced.
+Check 'CONTROL: ...and does NOT match it in a comment' `
+  ([regex]::Matches((Get-CSharpCodeOnly '// not `tid ?? _selTid` here'), '\?\?\s*_selTid\b').Count -eq 0) ''
 # INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
 # simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
 # which the cross-model adversary reported as HIGH: that is not an absence of information, it is

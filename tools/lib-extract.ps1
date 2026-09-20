@@ -126,6 +126,32 @@ function Get-JsBlock {
   return Get-CSharpBlock $Signature $From
 }
 
+# The source with every COMMENT removed, for a rule about what the code DOES.
+#
+# A raw text scan cannot tell a call from the comment explaining why that call must not be made - and the
+# better the comment, the more likely it quotes the exact idiom being banned. That has now bitten three
+# separate checks in this repo: the Get-Process scan in test-engine-session.ps1, the send('jump') scan in
+# test-pad-bpstate.js, and a `?? _selTid` scan that found two hits in DisassemblyView.cs, BOTH of them
+# comments saying "not `tid ?? _selTid`". String literals are KEPT: a rule about code usually cares about
+# them, and Skip-CSharpLiteral is what tells the two apart.
+function Get-CSharpCodeOnly {
+  param([string] $Src)
+  $sb = New-Object System.Text.StringBuilder
+  $n = $Src.Length
+  $j = 0
+  while ($j -lt $n) {
+    $c = $Src[$j]
+    if ($c -ne '/' -and $c -ne '"' -and $c -ne "'" -and $c -ne '@') { [void] $sb.Append($c); $j++; continue }
+    $k = Skip-CSharpLiteral $Src $j
+    if ($k -eq $j) { [void] $sb.Append($c); $j++; continue }
+    # A comment is dropped; a string or char literal is kept verbatim.
+    $isComment = ($c -eq '/' -and $j + 1 -lt $n -and ($Src[$j + 1] -eq '/' -or $Src[$j + 1] -eq '*'))
+    if ($isComment) { [void] $sb.Append(' ') } else { [void] $sb.Append($Src.Substring($j, $k - $j)) }
+    $j = $k
+  }
+  return $sb.ToString()
+}
+
 # ------------------------------------------------------------------ the harness-facing wrappers
 #
 # Get-CSharpBlock above answers $null for "not there". Every harness wants the same thing from that answer -
