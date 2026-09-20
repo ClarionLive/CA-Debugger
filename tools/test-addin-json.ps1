@@ -818,6 +818,10 @@ Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no
 
 Write-Host ''
 Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-named .clw'
+# A Check's DETAIL argument is evaluated BEFORE Check runs, so an index into a list that a broken build
+# left EMPTY throws and kills the suite mid-run - hiding every failure after it, in the one situation
+# where those failures are what you came for. This reports the owners the list actually has.
+function OwnerOf { param($list) if ($list.Count -eq 0) { '(no rows)' } else { ($list | ForEach-Object { ShowU $_.OwnerPath }) -join ' ' } }
 # Task e80072f1. `module` on the wire is a BARE BASENAME (clbrws011.clw), so in a multi-DLL app two loaded
 # images can each carry a compiland of that name. Keyed on (module, requestedLine) alone those are ONE
 # breakpoint: the pane shows a single row for two, the row can carry the other file's path, and one bp-del
@@ -855,13 +859,13 @@ Check 'and two echoes from the SAME image at that line are still 1 row' ($sameOw
 $dllSurv = HostBpDel $dllRows $delD1
 Check 'removing the Dll1 breakpoint leaves exactly 1 row' ($dllSurv.Count -eq 1) (Lines $dllSurv)
 Check 'and the row left behind is the Dll2 one' `
-  ($dllSurv.Count -eq 1 -and $dllSurv[0].OwnerPath -match 'dll2') (ShowU $dllSurv[0].OwnerPath)
+  ($dllSurv.Count -eq 1 -and $dllSurv[0].OwnerPath -match 'dll2') (OwnerOf $dllSurv)
 
 # What the owner IS, stated so nobody later treats it as a file to open: the IMAGE path, in the wire's
 # escaped form, because GetStr returns the raw JSON text and does not unescape. Both sides of every
 # comparison come off that same wire, so equality is exact - but File.Exists on it would not be.
 Check 'the owner reads back as the escaped wire form, an identity token rather than a usable path' `
-  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -eq 'C:\\App\\Dll1\\dll1.dll') (ShowU $dllRows[0].OwnerPath)
+  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -eq 'C:\\App\\Dll1\\dll1.dll') (OwnerOf $dllRows)
 
 Write-Host ''
 Write-Host 'an engine that predates ownerPath behaves EXACTLY as it did before, on every path that reads it'
