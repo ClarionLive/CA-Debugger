@@ -70,7 +70,7 @@ $($specClass -replace 'internal sealed class BpSpec', 'public sealed class BpSpe
 public sealed class LoadedModule { public string Path; public string Name; }
 public sealed class UserBreakpoint {
     public string Module; public int RequestedLine; public int Line;
-    public LoadedModule Owner; public string OwnerSpec; public bool SingleTarget;
+    public LoadedModule Owner; public string OwnerSpec; public bool SingleTargetRequested;
 }
 
 public static class BpOwner {
@@ -215,7 +215,7 @@ Check 'and it respects a breakpoint that named a DIFFERENT image' ($res -match '
 Check 'it iterates a SNAPSHOT, so the copies it appends are not re-examined by the same pass' `
   ($res -match '_bps\.ToArray\(\)') ''
 $copy = Get-Method 'private void CopyUnqualifiedInto(LoadedModule m, UserBreakpoint bp)'
-Check 'the copy is skipped for a single-target breakpoint (run to cursor stays one stop)' ($copy -match 'bp\.SingleTarget') ''
+Check 'the copy is skipped for a single-target breakpoint (run to cursor stays one stop)' ($copy -match 'bp\.SingleTargetRequested') ''
 Check 'and for one that named an image' ($copy -match 'IsNullOrEmpty\(bp\.OwnerSpec\)') ''
 # REQUESTED line, not planted: a second gutter line that snapped to the same record is a DIFFERENT
 # breakpoint and must not suppress this image's copy.
@@ -223,9 +223,71 @@ Check 'and the already-covered test is on the REQUESTED line, not the planted on
   ($copy -match 'other\.RequestedLine == bp\.RequestedLine' -and $copy -notmatch 'other\.Line == bp\.Line') ''
 
 Write-Host ''
+Write-Host 'an ambiguous single-target pick ANNOUNCES itself - it is the one first-match left in the tree'
+# |one=1 says "exactly one image". It does NOT say WHICH, so with several carriers the engine takes the
+# first - the same arbitrary choice that caused this ticket. That is acceptable ONLY while it is visible,
+# so the announcement is a tested behaviour and not a courtesy: a bare Console.WriteLine nobody asserts is
+# deleted by the next person tidying output, and the arbitrary pick goes silent again.
+Check 'it names HOW MANY images carry the compiland, not just that it was ambiguous' `
+  ($add -match 'owners\.Count} loaded images') ''
+Check 'and WHICH image it took, so the choice can be checked rather than guessed at' `
+  ($add -match 'owners\[0\]\.Name') ''
+Check 'and it says the pick came from a single-target request' ($add -match 'single-target request') ''
+# ISOLATION: the announcement must be tied to the AMBIGUOUS case. Announcing on every add would be noise
+# nobody reads, which is the same as not announcing.
+Check 'it fires only when more than one image carries the compiland' ($add -match 'spec\.One && owners\.Count > 1') ''
+# ...and it must be the FIRST statement in that block, not merely PRESENT in it. A text check alone
+# passes against `if (false) Console.WriteLine(...)` - the announcement still reads as written while
+# emitting nothing. Found by mutation: that exact change survived the checks above.
+$oneBlock = Get-CSharpBlock 'if (spec.One && owners.Count > 1)' $add
+$oneStmts = @($oneBlock -split "`n" | ForEach-Object { $_.Trim() } |
+  Where-Object { $_ -and $_ -notmatch '^//' -and $_ -ne '{' -and $_ -notmatch '^if \(spec\.One' })
+Check 'and it is the FIRST statement in the block, so it cannot be quietly guarded off' `
+  ($oneStmts.Count -gt 0 -and $oneStmts[0] -match '^Console\.WriteLine') ($oneStmts[0]) 
+
+Write-Host ''
+Write-Host 'the host SENDS one=1 for run-to-cursor, and for nothing else'
+# The engine cannot tell a transient from a persistent add - run-to-cursor is composed host-side as
+# `bp add` + `continue` and arrives as an ordinary add - so this is the only thing standing between
+# "get me to HERE and stop once" and "stop somewhere on the way".
+$webPath = Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs'
+$svcPath = Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'
+$web = Get-Content -Raw -LiteralPath $webPath
+$svc = Get-Content -Raw -LiteralPath $svcPath
+$rtc = Get-CSharpBlock 'public void CmdRunToCursor(string spec)' $web
+Check 'CmdRunToCursor asks for a single target' ($rtc -match '_svc\.AddBreakpoint\(module, line, true\)') ''
+# EXACTLY ONE site passes true. Counting is the guard: a second one would mean some persistent breakpoint
+# had quietly become single-target, which is this ticket's bug reintroduced from the host side.
+$trueSites = [regex]::Matches($web, 'AddBreakpoint\([^)]*,\s*true\)')
+Check 'and it is the ONLY caller that does - 1 site' ($trueSites.Count -eq 1) "$($trueSites.Count) site(s)"
+# The other four call sites are persistent user breakpoints or removals and must NOT be single-target:
+# OnGutterBpAdded and CmdBreakOnProcEntry both stage in _pending and survive to the next session, so a
+# gutter dot in a second DLL has to arm there too - which is the whole point of the ticket.
+$gutterAdd = Get-CSharpBlock 'private void OnGutterBpAdded(string module, int line)' $web
+Check 'a gutter dot is NOT single-target, so it arms in every image carrying the .clw' `
+  ($gutterAdd -match '_svc\.AddBreakpoint\(module, line\)') ''
+$procEntry = Get-CSharpBlock 'public void CmdBreakOnProcEntry(string data)' $web
+Check 'and neither is break-on-proc-entry, which is a persistent breakpoint despite staging like one' `
+  ($procEntry -match '_svc\.AddBreakpoint\(module, line\)') ''
+$svcAdd = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line, bool singleTarget)' $svc
+Check 'the service writes one=1 only when asked' ($svcAdd -match 'singleTarget \? "\|one=1" : ""') ''
+$svcAdd2 = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line)' $svc
+Check 'and the 2-argument overload defaults to FALSE, so an unthinking caller gets the fix' `
+  ($svcAdd2 -match 'AddBreakpoint\(module, line, false\)') ''
+# A properties edit rebuilds the spec through BuildBpSpec; losing the request there would silently re-arm
+# a transient in every image.
+$build = Get-CSharpBlock 'public static string BuildBpSpec(DebugBreakpoint bp)' $svc
+Check 'BuildBpSpec carries the request too, so a properties edit cannot drop it' `
+  ($build -match 'bp\.SingleTargetRequested') ''
+
+Write-Host ''
 Write-Host 'the cut-down stubs match the real records'
-Check 'UserBreakpoint really has OwnerSpec and SingleTarget' `
-  (($eng -match 'public string OwnerSpec;') -and ($eng -match 'public bool SingleTarget;')) ''
+Check 'UserBreakpoint really has OwnerSpec and SingleTargetRequested' `
+  (($eng -match 'public string OwnerSpec;') -and ($eng -match 'public bool SingleTargetRequested;')) ''
+# The name is part of the claim: it is a REQUEST from whoever created the breakpoint, not a property of
+# the breakpoint. A run-to-cursor and a gutter dot at one module:line are identical down here, which is
+# why the request has to travel with it - and why the bare name `SingleTarget` read as a fact it is not.
+Check 'and it is named as a REQUEST, not as a fact about the breakpoint' ($eng -notmatch 'public bool SingleTarget;') ''
 Check 'BpSpec really has Image and One' (($eng -match 'public string Image;') -and ($eng -match 'public bool One;')) ''
 $lm = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\LoadedModule.cs')
 Check 'LoadedModule really has Path and Name' (($lm -match 'public string Path;') -and ($lm -match 'public string Name;')) ''

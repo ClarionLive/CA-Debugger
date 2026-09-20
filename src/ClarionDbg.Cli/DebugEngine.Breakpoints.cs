@@ -95,7 +95,7 @@ namespace ClarionDbg.Cli
                         return;
                     }
                 var pend = new UserBreakpoint { Module = module, ModuleIdx = -1, RequestedLine = line, Line = line,
-                                                OwnerSpec = spec.Image, SingleTarget = spec.One };
+                                                OwnerSpec = spec.Image, SingleTargetRequested = spec.One };
                 ApplyBpProps(pend, condition, hitMode, hitValue, trace);
                 _bps.Add(pend);
                 Console.WriteLine($"bp: {module}:{line} pending — owning image not loaded yet");
@@ -147,7 +147,7 @@ namespace ClarionDbg.Cli
                 }
 
             var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, Owner = owner, RequestedLine = line, Line = planted,
-                                          OwnerSpec = spec.Image, SingleTarget = spec.One };
+                                          OwnerSpec = spec.Image, SingleTargetRequested = spec.One };
             bp.Rvas.AddRange(rvas);
             ApplyBpProps(bp, condition, hitMode, hitValue, trace);
             _bps.Add(bp);
@@ -368,7 +368,7 @@ namespace ClarionDbg.Cli
         /// for one requested single-target, and for a compiland this image does not carry.</summary>
         private void CopyUnqualifiedInto(LoadedModule m, UserBreakpoint bp)
         {
-            if (bp.Owner == m || bp.SingleTarget) return;
+            if (bp.Owner == m || bp.SingleTargetRequested) return;
             if (!string.IsNullOrEmpty(bp.OwnerSpec)) return;   // it named an image; it is not "every image"
             int mi = m.Dbg.FindModuleIdx(bp.Module);
             if (mi < 0) return;
@@ -396,7 +396,7 @@ namespace ClarionDbg.Cli
                 RequestedLine = bp.RequestedLine,
                 Line = planted,
                 OwnerSpec = null,
-                SingleTarget = false
+                SingleTargetRequested = false
             };
             copy.Rvas.AddRange(rvas);
             ApplyBpProps(copy, bp.Condition, bp.HitMode, bp.HitValue, bp.Trace);

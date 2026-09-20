@@ -140,10 +140,16 @@ namespace ClarionDbg.Cli
         /// </para></summary>
         public string OwnerSpec;
 
-        /// <summary>This breakpoint was requested single-target (<see cref="BpSpec.One"/>), so a later
-        /// image carrying the same compiland must NOT get a copy of it. Carried on the breakpoint because
-        /// the images that would trigger that copy map long after the add was handled.</summary>
-        public bool SingleTarget;
+        /// <summary>The CALLER ASKED for a single target (<see cref="BpSpec.One"/>), so a later image
+        /// carrying the same compiland must NOT get a copy of this breakpoint.
+        /// <para>
+        /// Named for what it is: a demand from whoever created the breakpoint, not a property of the
+        /// breakpoint itself. Nothing about a breakpoint makes it single-target - a run-to-cursor and a
+        /// gutter dot at the same module:line are identical down here, which is exactly why the request
+        /// has to travel with it. Carried on the record because the images that would trigger a copy map
+        /// long after the add was handled.
+        /// </para></summary>
+        public bool SingleTargetRequested;
         public int RequestedLine;      // the line the user asked for
         public int Line;               // the line actually planted (snapped to nearest record line)
         public readonly List<uint> Rvas = new List<uint>();   // code RVAs within Owner
