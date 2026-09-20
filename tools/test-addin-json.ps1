@@ -1277,13 +1277,19 @@ Check 'a 0 tid is a sentinel, not thread 0, so it is not a mismatch either' `
 # a stamped literal 0 as a sentinel while the seat assignment `tid ?? _selTid` seated it as thread 0, so
 # the view was never marked painted.
 #
-# WHAT THESE TWO DO AND DO NOT COVER, said plainly because the handover came with a mutation that does
-# NOT red them. The suggested falsification was to rewrite TidOf as `return t ?? 0u;` - but that is
-# EXACTLY EQUIVALENT to the shipped body: null gives 0, a stamped 0 unwraps to 0, and a real tid is
-# unchanged. Verified by running it; both checks stayed green, correctly. So these two pin the CONTRACT at
-# the boundary (0 and absent are the same thing to every reader of it) and they are honest, but no
-# realistic mutation of TidOf ITSELF can break them - unwrapping 0 gives 0 for free.
-# The defect was never inside TidOf. It was at the CALL SITES, which is what the third check pins.
+# WHAT THESE TWO DO AND DO NOT COVER. Stated from mutations that were RUN, because an earlier version of
+# this note generalised from the single mutation the handover supplied and understated its own coverage -
+# a limitation note that overstates the limitation talks the next reader out of a probe that works, which
+# is the same species of error as one that overstates the coverage.
+# Measured against TidOf's two halves separately:
+#   `return t ?? 0u;`                  (the suggested mutation)  does NOT red - EXACTLY EQUIVALENT to the
+#                                      shipped body over null/0/1/4812/uint.MaxValue.
+#   `return t == null ? 0u : t.Value;` (zero clause dropped)     does NOT red - unwrapping 0 gives 0 for
+#                                      free, so the 0-is-a-sentinel half is not falsifiable HERE.
+#   `return t == null ? 1u : t.Value;` (null arm changed)        DOES red. The null arm is load-bearing.
+# So these two are not merely a contract restatement: they discriminate on the null arm. What they cannot
+# see is the zero half - and that is the half the defect turned on, because the disagreement was between
+# TidOf and callers writing `tid ?? _selTid`. Hence the third check below, which pins the CALL SITES.
 Check 'a stamped 0 is unstamped, exactly as an absent tid is' `
   ([DisasmTagProbe]::TidOf([uint] 0) -eq 0 -and [DisasmTagProbe]::TidOf($null) -eq 0) ''
 # CONTROL: a TidOf that answered 0 for everything would satisfy the line above and erase every real tid.
@@ -1337,7 +1343,22 @@ Check 'and the event is declared wide enough to carry it' `
 Check 'RequestDisasmAt validates the tag it is handed' `
   ((Get-Method 'public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)') -match 'Regex\.IsMatch\(tag') ''
 
+# THE COUNT, ASSERTED AND PRINTED. This suite ran 222 checks and said only "ALL CHECKS PASSED" - a
+# sentence that is true of 222 checks and equally true of 69, which is what a skipped block actually
+# leaves. cb9324f2 fixed that class in Invoke-CheckSection, and this file - the largest consumer, 192
+# Check calls - never opted in, so every "ALL CHECKS PASSED" it printed was as unfalsifiable as before.
+#
+# WHAT THIS CLOSES AND WHAT IT DOES NOT, because the distinction is the whole lesson of cb9324f2:
+#   CLOSES  a block that is skipped, or returns early, while execution CONTINUES - the total is short and
+#           this says so, naming the number instead of asserting an adjective.
+#   DOES NOT CLOSE  a top-level `break`, which terminates the script HERE: nothing below it runs, this
+#           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
+#           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
+#           `finally` can still fire - filed as its own job rather than pretended away here.
+$EXPECTED_CHECKS = 222
+Assert-CheckTotal $EXPECTED_CHECKS
+
 Write-Host ''
-if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
-Write-Host 'ALL CHECKS PASSED'
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+Write-Host "ALL $($script:checks) CHECKS PASSED"
 exit 0
