@@ -1316,11 +1316,19 @@ Check 'CONTROL: ...and does NOT match it in a comment' `
 
 # ---- an empty WinTag reply releases the painted flag, BEFORE it erases what that flag described ------
 #
-# THIS PINS THE SHAPE, NOT THE BEHAVIOUR, and that limit is the point of the comment rather than an
-# apology for it. The behavioural seam three gates asked for is NOT CONSTRUCTIBLE today: these are
-# instance methods on a WinForms Control and three of them wrap their whole body in UI(...), which returns
-# immediately without a created handle, so the code under test never runs. Owen2 established that rather
-# than estimating it; it is blocked on ticket 8f352618.
+# THIS PINS THE SHAPE, NOT THE BEHAVIOUR - and the useful form of that sentence is the concrete one, not
+# the category. A SHAPE PIN SEES A WRONG PLACE, NEVER A WRONG VALUE. Measured against these six checks:
+#     `bool wasSeat = true;`   passes ALL of them.
+# Every statement stays exactly where it belongs and the meaning is inverted, so a seek's empty reply
+# would claim "this thread's code could not be decoded" about a thread nobody was seating. No position
+# assertion can ever catch that; only 8f352618's transition test can. Written out because the
+# honest-limitation note is the thing a future reader trusts, and "pins the shape, not the behaviour" is
+# true and vague where "a constant-true wasSeat passes all six" is true and actionable.
+#
+# The behavioural seam three gates asked for is NOT CONSTRUCTIBLE today: these are instance methods on a
+# WinForms Control and three of them wrap their whole body in UI(...), which returns immediately without a
+# created handle, so the code under test never runs. Owen2 established that rather than estimating it; it
+# is blocked on ticket 8f352618.
 # WHEN 8f352618 LANDS, REPLACE THIS CHECK - do not keep both. Two checks on one mechanism, one structural
 # and one behavioural, is how a suite starts disagreeing with itself about what it is guarding.
 #
@@ -1339,13 +1347,14 @@ $iClear     = $emptyArm.IndexOf('_seatedTid = 0')
 $iCache     = $emptyArm.IndexOf('_instrs = SortedUnique')
 $iIfWasSeat = $emptyArm.IndexOf('if (wasSeat)')
 $iEmptySet  = $emptyArm.IndexOf('_emptySeatTid = emptyTid')
+$iBanner    = $emptyArm.IndexOf('UpdateThreadBanner()')
 # ANCHORS FIRST. Every check below is an ORDER comparison, and -1 < anything, so a renamed method or a
 # missing statement would make them pass VACUOUSLY rather than fail. Owen2's own first draft of this
 # printed "ALL SHAPE CHECKS PASSED" while every assertion had thrown, which is what this guards.
 Check 'every anchor these shape checks need is present in OnDisasm' `
   (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iCountTest -ge 0) -and ($iClear -ge 0) `
-   -and ($iCache -ge 0) -and ($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0)) `
-  "wasSeat=$iWasSeat release=$iRelease count=$iCountTest clear=$iClear cache=$iCache if=$iIfWasSeat set=$iEmptySet"
+   -and ($iCache -ge 0) -and ($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iBanner -ge 0)) `
+  "wasSeat=$iWasSeat release=$iRelease count=$iCountTest clear=$iClear cache=$iCache if=$iIfWasSeat set=$iEmptySet banner=$iBanner"
 # THE PAINTED FLAG MUST NOT OUTLIVE THE PAINT.
 Check 'the empty WinTag branch clears _seatedTid BEFORE replacing the listing' `
   (($iClear -ge 0) -and ($iCache -ge 0) -and ($iClear -lt $iCache)) "clear=$iClear cache=$iCache"
@@ -1360,6 +1369,13 @@ Check 'wasSeat is captured BEFORE _seatingTid is released' `
 # nothing about the thread's own address.
 Check 'the _emptySeatTid claim is gated on wasSeat' `
   (($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iIfWasSeat -lt $iEmptySet)) "if=$iIfWasSeat set=$iEmptySet"
+# THE HALF THAT STOPS THE VIEW LYING. Both branches above have just changed _seatedTid, and the banner
+# DERIVES from it - so re-deriving it here, after the listing is replaced, is the other half of the fix. A
+# correct _seatedTid that the banner has not re-read yet is the same defect one frame later. Measured: the
+# five pins above were all green with this call DELETED, so the user-visible symptom was unpinned while
+# the bookkeeping around it was not.
+Check 'the banner is re-derived AFTER the listing is replaced' `
+  (($iBanner -ge 0) -and ($iCache -ge 0) -and ($iBanner -gt $iCache)) "banner=$iBanner cache=$iCache"
 # INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
 # simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
 # which the cross-model adversary reported as HIGH: that is not an absence of information, it is
@@ -1402,7 +1418,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 227
+$EXPECTED_CHECKS = 228
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
