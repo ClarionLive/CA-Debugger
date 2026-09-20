@@ -1,3 +1,8 @@
+# The shared Check/ShowVal/section runner, so a harness that dot-sources THIS file needs no second line.
+# Loaded before Set-StrictMode below, which is deliberate: lib-check.ps1 must stay loadable on its own by
+# suites that are not strict-clean (see its header).
+. (Join-Path $PSScriptRoot 'lib-check.ps1')
+
 # Pull a named block or declaration straight out of a C# source file, so a test can compile and drive the
 # REAL shipped code instead of a paraphrase of it. Dot-source this: . "$PSScriptRoot\lib-extract.ps1"
 #
@@ -120,3 +125,74 @@ function Get-JsBlock {
   param([string] $Signature, [string] $From)
   return Get-CSharpBlock $Signature $From
 }
+
+# ------------------------------------------------------------------ the harness-facing wrappers
+#
+# Get-CSharpBlock above answers $null for "not there". Every harness wants the same thing from that answer -
+# report it and stop - so the wrapper that does it lives here rather than in each of them. It was copied
+# verbatim into three suites (as Get-Method) and a fourth (as Get-Block, same body, shorter message).
+#
+# THE DEFAULT SOURCE IS NOW NAMED OUT LOUD, and that is the one behavioural change in this hoist. Each copy
+# ended `if (-not $From) { $From = $web }` - except test-addin-json.ps1's, which said `$src`. PowerShell
+# resolves that name dynamically in the CALLER's scope, so hoisting either copy verbatim would have silently
+# re-pointed the other harness's bare call sites at a different file. Extraction can still FIND a same-named
+# method in the wrong file, so that failure would have been a wrong ANSWER rather than an error. Each harness
+# therefore says once which text it means.
+$script:ExtractSource = $null
+
+function Set-ExtractSource {
+  param([string] $Text)
+  if ([string]::IsNullOrEmpty($Text)) {
+    Write-Host '  FAIL  Set-ExtractSource was given no text - the source file it reads is empty or unread.'
+    exit 1
+  }
+  $script:ExtractSource = $Text
+}
+
+# The text a bare Get-Method/Get-Statement call reads. Unset is a loud failure, never an empty search: an
+# empty haystack finds nothing, and "absent from this version of the add-in" would then be a lie about the
+# add-in rather than the truth about the harness.
+function Resolve-ExtractSource {
+  param([string] $From)
+  if ($From) { return $From }
+  if ([string]::IsNullOrEmpty($script:ExtractSource)) {
+    Write-Host '  FAIL  no default extraction source for this harness.'
+    Write-Host '        Call Set-ExtractSource <text> after dot-sourcing lib-extract.ps1, or pass the'
+    Write-Host '        source text explicitly as the second argument.'
+    exit 1
+  }
+  return $script:ExtractSource
+}
+
+function Get-ExtractMissing {
+  param([string] $Signature)
+  # Reported rather than thrown: a harness pointed at an add-in that predates the code under test should say
+  # so plainly instead of dying halfway through, which reads like a broken test rather than the before/after
+  # proof it is.
+  Write-Host "  FAIL  absent from this version of the add-in: $Signature"
+  Write-Host ''
+  Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
+  exit 1
+}
+
+# A method or property block, by signature. (test-addin-hooks.ps1 called this Get-Block; one function under
+# two names is the drift this hoist exists to end, so Get-Method is the single name.)
+function Get-Method {
+  param([string] $Signature, [string] $From)
+  $block = Get-CSharpBlock $Signature (Resolve-ExtractSource $From)
+  if ($null -eq $block) { Get-ExtractMissing $Signature }
+  return $block
+}
+
+# A field or const declaration, which has no braces to match - read to its terminating semicolon instead.
+# This is how the REAL declarations come under test rather than being re-typed into the harness.
+function Get-Statement {
+  param([string] $Signature, [string] $From)
+  $stmt = Get-CSharpStatement $Signature (Resolve-ExtractSource $From)
+  if ($null -eq $stmt) { Get-ExtractMissing $Signature }
+  return $stmt
+}
+
+# Check / ShowVal / Invoke-CheckSection live in lib-check.ps1, dot-sourced on this file's first line, so a
+# harness that dot-sources lib-extract gets them with no second line. See lib-check.ps1 for why they are
+# not in THIS file: Set-StrictMode below would otherwise be forced on every suite that wants a Check.

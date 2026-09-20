@@ -31,20 +31,13 @@ $web = Get-Content -Raw -LiteralPath $WebViewPath
 $edt = Get-Content -Raw -LiteralPath $EditorBpPath
 $svc = Get-Content -Raw -LiteralPath $ServicePath
 
-function Get-Method {
-  param([string] $Signature, [string] $From)
-  if (-not $From) { $From = $web }
-  $block = Get-CSharpBlock $Signature $From
-  if ($null -eq $block) {
-    # Pointed at a version that predates the method under test: say so plainly instead of throwing
-    # halfway through, which reads like a broken test rather than the before/after proof it is.
-    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
-    Write-Host ''
-    Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
-    exit 1
-  }
-  return $block
-}
+# Get-Method / Check / ShowVal live in lib-extract.ps1 (dot-sourced above).
+#
+# No Set-ExtractSource here, unlike the other three harnesses: every extraction below names its source
+# explicitly ($web / $edt / $svc, three different files), so a default would be a line nothing reads. It was
+# added and then removed after mutation-testing showed it dead - pointing it at the wrong file left this
+# suite green, which is the same evidence that proves the other three need theirs. If a bare Get-Method ever
+# appears here it fails loudly with "no default extraction source for this harness", which says what to do.
 
 $mapMethods = @(
   (Get-Method 'private static void ClaimGutterPath(Dictionary<string, string> paths, string key, string path)' $web),
@@ -91,14 +84,6 @@ $($gutterMethods -replace 'public bool RemoveByModuleLine', 'public bool RemoveB
 
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
 
-$script:failures = 0
-function Check {
-  param([string] $Label, [bool] $Ok, [string] $Detail)
-  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  '; }
-  if (-not $Ok) { $script:failures++ }
-  Write-Host ($mark + $Label + $(if ($Detail) { "  ->  $Detail" } else { '' }))
-}
-function ShowS { param($v) if ($null -eq $v) { '(null)' } else { [string] $v } }
 
 # The case throughout: one .clw basename, two DLLs, both bookmarked at line 50.
 $dll1Clw = 'H:\App\Dll1\clbrws011.clw'
@@ -124,7 +109,7 @@ Write-Host 'one bookmark: the map still hands back its exact path'
 $solo = New-Map
 Claim $solo $dll1Clw $line $line
 $soloPath = [BpMap]::GutterPathFor($solo, (New-Bp $module $line $line $null))
-Check 'a lone gutter bookmark resolves to its own file' ($soloPath -eq $dll1Clw) (ShowS $soloPath)
+Check 'a lone gutter bookmark resolves to its own file' ($soloPath -eq $dll1Clw) (ShowVal $soloPath)
 
 Write-Host ''
 Write-Host 'two DLLs at one module|line: the map refuses to guess instead of handing back the last writer'
@@ -133,9 +118,9 @@ Claim $both $dll1Clw $line $line
 Claim $both $dll2Clw $line $line
 $ambig = [BpMap]::GutterPathFor($both, (New-Bp $module $line $line $null))
 # The defect was that this answered $dll2Clw - the second writer - with nothing to say it had guessed.
-Check 'a contested module|line resolves to NO path, not to the second bookmark' ($null -eq $ambig) (ShowS $ambig)
+Check 'a contested module|line resolves to NO path, not to the second bookmark' ($null -eq $ambig) (ShowVal $ambig)
 Check 'and specifically not to either of the two candidates' `
-  (($ambig -ne $dll1Clw) -and ($ambig -ne $dll2Clw)) (ShowS $ambig)
+  (($ambig -ne $dll1Clw) -and ($ambig -ne $dll2Clw)) (ShowVal $ambig)
 # A row with no path falls back to the page's `jump` action and the .red resolution behind it. That is a
 # best effort that ADMITS it is one, which is the whole difference from opening the wrong file confidently.
 
@@ -159,14 +144,14 @@ Claim $twice $dll1Clw $line $line
 Claim $twice $dll1Clw $line $line
 Check 'the SAME file claiming its key twice is not a collision' `
   ([BpMap]::GutterPathFor($twice, (New-Bp $module $line $line $null)) -eq $dll1Clw) `
-  (ShowS ([BpMap]::GutterPathFor($twice, (New-Bp $module $line $line $null))))
+  (ShowVal ([BpMap]::GutterPathFor($twice, (New-Bp $module $line $line $null))))
 # ...and a row whose PLANTED line is contested may still have an uncontested requested line. 40 and 41 both
 # snapped to 50 in Dll1; only 50 is contested, so the row requested at 40 still knows its file.
 $mixed = New-Map
 Claim $mixed $dll1Clw 40 50
 Claim $mixed $dll2Clw 50 50
 $viaRequested = [BpMap]::GutterPathFor($mixed, (New-Bp $module 40 50 $null))
-Check 'a contested planted line still resolves through an uncontested requested line' ($viaRequested -eq $dll1Clw) (ShowS $viaRequested)
+Check 'a contested planted line still resolves through an uncontested requested line' ($viaRequested -eq $dll1Clw) (ShowVal $viaRequested)
 
 Write-Host ''
 Write-Host 'a row that knows its own file always opens THAT file - which is how the link stays right'
@@ -176,8 +161,8 @@ Write-Host 'a row that knows its own file always opens THAT file - which is how 
 # such path to fall back on.
 $rowD1 = New-Bp $module $line $line $dll1Clw
 $rowD2 = New-Bp $module $line $line $dll2Clw
-Check 'the Dll1 row opens the Dll1 file' ([BpMap]::GutterPathFor($both, $rowD1) -eq $dll1Clw) (ShowS ([BpMap]::GutterPathFor($both, $rowD1)))
-Check 'the Dll2 row opens the Dll2 file' ([BpMap]::GutterPathFor($both, $rowD2) -eq $dll2Clw) (ShowS ([BpMap]::GutterPathFor($both, $rowD2)))
+Check 'the Dll1 row opens the Dll1 file' ([BpMap]::GutterPathFor($both, $rowD1) -eq $dll1Clw) (ShowVal ([BpMap]::GutterPathFor($both, $rowD1)))
+Check 'the Dll2 row opens the Dll2 file' ([BpMap]::GutterPathFor($both, $rowD2) -eq $dll2Clw) (ShowVal ([BpMap]::GutterPathFor($both, $rowD2)))
 Check 'and the two rows do not resolve to the same file' `
   ([BpMap]::GutterPathFor($both, $rowD1) -ne [BpMap]::GutterPathFor($both, $rowD2)) ''
 

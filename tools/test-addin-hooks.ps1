@@ -48,37 +48,11 @@ if (-not $Scenario) {
 $web  = Get-Content -Raw -LiteralPath $WebViewPath
 $ctrl = Get-Content -Raw -LiteralPath $ControllerPath
 
-function Get-Block {
-  param([string] $Signature, [string] $From)
-  if (-not $From) { $From = $web }
-  $block = Get-CSharpBlock $Signature $From
-  if ($null -eq $block) {
-    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
-    exit 1
-  }
-  return $block
-}
+# Get-Method (this file called it Get-Method), Get-Statement and Check live in lib-extract.ps1, dot-sourced
+# above. This names the text a bare call reads, which each harness used to bury in its own `if (-not $From)`.
+Set-ExtractSource $web
 
-# A field/const declaration is not brace-delimited, so read to its terminating semicolon instead. This is how
-# the REAL hook declarations - the actual expected signatures - come under test rather than being re-typed.
-function Get-Statement {
-  param([string] $Signature, [string] $From)
-  if (-not $From) { $From = $web }
-  $stmt = Get-CSharpStatement $Signature $From
-  if ($null -eq $stmt) {
-    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
-    exit 1
-  }
-  return $stmt
-}
 
-$script:failures = 0
-function Check {
-  param([string] $Label, [bool] $Ok, [string] $Detail)
-  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  '; }
-  if (-not $Ok) { $script:failures++ }
-  Write-Host ($mark + $Label + $(if ($Detail) { "  ->  $Detail" } else { '' }))
-}
 
 function Done {
   Write-Host ''
@@ -100,17 +74,17 @@ if ($Scenario -eq 'source') {
   $old = [regex]::Matches($web, '\bTryJump\b')
   Check 'no TryJump left anywhere, doc comments included' ($old.Count -eq 0) "$($old.Count) occurrence(s)"
   Check 'JumpToLine exists and says its return value is not success' `
-    ($web -match 'private static bool JumpToLine' -and (Get-Block 'private static bool JumpToLine(string path, int line)') -ne $null -and $web -match 'usedNativeMarker')
+    ($web -match 'private static bool JumpToLine' -and (Get-Method 'private static bool JumpToLine(string path, int line)') -ne $null -and $web -match 'usedNativeMarker')
   # Finding 3 [NIT]: the native-marker paint was duplicated between the jump helper and MarkExecutionLine.
   # Match the CALL - fully qualified, open paren - not the bare name, which also appears in a doc comment
   # about 0-based line conversion. Counting mentions would make this check claim more than it verifies.
   $paint = [regex]::Matches($web, 'ICSharpCode\.SharpDevelop\.Debugging\.DebuggerService\.JumpToCurrentLine\s*\(')
   Check 'exactly one call site paints the native marker' ($paint.Count -eq 1) "$($paint.Count) call(s)"
   Check 'and it is PaintNativeMarker that owns it' `
-    ((Get-Block 'private static void PaintNativeMarker(string path, int line)') -match 'JumpToCurrentLine')
+    ((Get-Method 'private static void PaintNativeMarker(string path, int line)') -match 'JumpToCurrentLine')
 
   # Finding 2: the miss must be cached, and re-armed at session start - not on some other event.
-  Check 'the hooks are re-armed from StartSession' ((Get-Block 'private void StartSession()') -match 'RearmAndReportMonacoHooks')
+  Check 'the hooks are re-armed from StartSession' ((Get-Method 'private void StartSession()') -match 'RearmAndReportMonacoHooks')
 
   # THE FROZEN CONTRACT. ClarionAssistant's ClarionDebuggerBridge.Bind() requires BOTH of these to resolve,
   # or the entire debugger context menu disappears on that side. They are the wire; this is the guard that
@@ -133,14 +107,14 @@ using System.Reflection;
 public static class MonacoProbe {
 $(Get-Statement 'private const string MonacoTypeName')
 $(Get-Statement 'private const string MonacoAssemblyName')
-$(Get-Block 'private enum HookStatus')
-$((Get-Block 'private sealed class MonacoHook') -replace 'private sealed class MonacoHook', 'public sealed class MonacoHook')
+$(Get-Method 'private enum HookStatus')
+$((Get-Method 'private sealed class MonacoHook') -replace 'private sealed class MonacoHook', 'public sealed class MonacoHook')
 $(Get-Statement 'private static string _monacoDupeNote')
-$(Get-Block 'private static Type FindMonacoType()')
+$(Get-Method 'private static Type FindMonacoType()')
 $(Get-Statement 'private static readonly MonacoHook _hookNavigate')
 $(Get-Statement 'private static readonly MonacoHook _hookExecLine')
 $(Get-Statement 'private static readonly MonacoHook _hookCursor')
-$(Get-Block 'private static void RearmMonacoHooks()')
+$(Get-Method 'private static void RearmMonacoHooks()')
 }
 "@ -replace '(?m)^\s*private const string', '    public const string' `
    -replace '(?m)^\s*private enum HookStatus', '    public enum HookStatus' `
@@ -338,9 +312,9 @@ using System.Diagnostics;
 using System.Threading;
 using System.Windows.Forms;
 
-$((Get-Block 'public enum DebugControllerState' $ctrl))
+$((Get-Method 'public enum DebugControllerState' $ctrl))
 
-$((Get-Block 'public interface IDebugSessionTarget' $ctrl))
+$((Get-Method 'public interface IDebugSessionTarget' $ctrl))
 
 /// A pad that is a real Control, so the cast and the InvokeRequired test in Invoke mean what they mean
 /// in the IDE. It records WHICH THREAD each command actually ran on - the whole point of the exercise.
@@ -364,11 +338,11 @@ public static class Program {
     private static IDebugSessionTarget _target;
     private static DebugControllerState _state = DebugControllerState.Paused;
 
-$((Get-Block 'private static void Invoke(Action<IDebugSessionTarget> action, bool requireReady = true, Func<DebugControllerState, bool> allowed = null)' $ctrl))
+$((Get-Method 'private static void Invoke(Action<IDebugSessionTarget> action, bool requireReady = true, Func<DebugControllerState, bool> allowed = null)' $ctrl))
 
-$((Get-Block 'private static bool SafeIsReady(IDebugSessionTarget t)' $ctrl))
+$((Get-Method 'private static bool SafeIsReady(IDebugSessionTarget t)' $ctrl))
 
-$((Get-Block 'private static bool IsPaused(DebugControllerState s)' $ctrl))
+$((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
 
     private static int _failures;
     private static void Check(string label, bool ok, string detail) {

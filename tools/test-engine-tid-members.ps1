@@ -67,12 +67,10 @@ $ruleFile  = Join-Path $engineDir $ruleFileName
 # wire cannot emit a bad tid to it -- and the check for that is the '@JSON' marker every emit carries.
 $checkerFile = 'ProtocolCheck.cs'
 
-$fail = 0
-$pass = 0
-function Check([string] $What, [bool] $Ok, [string] $Detail = '') {
-  if ($Ok) { $script:pass++; Write-Host "  ok   $What" }
-  else     { $script:fail++; Write-Host "  FAIL $What$(if ($Detail) { " -- $Detail" })" -ForegroundColor Red }
-}
+# Check now comes from lib-check.ps1 (via lib-extract.ps1 above). This file used to carry its own, printing
+# "  ok   " with a " -- " separator and counting into $pass/$fail - a private vocabulary for the same two
+# outcomes every other suite reports. The visible output changes to "  PASS  " / "  ->  " deliberately: one
+# way of saying "this failed" across the folder is the point of the hoist.
 
 # ---------------------------------------------------------------- the declared name set, read off the code
 
@@ -457,6 +455,8 @@ if ($SelfTest) {
 }
 
 Write-Host ''
+$fail = $script:failures
+$pass = $script:checks - $script:failures
 if ($fail -eq 0) {
   Write-Host "test-engine-tid-members: PASS ($pass checks). Every thread-id member the engine writes goes"
   Write-Host "  through AppendTidValuedMember or WithTid. The $($names.Count) declared names"

@@ -1,4 +1,4 @@
-# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
+﻿# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
 #
 # Two ways this hurts, both silent:
 #   - a "tid" read out of a nested array or a string value names the wrong thread, so good replies get
@@ -54,20 +54,10 @@ $engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 
-function Get-Method {
-  param([string] $Signature, [string] $From)
-  if (-not $From) { $From = $src }
-  $block = Get-CSharpBlock $Signature $From
-  if ($null -eq $block) {
-    # Pointed at a version that predates the method under test: say so plainly instead of throwing
-    # halfway through, which reads like a broken test rather than the before/after proof it is.
-    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
-    Write-Host ''
-    Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
-    exit 1
-  }
-  return $block
-}
+# Get-Method / Check / the null renderer live in lib-extract.ps1 (dot-sourced above). This names the text a
+# bare Get-Method reads, which each harness used to bury in its own copy's `if (-not $From)` fallback.
+Set-ExtractSource $src
+
 
 $methods = @(
   (Get-Method 'private static string ScanNumberToken(string json, string key)'),
@@ -88,24 +78,18 @@ $($methods -replace 'private static', 'public static')
 
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
 
-$script:failures = 0
-function Check {
-  param([string] $Label, [bool] $Ok, [string] $Detail)
-  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  '; }
-  if (-not $Ok) { $script:failures++ }
-  Write-Host ($mark + $Label + $(if ($Detail) { "  ->  $Detail" } else { '' }))
-}
-function ShowU { param($v) if ($null -eq $v) { 'null' } else { [string] $v } }
+
+function ShowVal { param($v) if ($null -eq $v) { 'null' } else { [string] $v } }
 
 Write-Host 'the event''s own tid, and nothing else''s'
 $paused = '{"tid":116932,"event":"paused","reason":"breakpoint","proc":"SPLASHSCREEN","regs":{"eax":"0x0"}}'
-Check 'tid first, before event, with a nested regs object' ([PadJsonProbe]::GetUIntOrNull($paused, 'tid') -eq 116932) (ShowU ([PadJsonProbe]::GetUIntOrNull($paused, 'tid')))
+Check 'tid first, before event, with a nested regs object' ([PadJsonProbe]::GetUIntOrNull($paused, 'tid') -eq 116932) (ShowVal ([PadJsonProbe]::GetUIntOrNull($paused, 'tid')))
 $stack = '{"event":"stack","frames":[{"frame":0,"tid":1}]}'
-Check 'a tid inside the frames array is not the event''s' ($null -eq [PadJsonProbe]::GetUIntOrNull($stack, 'tid')) (ShowU ([PadJsonProbe]::GetUIntOrNull($stack, 'tid')))
+Check 'a tid inside the frames array is not the event''s' ($null -eq [PadJsonProbe]::GetUIntOrNull($stack, 'tid')) (ShowVal ([PadJsonProbe]::GetUIntOrNull($stack, 'tid')))
 $both = '{"frames":[{"tid":1}],"tid":4812}'
-Check 'the top-level one wins over a nested one' ([PadJsonProbe]::GetUIntOrNull($both, 'tid') -eq 4812) (ShowU ([PadJsonProbe]::GetUIntOrNull($both, 'tid')))
+Check 'the top-level one wins over a nested one' ([PadJsonProbe]::GetUIntOrNull($both, 'tid') -eq 4812) (ShowVal ([PadJsonProbe]::GetUIntOrNull($both, 'tid')))
 $instr = '{"value":"x \"tid\":99 y","tid":7}'
-Check 'a tid inside a string VALUE is not the event''s' ([PadJsonProbe]::GetUIntOrNull($instr, 'tid') -eq 7) (ShowU ([PadJsonProbe]::GetUIntOrNull($instr, 'tid')))
+Check 'a tid inside a string VALUE is not the event''s' ([PadJsonProbe]::GetUIntOrNull($instr, 'tid') -eq 7) (ShowVal ([PadJsonProbe]::GetUIntOrNull($instr, 'tid')))
 
 Write-Host ''
 Write-Host 'absent is the only way to say "unknown"'
@@ -118,10 +102,10 @@ Write-Host 'a Win32 thread id is a DWORD: a real one is never degraded to "unsco
 foreach ($tid in 4294967295, 4294967294, 3221225472, 2147483648, 2147483647, 116932) {
   $json = '{"tid":' + $tid + ',"event":"watch","found":true}'
   $got = [PadJsonProbe]::GetUIntOrNull($json, 'tid')
-  Check "tid $tid survives" ($got -eq $tid) (ShowU $got)
+  Check "tid $tid survives" ($got -eq $tid) (ShowVal $got)
 }
 $overflow = '{"tid":4294967296}'   # past a DWORD: malformed protocol, not a thread we could select
-Check 'a value past the DWORD range is refused rather than truncated' ($null -eq [PadJsonProbe]::GetUIntOrNull($overflow, 'tid')) (ShowU ([PadJsonProbe]::GetUIntOrNull($overflow, 'tid')))
+Check 'a value past the DWORD range is refused rather than truncated' ($null -eq [PadJsonProbe]::GetUIntOrNull($overflow, 'tid')) (ShowVal ([PadJsonProbe]::GetUIntOrNull($overflow, 'tid')))
 Check 'the signed reader still refuses a DWORD it cannot hold' ($null -eq [PadJsonProbe]::GetIntOrNull('{"tid":4294967295}', 'tid')) ''
 
 Write-Host ''
@@ -831,7 +815,7 @@ Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-nam
 # A Check's DETAIL argument is evaluated BEFORE Check runs, so an index into a list that a broken build
 # left EMPTY throws and kills the suite mid-run - hiding every failure after it, in the one situation
 # where those failures are what you came for. This reports the owners the list actually has.
-function OwnerOf { param($list) if ($list.Count -eq 0) { '(no rows)' } else { ($list | ForEach-Object { ShowU $_.OwnerPath }) -join ' ' } }
+function OwnerOf { param($list) if ($list.Count -eq 0) { '(no rows)' } else { ($list | ForEach-Object { ShowVal $_.OwnerPath }) -join ' ' } }
 # Task e80072f1. `module` on the wire is a BARE BASENAME (clbrws011.clw), so in a multi-DLL app two loaded
 # images can each carry a compiland of that name. Keyed on (module, requestedLine) alone those are ONE
 # breakpoint: the pane shows a single row for two, the row can carry the other file's path, and one bp-del
