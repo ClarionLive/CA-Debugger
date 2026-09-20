@@ -162,10 +162,30 @@ namespace ClarionDbg.Cli
             return "{\"event\":\"regs\",\"regs\":" + (regsJson ?? "null") + "}";
         }
 
+        /// <summary>The OWNING IMAGE of a breakpoint, as a full disk path, or JSON null when the
+        /// breakpoint is still pending (no image carries its compiland yet).
+        /// <para>
+        /// The .clw <c>module</c> alone is only a BASENAME, and two loaded images can each carry a
+        /// compiland of that name. The host keys breakpoint identity on it, so without an owner two
+        /// breakpoints in two DLLs collapse into one — which is the whole of task e80072f1. This is
+        /// the IMAGE path (the EXE/DLL), NOT the .clw: it is an identity token to compare, never a
+        /// file for anyone to open.
+        /// </para>
+        /// <para>
+        /// Written by ONE function for all three breakpoint echoes (bp-set, bp-list, bp-del) so a
+        /// future emitter cannot carry the owner on some of them and not others. That asymmetry is
+        /// exactly how the <c>requestedLine</c> promise came to hold on one of three paths.
+        /// </para></summary>
+        private static string OwnerPath(UserBreakpoint bp)
+        {
+            return Str(bp.Owner == null ? null : bp.Owner.Path);
+        }
+
         public static string BpSet(UserBreakpoint bp)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"bp-set\",\"module\":").Append(Str(bp.Module))
+              .Append(",\"ownerPath\":").Append(OwnerPath(bp))
               .Append(",\"requestedLine\":").Append(bp.RequestedLine)
               .Append(",\"line\":").Append(bp.Line)
               .Append(",\"rvas\":[");
@@ -199,6 +219,7 @@ namespace ClarionDbg.Cli
         public static string BpDel(UserBreakpoint bp)
         {
             return "{\"event\":\"bp-del\",\"module\":" + Str(bp.Module)
+                 + ",\"ownerPath\":" + OwnerPath(bp)
                  + ",\"requestedLine\":" + bp.RequestedLine
                  + ",\"line\":" + bp.Line + "}";
         }
@@ -235,6 +256,7 @@ namespace ClarionDbg.Cli
             {
                 if (i > 0) sb.Append(',');
                 sb.Append("{\"module\":").Append(Str(bps[i].Module))
+                  .Append(",\"ownerPath\":").Append(OwnerPath(bps[i]))
                   .Append(",\"line\":").Append(bps[i].Line)
                   .Append(",\"requestedLine\":").Append(bps[i].RequestedLine);
                 AppendBpProps(sb, bps[i]);
