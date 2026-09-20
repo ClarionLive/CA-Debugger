@@ -1044,7 +1044,9 @@ namespace ClarionDbg.Cli
         {
             claims.Claim("a vetoed row's descendants offer no edit metadata, INLINE and through `expand` - "
                          + "whose veto is derived from the address over the whole group's SPAN - while an "
-                         + "ordinary group keeps its pencils.");
+                         + "ordinary group keeps its pencils; and the veto and the NOTE that explains it "
+                         + "come from ONE classification, so a group straddling into the template is told "
+                         + "the template reason and not another thread's.");
 
             // A DebugEngine with no target: rows still build, the values just read as nothing.
             var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
@@ -1137,6 +1139,29 @@ namespace ClarionDbg.Cli
             if (CountVa(straddling) != 0)
                 failures.Add("expand-veto: a GROUP at 0x4C7FFC has a member ON the template's first byte "
                              + "but " + CountVa(straddling) + " member row(s) were still offered a pencil");
+            // AND IT MUST NAME THE RIGHT REFUSAL — the guarantee ticket 49538b78 item 3 created, which
+            // nothing asserted until now.
+            //
+            // The veto was span-based and correct. The NOTE was decided by a SECOND, INDEPENDENT point
+            // test on the row's START address, so this group — outside the template at its first byte,
+            // inside it at its last — was vetoed correctly and then labelled "another thread's data",
+            // a different refusal entirely. Counting `va` cannot see that: the row is vetoed either way,
+            // so the check stayed green while the user was told the wrong thing.
+            //
+            // THIS IS THE DISCRIMINATING CASE. A group whose start is outside the block and whose SPAN
+            // straddles in is the only shape where a point test and a span test disagree; every other
+            // case agrees by accident and proves nothing. An address inside a .cwtls block can earn only
+            // the template refusal, so that is what the wording must name.
+            //
+            // It asserts on TEXT, which this file otherwise avoids, and the reason is worth stating: the
+            // note reaches the pad as a string and nothing else about it is observable from here. The
+            // structural version wants a seam over ClassifyThreadedAccess's Kind, in another owner's
+            // file — noted rather than quietly settled for.
+            if (straddling.IndexOf("template", StringComparison.OrdinalIgnoreCase) < 0)
+                failures.Add("expand-veto: a GROUP straddling into the shared template was vetoed but "
+                             + "labelled with the WRONG REFUSAL — the veto is derived over the span and "
+                             + "the note is not, so they no longer come from one classification: "
+                             + straddling);
             // ...and the group that really does stay below it keeps its pencils: 0x4C7FF8 + 8 ends
             // exactly at the template's first byte, which is past the last byte it touches.
             string justBelow = xeng.ExpandChildrenForTest(grp, 0x4C7FF8, "app.exe", xtid);
