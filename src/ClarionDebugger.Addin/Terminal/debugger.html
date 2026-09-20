@@ -250,6 +250,12 @@
   .bp .file { color:var(--blue); } .bp .ln { color:var(--num); }
   .bp .bplink { color:var(--blue); cursor:pointer; text-decoration:underline; }
   .bp .bplink:hover { filter:brightness(1.25); }
+  /* An AMBIGUOUS row must not look clickable: several files claim this module:line and the host refuses to
+     choose, so there is no correct target to offer. Not blue, not underlined, not a pointer - `cursor:help`
+     because the affordance it DOES have is the explanation. */
+  .bp .bplink.ambig { color:var(--fg-dim); cursor:help; text-decoration:underline dotted; }
+  .bp .bplink.ambig:hover { filter:none; }
+  .bp .badge.ambig { color:var(--warn); }
   /* owning procedure (+ routine crumb) — subordinate to module:line. The outsized flex-shrink is what
      makes it yield room before module:line does: flex distributes shrink in proportion to each item's
      base size, so a plain "0 1 auto" would shorten the location alongside it. min-width:0 is what lets a
@@ -1998,6 +2004,35 @@
   }
 
   // ---- breakpoints ----
+  // Which of three states a bplist row's path is in (frozen contract, ticket 49538b78 item 5).
+  //
+  // The host sends `pathState` on EVERY row: "ok" (path is a real file), "ambiguous" (path is null because
+  // several DIFFERENT files claim this module|line and the host refuses to choose), "unknown" (path is null
+  // because no gutter bookmark claims it at all). The two null cases need different UI and only the host can
+  // tell them apart — which is the whole reason the field exists. Before it, `path:null` said "no path" for
+  // both, so an ambiguous row rendered as an ordinary link and clicking it opened ONE of several equally
+  // plausible files with nothing saying it had guessed.
+  //
+  // Resolution, in order, and each line of it is a decision:
+  //   absent             -> "unknown". An older host that sends no pathState degrades to today's best
+  //                         effort, never to a confident wrong answer.
+  //   "ok" with no path  -> NOT ok. The host guarantees (pathState === "ok") === (path != null); if that is
+  //                         broken there is nothing to open, and nothing establishes that the basename
+  //                         fallback is safe either, so it declines exactly as "ambiguous" does. The page
+  //                         asserts the invariant rather than trusting it.
+  //   unrecognised token -> declines. It comes from a newer or a broken host, and the one thing it
+  //                         establishes is that we do not know which state this is; the basename fallback is
+  //                         precisely the action that must not be taken on a guess.
+  // Compared CASE-SENSITIVELY on purpose: these are JSON tokens, and "OK" is not "ok".
+  const BP_PATH_STATES=['ok','ambiguous','unknown'];
+  function bpPathState(b){
+    if(!b) return 'ambiguous';
+    const raw=b.pathState;
+    if(raw===undefined||raw===null) return 'unknown';
+    if(BP_PATH_STATES.indexOf(raw)<0) return 'ambiguous';
+    if(raw==='ok' && !b.path) return 'ambiguous';
+    return raw;
+  }
   let bps=[];
   function buildBps(list){ bps=list||[];
     const el=$('bpList'); el.innerHTML=''; $('bpCount').textContent=bps.length;
@@ -2008,7 +2043,26 @@
       // base row: dot + module:line link
       d.innerHTML='<span class="chk on"></span><span class="bplink" title="Open in editor">'+esc(b.module)+'</span>:<span class="ln">'+b.line+'</span>';
       const lk=d.querySelector('.bplink');
-      if(lk) lk.onclick=()=>{ if(b.path) send('openbp', b.line+'\t'+b.path); else if(b.module) send('jump', b.module+':'+b.line); };
+      if(lk){
+        const pstate=bpPathState(b);
+        if(pstate==='ambiguous'){
+          // NO onclick at all. `send('jump', module:line)` re-enters the basename lookup that the host
+          // withheld the path to avoid, and would open an arbitrary one of the candidate files — the
+          // plausible wrong answer this whole contract exists to stop. Declining is the honest action.
+          // Title set as a PROPERTY, never interpolated into innerHTML: b.module comes from the debuggee's
+          // TSWD info and is untrusted, and esc() does not escape quotes.
+          lk.classList.add('ambig');
+          lk.title='Cannot open: more than one file claims '+b.module+':'+b.line+'. '
+                 +'Open it from the Clarion editor gutter instead.';
+          d.appendChild(badge('ambig','⚠', lk.title));
+        } else if(pstate==='ok'){
+          lk.onclick=()=>send('openbp', b.line+'\t'+b.path);
+        } else if(b.module){
+          // "unknown": no gutter information at all, so a best effort IS the honest answer, and this is
+          // deliberately the behaviour the page has always had.
+          lk.onclick=()=>send('jump', b.module+':'+b.line);
+        }
+      }
       // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
       // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
       // be an injection sink, since esc() doesn't escape quotes. Absent before symbols load: the row then
