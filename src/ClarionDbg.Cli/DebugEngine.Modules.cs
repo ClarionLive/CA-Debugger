@@ -73,6 +73,64 @@ namespace ClarionDbg.Cli
             return null;
         }
 
+        /// <summary>EVERY loaded image whose TSWD carries this compiland, not just the first.
+        /// <para>
+        /// A .clw name is a BASENAME. Two DLLs in one solution can each contain a <c>clbrws011.clw</c>, and
+        /// <see cref="OwnerOfModule"/> answering "the first one" is why a breakpoint set in the second DLL
+        /// was never armed and the user's gutter dot silently never fired (task af81c054). The list is the
+        /// honest answer to "which image owns this name"; the caller decides what to do with more than one.
+        /// </para></summary>
+        private List<LoadedModule> OwnersOfModule(string clwName)
+        {
+            var owners = new List<LoadedModule>();
+            foreach (var m in _modules)
+                if (m.HasDebug && m.Dbg.FindModuleIdx(clwName) >= 0) owners.Add(m);
+            return owners;
+        }
+
+        /// <summary>Does <paramref name="m"/> answer to the image identity a caller named?
+        /// <para>
+        /// THE FORM OF THE SPEC DECIDES WHICH COMPARISON IS MADE, and there is NO FALLBACK between them.
+        /// A spec carrying a directory separator is a PATH and is matched only against
+        /// <see cref="LoadedModule.Path"/>; a bare name is matched only against
+        /// <see cref="LoadedModule.Name"/>.
+        /// </para>
+        /// <para>
+        /// FALLING BACK FROM PATH TO NAME REINTRODUCES THE BUG, which is why it is spelled out rather than
+        /// left to read as an oversight. Two DLLs built from different projects routinely share a file
+        /// name - <c>C:\App\Dll1\shared.dll</c> and <c>C:\App\Dll2\shared.dll</c> - and a caller that
+        /// takes the trouble to name a full path is doing so precisely to tell those two apart. Matching
+        /// the second against the first's name because the path did not match hands back the wrong image
+        /// with full confidence, which is task af81c054 wearing a different hat. A path that names no
+        /// loaded image matches NOTHING, and the breakpoint stays pending until that image maps - the
+        /// honest answer when the one thing asked for is not here yet.
+        /// </para>
+        /// <para>
+        /// The bare-name form stays because a caller may legitimately only know the name, and because it
+        /// is unambiguous whenever only one loaded image has it.
+        /// </para>
+        /// <para>
+        /// A NULL SPEC MATCHES NOTHING HERE. "The caller named no image" is a decision for the caller to
+        /// make, not a match: treating null as "matches anything" inside this helper would silently arm an
+        /// unqualified breakpoint in whichever image was asked about first, which is the bug.
+        /// </para>
+        /// <para>
+        /// KNOWN LIMIT, recorded rather than papered over: the path comparison is exact (bar case). Both
+        /// sides come from the engine today - the host echoes back the <c>ownerPath</c> the engine gave it -
+        /// so they are the same string by construction. A future host that DERIVES the path from the
+        /// project model instead could produce a different spelling of the same file (short 8.3 form, a
+        /// mapped drive, a <c>\\?\</c> prefix) and would match nothing. That belongs with whatever builds
+        /// that mapping, and it should canonicalize before it sends, not be smoothed over here by a
+        /// fallback that cannot tell a different spelling from a different file.
+        /// </para></summary>
+        private static bool ImageMatches(LoadedModule m, string spec)
+        {
+            if (m == null || string.IsNullOrEmpty(spec)) return false;
+            if (spec.IndexOf('\\') >= 0 || spec.IndexOf('/') >= 0)
+                return !string.IsNullOrEmpty(m.Path) && string.Equals(m.Path, spec, StringComparison.OrdinalIgnoreCase);
+            return !string.IsNullOrEmpty(m.Name) && string.Equals(m.Name, spec, StringComparison.OrdinalIgnoreCase);
+        }
+
         /// <summary>Resolve a live VA to its owning module + source line via that image's TSWD.
         /// Returns false when no mapped module owns it or the owner carries no debug info.</summary>
         private bool ResolveVa(uint va, out LoadedModule m, out int line, out int moduleIdx, out uint recRva)

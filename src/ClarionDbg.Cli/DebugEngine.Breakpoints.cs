@@ -31,21 +31,71 @@ namespace ClarionDbg.Cli
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpSet(bp));
         }
 
-        private void AddBreakpoint(string module, int line, string condition = null, string hitMode = null, int hitValue = 0, string trace = null)
+        /// <summary>Register a breakpoint from a parsed spec.
+        /// <para>
+        /// WHICH IMAGES IT ARMS IN, and why each case is what it is (task af81c054):
+        /// </para>
+        /// <list type="bullet">
+        /// <item>the spec NAMES an image (<c>|img=</c>) — that one, and if it is not mapped yet the
+        /// breakpoint stays pending AGAINST THAT NAME rather than binding to whichever image happens to
+        /// carry the compiland first.</item>
+        /// <item>no image named, ONE image carries the compiland — that one. Identical to the behaviour
+        /// before this ticket, and this is every single-DLL app and every non-colliding name, i.e. very
+        /// nearly all real usage.</item>
+        /// <item>no image named, SEVERAL carry it — ALL of them, one logical breakpoint each. The user
+        /// pointed at a source LINE; if that source is compiled into three images it genuinely runs in
+        /// three places, and stopping at all three is the honest answer. Picking one silently is not a
+        /// smaller version of that answer, it is a different and wrong one delivered with confidence —
+        /// and a missing stop is undetectable from inside the debugger while an extra one is explicable
+        /// in a second, now that every echo carries its <c>ownerPath</c>.</item>
+        /// <item>no image named, several carry it, but the caller asked for ONE target (<c>|one=1</c>) —
+        /// the first, AND SAY SO. That is run-to-cursor, which means "get me to HERE and stop once";
+        /// arming it everywhere would turn it into "stop somewhere on the way", defeating the feature
+        /// rather than widening it. The log line is the point: an arbitrary choice announced beats the
+        /// same choice made silently, and it is the most this can honestly buy until the host can name
+        /// the image for a run-to-cursor from the file the caret is in.</item>
+        /// </list></summary>
+        private void AddBreakpoint(BpSpec spec)
         {
-            var owner = OwnerOfModule(module);
-            if (owner == null)
+            string module = spec.Module;
+            int line = spec.Line;
+            string condition = spec.Condition, hitMode = spec.HitMode, trace = spec.Trace;
+            int hitValue = spec.HitValue;
+
+            var owners = OwnersOfModule(module);
+            if (!string.IsNullOrEmpty(spec.Image))
+            {
+                // Narrow to the image the caller named. An empty result is NOT an error: at launch the
+                // DLL is simply not mapped yet, and the pending path below binds it when it is.
+                var narrowed = new List<LoadedModule>();
+                foreach (var m in owners) if (ImageMatches(m, spec.Image)) narrowed.Add(m);
+                owners = narrowed;
+            }
+            else if (spec.One && owners.Count > 1)
+            {
+                // Single-target by request. Announce the arbitrary pick rather than making it silently -
+                // this is the ONE place this ticket knowingly leaves a first-match, so it says so.
+                Console.WriteLine($"bp: {module}:{line} is carried by {owners.Count} loaded images; "
+                                + $"arming only in {owners[0].Name} (single-target request)");
+                owners = new List<LoadedModule> { owners[0] };
+            }
+
+            if (owners.Count == 0)
             {
                 // No loaded/known image carries this compiland yet — defer. Arms when its DLL loads.
+                // The dedupe key includes the IMAGE the caller named: two pre-launch dots in two DLLs are
+                // two breakpoints, and before launch nothing is mapped, so THIS is where they used to
+                // collapse into one - before any image resolution ran at all.
                 foreach (var b in _bps)
-                    if (Eq(b.Module, module) && (b.RequestedLine == line || b.Line == line))
+                    if (PendingDuplicates(b, module, line, spec.Image))
                     {
                         // re-add of a pending bp = a properties update; re-apply and re-confirm
                         ApplyBpProps(b, condition, hitMode, hitValue, trace);
                         EmitBpSet(b);
                         return;
                     }
-                var pend = new UserBreakpoint { Module = module, ModuleIdx = -1, RequestedLine = line, Line = line };
+                var pend = new UserBreakpoint { Module = module, ModuleIdx = -1, RequestedLine = line, Line = line,
+                                                OwnerSpec = spec.Image, SingleTarget = spec.One };
                 ApplyBpProps(pend, condition, hitMode, hitValue, trace);
                 _bps.Add(pend);
                 Console.WriteLine($"bp: {module}:{line} pending — owning image not loaded yet");
@@ -53,6 +103,15 @@ namespace ClarionDbg.Cli
                 return;
             }
 
+            foreach (var owner in owners) AddBreakpointIn(owner, spec, module, line, condition, hitMode, hitValue, trace);
+        }
+
+        /// <summary>Register (or re-confirm) one breakpoint in ONE named image. Split out of
+        /// <see cref="AddBreakpoint"/> so arming in several images is a loop over the same body rather
+        /// than a second copy of the resolve-snap-plant sequence.</summary>
+        private void AddBreakpointIn(LoadedModule owner, BpSpec spec, string module, int line,
+                                     string condition, string hitMode, int hitValue, string trace)
+        {
             var dbg = owner.Dbg;
             int mi = dbg.FindModuleIdx(module);
             string canon = dbg.ModuleNameForIdx(mi) ?? module;
@@ -87,7 +146,8 @@ namespace ClarionDbg.Cli
                     return;
                 }
 
-            var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, Owner = owner, RequestedLine = line, Line = planted };
+            var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, Owner = owner, RequestedLine = line, Line = planted,
+                                          OwnerSpec = spec.Image, SingleTarget = spec.One };
             bp.Rvas.AddRange(rvas);
             ApplyBpProps(bp, condition, hitMode, hitValue, trace);
             _bps.Add(bp);
@@ -118,23 +178,76 @@ namespace ClarionDbg.Cli
 
         private static bool Eq(string a, string b) { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
 
-        private void RemoveBreakpoint(string module, int line)
+        /// <summary>Is this pending entry already the breakpoint the spec is asking for?
+        /// <para>
+        /// A NAMED PREDICATE RATHER THAN AN INLINE CONDITION, because this is the site that actually
+        /// caused task af81c054. Before launch NOTHING is mapped, so every breakpoint arrives here, and
+        /// the key used to be (module, line) alone - so two gutter dots in two different DLLs were folded
+        /// into one entry before any image resolution ran, and no amount of correctness further down could
+        /// recover the one that was thrown away.
+        /// </para>
+        /// <para>
+        /// THE IMAGE IS PART OF THE KEY. Two entries naming different images are different breakpoints;
+        /// two naming NO image are the same one, which is right, because an unqualified breakpoint means
+        /// "every image that carries this compiland" and there is no second one of those to keep.
+        /// <c>Eq</c> compares two nulls as equal, which is exactly that case.
+        /// </para>
+        /// <para>
+        /// The two-way line test is the PRE-EXISTING behaviour of this branch and is left alone: a pending
+        /// entry has Line == RequestedLine (nothing has snapped it yet, because nothing is mapped), so the
+        /// second comparison cannot currently differ from the first.
+        /// </para></summary>
+        private static bool PendingDuplicates(UserBreakpoint b, string module, int line, string image)
         {
-            UserBreakpoint found = null;
+            return Eq(b.Module, module) && Eq(b.OwnerSpec, image)
+                && (b.RequestedLine == line || b.Line == line);
+        }
+
+        /// <summary>Remove the breakpoint(s) a <c>bp del</c> spec names.
+        /// <para>
+        /// SYMMETRY WITH ADD IS THE RULE. A spec naming an image removes that one; an unqualified spec
+        /// removes EVERY image's copy of that module:line, because an unqualified ADD is what armed them
+        /// all and one gutter dot is what the user is taking away. Removing only the first would leave the
+        /// others armed with nothing on screen accounting for them - the same silent-mismatch failure as
+        /// the original defect, pointed the other way.
+        /// </para></summary>
+        private void RemoveBreakpoint(BpSpec spec)
+        {
+            string module = spec.Module;
+            int line = spec.Line;
+
             // Prefer an exact requested-line match; only fall back to the planted line if nothing
             // requested it. Several logical bps can share one planted Line (distinct gutter lines that
             // snapped to the same record), so a planted-line match alone would remove an arbitrary one.
+            var matches = new List<UserBreakpoint>();
             foreach (var b in _bps)
-                if (Eq(b.Module, module) && b.RequestedLine == line) { found = b; break; }
-            if (found == null)
+                if (Eq(b.Module, module) && b.RequestedLine == line && RemovalNames(b, spec.Image)) matches.Add(b);
+            if (matches.Count == 0)
                 foreach (var b in _bps)
-                    if (Eq(b.Module, module) && b.Line == line) { found = b; break; }
-            string canon = found != null ? found.Module : module;
-            if (found == null)
+                    if (Eq(b.Module, module) && b.Line == line && RemovalNames(b, spec.Image)) matches.Add(b);
+
+            if (matches.Count == 0)
             {
-                if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no such breakpoint"));
+                if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(module, line, "no such breakpoint"));
                 return;
             }
+            foreach (var m in matches) RemoveOne(m, line);
+        }
+
+        /// <summary>Whether a del spec naming <paramref name="image"/> reaches breakpoint <paramref name="b"/>.
+        /// A spec that names NO image reaches every copy (see <see cref="RemoveBreakpoint"/>); one that names
+        /// an image reaches the copy bound to it, or - before that image has mapped - the pending entry that
+        /// asked for it.</summary>
+        private static bool RemovalNames(UserBreakpoint b, string image)
+        {
+            if (string.IsNullOrEmpty(image)) return true;
+            if (b.Owner != null) return ImageMatches(b.Owner, image);
+            return Eq(b.OwnerSpec, image);
+        }
+
+        private void RemoveOne(UserBreakpoint found, int line)
+        {
+            string canon = found.Module;
             uint baseVa = found.Owner != null ? found.Owner.LoadBase : 0;
             // Drop the logical breakpoint first so the ref-count check below sees only the survivors.
             _bps.Remove(found);
@@ -203,13 +316,29 @@ namespace ClarionDbg.Cli
             }
         }
 
-        /// <summary>After an image maps, resolve+plant any pending breakpoints whose compiland it owns.</summary>
+        /// <summary>After an image maps, resolve+plant the breakpoints it owns.
+        /// <para>
+        /// TWO JOBS, and the second one is what actually fixes the reported defect. The first is the
+        /// original: bind a PENDING breakpoint to the image that just arrived. The second is that an
+        /// already-armed UNQUALIFIED breakpoint gets a COPY armed in this image too, because "no image
+        /// named" means every image that carries the compiland (task af81c054) and the images do not all
+        /// arrive at once - the second DLL typically maps long after the first has already claimed the
+        /// breakpoint.
+        /// </para>
+        /// <para>
+        /// Without the second job the launch case stays broken however well <c>AddBreakpoint</c> behaves:
+        /// at launch NOTHING is mapped, so every breakpoint starts pending, the first image to map takes
+        /// it, and every later image carrying the same .clw silently gets nothing.
+        /// </para></summary>
         private void ResolvePendingFor(LoadedModule m)
         {
             if (m == null || m.Dbg == null) return;
-            foreach (var bp in _bps)
+            // ToArray: the copy loop below appends to _bps, and the copies must not themselves be
+            // re-examined by this same pass.
+            foreach (var bp in _bps.ToArray())
             {
-                if (!bp.Pending) continue;
+                if (!bp.Pending) { CopyUnqualifiedInto(m, bp); continue; }
+                if (!string.IsNullOrEmpty(bp.OwnerSpec) && !ImageMatches(m, bp.OwnerSpec)) continue; // asked for a different image
                 int mi = m.Dbg.FindModuleIdx(bp.Module);
                 if (mi < 0) continue; // this image doesn't carry that compiland
 
@@ -232,6 +361,50 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"bp: armed pending {bp.Module}:{bp.Line} ({bp.Rvas.Count} address(es)) in {m.Name}");
                 EmitBpSet(bp);
             }
+        }
+
+        /// <summary>An image just mapped that carries a compiland an UNQUALIFIED breakpoint is already
+        /// armed in elsewhere: give this image its own copy. No-op for a breakpoint that named an image,
+        /// for one requested single-target, and for a compiland this image does not carry.</summary>
+        private void CopyUnqualifiedInto(LoadedModule m, UserBreakpoint bp)
+        {
+            if (bp.Owner == m || bp.SingleTarget) return;
+            if (!string.IsNullOrEmpty(bp.OwnerSpec)) return;   // it named an image; it is not "every image"
+            int mi = m.Dbg.FindModuleIdx(bp.Module);
+            if (mi < 0) return;
+
+            // Already covered here? A second gutter line that snapped to this same record is a DIFFERENT
+            // logical breakpoint and must not suppress this copy, so the check is on the REQUESTED line -
+            // the same key AddBreakpointIn dedupes on, for the same reason.
+            foreach (var other in _bps)
+                if (other.Owner == m && other.ModuleIdx == mi && other.RequestedLine == bp.RequestedLine) return;
+
+            int planted = bp.RequestedLine;
+            var rvas = m.Dbg.LineToRvasInModuleIdx(mi, planted);
+            if (rvas.Count == 0)
+            {
+                int snapped = NearestIn(m.Dbg.BreakableLinesInModuleIdx(mi), planted);
+                if (snapped > 0) { planted = snapped; rvas = m.Dbg.LineToRvasInModuleIdx(mi, snapped); }
+            }
+            if (rvas.Count == 0) return;   // this image carries the name but not the line
+
+            var copy = new UserBreakpoint
+            {
+                Module = m.Dbg.ModuleNameForIdx(mi) ?? bp.Module,
+                ModuleIdx = mi,
+                Owner = m,
+                RequestedLine = bp.RequestedLine,
+                Line = planted,
+                OwnerSpec = null,
+                SingleTarget = false
+            };
+            copy.Rvas.AddRange(rvas);
+            ApplyBpProps(copy, bp.Condition, bp.HitMode, bp.HitValue, bp.Trace);
+            _bps.Add(copy);
+            if (m.LoadBase != 0) PlantBp(copy);
+            Console.WriteLine($"bp: also armed {copy.Module}:{copy.Line} in {m.Name} "
+                            + $"(same .clw name is carried by more than one image)");
+            EmitBpSet(copy);
         }
 
         /// <summary>Nearest breakable line: smallest &gt;= line (forward snap), else largest &lt; line.</summary>
