@@ -362,8 +362,17 @@ namespace ClarionDebugger.Disassembly
         {
             if (list == null) return;
             _threads = list.Threads ?? new List<DebugThread>();
-            _stoppedTid = list.StoppedTid;
-            _selTid = list.SelectedTid != 0 ? list.SelectedTid : list.StoppedTid;
+            // StoppedTid/SelectedTid became uint? in the same wave (task 3b043dfc): on the WIRE and in the
+            // host's model, "the engine did not say" is ABSENT, never 0. This view keeps its own uint fields
+            // with the local `0 = unknown` convention documented at their declaration, so the conversion
+            // happens HERE, once, at the boundary — deliberately, not by a cast that hides it. `?? 0` is the
+            // same idiom OnPaused already uses for p.Tid.
+            // `SelectedTid ?? StoppedTid` preserves what the old `SelectedTid != 0 ? ... : StoppedTid` meant:
+            // show the selected thread if there is one, else the stopped one. The old test read 0 as "no
+            // selection", which is exactly the sentinel the wire rule abolished — so it had to change shape
+            // rather than just gain a cast.
+            _stoppedTid = list.StoppedTid ?? 0;
+            _selTid = list.SelectedTid ?? list.StoppedTid ?? 0;
             UpdateThreadBanner();
             // THE WINDOW-OPENED-LATE CASE. A selection made before this view existed (or before it was
             // rebound) is reported here and nowhere else: without this the listing would sit on the stopped
