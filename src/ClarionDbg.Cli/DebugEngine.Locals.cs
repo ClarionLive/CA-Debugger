@@ -484,7 +484,7 @@ namespace ClarionDbg.Cli
                 {
                     case ThreadedResolve.Ok:
                         // The thread HAS a copy — this address is simply the template it was made from.
-                        return "shared " + m.Name + " template — thread " + tid + "'s own copy is at 0x"
+                        return "shared " + m.Name + " template — thread " + TidText(tid) + "'s own copy is at 0x"
                                + instanceVa.ToString("X");
                     case ThreadedResolve.Unallocated:
                         return "not yet used on this thread — initial value";

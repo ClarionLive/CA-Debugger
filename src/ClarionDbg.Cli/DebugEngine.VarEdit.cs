@@ -52,8 +52,8 @@ namespace ClarionDbg.Cli
                 }
                 if (wantTid != selectedTid)
                 {
-                    EmitVarSetError(va, "not written: this edit was for thread " + wantTid
-                                        + ", but thread " + selectedTid + " is selected now");
+                    EmitVarSetError(va, "not written: this edit was for thread " + TidText(wantTid)
+                                        + ", but thread " + TidText(selectedTid) + " is selected now");
                     return;
                 }
             }
@@ -232,14 +232,14 @@ namespace ClarionDbg.Cli
                 if (Kind == ThreadedRefusal.SharedTemplate)
                 {
                     string where = HaveOwnCopy
-                        ? " — thread " + SelectedTid + "'s own copy of that byte is at 0x" + OwnCopyVa.ToString("X")
-                        : " and thread " + SelectedTid + " has no instance of it";
+                        ? " — thread " + TidText(SelectedTid) + "'s own copy of that byte is at 0x" + OwnCopyVa.ToString("X")
+                        : " and thread " + TidText(SelectedTid) + " has no instance of it";
                     return "not written: " + Range(va, len) + " touches the shared " + Owner.Name
                          + " template, not one thread's data" + where;
                 }
                 if (Kind == ThreadedRefusal.OtherThreadInstance)
-                    return "not written: " + Range(va, len) + " touches thread " + OwnerTid + "'s copy of the "
-                         + Owner.Name + " data, but thread " + SelectedTid + " is selected";
+                    return "not written: " + Range(va, len) + " touches thread " + TidText(OwnerTid) + "'s copy of the "
+                         + Owner.Name + " data, but thread " + TidText(SelectedTid) + " is selected";
                 return null;
             }
         }
