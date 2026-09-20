@@ -1332,16 +1332,34 @@ Check 'CONTROL: ...and does NOT match it in a comment' `
 $winCode = Get-CSharpCodeOnly $onDisasm
 $winAt = $winCode.IndexOf('if (kind == WinTag)')
 $emptyArm = if ($winAt -ge 0) { $winCode.Substring($winAt) } else { '' }
-$clearAt = $emptyArm.IndexOf('_seatedTid = 0;')
-$replaceAt = $emptyArm.IndexOf('_instrs = SortedUnique(instrs);')
-Check 'the empty WinTag branch releases the painted flag' ($clearAt -ge 0) `
-  $(if ($clearAt -ge 0) { '' } else { 'no _seatedTid clear in the WinTag handling' })
-# CONTROL: the anchor this is measured against must itself be found, or "before" compares against -1 and
-# passes for free.
-Check 'CONTROL: the cache replacement is located, so BEFORE means something' ($replaceAt -ge 0) `
-  $(if ($replaceAt -ge 0) { '' } else { 'SortedUnique replacement not found' })
-Check '...and it is ordered BEFORE the replacement that erases what it described' `
-  ($clearAt -ge 0 -and $replaceAt -ge 0 -and $clearAt -lt $replaceAt) "clear@$clearAt replace@$replaceAt"
+$iWasSeat   = $emptyArm.IndexOf('bool wasSeat')
+$iRelease   = $emptyArm.IndexOf('_seatingTid = 0')
+$iCountTest = $emptyArm.IndexOf('if (instrs.Count > 0)')
+$iClear     = $emptyArm.IndexOf('_seatedTid = 0')
+$iCache     = $emptyArm.IndexOf('_instrs = SortedUnique')
+$iIfWasSeat = $emptyArm.IndexOf('if (wasSeat)')
+$iEmptySet  = $emptyArm.IndexOf('_emptySeatTid = emptyTid')
+# ANCHORS FIRST. Every check below is an ORDER comparison, and -1 < anything, so a renamed method or a
+# missing statement would make them pass VACUOUSLY rather than fail. Owen2's own first draft of this
+# printed "ALL SHAPE CHECKS PASSED" while every assertion had thrown, which is what this guards.
+Check 'every anchor these shape checks need is present in OnDisasm' `
+  (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iCountTest -ge 0) -and ($iClear -ge 0) `
+   -and ($iCache -ge 0) -and ($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0)) `
+  "wasSeat=$iWasSeat release=$iRelease count=$iCountTest clear=$iClear cache=$iCache if=$iIfWasSeat set=$iEmptySet"
+# THE PAINTED FLAG MUST NOT OUTLIVE THE PAINT.
+Check 'the empty WinTag branch clears _seatedTid BEFORE replacing the listing' `
+  (($iClear -ge 0) -and ($iCache -ge 0) -and ($iClear -lt $iCache)) "clear=$iClear cache=$iCache"
+Check 'and that clear sits in the EMPTY branch, after the instrs.Count test' `
+  (($iCountTest -ge 0) -and ($iClear -gt $iCountTest)) "count=$iCountTest clear=$iClear"
+# A coarse SEEK is a WinTag reply too, and `wasSeat` is the ONLY thing distinguishing the two callers.
+# Capturing it after the release is not merely a shape break - it makes wasSeat always false, so a seat
+# that decoded nothing would stop recording it and retry forever.
+Check 'wasSeat is captured BEFORE _seatingTid is released' `
+  (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iWasSeat -lt $iRelease)) "wasSeat=$iWasSeat release=$iRelease"
+# ...and only a SEAT may claim "this thread's code could not be decoded". A seek's empty result says
+# nothing about the thread's own address.
+Check 'the _emptySeatTid claim is gated on wasSeat' `
+  (($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iIfWasSeat -lt $iEmptySet)) "if=$iIfWasSeat set=$iEmptySet"
 # INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
 # simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
 # which the cross-model adversary reported as HIGH: that is not an absence of information, it is
@@ -1384,7 +1402,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 225
+$EXPECTED_CHECKS = 227
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
