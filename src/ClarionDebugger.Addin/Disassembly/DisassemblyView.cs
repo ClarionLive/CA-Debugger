@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
@@ -20,6 +21,8 @@ namespace ClarionDebugger.Disassembly
     /// </summary>
     public sealed class DisassemblyView : Control
     {
+        // The three request KINDS. They are no longer sent as the whole tag: see MakeTag — a tag is not a
+        // thread, and three tag-keyed requests can be in flight across a thread switch.
         private const string WinTag = "win";      // (re)seat the window at an address (replaces the cache)
         private const string FwdTag = "winf";     // forward extension (append)
         private const string BwdTag = "winb";     // backward extension (prepend, via engine re-sync)
@@ -65,6 +68,29 @@ namespace ClarionDebugger.Disassembly
         private uint _curVa;         // EIP VA (the highlighted instruction), 0 = none
         private bool _hasCur;
         private bool _pendFwd, _pendBwd;   // an edge extension is in flight (avoid duplicate requests)
+
+        // ----- which thread this listing is of -----
+        //
+        // The view follows the PAD's selection: one selected thread for the whole debugger, so the window
+        // and the Call Stack can never disagree about whose execution point is on screen.
+        //
+        // WHAT IS AND IS NOT PER-THREAD, because it right-sizes the gate below: the instruction BYTES are
+        // process memory, shared by every thread, so a listing decoded for one thread is not wrong code for
+        // another. What IS per-thread is where the window was SEATED (the thread's EIP) and which row is
+        // flagged `current`. A late reply therefore does not paint foreign code — it moves the view to a
+        // thread you are no longer looking at and marks that thread's instruction as the current one.
+        private uint _stoppedTid;    // the thread the engine stopped on (0 = unknown)
+        private uint _selTid;        // the thread every panel is currently reading (0 = unknown)
+        private List<DebugThread> _threads = new List<DebugThread>();   // for naming a thread in the banner
+        private ToolStripLabel _thread;   // "viewing Thread N — not the stopped thread", or blank
+        private uint _seatedTid;          // the thread the window is currently seated on (0 = none yet)
+
+        // Bumped whenever the answer to "whose execution point is this?" changes — a thread switch, a new
+        // stop, a session rebind. It is carried in the request TAG, which the engine echoes back verbatim,
+        // so a reply can be matched to the state that asked for it with no protocol change. Without it the
+        // three in-flight requests are keyed only by kind, and a `winf` issued before a switch is
+        // indistinguishable from one issued after.
+        private int _epoch;
         private int _top;            // first visible row index
         private int _rowH = 16;
         private int _charW = 8;
@@ -117,13 +143,25 @@ namespace ClarionDebugger.Disassembly
         private void Bind(ClarionDebuggerService svc)
         {
             _svc = svc;
+            // A different session (or none) knows nothing about the thread the old one was showing.
+            NewEpoch();
+            _stoppedTid = _selTid = _seatedTid = 0;
+            _threads = new List<DebugThread>();
             if (_svc != null)
             {
                 _svc.Paused += OnPaused;
                 _svc.DisasmReceived += OnDisasm;
                 _svc.Exited += OnExited;
                 _svc.StateChanged += OnState;
+                // The pad owns the thread selection; this view reads it rather than keeping its own, so the
+                // window and the Call Stack cannot disagree about whose execution point is on screen.
+                _svc.ThreadsReceived += OnThreads;
+                _svc.ThreadSelected += OnThreadSelected;
+                // How the view learns the NEW thread's EIP after a switch: the inventory names threads but
+                // carries no EIP, so the seat comes from the registers, which are already tid-stamped.
+                _svc.RegsReceived += OnRegs;
             }
+            UpdateThreadBanner();
             UpdateButtons(_svc?.State ?? DebugSessionState.Idle);
         }
 
@@ -134,6 +172,9 @@ namespace ClarionDebugger.Disassembly
             _svc.DisasmReceived -= OnDisasm;
             _svc.Exited -= OnExited;
             _svc.StateChanged -= OnState;
+            _svc.ThreadsReceived -= OnThreads;
+            _svc.ThreadSelected -= OnThreadSelected;
+            _svc.RegsReceived -= OnRegs;
             _svc = null;
         }
 
@@ -145,7 +186,7 @@ namespace ClarionDebugger.Disassembly
             Unbind();
             Bind(ClarionDebuggerService.Active);
             if (_svc != null && _svc.State == DebugSessionState.Paused && !string.IsNullOrEmpty(_svc.CurrentVa))
-                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, WinTag, Context);
+                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);
         }
 
         // ----- stepping toolbar -----
@@ -168,6 +209,12 @@ namespace ClarionDebugger.Disassembly
             _bSrc   = AddButton("◧ Source", "Open the .clw source at the current line", ShowSource);
             _bar.Items.Add(new ToolStripSeparator());
             _bStop  = AddButton("■ Stop",  "Terminate the debug session", () => _svc?.Stop());
+            // Amber, like the pad's own "not the stopped thread" badge, and right-aligned ahead of the
+            // location so the two read as one status area. Hidden unless it has something to say.
+            _thread = new ToolStripLabel("") { ForeColor = Color.FromArgb(220, 180, 90),
+                Alignment = ToolStripItemAlignment.Right, AutoToolTip = false, Visible = false,
+                ToolTipText = "The listing is showing a thread other than the one execution stopped on" };
+            _bar.Items.Add(_thread);
             _loc = new ToolStripLabel("") { ForeColor = Color.FromArgb(150, 175, 150),
                 Alignment = ToolStripItemAlignment.Right, AutoToolTip = false };
             _bar.Items.Add(_loc);
@@ -223,7 +270,7 @@ namespace ClarionDebugger.Disassembly
             // Opened (or reopened) mid-session while already paused — fetch at the live EIP now instead
             // of waiting for the next step.
             if (_svc != null && _svc.State == DebugSessionState.Paused && !string.IsNullOrEmpty(_svc.CurrentVa))
-                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, WinTag, Context);
+                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);
         }
 
         private void OnPaused(DebugPause p)
@@ -231,20 +278,159 @@ namespace ClarionDebugger.Disassembly
             if (string.IsNullOrEmpty(p.Va)) return;
             UI(() =>
             {
+                // A new stop resets the engine's selection to the stopped thread, so any request still in
+                // flight was asked under a selection that no longer exists. The engine forgets it; so does
+                // this view, and the epoch is what makes the older replies harmless.
+                NewEpoch();
+                // Taken from the STOP, not from the `threads` reply that follows it — that reply can fail
+                // or be overtaken. It is also what stops the inventory triggering a second, pointless
+                // reseat on every stop when the selection is (as it almost always is) the stopped thread.
+                // A null Tid means an engine that does not name it: fall back to knowing nothing, where the
+                // banner stays blank rather than naming a thread we would be guessing at.
+                _selTid = _stoppedTid = _seatedTid = p.Tid ?? 0;
+                UpdateThreadBanner();
                 _curSym = p.Sym;   // runtime location for non-TSWD stops (TSWD line comes from the disasm)
-                _svc?.RequestDisasmAt(p.Va, WindowCount, WinTag, Context);
+                _svc?.RequestDisasmAt(p.Va, WindowCount, MakeTag(WinTag), Context);
             });
+        }
+
+        /// <summary>The tag sent with a request: its KIND plus the epoch that asked for it. The engine
+        /// echoes the tag verbatim, so this is how a reply is matched to the state that wanted it without
+        /// widening the protocol. '#' is safe in a tag — the stdin protocol is space-split, and
+        /// <see cref="ClarionDebuggerService.RequestDisasmAt"/> puts the tag in its own positional slot;
+        /// a tag containing a SPACE would shift `before` into the wrong argument, which is why the kind
+        /// and the epoch are both space-free by construction.</summary>
+        private string MakeTag(string kind) { return FormatTag(kind, _epoch); }
+
+        /// <summary>The tag wire format, in one place so <see cref="ParseTag"/> cannot drift from it and so
+        /// `protocolcheck`'s add-in counterpart can assert the round trip against the shipped code.</summary>
+        private static string FormatTag(string kind, int epoch)
+        {
+            return kind + "#" + epoch.ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Split a reply's tag back into kind + epoch. False when it is not one of ours at all.
+        /// A tag with no '#' is an OLD-FORMAT tag (or another view's): treated as not ours, because it
+        /// carries no epoch and so cannot be shown to belong to the thread on screen.</summary>
+        private static bool ParseTag(string tag, out string kind, out int epoch)
+        {
+            kind = null; epoch = -1;
+            if (string.IsNullOrEmpty(tag)) return false;
+            int h = tag.IndexOf('#');
+            if (h <= 0 || h == tag.Length - 1) return false;
+            kind = tag.Substring(0, h);
+            if (kind != WinTag && kind != FwdTag && kind != BwdTag) return false;
+            return int.TryParse(tag.Substring(h + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out epoch);
+        }
+
+        /// <summary>Invalidate every in-flight request: the question they were asked under has changed.
+        /// Clearing the pending flags matters as much as bumping the epoch — the dropped replies will
+        /// never arrive to clear them, and a stuck _pendFwd would freeze forward extension for good.</summary>
+        private void NewEpoch()
+        {
+            _epoch++;
+            _pendFwd = _pendBwd = false;
+        }
+
+        // ----- following the pad's thread selection -----
+
+        /// <summary>The thread inventory for this stop. It names the threads (a bare tid is useless in a
+        /// banner) and reports who is stopped and who is selected — the engine's answer, not our guess.</summary>
+        private void OnThreads(DebugThreadList list) => UI(() =>
+        {
+            if (list == null) return;
+            _threads = list.Threads ?? new List<DebugThread>();
+            _stoppedTid = list.StoppedTid;
+            _selTid = list.SelectedTid != 0 ? list.SelectedTid : list.StoppedTid;
+            UpdateThreadBanner();
+            // THE WINDOW-OPENED-LATE CASE. A selection made before this view existed (or before it was
+            // rebound) is reported here and nowhere else: without this the listing would sit on the stopped
+            // thread showing no banner, while the pad's own banner says you are viewing another thread —
+            // the exact mismatch this view is supposed to have stopped being capable of.
+            SeatOnSelectedThread();
+        });
+
+        /// <summary>Re-seat the window on the selected thread, if it is not already there. The thread's EIP
+        /// is not in the inventory, so this asks for its registers and seats on that reply; everything in
+        /// flight is dropped first, because it was asked under the previous seat.</summary>
+        private void SeatOnSelectedThread()
+        {
+            if (_svc == null || _selTid == 0 || _selTid == _seatedTid) return;
+            NewEpoch();
+            _svc.RequestRegs();
+        }
+
+        /// <summary>The engine's answer to a `thread N` request. <paramref name="tid"/> is the thread that
+        /// was ASKED FOR and is null when the request was malformed, so a failure is never read as thread 0.
+        /// On success the view re-seats on the new thread — but it does not yet know where that thread is,
+        /// so it asks for its registers and seats on the reply.</summary>
+        private void OnThreadSelected(uint? tid, bool ok, string error) => UI(() =>
+        {
+            // A refused or malformed select leaves the view exactly where it was. Re-rendering the banner
+            // from unchanged state is deliberate: it must not start naming a thread the engine declined.
+            if (!ok || tid == null || tid.Value == 0) { UpdateThreadBanner(); return; }
+            _selTid = tid.Value;
+            UpdateThreadBanner();
+            SeatOnSelectedThread();
+        });
+
+        /// <summary>Registers for a thread. Used only to learn where the newly selected thread is frozen,
+        /// and only when the reply is for the thread now on screen — the pad requests registers for its own
+        /// reasons too, and an older reply names an older thread.</summary>
+        private void OnRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
+        {
+            if (regs == null || tid == null || _selTid == 0 || tid.Value != _selTid) return;
+            string eip;
+            if (!regs.TryGetValue("eip", out eip) || string.IsNullOrEmpty(eip)) return;
+            uint va;
+            if (!TryParseVa(eip, out va) || va == 0) return;
+            _seatedTid = tid.Value;
+            _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, MakeTag(WinTag), Context);
+        });
+
+        /// <summary>Say whose execution point is on screen, in the pad's own words, and only when it is
+        /// worth saying: while the view shows the thread the engine stopped on — nearly always — this is
+        /// blank rather than noise. Mirrors the pad's banner so the two never word the same fact
+        /// differently.</summary>
+        private void UpdateThreadBanner()
+        {
+            if (_thread == null) return;
+            string text = "";
+            if (_selTid != 0 && _stoppedTid != 0 && _selTid != _stoppedTid)
+                text = "viewing " + ThreadName(_selTid) + " — not the stopped thread";
+            _thread.Text = text;
+            _thread.Visible = text.Length > 0;
+        }
+
+        /// <summary>Name a thread the way the pad names it: its Clarion thread number when the RTL gave one,
+        /// otherwise the bare tid. Never invents a Clarion number.</summary>
+        private string ThreadName(uint tid)
+        {
+            foreach (var t in _threads)
+                if (t != null && t.Tid == tid)
+                    return t.ClarionThread != null
+                        ? "Thread " + t.ClarionThread.Value.ToString(CultureInfo.InvariantCulture)
+                        : "tid " + tid.ToString(CultureInfo.InvariantCulture);
+            return "tid " + tid.ToString(CultureInfo.InvariantCulture);
         }
 
         private void OnDisasm(string tag, List<DebugDisasmInstr> instrs)
         {
-            if (tag != WinTag && tag != FwdTag && tag != BwdTag) return;   // not ours
+            string kind; int epoch;
+            if (!ParseTag(tag, out kind, out epoch)) return;   // not ours
+            // A reply from a superseded epoch: the thread selection (or the stop) moved on after it was
+            // asked for. Dropping it is the whole point — it would re-seat the view on a thread the user
+            // is no longer looking at and flag that thread's instruction as current.
+            if (epoch != _epoch) return;
             UI(() =>
             {
+                // Re-checked INSIDE the marshal: the epoch can move between the reader thread's test above
+                // and this running on the UI thread, which is exactly the window a thread switch lands in.
+                if (epoch != _epoch) return;
                 instrs = instrs ?? new List<DebugDisasmInstr>();
                 var selVas = SelectedInstrVas();   // carry the copy-selection across the rebuild
                 uint anchorVa = _anchorRow >= 0 && _anchorRow < _rows.Count ? InstrVaOfRow(_anchorRow) : 0;
-                if (tag == WinTag)
+                if (kind == WinTag)
                 {
                     // fresh window: replace the cache and centre on EIP (the flagged instruction)
                     _instrs = SortedUnique(instrs);
@@ -264,7 +450,7 @@ namespace ClarionDebugger.Disassembly
                     // edge extension: keep the same instruction under the top of the view across the merge
                     uint anchor = TopInstrVa();
                     Merge(instrs);
-                    if (tag == FwdTag) _pendFwd = false; else _pendBwd = false;
+                    if (kind == FwdTag) _pendFwd = false; else _pendBwd = false;
                     Rebuild();
                     RemapSelection(selVas);
                     _anchorRow = anchorVa != 0 ? RowOfVa(anchorVa) : (_anchorRow < _rows.Count ? _anchorRow : -1);
@@ -285,8 +471,13 @@ namespace ClarionDebugger.Disassembly
             _sel.Clear(); _anchorRow = -1;
             _current = -1;
             _hasCur = false; _curVa = 0;
-            _pendFwd = _pendBwd = false;
             _curPath = _curModule = _curSym = null; _curLine = 0;
+            // The process is gone, so there are no threads to be viewing and nothing in flight can be
+            // answered. NewEpoch clears the pending flags as well as retiring the outstanding replies.
+            NewEpoch();
+            _stoppedTid = _selTid = _seatedTid = 0;
+            _threads = new List<DebugThread>();
+            UpdateThreadBanner();
             UpdateLocation();
             Invalidate();
         });
@@ -307,12 +498,12 @@ namespace ClarionDebugger.Disassembly
             if (!_pendBwd && _top <= Edge)
             {
                 _pendBwd = true;
-                _svc?.RequestDisasmAt(HexVa(_instrs[0].Va), 1, BwdTag, Batch);
+                _svc?.RequestDisasmAt(HexVa(_instrs[0].Va), 1, MakeTag(BwdTag), Batch);
             }
             if (!_pendFwd && _top + VisibleRows() >= _rows.Count - Edge)
             {
                 _pendFwd = true;
-                _svc?.RequestDisasmAt(HexVa(_instrs[_instrs.Count - 1].Va), Batch, FwdTag);
+                _svc?.RequestDisasmAt(HexVa(_instrs[_instrs.Count - 1].Va), Batch, MakeTag(FwdTag));
             }
         }
 
@@ -566,7 +757,7 @@ namespace ClarionDebugger.Disassembly
             uint lo = Lo(), hi = Hi();
             if (hi <= lo) return;
             uint va = (uint)(lo + (long)((double)e.NewValue / CoarseMax * (hi - lo)));
-            _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, WinTag);   // reseat the window there
+            _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, MakeTag(WinTag));   // reseat the window there
         }
 
         /// <summary>Move the coarse thumb to reflect the top visible address (programmatic — does not

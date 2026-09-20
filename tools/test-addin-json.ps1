@@ -29,6 +29,8 @@ param(
   # the inbound reader and the page that builds the payloads it parses
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
+  # the disassembly view: its request tags carry the epoch that decides whether a reply is still wanted
+  [string] $DisasmViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
   # the captured host output tools/test-pad-source.js drives the page with. Regenerate with the switch below
   # after a deliberate change to SendSource; the checks at the end of this file fail while it is stale.
   [string] $HostSourceFixture = (Join-Path $PSScriptRoot 'fixtures\host-source-messages.json'),
@@ -43,6 +45,7 @@ $engine = Get-Content -Raw -LiteralPath $EngineJsonPath
 $engineSrc = Get-Content -Raw -LiteralPath $EnginePath
 $bpSrc = Get-Content -Raw -LiteralPath $EngineBpPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
+$disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 
 function Get-Method {
   param([string] $Signature, [string] $From)
@@ -797,6 +800,85 @@ $doc = $doc.Substring([Math]::Max(0, $doc.Length - 1600))
 Check 'its doc comment no longer instructs new payloads to order their fields' `
   ($doc -notmatch 'must do the same' -and $doc -notmatch 'goes LAST') ''
 Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
+
+Write-Host ''
+Write-Host 'the Disassembly view keeps THREE tag-keyed requests in flight, and a tag is not a thread'
+# The view asks for a window (win), a forward extension (winf) and a backward one (winb), each keyed only
+# by its kind. Across a thread switch that is not enough to tell a reply asked for BEFORE the switch from
+# one asked for after: same kind, same shape, different thread. The tag now carries the EPOCH that asked,
+# and the engine echoes a tag verbatim, so the match is made with no protocol change.
+#
+# What a stale reply actually costs is narrower than "the wrong code" — instruction bytes are process
+# memory, shared by every thread. It re-seats the window on a thread you are no longer viewing and flags
+# that thread's instruction as current. Still wrong, and silent.
+$fmtTag = Get-Method 'private static string FormatTag(string kind, int epoch)' $disasmView
+$parseTag = Get-Method 'private static bool ParseTag(string tag, out string kind, out int epoch)' $disasmView
+$tagShim = @"
+using System;
+using System.Globalization;
+public static class DisasmTagProbe {
+  public const string WinTag = "win";
+  public const string FwdTag = "winf";
+  public const string BwdTag = "winb";
+$(($fmtTag, $parseTag -join "`n") -replace 'private static', 'public static')
+}
+"@
+Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
+
+# CONTROL FIRST: a gate that rejected everything would pass every rejection below for the wrong reason.
+foreach ($kind in 'win', 'winf', 'winb') {
+  $k = ''; $e = 0
+  $tag = [DisasmTagProbe]::FormatTag($kind, 7)
+  $ok = [DisasmTagProbe]::ParseTag($tag, [ref] $k, [ref] $e)
+  Check "control: a $kind tag this view built round-trips" ($ok -and $k -eq $kind -and $e -eq 7) "$tag -> kind=$k epoch=$e"
+}
+
+# THE RULE: a reply from a superseded epoch is distinguishable, which is the whole gate.
+$k = ''; $e = 0
+[DisasmTagProbe]::ParseTag([DisasmTagProbe]::FormatTag('winf', 3), [ref] $k, [ref] $e) | Out-Null
+Check 'a winf asked for under epoch 3 does not read as the current epoch 4' ($e -ne 4) "epoch=$e"
+Check 'and it is still recognised as OURS, so it is dropped deliberately rather than ignored as foreign' ($k -eq 'winf') "kind=$k"
+
+# A BARE kind is the OLD format. It carries no epoch, so it cannot be shown to belong to the thread on
+# screen — rejecting it is the safe reading, and it is what an engine replaying an old tag would send.
+foreach ($bare in 'win', 'winf', 'winb') {
+  $k = ''; $e = 0
+  Check "a bare '$bare' tag with no epoch is not accepted" (-not [DisasmTagProbe]::ParseTag($bare, [ref] $k, [ref] $e)) ''
+}
+foreach ($bad in 'other#1', '#4', 'win#', 'win#x', 'winx#1', '', 'win#1#2') {
+  $k = ''; $e = 0
+  $got = [DisasmTagProbe]::ParseTag($bad, [ref] $k, [ref] $e)
+  Check "a malformed or foreign tag '$bad' is not ours" (-not $got) ''
+}
+
+# THE POSITIONAL HAZARD: RequestDisasmAt sends the tag in its own space-separated slot, ahead of `before`.
+# A tag containing a space would push `before` into the wrong argument and silently change the request.
+foreach ($kind in 'win', 'winf', 'winb') {
+  $tag = [DisasmTagProbe]::FormatTag($kind, 12345)
+  Check "a $kind tag never contains a space" (-not $tag.Contains(' ')) $tag
+}
+
+# The engine echoes the tag through Json.Str, so a tag needing JSON escaping would survive but is a smell.
+$tag = [DisasmTagProbe]::FormatTag('win', 0)
+Check 'a tag needs no JSON escaping' ($tag -notmatch '["\\]') $tag
+
+Write-Host ''
+Write-Host 'and the view really uses that tag everywhere, so no request can escape the gate'
+# A single RequestDisasmAt left sending a bare constant would be a hole the round-trip checks cannot see.
+# Per LINE, not per regex-across-arguments: a nested HexVa(...) closes a paren before the tag does, so an
+# [^)]* scan silently stops early and undercounts. That is how this check first passed at 3 of 7.
+$callLines = @($disasmView -split "`n" | Where-Object { $_ -match 'RequestDisasmAt\(' })
+$viaMakeTag = @($callLines | Where-Object { $_ -match 'MakeTag\(' })
+$bareTag = @($callLines | Where-Object { $_ -match ',\s*(WinTag|FwdTag|BwdTag)\s*[,)]' })
+Check 'the view has the request sites this check expects' ($callLines.Count -eq 7) "$($callLines.Count) call site(s)"
+Check 'no RequestDisasmAt still passes a bare tag constant' ($bareTag.Count -eq 0) "$($bareTag.Count) bare call(s)"
+Check 'every disasm request goes out through MakeTag' ($viaMakeTag.Count -eq $callLines.Count) "$($viaMakeTag.Count) of $($callLines.Count)"
+Check 'OnDisasm gates on the epoch before touching the cache' `
+  ((Get-Method 'private void OnDisasm(string tag, List<DebugDisasmInstr> instrs)' $disasmView) -match 'epoch\s*!=\s*_epoch') ''
+# The pending flags are cleared by NewEpoch, not by the replies: the dropped ones never arrive to clear
+# them, and a stuck _pendFwd would freeze forward extension for the rest of the session.
+Check 'NewEpoch clears the in-flight flags as well as retiring the replies' `
+  ((Get-Method 'private void NewEpoch()' $disasmView) -match '_pendFwd\s*=\s*_pendBwd\s*=\s*false') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

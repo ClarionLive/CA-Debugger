@@ -792,15 +792,18 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "disasm": case "u":
-                        // DELIBERATELY the STOPPED thread, not the selection. The standalone disassembly
-                        // window subscribes to the disasm reply directly and drives it by its own tag,
-                        // OUTSIDE the pad's thread-scoped message path: it has no thread picker, no
-                        // "viewing thread N" banner, and no way to say which thread it decoded. Honouring a
-                        // selection it cannot display would put one thread's code on screen while the pad
-                        // says you are viewing another — the mismatch relocated, not fixed. It is still
-                        // STAMPED with the thread it read from, so the choice is checkable rather than
-                        // assumed, and a thread-aware disassembly view is ticket 381aabd7.
-                        HandleDisasmCommand(parts, ref ctx, haveCtx, tid);
+                        // The SELECTED thread, like every read below it. 0128a37e pinned this to the
+                        // stopped thread for one reason only: the disassembly window could not say whose
+                        // code it was showing, so honouring a selection would have put one thread's code on
+                        // screen while the pad said you were viewing another — the mismatch relocated, not
+                        // fixed. The window names the thread now (381aabd7) and gates replies on the
+                        // stamped tid, so the reason is gone and the restriction with it.
+                        //
+                        // The view goes in WHOLE. The failure this path invites is a context from one
+                        // thread stamped with another's id, and passing `ref view.Ctx, view.HaveCtx,
+                        // view.Tid` separately is three chances to get that pairing wrong at the one call
+                        // site that matters.
+                        HandleDisasmCommand(parts, view);
                         break;
 
                     case "sym":
