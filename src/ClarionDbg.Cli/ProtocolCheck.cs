@@ -110,11 +110,13 @@ namespace ClarionDbg.Cli
                                   + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
                                   + "test seams REFUSE an attached engine, with OnUserBpForTest also "
                                   + "refusing the --once and interactive engines, while all of them still "
-                                  + "work with no target; and the repeating console diagnostics report once "
-                                  + "per (image, reason) per ENGINE, keyed on the reason CATEGORY and not "
-                                  + "on the message - which interpolates addresses, so keying on it would "
-                                  + "dedup nothing while looking like it worked - with the suppression "
-                                  + "said on the line rather than left to be inferred.");
+                                  + "work with no target, and ArmUserBpForTest refusing a load base that "
+                                  + "disagrees with the module its va resolves to; and the repeating "
+                                  + "console diagnostics report once per (image, reason) per ENGINE, keyed "
+                                  + "on the reason CATEGORY and not on the message - which interpolates "
+                                  + "addresses, so keying on it would dedup nothing while looking like it "
+                                  + "worked - with the suppression said on the line rather than left to "
+                                  + "be inferred.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -516,7 +518,7 @@ namespace ClarionDbg.Cli
             // ---- case 1: THE RULE. A hit-count rule that is not yet satisfied resumes SILENTLY.
             var eng = NewEngine();
             var bp = eng.ArmUserBpForTest(loadBase, va, null, "eq", 99, null);
-            eng.ArmStepSessionForTest(tid, prevVa, tempVa);
+            eng.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             uint rc = 0;
             string log = CaptureConsole(() => { rc = eng.OnUserBpForTest(tid, va); });
 
@@ -553,7 +555,7 @@ namespace ClarionDbg.Cli
             // ---- case 2: PAUSING ROUTE A — a plain breakpoint, which never enters the gate at all.
             var plain = NewEngine();
             plain.ArmUserBpForTest(loadBase, va, null, null, 0, null);
-            plain.ArmStepSessionForTest(tid, prevVa, tempVa);
+            plain.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             string plainLog = CaptureConsole(() => { plain.OnUserBpForTest(tid, va); });
             if (plainLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
                 failures.Add("bp-hit control: a plain breakpoint did not report a hit, so this case never "
@@ -573,7 +575,7 @@ namespace ClarionDbg.Cli
             // CancelStep into the plain-breakpoint branch only would pass case 2 and fail here.
             var gated = NewEngine();
             var gbp = gated.ArmUserBpForTest(loadBase, va, null, "eq", 1, null);   // first hit satisfies =1
-            gated.ArmStepSessionForTest(tid, prevVa, tempVa);
+            gated.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             string gatedLog = CaptureConsole(() => { gated.OnUserBpForTest(tid, va); });
             if (gbp.HitCount != 1 || gatedLog.IndexOf("*** BREAKPOINT HIT ***", StringComparison.Ordinal) < 0)
                 failures.Add("bp-hit control: a hit-count rule of =1 did not pause on its first hit "
@@ -592,7 +594,7 @@ namespace ClarionDbg.Cli
             // target that is not there.
             var trace = NewEngine();
             trace.ArmUserBpForTest(loadBase, va, null, null, 0, "step-in-flight probe");
-            trace.ArmStepSessionForTest(tid, prevVa, tempVa);
+            trace.ArmStepOverSessionForTest(tid, prevVa, tempVa);
             string traceLog = CaptureConsole(() => { trace.OnUserBpForTest(tid, va); });
             if (traceLog.IndexOf("[TRACE] pc001.clw:100: step-in-flight probe", StringComparison.Ordinal) < 0)
                 failures.Add("bp-hit control: the tracepoint never logged — this case did not reach the "
@@ -664,8 +666,8 @@ namespace ClarionDbg.Cli
                             e => e.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
             refusesAttached("ArmUserBpForTest", null,
                             e => e.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null));
-            refusesAttached("ArmStepSessionForTest", null,
-                            e => e.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
+            refusesAttached("ArmStepOverSessionForTest", null,
+                            e => e.ArmStepOverSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000));
             refusesAttached("CancelStepForTest", null, e => e.CancelStepForTest());
             refusesAttached("ArmPrologueBypassForTest", null, e => e.ArmPrologueBypassForTest(0x1000));
             refusesAttached("RegisterThreadedModuleForTest", null,
@@ -695,7 +697,7 @@ namespace ClarionDbg.Cli
             {
                 var ok = NewEngine();
                 ok.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);
-                ok.ArmStepSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000);
+                ok.ArmStepOverSessionForTest(0xFFFFFFF1, 0x00401000, 0x00402000);
                 CaptureConsole(() => ok.OnUserBpForTest(0xFFFFFFF1, 0x00401100));
                 ok.ArmPrologueBypassForTest(0x1000);
                 ok.CancelStepForTest();
@@ -707,6 +709,30 @@ namespace ClarionDbg.Cli
                              + "flag set (" + ex.GetType().Name + ": " + ex.Message + ") — the guard is too "
                              + "broad and every seam-driven check above is now asserting nothing");
             }
+
+            // ---- and ArmUserBpForTest's loadBase must AGREE with the module the va resolves to ----------
+            // The image is registered ONCE. On every arm after the first, ModuleAt(va) already resolved and
+            // the seam dropped `loadBase` on the floor, computing the RVA from the resolved module instead
+            // — so the argument was a decoration on all but the first call, and a case arming two
+            // breakpoints under two different bases was quietly testing one. Rvas is what the un-patch and
+            // re-arm paths work from, so this is not something a caller may be vague about.
+            var lb = NewEngine();
+            lb.ArmUserBpForTest(0x00400000, 0x00401100, null, null, 0, null);   // registers the image
+
+            // CONTROL FIRST: a second arm INSIDE that image, passing the base it was registered under, is
+            // still accepted. Without this the rule below would be met just as well by a seam that had
+            // started refusing every arm after the first.
+            string agrees = SeamOutcome(() => lb.ArmUserBpForTest(0x00400000, 0x00401200, null, null, 0, null));
+            if (agrees == null)
+                failures.Add("seam-loadbase control: a second arm passing the SAME load base was refused — "
+                             + "the agreement check is refusing everything and asserting nothing");
+
+            // THE RULE. Same registered image, a base that contradicts it.
+            string disagrees = SeamOutcome(() => lb.ArmUserBpForTest(0x00500000, 0x00401300, null, null, 0, null));
+            if (disagrees != null)
+                failures.Add("seam-loadbase: ArmUserBpForTest " + disagrees + " when handed a load base that "
+                             + "disagrees with the module its va resolves to — it must refuse, not plant at "
+                             + "an RVA computed from a base its caller never passed");
         }
 
         /// <summary>How a seam call ENDED: null when it refused with InvalidOperationException, otherwise a

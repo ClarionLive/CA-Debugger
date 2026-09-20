@@ -60,7 +60,7 @@ const dtModes = {};
 // editThreadSuffix names the thread an edit will write when the panels are showing a non-stopped thread;
 // this suite has no thread selection, so it returns '' and the pencil keeps its plain tooltip.
 const NEEDED = ['dtParseInt','fieldPart','fmtClarionDate','fmtClarionTime','dtDefault','dtModeFor','dtApply','dtCycle',
-                'clearEditMeta','clearValueMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
+                'clearEditMeta','clearDtMeta','clearValueMeta','setEditMeta','applyNote','viewingOtherThread','editThreadSuffix','wireEdit',
                 'applyValue','showTipFor'];
 const missing = [];
 const src = NEEDED.map(n => {
@@ -306,6 +306,63 @@ console.log('10) clearValueMeta clears BOTH families, so its two callers cannot 
         && v.dataset.dtmode === undefined);
   check('and the tag is out of the row, not just unhooked', siblings(row) === 'vval',
         'siblings=[' + siblings(row) + ']');
+}
+
+// ---- ec45805f item 1: the THIRD clear site, and why it is not just a clearValueMeta call ----
+// dtApply's "this value is not a number after all" branch was clearing the view-as family INLINE - the
+// same three deletes and the same tag removal clearValueMeta does. Three copies of one clear is how
+// 77f84ca5 happened. It cannot simply call clearValueMeta, though: dtApply runs AFTER wireEdit, so that
+// would strip the edit metadata this very reply just set and silently close the write path on a cell the
+// engine said IS writable.
+//
+// Said plainly, because a test name is a claim: this case PASSES against the pre-fix page too. The
+// inline copy had the same behaviour - duplication was the defect, not a wrong answer. What it pins is
+// the constraint that shaped the fix, so the next person to "simplify" dtApply into a clearValueMeta
+// call gets a failure instead of a silently unwritable cell. Section 12 is the one that discriminates.
+console.log('11) dtApply clears the view-as half ONLY, leaving the pencil this reply just wired');
+{
+  const row = makeRow('CUS:BALANCE');
+  applyValue('CUS:BALANCE', true, '4711', 'LONG', true, { va: '0x9012A0', typeCode: '0x11', size: 4, places: 0 });
+  const v = row.querySelector('.vval');
+  check('precondition: both families present', !!v.dataset.va && !!v._vas && v.dataset.raw === '4711',
+        'va=' + v.dataset.va + ' raw=' + v.dataset.raw);
+
+  // The next stop answers the same row with something that does not parse as a number.
+  dtApply(v, 'CUS:BALANCE', '<unreadable>');
+
+  check('view-as family cleared', !v._vas && v.dataset.raw === undefined
+        && v.dataset.dtname === undefined && v.dataset.dtmode === undefined,
+        'raw=' + v.dataset.raw + ' mode=' + v.dataset.dtmode);
+  // The .vas tag goes; the pencil STAYS. Section 10's clearValueMeta case leaves 'vval' alone precisely
+  // because it takes both halves - the difference between these two sibling lists IS the decomposition.
+  check('the stale cycle tag is out of the row, so dtCycle cannot resurrect 4711',
+        !siblings(row).split(',').includes('vas'), 'siblings=[' + siblings(row) + ']');
+  check('...while the pencil stays in the row beside it',
+        siblings(row).split(',').includes('vedit-btn'), 'siblings=[' + siblings(row) + ']');
+  // THE POINT. clearValueMeta here would have wiped all four of these.
+  check('edit family UNTOUCHED: the address survives', v.dataset.va === '0x9012A0', v.dataset.va);
+  check('...and the type, size and places with it',
+        String(v.dataset.tc) === '0x11' && String(v.dataset.sz) === '4' && String(v.dataset.pl) === '0',
+        'tc=' + v.dataset.tc + ' sz=' + v.dataset.sz + ' pl=' + v.dataset.pl);
+  check('...and the cell is still marked editable', v.classList.contains('editable'), v.className);
+  check('...and the pencil is still on the cell', !!v._vedit);
+}
+
+// The three clears are ONE implementation each. A future inline copy is the defect returning, and it
+// would not fail any behavioural case above - only this.
+console.log('12) no site re-implements the view-as clear inline');
+{
+  const page = require('fs').readFileSync(require('./pad-dom').resolvePage(process.argv.slice(2).find(a => !a.startsWith('--'))), 'utf8');
+  const inline = (page.match(/delete\s+\w+\.dataset\.dtmode/g) || []).length;
+  check('dataset.dtmode is deleted in exactly one place (clearDtMeta)', inline === 1,
+        inline + ' site(s)');
+  const dt = require('./pad-dom').extract(page, 'dtApply');
+  check('dtApply delegates its null branch', /clearDtMeta\(/.test(dt) && !/delete\s+cell\.dataset\.dtmode/.test(dt),
+        dt.replace(/\s+/g, ' ').slice(0, 100));
+  const cvm = require('./pad-dom').extract(page, 'clearValueMeta');
+  check('clearValueMeta is composed of the two halves, not a third copy',
+        /clearEditMeta\(/.test(cvm) && /clearDtMeta\(/.test(cvm) && !/delete\s+cell\.dataset/.test(cvm),
+        cvm.replace(/\s+/g, ' '));
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');

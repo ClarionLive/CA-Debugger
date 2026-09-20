@@ -1083,6 +1083,39 @@ CheckWhy 'a pad-sent tid on a WRITE must equal the selected thread, or the write
 $svcSelect = Get-Method 'public bool SelectThread(uint tid)'
 CheckWhy 'the host refuses to forward a 0 as a thread selection' ($svcSelect -match 'tid\s*>\s*0') `
   'SelectThread would now send `thread 0` - the engine refuses it, but the host stopped holding its own half of the rule'
+Write-Host ''
+Write-Host 'a member with NO value at all is decided by the loop, and the loop always ends'
+# ec45805f item 4. A "did the value scan advance?" guard used to sit between ReadValue and the malformed
+# check: `if (i <= before && i >= json.Length) return null;`. It could not fire - ReadValue sets i = -1
+# when i is already at or past the end, so `i >= json.Length` needs a scan that advanced to exactly the
+# end, which contradicts `i <= before`. Verified as well as reasoned: the shipped reader was compiled
+# twice, once with that line instrumented and once with it removed, and fuzzed over 1.8M calls; the guard
+# never fired and the two builds never disagreed. It is gone.
+#
+# What was NOT covered here is the input that made it look necessary: a member whose value is empty, so
+# the number scan stops where it started. These pin the cases the removed line appeared to be about -
+# the answer, and that the loop TERMINATES rather than spinning on a value that never advances.
+Check 'an empty value reads as absent, and the members after it still read' `
+  (($null -eq (Read1 '{"a":,"b":1}' 'a')) -and ((Read1 '{"a":,"b":1}' 'b') -eq '1')) `
+  ("a=" + (Read1 '{"a":,"b":1}' 'a') + " b=" + (Read1 '{"a":,"b":1}' 'b'))
+Check 'an empty value as the LAST member reads as absent' ($null -eq (Read1 '{"a":}' 'a')) ''
+Check 'a stray closing bracket where a value belongs stops the walk' ($null -eq (Read1 '{"a":]}' 'b')) ''
+Check 'whitespace where a value belongs is still no value' ($null -eq (Read1 '{"a": ,"b":2}' 'a')) ''
+Check '...and the member after THAT one is still found' ((Read1 '{"a": ,"b":2}' 'b') -eq '2') (Read1 '{"a": ,"b":2}' 'b')
+# The removed guard's only plausible job was ending a loop that cannot advance, so termination is the
+# part worth sweeping. Every shape here asks for a key that is NOT present, which is the case that walks
+# the whole object instead of returning at the first match.
+#
+# STATED PLAINLY: this detects a walk that ends in the wrong PLACE, not one that never ends. A reader
+# that truly spins hangs this suite rather than failing it - and hangs the WebView message pump in the
+# product, which is worse. A bounded join was tried and is not worth its machinery here: PowerShell
+# cannot hand a script block to a foreign thread with no runspace, and the four checks above already
+# return from the value-less shapes that could reach the loop at all.
+$sweep = @('{"a":,"b":1}', '{"a":}', '{"a":]}', '{"a": }', '{"a":,}', '{"a":,,}', '{"a":', '{"a":-}')
+$walked = 0
+foreach ($s in $sweep) { [void](Read1 $s 'zzz'); $walked++ }
+Check "every value-less shape finishes its walk and reports absence ($walked shapes)" `
+  (($walked -eq $sweep.Count) -and -not ($sweep | Where-Object { $null -ne (Read1 $_ 'zzz') })) ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

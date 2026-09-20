@@ -1049,7 +1049,10 @@
   });
   $('miBpEntry').onclick=()=>{ $('procMenu').classList.remove('show');
     if(!procCtx||!procCtx.module||!procCtx.line||isNaN(procCtx.line)) return;
-    // module+line FIRST so the host's minimal JSON parser reads them before the (untrusted) proc name
+    // Field order here is free. This used to read "module+line FIRST so the host's minimal JSON parser
+    // reads them before the (untrusted) proc name" — a real constraint of the IndexOf scanner that
+    // ae5b678a stage 1 retired. The host now reads by key (JsonVal -> JsonMessageReader.ReadField), which
+    // walks the object and matches only top-level members, so no field can be reached past another.
     send('breakonprocentry', JSON.stringify({ module:procCtx.module, line:procCtx.line, name:procCtx.name })); };
   function removeWatch(name){ const k=watchedKey(name);
     // saveWatches() on removal too, or a name you deleted comes back at the next startup. With no target
@@ -1141,11 +1144,23 @@
   //
   // The correct clearing existed, but only inline inside invalidateThreadScopedState, which is how the two
   // sites came to clear different SUBSETS of the same state. One function owns it now; that is the fix.
+  //
+  // The DATE/TIME half is its OWN function for the same reason, one ticket later (ec45805f item 1): a
+  // THIRD site was clearing it inline — dtApply's "this is not a number after all" branch — and it cannot
+  // just call clearValueMeta, because dtApply runs AFTER wireEdit and that would strip the edit metadata
+  // the pencil was just given. So the split is by FAMILY, and each caller takes the half it means:
+  //   clearEditMeta  — the write path only          (selectThread: close it, disturb nothing on screen)
+  //   clearDtMeta    — the view-as tag only         (dtApply: this cell holds no number to view)
+  //   clearValueMeta — both, for a reused cell      (everyone else)
+  function clearDtMeta(cell){
+    if(!cell) return;
+    if(cell._vas){ cell._vas.remove(); cell._vas=null; }
+    delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode;
+  }
   function clearValueMeta(cell){
     if(!cell) return;
     clearEditMeta(cell);
-    if(cell._vas){ cell._vas.remove(); cell._vas=null; }
-    delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode;
+    clearDtMeta(cell);
   }
   // A REAL value that carries a caveat — a THREADed name with no instance on the thread being read, or one
   // this thread hasn't used yet. ONE function for it, because the Watch panel and the Variables tree are
@@ -1250,10 +1265,13 @@
       if(finished) return; finished=true; cell._editing=false;
       if(activeEdit && activeEdit.cell===cell) activeEdit=null;
       cell.textContent=old;                 // restore now; a successful write repaints via the 'varset' reply
-      // tid BEFORE value: the host's minimal JSON reader takes the FIRST "key": it finds anywhere in the
-      // text, and `value` is the one field here the user typed — it could otherwise carry its own "tid".
       // The tid names the thread this address was read on, so the engine can refuse a write whose thread
       // is no longer the selected one instead of writing another thread's memory.
+      // It used to be ordered BEFORE `value` because the host's scanner took the first `"key":` it found
+      // anywhere in the text, so a user-typed value containing "tid" could impersonate this field. That
+      // reader is gone (ae5b678a stage 1): JsonMessageReader tracks string state and matches only
+      // top-level members, so a "tid" inside a string value is text. Order is not carrying the rule here
+      // and must not be mistaken for it — the guarantee is the reader's, and it holds whatever the order.
       if(commit){
         send('editvar', JSON.stringify({va:meta.va, typeCode:meta.typeCode, size:meta.size,
                                         places:meta.places, tid:(selTid==null?null:selTid), value:inp.value}));
@@ -1324,7 +1342,9 @@
   function dtApply(cell, name, rawText){
     if(!cell) return;
     const n=dtParseInt(rawText!=null?rawText:cell.dataset.raw!=null?cell.dataset.raw:cell.textContent);
-    if(n===null){ if(cell._vas){ cell._vas.remove(); cell._vas=null; } delete cell.dataset.raw; delete cell.dataset.dtname; delete cell.dataset.dtmode; return; }
+    // Not a number: drop the view-as half and leave the edit half alone. NOT clearValueMeta — dtApply runs
+    // after wireEdit, so that would strip the pencil's metadata this reply has just set.
+    if(n===null){ clearDtMeta(cell); return; }
     cell.dataset.raw=String(n); cell.dataset.dtname=name||'';
     const mode=dtModeFor(name, n); cell.dataset.dtmode=mode;
     cell.textContent = mode==='date'?fmtClarionDate(n) : mode==='time'?fmtClarionTime(n) : String(n);
@@ -1813,7 +1833,9 @@
   //      and committing an edit against it would write another thread's memory
   //   4. the DATE/TIME view tag (.vas), whose own title carries the old thread's raw value
   //   5. the `values` cache — read by the hover data-tip long after the reply, including over a SOURCE
-  //      identifier where there is no row to look at, and by the tip's Copy Value action
+  //      identifier where there is no row to look at, and by the tip's Copy Value action.
+  //      A thread switch is not its only boundary: resetThreadState clears it at a resume and at a new
+  //      stop too, because those end a value's validity just as completely (ec45805f item 13).
   //   6. any OPEN Watch .wdetail panel, which keeps showing whatever it was last given
   function invalidateThreadScopedState(gen){
     values.clear();                                                                     // (5)
@@ -1880,6 +1902,20 @@
   // stop, even if the inventory request that follows fails or is overtaken; the inventory only ever adds
   // to it (the Clarion thread number, the procedure), never contradicts it.
   function resetThreadState(stoppedTid){
+    // The `values` cache is entry (5) in invalidateThreadScopedState's list, and a thread switch was the
+    // ONLY thing clearing it. A resume and a new stop end the validity of every cached value just as
+    // completely, and this function owns both — so the cache outlived the episode it belonged to
+    // (ec45805f item 13). Cleared here for the same reason the engine drops its .cwtls cache at the same
+    // boundary.
+    //
+    // It matters because not every reader of this cache is a visible cell that a new reply would repaint.
+    // Its six readers: the hover tip's value, type and engine note; the tip's Copy Value button (which
+    // copies what the tip resolved); an expanded Watch .wdetail panel, which reads the cache when it is
+    // opened; and — the one with no row behind it at all — the tip over a SOURCE identifier, where
+    // `known.value` is the only value there has ever been. That last one presented the PREVIOUS stop's
+    // number as this stop's, for a name the engine never answered this time, with nothing on screen to
+    // contradict it.
+    values.clear();
     threadRows=[]; stopTid=null; selTid=null; threadSwitching=false; stackPendingTid=null;
     switchGen++;                 // invalidates any armed sweep
     if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
@@ -2136,12 +2172,20 @@
   // Session teardown ('clear'): no stop at all, so the header goes back to its idle prompt. The only other
   // writer of curFile/curLine is buildSource, and this one only ever CLEARS them, so the two cannot
   // disagree about which file the page is showing.
-  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent='No source — pause to show the current location.'; curFile=null; curLine=0; }
-  // The one place the current location is written, so the pause event and the source reply cannot say
-  // it two different ways. `line` is optional: the gutter in the snippet below also shows it, but the
-  // snippet can be absent (paused where the pad has no source file) or its section collapsed, and this
-  // header is neither.
-  function setSrcHeader(file, proc, line){
+  // The header's idle prompt: what the markup ships with, and what a teardown must put back. One home for
+  // it, because it is written in two places — the static #srchdrText above and clearSrc below — and a
+  // reword in one of them would leave a session that has been torn down looking different from one that
+  // never started. tools/test-pad-source.js checks the markup still agrees with this.
+  const SRC_IDLE_TEXT='No source — pause to show the current location.';
+  function clearSrc(){ $('src').innerHTML=''; $('srchdrText').textContent=SRC_IDLE_TEXT; curFile=null; curLine=0; }
+  // The one place a LOCATION is written into the header, so the pause event and the source reply cannot
+  // say it two different ways. Named for that rather than for the element: clearSrc writes #srchdrText
+  // too, and the reviewer's judgement (ec45805f item 8), which stands, is that its idle prompt is not a
+  // location and composing it out of (file, proc, line) would be worse than the second write. So this owns
+  // the location wording and clearSrc owns the empty state, and neither is the element's only writer.
+  // `line` is optional: the gutter in the snippet below also shows it, but the snippet can be absent
+  // (paused where the pad has no source file) or its section collapsed, and this header is neither.
+  function setSrcLocation(file, proc, line){
     $('srchdrText').innerHTML='▣ <span class="file">'+esc(file||'?')+'</span>'
       +(line?':<span class="ln">'+esc(String(line))+'</span>':'')
       +(proc?' — '+esc(proc):'');
@@ -2153,7 +2197,7 @@
   // load-bearing, because run-to-cursor is sent as curFile+':'+line, so the stale one armed a breakpoint in
   // a file the user was no longer stopped in.
   function buildSource(file, proc, startLine, lines, current){
-    setSrcHeader(file, proc, current);
+    setSrcLocation(file, proc, current);
     const src=$('src'); src.innerHTML='';
     if(!lines || !lines.length){
       // No listing => no file to act on. Everything keyed off curFile (run-to-cursor, the source
@@ -2274,7 +2318,7 @@
         // follow: pause somewhere the pad has no source file for and this is the only statement of the
         // location there is. The 'source' case below overwrites it with the same shape once the snippet
         // arrives, so the two never read differently.
-        setSrcHeader(m.module, m.proc, m.line);
+        setSrcLocation(m.module, m.proc, m.line);
         // A new stop is a new thread world: the engine has re-picked the stopped thread and dropped any
         // selection. Forget last stop's tids FIRST — a leftover selTid would drop every reply this stop
         // is about to push — then adopt the thread this stop is ON, when the event names it. The host
