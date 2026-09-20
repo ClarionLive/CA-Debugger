@@ -1313,6 +1313,35 @@ Check 'CONTROL: the idiom scan matches it in code' `
 # which is precisely the two hits the raw scan produced.
 Check 'CONTROL: ...and does NOT match it in a comment' `
   ([regex]::Matches((Get-CSharpCodeOnly '// not `tid ?? _selTid` here'), '\?\?\s*_selTid\b').Count -eq 0) ''
+
+# ---- an empty WinTag reply releases the painted flag, BEFORE it erases what that flag described ------
+#
+# THIS PINS THE SHAPE, NOT THE BEHAVIOUR, and that limit is the point of the comment rather than an
+# apology for it. The behavioural seam three gates asked for is NOT CONSTRUCTIBLE today: these are
+# instance methods on a WinForms Control and three of them wrap their whole body in UI(...), which returns
+# immediately without a created handle, so the code under test never runs. Owen2 established that rather
+# than estimating it; it is blocked on ticket 8f352618.
+# WHEN 8f352618 LANDS, REPLACE THIS CHECK - do not keep both. Two checks on one mechanism, one structural
+# and one behavioural, is how a suite starts disagreeing with itself about what it is guarding.
+#
+# THE DEFECT: thread A painted, a seat for B comes back EMPTY. The screen is about to be erased by the
+# cache replacement, so a _seatedTid still naming A outlives the paint it described - the banner claims A
+# while nothing is on screen, and the already-painted guard then refuses to reseat A.
+# POSITION, not text. The clear being PRESENT but moved AFTER the cache replacement is exactly the
+# regression, and a `-match '_seatedTid = 0'` would pass against it happily.
+$winCode = Get-CSharpCodeOnly $onDisasm
+$winAt = $winCode.IndexOf('if (kind == WinTag)')
+$emptyArm = if ($winAt -ge 0) { $winCode.Substring($winAt) } else { '' }
+$clearAt = $emptyArm.IndexOf('_seatedTid = 0;')
+$replaceAt = $emptyArm.IndexOf('_instrs = SortedUnique(instrs);')
+Check 'the empty WinTag branch releases the painted flag' ($clearAt -ge 0) `
+  $(if ($clearAt -ge 0) { '' } else { 'no _seatedTid clear in the WinTag handling' })
+# CONTROL: the anchor this is measured against must itself be found, or "before" compares against -1 and
+# passes for free.
+Check 'CONTROL: the cache replacement is located, so BEFORE means something' ($replaceAt -ge 0) `
+  $(if ($replaceAt -ge 0) { '' } else { 'SortedUnique replacement not found' })
+Check '...and it is ordered BEFORE the replacement that erases what it described' `
+  ($clearAt -ge 0 -and $replaceAt -ge 0 -and $clearAt -lt $replaceAt) "clear@$clearAt replace@$replaceAt"
 # INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
 # simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
 # which the cross-model adversary reported as HIGH: that is not an absence of information, it is
@@ -1355,7 +1384,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 222
+$EXPECTED_CHECKS = 225
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
