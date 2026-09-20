@@ -415,10 +415,13 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
 $EXPECTED_CHECKS = 56
-$ran = $script:checks
 Assert-CheckTotal $EXPECTED_CHECKS
 
+# $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean
+# run printed "ALL 56 CHECKS PASSED" while 57 had run - the assertion does not count itself for the
+# COMPARISON, but it is still a check, and it is still reported. A suite whose subject is silently missing
+# checks should not mis-state its own count by one.
 Write-Host ''
-if ($script:failures) { Write-Host "$($script:failures) of $ran CHECKS FAILED"; exit 1 }
-Write-Host "ALL $ran CHECKS PASSED"
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+Write-Host "ALL $($script:checks) CHECKS PASSED"
 exit 0
