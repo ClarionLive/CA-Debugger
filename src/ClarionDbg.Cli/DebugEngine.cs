@@ -784,7 +784,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
-                        HandleExpandCommand(parts);
+                        HandleExpandCommand(parts, view.Tid);
                         break;
 
                     case "framelocals":   // locals of one call-stack frame (Call-Stack-driven Variables)

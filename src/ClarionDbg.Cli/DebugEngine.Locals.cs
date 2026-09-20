@@ -392,12 +392,12 @@ namespace ClarionDbg.Cli
         /// TSWD and render that group's members read live at the dereferenced address. Emits an `expanded`
         /// event keyed by the host's reqId. Read-only — no target code runs.
         ///
-        /// KNOWN GAP, deliberately not guessed at: the command carries only reqId/module/typeRef/addr, so the
-        /// engine cannot tell whether that address came from a row whose edit pencil was vetoed (a shared
-        /// .cwtls template). Expanding such a row therefore still yields editable members. Closing it needs
-        /// the HOST to pass the flag it already has, which is a protocol change rather than an engine fix —
-        /// raised with the PM rather than decided here. The inline paths above, which DO know, are fixed.</summary>
-        private void HandleExpandCommand(string[] parts)
+        /// The edit veto is DERIVED here rather than carried in the command. The row the host is expanding
+        /// may be a shared .cwtls template — a ,THREAD symbol the selected thread has no instance of — and
+        /// its members sit at template+offset, so they must not offer a pencil either. Deriving it costs one
+        /// (usually cached) resolve per expand and cannot be forgotten by a caller; being TOLD would need a
+        /// protocol change and a host that never omits the flag.</summary>
+        private void HandleExpandCommand(string[] parts, uint tid)
         {
             // expand <reqId> <module> <typeRef(dec)> <addr(hex)>
             if (parts.Length < 5) { EmitError("expand expects: expand reqId module typeRef addr"); return; }
@@ -410,11 +410,92 @@ namespace ClarionDbg.Cli
             {
                 var t = m.Dbg.ResolveType(typeRef);
                 var g = (t != null && t.Kind == TypeKind.Group) ? t : GroupTypeOf(t);
-                if (g != null) rows.Add(GroupChildrenJson(g, addr, parts[2]));
+                if (g != null) rows.Add(ExpandChildrenJson(g, addr, parts[2], tid));
             }
             if (EmitJson)
                 Console.WriteLine("@JSON {\"event\":\"expanded\",\"reqId\":" + Json.Str(reqId)
                     + ",\"items\":[" + string.Join("", rows) + "]}");
+        }
+
+        /// <summary>Render an expanded node's members, vetoing their edit pencils when the address being
+        /// expanded is not data the selected thread may be offered a write to. Split out of
+        /// <see cref="HandleExpandCommand"/> only so `protocolcheck` can assert the derive-and-render pair
+        /// it shares; the TSWD type lookup above is the part a no-target check cannot reach.</summary>
+        private string ExpandChildrenJson(ClarionType g, uint addr, string module, uint tid)
+        {
+            string note;
+            bool editable = ExpandEditAllowed(g, addr, tid, out note);
+            return GroupChildrenJson(g, addr, module, editable, note);
+        }
+
+        /// <summary>May the members of the group at <paramref name="addr"/> carry edit metadata?
+        ///
+        /// The DECISION is <c>ThreadedWriteAllowed</c> itself — the shipped write guard, not a restatement
+        /// of its rules. The pencil's only promise is that a write will be accepted, so the two have to
+        /// answer the same question or the affordance lies again in a new place. It is asked over the
+        /// group's whole span, because one flag covers every member: if any member's byte would be refused,
+        /// none of them may be offered. A group with no known size is asked about its first byte.
+        ///
+        /// The NOTE is worded for a row rather than for a rejected write, in the same vocabulary the
+        /// moduledata path already puts on the parent — the tree can be scrolled anywhere, so a member row
+        /// read on its own still has to say why it cannot be edited.</summary>
+        private bool ExpandEditAllowed(ClarionType g, uint addr, uint tid, out string note)
+        {
+            note = null;
+            int span = (g != null && g.Size > 0 && g.Size <= int.MaxValue) ? (int)g.Size : 1;
+            string ignored;
+            if (ThreadedWriteAllowed(addr, span, tid, out ignored)) return true;
+
+            // Refused. Say which of the two refusals it was, in row vocabulary. The template address is the
+            // overwhelmingly common one and the only one worth a resolve to describe precisely: "no instance
+            // at all" and "an instance exists, but this is not it" read differently to someone looking at a
+            // value and wondering why it is greyed out.
+            foreach (var m in _modules)
+            {
+                if (m == null || m.LoadBase == 0 || m.CwtlsHi <= m.CwtlsLo) continue;
+                uint tmplLo = m.LoadBase + m.CwtlsLo, tmplHi = m.LoadBase + m.CwtlsHi;
+                if (addr < tmplLo || addr >= tmplHi) continue;
+                note = ThreadedTemplateNote(m, addr, tid);
+                return false;
+            }
+            note = "another thread's data — thread " + tid + " is selected";
+            return false;
+        }
+
+        /// <summary>The row-vocabulary explanation for an address inside <paramref name="m"/>'s shared
+        /// .cwtls template, mirroring the wording HandleModuleDataCommand puts on the parent row.</summary>
+        private string ThreadedTemplateNote(LoadedModule m, uint addr, uint tid)
+        {
+            const string noInstance = "no thread instance — shared template value";
+            if (!m.HasThreadedData) return noInstance;
+            IntPtr h = OpenThreadForContext(tid);
+            if (h == IntPtr.Zero) return noInstance;
+            try
+            {
+                uint instanceVa; string reason;
+                switch (TryResolveThreadedInstance(m, addr, tid, h, out instanceVa, out reason))
+                {
+                    case ThreadedResolve.Ok:
+                        // The thread HAS a copy — this address is simply the template it was made from.
+                        return "shared " + m.Name + " template — thread " + tid + "'s own copy is at 0x"
+                               + instanceVa.ToString("X");
+                    case ThreadedResolve.Unallocated:
+                        return "not yet used on this thread — initial value";
+                    default:
+                        return reason ?? noInstance;
+                }
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        /// <summary>Test seam for `protocolcheck`: derive the expand veto and render the members through the
+        /// REAL <see cref="ExpandChildrenJson"/>, so the expand path is asserted against the shipped code
+        /// rather than a copy of its rules. Read-only, and needs no live process: whether a row carries a
+        /// `va` never depends on the value read. Covers everything HandleExpandCommand does EXCEPT the TSWD
+        /// type lookup, which needs a loaded image's debug info.</summary>
+        internal string ExpandChildrenForTest(ClarionType g, uint addr, string module, uint tid)
+        {
+            return ExpandChildrenJson(g, addr, module, tid);
         }
 
         private static uint ParseHexU(string s)
