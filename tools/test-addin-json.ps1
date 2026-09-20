@@ -24,6 +24,11 @@ param(
   [string] $EngineJsonPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\Json.cs'),
   [string] $EnginePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.cs'),
   [string] $EngineBpPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Breakpoints.cs'),
+  # the two commands that carry a thread id from the PAD back toward the engine. The direction-of-flow
+  # checks at the end of this file read them, because the safety of the tid writers' divergence is a claim
+  # about which side may ORIGINATE a thread id, and that is decided in these two methods.
+  [string] $EngineThreadsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Threads.cs'),
+  [string] $EngineVarEditPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.VarEdit.cs'),
   # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
@@ -42,6 +47,8 @@ $web = Get-Content -Raw -LiteralPath $WebViewPath
 $engine = Get-Content -Raw -LiteralPath $EngineJsonPath
 $engineSrc = Get-Content -Raw -LiteralPath $EnginePath
 $bpSrc = Get-Content -Raw -LiteralPath $EngineBpPath
+$engineThreadsSrc = Get-Content -Raw -LiteralPath $EngineThreadsPath
+$engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 
 function Get-Method {
@@ -797,6 +804,92 @@ $doc = $doc.Substring([Math]::Max(0, $doc.Length - 1600))
 Check 'its doc comment no longer instructs new payloads to order their fields' `
   ($doc -notmatch 'must do the same' -and $doc -notmatch 'goes LAST') ''
 Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
+
+Write-Host ''
+Write-Host 'the two tid writers disagree about one value, and this is the direction of flow that makes it safe'
+#
+# TICKET 3b043dfc, HOLE 3. The engine's writer treats uint.MaxValue as UNKNOWN - it is the (uint)-1 an int
+# cast produces, and the protocol names -1 forbidden - and omits the member. The add-in's TidJson does not:
+# it writes a high DWORD whole, which the check above asserts and which still passes. Two writers on one
+# wire holding two different rules.
+#
+# THE QUESTION IS NOT "WHICH VALUE IS RIGHT". It is WHICH SIDE MAY ORIGINATE A THREAD ID, because that is
+# what decides whether the permissive writer is ever the one a bad value meets first. The answer, read off
+# the code below rather than asserted:
+#
+#   THE ENGINE IS THE SOLE ORIGINATOR. Every thread id in this system came out of a Win32 debug event the
+#   engine received. The host and the page only ever ECHO one back: the page sends `selectthread` with a
+#   tid it took from a row the engine sent, and `setval` with the tid the row was read on.
+#
+#   AND BOTH ECHO PATHS FAIL CLOSED AT THE ENGINE. `thread <tid>` is refused unless the tid is in the
+#   engine's own live thread set, and `setval`'s trailing tid must equal the selected one or the write is
+#   refused rather than applied to another thread's memory. So a tid the page invents cannot become a
+#   selection and cannot steer a write - it can only produce a refusal.
+#
+# THE DIVERGENCE IS THEREFORE SAFE TODAY, and safe for a reason that is CHECKABLE rather than a fact about
+# nobody having written the feature yet: TidJson can only be handed a tid that arrived from the engine, and
+# the engine cannot emit uint.MaxValue. The load-bearing assertion is that second clause, so it is the one
+# made here, against the engine's own predicate. If TidIsKnown ever stops rejecting uint.MaxValue, the
+# add-in's permissiveness becomes live on the same day, and this fails on that day rather than later.
+#
+# THE DECISION, stated so the next person does not have to re-derive it: the add-in writer SHOULD adopt the
+# engine's rule and treat uint.MaxValue as unknown too. Not because a 0xFFFFFFFF thread id is likely, but
+# because the alternative makes one writer's correctness depend on a property of the OTHER side plus the
+# absence of a feature - which is the exact "safe by construction, not by guard" shape this ticket exists
+# to remove, and leaving it in place while fixing the engine's version of it would be inconsistent. It is
+# one clause in TidJson. It is NOT made here because ClarionDebuggerWebView.cs belongs to another helper
+# this wave; it is recorded on 3b043dfc for them, and the assertions below pin the current state exactly so
+# the change shows up as a deliberate edit to this file rather than a silent drift.
+#
+# IF YOU ARE ADDING A PAD-ORIGINATED TID PATH - a tid typed into a box, restored from a saved session,
+# computed from an int that could go negative - THE RULES INVERT AND THIS SECTION IS THE ASSUMPTION YOU
+# ARE BREAKING. The add-in becomes the writer on the permissive side of a boundary it was never told it
+# was on. Make TidJson adopt the rule first.
+
+# Check prints its Detail on a PASS as well as a FAIL, so a consequence spelled out as Detail would read
+# like something that HAD happened. These consequences are worth spelling out, so they are attached only
+# when the check is actually failing.
+function CheckWhy {
+  param([string] $Label, [bool] $Ok, [string] $Why)
+  Check $Label $Ok $(if ($Ok) { '' } else { $Why })
+}
+
+$tidIsKnown = Get-CSharpStatement 'private static bool TidIsKnown(uint tid)' $engineSrc
+Check 'the engine still has one predicate deciding whether a tid is known' ($null -ne $tidIsKnown) ''
+# The precondition the divergence rests on. Read as text because TidIsKnown is not reachable from here,
+# and named rather than pattern-guessed so a rewrite that drops the clause cannot pass by looking similar.
+CheckWhy 'THE PRECONDITION: the engine cannot originate uint.MaxValue, so TidJson never meets one' `
+  ($null -ne $tidIsKnown -and $tidIsKnown -match 'uint\.MaxValue') `
+  'TidIsKnown no longer rejects uint.MaxValue - the add-in writer is NOW the permissive side of a live boundary and must adopt the rule (3b043dfc hole 3)'
+CheckWhy 'and it still rejects 0, which is the half both writers already agree on' `
+  ($null -ne $tidIsKnown -and $tidIsKnown -match 'tid\s*!=\s*0') `
+  'the engine writer no longer treats 0 as unknown - the rule the whole protocol rests on is gone'
+
+# The divergence itself, pinned. This asserts CURRENT behaviour on purpose: it is the "documented" half of
+# the decision above, and it names its own successor so nobody reads it as approval.
+CheckWhy 'the divergence, stated: TidJson writes uint.MaxValue whole where the engine would omit it' `
+  ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') `
+  'TidJson has adopted the engine rule - good; delete this check and update the note above, on 3b043dfc'
+CheckWhy 'the two writers DO agree on 0, so this is a one-value divergence and not two rules' `
+  ([PadJsonProbe]::TidJson(0) -eq '') `
+  'TidJson now writes a 0 - the page would read it as a real thread and start dropping good replies'
+
+# The echo paths, fail-closed, read off the engine. These are what make "the engine is the sole
+# originator" a property of the code rather than a description of current habits.
+$selCmd = Get-CSharpBlock 'private void HandleThreadSelectCommand(' $engineThreadsSrc
+Check 'the engine still owns thread selection' ($null -ne $selCmd) ''
+CheckWhy 'a pad-sent tid must be one the ENGINE knows is live, or the selection is refused' `
+  ($null -ne $selCmd -and $selCmd -match '_threads\.Contains\(\s*tid\s*\)') `
+  'HandleThreadSelectCommand no longer validates against the engine live thread set - the page can now name a thread the engine never offered, so it ORIGINATES one'
+$setVal = Get-CSharpBlock 'private void HandleSetValCommand(' $engineVarEditSrc
+Check 'the engine still owns the edit-write thread check' ($null -ne $setVal) ''
+CheckWhy 'a pad-sent tid on a WRITE must equal the selected thread, or the write is refused' `
+  ($null -ne $setVal -and $setVal -match 'wantTid\s*!=\s*selectedTid') `
+  'HandleSetValCommand no longer compares the requested thread with the selected one - a stale edit could write another thread''s memory in the user''s own program'
+# And the host's own send-side gate, so "echo only" is not resting on the engine alone.
+$svcSelect = Get-Method 'public bool SelectThread(uint tid)'
+CheckWhy 'the host refuses to forward a 0 as a thread selection' ($svcSelect -match 'tid\s*>\s*0') `
+  'SelectThread would now send `thread 0` - the engine refuses it, but the host stopped holding its own half of the rule'
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
