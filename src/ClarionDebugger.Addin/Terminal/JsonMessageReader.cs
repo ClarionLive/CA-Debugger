@@ -68,9 +68,16 @@ namespace ClarionDebugger.Terminal
                 // The value is walked either way. Skipping it properly is what stops the NEXT member's name
                 // being read out of the middle of this one's text.
                 bool wanted = string.Equals(name, key, StringComparison.Ordinal);
-                int before = i;
                 string value = ReadValue(json, ref i, wanted);
-                if (i <= before && i >= json.Length) return null;
+                // A "did the scan advance?" guard used to sit here — `if (i <= before && i >= json.Length)
+                // return null;` — and it could not fire. ReadValue's first statement sets i = -1 whenever i
+                // is ALREADY at or past the end, so `i >= json.Length` can hold only when the scan advanced
+                // to exactly the end, which contradicts `i <= before`. A value that genuinely does not
+                // advance (`{"a":,"b":1}`) leaves i below the end, and the ','/'}'/return-null cases at the
+                // top of this loop decide it — they also guarantee termination, which is what the guard
+                // looked like it was there for. Removed rather than kept unverified: by house rule 3 a
+                // guard no case can isolate is not a guard. See the empty-value checks in
+                // tools/test-addin-json.ps1 for the shapes that used to reach it.
                 if (i < 0) return null;             // malformed value; nothing after it can be trusted
                 if (wanted) return value;
             }
