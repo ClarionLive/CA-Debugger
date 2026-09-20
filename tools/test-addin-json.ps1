@@ -36,6 +36,11 @@ param(
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
   # the disassembly view: its request tags carry the epoch that decides whether a reply is still wanted
   [string] $DisasmViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
+  # the owning image, whose one field the cut-down stub near the top of this file claims to match. A
+  # PARAMETER like every other source this suite reads (Quinn-2's own finding on his wave-2 code): it was
+  # a Join-Path buried at the call site, which works in place and crashes the moment the suite is run from
+  # a copy in another directory - which is how he hit it while shadow-testing a handover.
+  [string] $LoadedModulePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\LoadedModule.cs'),
   # the captured host output tools/test-pad-source.js drives the page with. Regenerate with the switch below
   # after a deliberate change to SendSource; the checks at the end of this file fail while it is stale.
   [string] $HostSourceFixture = (Join-Path $PSScriptRoot 'fixtures\host-source-messages.json'),
@@ -774,8 +779,16 @@ Check 'a key name that is a prefix of another is not confused with it' `
   ((Read1 '{"lineNumber":9,"line":42}' 'line') -eq '42') (Read1 '{"lineNumber":9,"line":42}' 'line')
 Check 'whitespace and newlines around members' `
   ((Read1 "{ `"line`" : 42 ,`n `"name`" : `"x`" }" 'line') -eq '42') ''
-# old JsonVal returned 'au0042c' - it appended the escape letter and then the digits verbatim
-Check 'a \u escape is decoded' ((Read1 '{"name":"aBc"}' 'name') -eq 'aBc') (Read1 '{"name":"aBc"}' 'name')
+# old JsonVal returned 'au0042c' - it appended the escape letter and then the digits verbatim.
+# AND THAT STRING IS THE CLUE TO HOW THIS CHECK WENT VACUOUS. Until 2026-09-20 the input here held a bare
+# B where the escape belongs - no backslash, no u, nothing to decode - so the check asserted that an escape
+# is decoded while handing the reader a plain letter. Quinn-2 proved it by disabling the reader's ENTIRE
+# escape branch and watching this line stay GREEN.
+# 'au0042c' is exactly what you get when the backslash is dropped and the digits pass through, which is
+# the same collapse that mangled this very line twice in chat while it was being handed over. So the
+# literal was most likely mangled at AUTHORING time in 011ea32 by that class of transform: a
+# transmission defect with a three-month latency, not a typo. Re-landed by copying bytes, never retyping.
+Check 'a \u escape is decoded' ((Read1 '{"name":"a\u0042c"}' 'name') -ceq 'aBc') (Read1 '{"name":"a\u0042c"}' 'name')
 
 Write-Host ''
 Write-Host 'absent, null and malformed all read as "not there" - and nothing throws'
@@ -939,7 +952,7 @@ Check 'SameBpIdentity is symmetric, so a dedupe cannot depend on list order' ($a
 
 # The cut-down engine stub gained an Owner; pin the field names it borrows, as the section above does for
 # the line fields, so a rename in the engine fails here instead of passing against a stale imitation.
-$lm = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\LoadedModule.cs')
+$lm = Get-Content -Raw -LiteralPath $LoadedModulePath
 Check 'the cut-down stubs match the real UserBreakpoint.Owner and LoadedModule.Path' `
   (($engineSrc -match 'public LoadedModule Owner;') -and ($lm -match 'public string Path;')) ''
 # ONE writer for the owner on all three echoes, so a fourth emitter cannot carry it on some and not others.

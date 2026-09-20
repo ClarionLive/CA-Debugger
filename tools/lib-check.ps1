@@ -2,16 +2,18 @@
 # Dot-source this: . "$PSScriptRoot\lib-check.ps1"   (lib-extract.ps1 already does, so a harness that
 # dot-sources lib-extract gets these for free and needs no second line.)
 #
-# WHY THIS IS NOT IN lib-extract.ps1, stated as it stands TODAY rather than as it was discovered.
+# WHY THIS IS NOT IN lib-extract.ps1.
 #
-# lib-extract.ps1 calls `Set-StrictMode -Version Latest` at top level, and a dot-source imposes that on the
-# CALLER. When this split was made, test-engine-session.ps1 - the one suite with no C# to extract, because
-# it scans PowerShell - was not strict-clean: adding that dot-source made it throw and report ALL 48 CHECKS
-# PASSED instead of 56. That particular fault is now FIXED (its `.Count` on a scalar became `@(...).Count`)
-# and the file is strict-clean, so do not read the paragraph above as a live failure; it is the measurement
-# that prompted the layering.
+# THE MEASUREMENT THAT PROMPTED THE SPLIT, dated so it cannot go stale:
+#   "measured 2026-09-20, before the @() fix at test-engine-session.ps1:380 - dot-sourcing lib-extract.ps1
+#    cost test-engine-session.ps1 8 of its 56 checks, reporting ALL 48 CHECKS PASSED."
+# That fault is now fixed and the file IS strict-clean, so the line above is history, not a live failure.
+# It is kept verbatim because a DATED measurement is a fact about the past and cannot rot; an UNDATED claim
+# about present code is a live assertion and goes stale the moment the code moves. This file had the second
+# kind for about an hour, and it went false the moment the fix landed - the same way the field-order
+# comments in debugger.html outlived the scanner they described. Date anything you measure into a comment.
 #
-# The layering stands on the reasons that OUTLIVED it:
+# The layering is KEPT for the reasons that outlived the measurement:
 #   - Check has nothing to do with extracting C#. test-engine-session.ps1 would be loading a C# extractor
 #     it never calls, purely to get a Check.
 #   - A library that silently changes its caller's strictness cannot also be the library everyone is
