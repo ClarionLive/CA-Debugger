@@ -79,9 +79,9 @@ function renderWatchList() { }   // builds rows with innerHTML; not what these c
 function saveWatches() { }       // localStorage persistence; covered by test-pad-watch-persist.js
 
 // ---- the page's own code ---------------------------------------------------------------------------
-const FNS = ['esc', 'send', 'resetThreadState', 'setSrcHeader', 'clearSrc',
+const FNS = ['esc', 'send', 'resetThreadState', 'setSrcLocation', 'clearSrc',
   'dtParseInt', 'fieldPart', 'fmtClarionDate', 'fmtClarionTime', 'dtDefault', 'dtModeFor', 'dtApply', 'dtCycle',
-  'clearEditMeta', 'clearValueMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
+  'clearEditMeta', 'clearDtMeta', 'clearValueMeta', 'setEditMeta', 'applyNote', 'wireEdit', 'applyValue', 'showTipFor',
   'stripEditQuotes', 'beginEdit', 'cancelActiveEdit',
   'tidAccepted', 'threadRowFor', 'threadName', 'threadProc', 'threadPickerOpen', 'closeThreadPicker',
   'toggleThreadPicker', 'requestThreads', 'renderThreadPicker', 'renderThreadUi', 'selectThread',
@@ -887,6 +887,78 @@ console.log('\n13) the paused location survives the removal of the run-state ban
   // NOT tested here: that going idle still calls clearSrc(). setRunState is a no-op stub in this suite
   // (line 74), so a check here would be testing the stub. It is asserted in test-pad-watch-persist.js,
   // which extracts the real one.
+}
+
+// ---- ec45805f item 13: a resume and a new stop end a cached value, same as a thread switch ----------
+// invalidateThreadScopedState cleared the `values` cache; resetThreadState did not, and it is the one
+// that runs at a resume and at every new pause. So a value cached at stop 1 stayed readable through
+// stop 2 for any name the engine did not answer again.
+//
+// Driven per READER, because the cache's readers are not all visible cells a fresh reply would repaint,
+// and the reader that actually breaks has no cell at all. Enumerated: (a) the tip's value, (b) the tip's
+// type, (c) the tip's engine note, (d) the tip's Copy Value, (e) an expanded Watch .wdetail, and (f) the
+// tip over a SOURCE identifier, where the cache is the only value that has ever existed.
+console.log('\nX) a resume and a new stop clear the values cache, for every reader of it');
+{
+  resetAll();
+  const NAME = 'CUS:STATE';
+  const row = makeRow(NAME);
+  // Stop 1 answers it, with a type and an engine caveat, so every field the tip can read is populated.
+  applyValue(NAME, true, "'CA'", 'STRING(2)', true,
+             { va: A_INSTANCE.va, typeCode: '0x18', size: 2, places: 0, note: 'shared template' });
+  check('precondition: stop 1 cached a value, a type and a note', values.size === 1
+        && values.get(nameKey(NAME)).value === "'CA'" && values.get(nameKey(NAME)).type === 'STRING(2)'
+        && values.get(nameKey(NAME)).note === 'shared template',
+        JSON.stringify(values.get(nameKey(NAME))));
+
+  // (f) FIRST - the reader with no row behind it. A source identifier the developer hovers.
+  const token = new El('span'); token.dataset.name = NAME; doc.body.appendChild(token);
+  showTipFor(token);
+  check('CONTROL: while stop 1 stands, the source-identifier tip shows its value',
+        $('dtVal').textContent.includes('CA'), $('dtVal').textContent);
+
+  // The target runs on. THIS is the boundary that was not closing the cache.
+  onMessage(JSON.stringify({ type: 'resumed' }));
+  check('a resume empties the cache', values.size === 0, 'size=' + values.size);
+
+  showTipFor(token);
+  check('(f) the source-identifier tip no longer quotes stop 1\'s value',
+        !$('dtVal').textContent.includes('CA'), $('dtVal').textContent);
+  check('(a) it offers the not-watched prompt instead of a stale number',
+        $('dtVal').textContent.includes('not watched'), $('dtVal').textContent);
+  check('(b) the type is not carried over either', $('dtType').textContent === '', $('dtType').textContent);
+  check('(c) and neither is the engine note', !$('dtVal').textContent.includes('shared template'),
+        $('dtVal').textContent);
+  // (d) Copy Value copies whatever the tip resolved, so it cannot disagree with what was just checked -
+  // named as the reader it is rather than re-asserted, because $('dtCopy') is wired by page code this
+  // suite does not extract.
+  check('(d) Copy Value copies the tip\'s own text, so it inherits (a)',
+        /copyText\(tipTarget\.val\)/.test(html) && /tipTarget=\{name,type,val\}/.test(html));
+
+  // (e) an expanded .wdetail reads the cache when it is OPENED, so it is a reader of a later moment.
+  const det = new El('div'); det.className = 'wdetail'; det.dataset.detail = NAME; det.style.display = '';
+  doc.body.appendChild(det);
+  det.textContent = values.has(nameKey(NAME)) ? values.get(nameKey(NAME)).value : '';
+  check('(e) a panel opened after the resume has no cached value to show', det.textContent === '',
+        JSON.stringify(det.textContent));
+
+  // And the same boundary at a NEW STOP, not only at a resume - resetThreadState owns both paths.
+  applyValue(NAME, true, "'CA'", 'STRING(2)', true, { va: A_INSTANCE.va, typeCode: '0x18', size: 2, places: 0 });
+  check('precondition: a value is cached again', values.size === 1, 'size=' + values.size);
+  onMessage(JSON.stringify({ type: 'paused', module: 'CUST.CLW', proc: 'BrowseCustomers', line: 412,
+                             tid: STOP_TID, regs: null }));
+  check('a NEW STOP empties it too', values.size === 0, 'size=' + values.size);
+  showTipFor(token);
+  check('…so the source-identifier tip does not carry stop 1 into stop 2',
+        !$('dtVal').textContent.includes('CA'), $('dtVal').textContent);
+
+  // ISOLATION: the clear is tied to the episode boundary, not to "the tip shows nothing any more".
+  // A value answered AFTER the new stop must be readable exactly as before.
+  applyValue(NAME, true, "'NV'", 'STRING(2)', true, { va: A_INSTANCE.va, typeCode: '0x18', size: 2, places: 0 });
+  showTipFor(token);
+  check('CONTROL: this stop\'s own answer is shown normally', $('dtVal').textContent.includes('NV'),
+        $('dtVal').textContent);
+  check('   and the row still carries it', state(row).text === "'NV'", state(row).text);
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
