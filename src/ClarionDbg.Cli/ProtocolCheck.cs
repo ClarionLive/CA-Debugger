@@ -85,6 +85,7 @@ namespace ClarionDbg.Cli
             CheckSeamsRefuseLiveTarget(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
+            CheckOnceOnlyDiagnostics(failures);
 
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
@@ -109,7 +110,11 @@ namespace ClarionDbg.Cli
                                   + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
                                   + "test seams REFUSE an attached engine, with OnUserBpForTest also "
                                   + "refusing the --once and interactive engines, while all of them still "
-                                  + "work with no target.");
+                                  + "work with no target; and the repeating console diagnostics report once "
+                                  + "per (image, reason) per ENGINE, keyed on the reason CATEGORY and not "
+                                  + "on the message - which interpolates addresses, so keying on it would "
+                                  + "dedup nothing while looking like it worked - with the suppression "
+                                  + "said on the line rather than left to be inferred.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -742,6 +747,80 @@ namespace ClarionDbg.Cli
             try { body(); }
             finally { Console.SetOut(prev); }
             return buf.ToString();
+        }
+
+        /// <summary>
+        /// The once-per-session diagnostics (ticket ec45805f item 5), and specifically HOW THEY KEY.
+        ///
+        /// Two console notes fired on a repeating event rather than a changing one: the window-walk cap on
+        /// every pause, and the THREADed-emulation notes on every field read — so a conditional breakpoint
+        /// over an image with no .cwtls span buried the console in identical text, up to 13 lines each.
+        ///
+        /// The interesting half is not "does it dedup". It is WHAT IT DEDUPS ON. These notes interpolate the
+        /// instance address and the block span, so a version that keyed on the MESSAGE would dedup nothing
+        /// at all while looking exactly like a working one — a suppression that never suppresses is the same
+        /// class of unfalsifiable check as the `"tid":-1` search at the top of this file. So this drives the
+        /// REAL reporter through its seam, not the predicate underneath it, and the decisive case is two
+        /// calls with the same (image, reason) and DIFFERENT text.
+        ///
+        /// The set is also per ENGINE, and that is asserted: static state would carry a session's
+        /// suppressions into the next one, and the note that mattered would be the one nobody saw.
+        ///
+        /// The window-cap site needs real windows and is not reachable here; it shares this rule holder, and
+        /// that sharing is the whole reason there is one holder rather than a flag in each file.
+        /// </summary>
+        private static void CheckOnceOnlyDiagnostics(List<string> failures)
+        {
+            // ---- the rule holder, isolated: first sighting true, every later one false, keys independent.
+            var eng = NewEngine();
+            if (!eng.FirstReportOfForTest("k1"))
+                failures.Add("once-only control: the FIRST sighting of a key was suppressed — the "
+                             + "diagnostic would never be printed at all");
+            if (eng.FirstReportOfForTest("k1"))
+                failures.Add("once-only: a repeated key reported again — the console floods");
+            if (!eng.FirstReportOfForTest("k2"))
+                failures.Add("once-only: a DIFFERENT key was suppressed by the first one — one noisy "
+                             + "diagnostic would silence every other");
+
+            // ---- per session, not per process. A static set would hide the second session's first warning.
+            if (!NewEngine().FirstReportOfForTest("k1"))
+                failures.Add("once-only: a NEW engine inherited the previous session's suppressions — the "
+                             + "set must be per engine, or a fresh run starts already silent");
+
+            // ---- THE DECIDING CASE: same image, same reason, different TEXT reports ONCE.
+            var e2 = NewEngine();
+            string first = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "write-outside-block", "kept instance 0x11110000 despite a write outside 0x2000"));
+            string again = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "write-outside-block", "kept instance 0x99990000 despite a write outside 0x7777"));
+
+            if (first.IndexOf("app.dll", StringComparison.Ordinal) < 0
+                || first.IndexOf("0x11110000", StringComparison.Ordinal) < 0)
+                failures.Add("threaded-note control: the FIRST note did not print its image and detail — "
+                             + "got: " + first.Trim());
+            if (again.Trim().Length != 0)
+                failures.Add("threaded-note: the same (image, reason) reported twice because the text "
+                             + "differed — it is keyed on the MESSAGE, which interpolates addresses, so it "
+                             + "dedups nothing: " + again.Trim());
+
+            // ---- and the suppression is ANNOUNCED. This reporter's whole contract is that it is never
+            //      silent; dropping repeats without saying so is a quieter way of being silent.
+            if (first.IndexOf("reported once", StringComparison.OrdinalIgnoreCase) < 0)
+                failures.Add("threaded-note: the note does not say it is reported once per session, so a "
+                             + "reader cannot tell 'happened once' from 'happening constantly, suppressed'");
+
+            // ---- the key's two halves, each isolated with the other held fixed.
+            string otherReason = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "no-cwtls-span", "no .cwtls span to test the write against"));
+            if (otherReason.Trim().Length == 0)
+                failures.Add("threaded-note: a DIFFERENT reason on the same image was suppressed — the two "
+                             + "conditions are different findings and the second would never be seen");
+
+            string otherImage = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "other.dll", "write-outside-block", "kept instance 0x11110000 despite a write outside 0x2000"));
+            if (otherImage.Trim().Length == 0)
+                failures.Add("threaded-note: the SAME reason on a different image was suppressed — one bad "
+                             + "image would mask the same fault in every other");
         }
 
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
