@@ -292,7 +292,10 @@ namespace ClarionDebugger.Services
         // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
         // the selection it had and asks 'threads' for the authoritative one.
         public event Action<uint?, bool, string> ThreadSelected;
-        public event Action<string, List<DebugDisasmInstr>> DisasmReceived; // EXPERIMENT: disassembly listing (tag, instrs)
+        // Disassembly listing (tag, instrs, tid). The tid is the thread the engine actually DECODED, and it
+        // was the one thread-scoped reply whose invoke dropped it while the decoder below already parsed it
+        // — so the view could only ever gate on its own bookkeeping, never on the engine's own answer.
+        public event Action<string, List<DebugDisasmInstr>, uint?> DisasmReceived;
         public event Action<DebugWatch> WatchReceived;             // watch-by-name value
         public event Action<string, bool, string, string> VariableSet; // edit result: va, ok, re-read value, error
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
@@ -605,8 +608,8 @@ namespace ClarionDebugger.Services
             return SendCommand("framelocals " + reqId + " " + vaHex + " " + ebpHex);
         }
 
-        /// <summary>EXPERIMENT: request a disassembly listing at the current EIP (paused only);
-        /// result arrives via DisasmReceived.</summary>
+        /// <summary>EXPERIMENT: request a disassembly listing at the SELECTED thread's EIP (paused only);
+        /// result arrives via DisasmReceived, stamped with the thread the engine decoded.</summary>
         public bool RequestDisasm() { return SendCommand("disasm"); }
 
         /// <summary>EXPERIMENT: request a disassembly window starting at a specific VA (hex like
@@ -614,6 +617,12 @@ namespace ClarionDebugger.Services
         public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)
         {
             if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
+            // The tag is POSITIONAL: it occupies its own space-separated slot ahead of `before`. A tag
+            // containing whitespace would push `before` into the wrong argument and silently change the
+            // request — so it is validated HERE, in the writer every caller goes through, rather than left
+            // to each caller's own care. This was safe while every tag was a literal constant; it stopped
+            // being safe the moment the disassembly view began generating them (it appends an epoch).
+            if (tag != null && !Regex.IsMatch(tag, @"^[A-Za-z0-9_#.-]{0,32}$")) return false;
             // 'before' needs a tag slot ahead of it in the command; default to "win" so positions line up.
             string t = string.IsNullOrEmpty(tag) ? (before > 0 ? "win" : "") : tag;
             string cmd = "disasm " + vaHex + " " + count + (string.IsNullOrEmpty(t) ? "" : " " + t);
@@ -887,7 +896,10 @@ namespace ClarionDebugger.Services
                         if (!dpaths.TryGetValue(di.Module, out rp)) { rp = ResolveModulePath(di.Module); dpaths[di.Module] = rp; }
                         di.ResolvedPath = rp;
                     }
-                    DisasmReceived?.Invoke(GetStr(json, "tag"), dlist);
+                    // Same absent-aware reader every other thread-scoped reply uses: an engine that does not
+                    // stamp disasm yields null, which means UNKNOWN — never 0, which a consumer would read
+                    // as a real thread.
+                    DisasmReceived?.Invoke(GetStr(json, "tag"), dlist, GetUIntOrNull(json, "tid"));
                     break;
 
                 case "stack":

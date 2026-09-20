@@ -70,15 +70,22 @@ namespace ClarionDbg.Cli
         /// </summary>
         /// <summary>disasm [addr] [count] [tag] [before] — decode instructions around an address.
         ///
-        /// <paramref name="ctx"/> and <paramref name="tid"/> are the STOPPED thread's, never the selected
-        /// thread's, even while another thread is selected for every other read. The disassembly window
-        /// lives outside the pad's thread-scoped message path and cannot show which thread it is decoding,
-        /// so following a selection it cannot display would be a silent mismatch rather than a feature.
-        /// The reply is stamped with the tid anyway, so a host CAN tell — and a thread-aware disassembly
-        /// view is ticket 381aabd7, rather than a thing to half-do here.</summary>
-        private void HandleDisasmCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
+        /// Reads the SELECTED thread, like every other read path. 0128a37e pinned this to the stopped
+        /// thread because the disassembly window could not say whose code it was showing, which would have
+        /// relocated the mismatch rather than fixed it; the window can say so now (381aabd7), so the
+        /// restriction is lifted and the reply is still stamped with the thread it actually read.
+        ///
+        /// It takes the <see cref="ThreadView"/> WHOLE rather than a context and a tid, and that is the
+        /// point: the defect this path is prone to is a context from one thread stamped with another
+        /// thread's id — a listing that lies about whose EIP it centred on. Destructuring at the call site
+        /// makes that a two-argument mistake anyone can make; passing the view makes it unrepresentable.
+        /// The default address is the view's EIP, so an explicit `disasm 0xADDR` still decodes exactly
+        /// where it was told to, on whichever thread is selected.</summary>
+        private void HandleDisasmCommand(string[] parts, ThreadView view)
         {
-            uint addr = haveCtx ? ctx.Eip : 0;
+            bool haveCtx = view.HaveCtx;
+            uint tid = view.Tid;
+            uint addr = haveCtx ? view.Ctx.Eip : 0;
             int count = 16;
             if (parts.Length > 1 && parts[1].Length > 0)
             {
@@ -111,7 +118,9 @@ namespace ClarionDbg.Cli
             decoder.IP = addr;
             var formatter = new Iced.Intel.NasmFormatter();
             var output = new Iced.Intel.StringOutput();
-            uint eip = haveCtx ? ctx.Eip : 0;
+            // The `current` flag marks the SELECTED thread's EIP, which is what this listing is of. On the
+            // stopped thread that is the stop location; on any other it is where that thread is frozen.
+            uint eip = haveCtx ? view.Ctx.Eip : 0;
 
             var jsonRows = new List<string>();
             var textRows = new List<string>();
@@ -152,9 +161,10 @@ namespace ClarionDbg.Cli
             }
 
             if (EmitJson)
-                // Stamped like every other thread-scoped reply, even though this one is pinned to the
-                // stopped thread: the stamp is what makes "disasm is always the stopped thread" a checkable
-                // fact on the wire instead of a claim in a comment.
+                // Stamped with the thread this listing was actually decoded FOR, which is now the host's
+                // gate: replies are tag-keyed, and a tag is not a thread, so an in-flight request issued
+                // before a thread switch comes back looking exactly like one issued after it. The stamp is
+                // the only thing that tells those apart on the wire.
                 EmitThreadEvent(tid, "{\"event\":\"disasm\",\"addr\":\"0x" + addr.ToString("X") + "\",\"tag\":" + Json.Str(tag) + ",\"instrs\":[" + string.Join(",", jsonRows) + "]}");
             else
             {

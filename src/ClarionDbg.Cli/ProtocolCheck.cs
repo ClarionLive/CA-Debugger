@@ -99,9 +99,10 @@ namespace ClarionDbg.Cli
                                   + "`threadscan`.stopped) - each tested with the others KNOWN, so an "
                                   + "omission is per member and not the builder giving up, while the "
                                   + "same-named per-row booleans survive and no row claims a selection the "
-                                  + "event does not state; a vetoed row's INLINE "
-                                  + "descendants offer no edit metadata (the expand path is a known gap — "
-                                  + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
+                                  + "event does not state; a vetoed row's descendants "
+                                  + "offer no edit metadata, INLINE and through `expand`, whose veto is "
+                                  + "derived from the address over the whole group's span while an "
+                                  + "ordinary group keeps its pencils; no write, of any length, "
                                   + "can touch the shared template; the resume-verb set has one owner across "
                                   + "its 2 remaining sites; Step Over's ESP gate and its prologue bypass "
                                   + "each hold with the other one out of the way; and a breakpoint hit "
@@ -937,6 +938,65 @@ namespace ClarionDbg.Cli
             if (CountVa(scalarVetoed) != 0) failures.Add("edit-veto: a vetoed scalar row still carried edit metadata");
             if (scalarVetoed.IndexOf("\"note\":", StringComparison.Ordinal) < 0)
                 failures.Add("edit-veto: a vetoed row dropped its explanation");
+
+            // ---- THE EXPAND PATH ------------------------------------------------------------------
+            // The rows above are the ones the engine builds knowing whether they are vetoed. `expand`
+            // is the path that does NOT know: until cc3ac96e the command carried only
+            // reqId/module/typeRef/addr, so an expanded node's members were always built editable —
+            // including when the node was a shared .cwtls template reached through a by-ref member or
+            // an array-of-group element. That hole was stated in this check's own success message.
+            // The engine now DERIVES the veto from the address, through the same write guard that
+            // would refuse the commit, and these are the assertions that retire the claim.
+            //
+            // A separate engine, so registering an image cannot disturb anything asserted above.
+            var xeng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            // An image at 0x400000 whose .cwtls template block is RVA 0xC8000..0xCC000 — the same
+            // layout CheckThreadedWriteGuard uses. iatRva 0 (THR$GetInstance not resolved) on purpose:
+            // it keeps this check off OpenThread, which protocolcheck has no target for and which a
+            // bare tid cannot identify anyway, while leaving the template refusal — the branch that
+            // needs nothing resolved — exactly as it ships.
+            xeng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000, iatRva: 0);
+            const uint xtid = 4812;
+
+            // CONTROL, and it carries as much weight as the rule: expanding an ORDINARY address must
+            // still produce editable members. A derive that simply vetoed everything would satisfy the
+            // rule below while silently ending in-place editing for every non-threaded group.
+            string expandOk = xeng.ExpandChildrenForTest(grp, 0x401000, "app.exe", xtid);
+            if (CountVa(expandOk) != 2)
+                failures.Add("expand-veto control: expanding an ordinary GROUP offered " + CountVa(expandOk)
+                             + " editable member(s), expected 2 — the derive over-vetoes");
+            if (expandOk.IndexOf("\"note\":", StringComparison.Ordinal) >= 0)
+                failures.Add("expand-veto control: an ordinary expanded GROUP carried a refusal note");
+
+            // THE RULE: expanding a row that sits on the shared template offers no pencil beneath it.
+            string expandVetoed = xeng.ExpandChildrenForTest(grp, 0x4C8000, "app.exe", xtid);
+            n = CountVa(expandVetoed);
+            if (n != 0)
+                failures.Add("expand-veto: expanding a shared-template row offered " + n + " editable "
+                             + "member row(s) — a pencil promising a write HandleSetValCommand will refuse");
+            if (Count(expandVetoed, "\"note\":") != 2)
+                failures.Add("expand-veto: a vetoed expanded row did not explain itself on every member — "
+                             + "the tree can be scrolled until only the member is on screen");
+
+            // THE GROUP IS AN INTERVAL, exactly as a write is. Its members are read at base+offset, so
+            // a group that STARTS below the template and reaches into it must be vetoed whole: one
+            // flag covers every member, and the member that lands on shared bytes is the one that
+            // matters. Testing only the base address would let this through.
+            //   0x4C7FFC + member SECOND at +4 = 0x4C8000, the template's first byte.
+            string straddling = xeng.ExpandChildrenForTest(grp, 0x4C7FFC, "app.exe", xtid);
+            if (CountVa(straddling) != 0)
+                failures.Add("expand-veto: a GROUP at 0x4C7FFC has a member ON the template's first byte "
+                             + "but " + CountVa(straddling) + " member row(s) were still offered a pencil");
+            // ...and the group that really does stay below it keeps its pencils: 0x4C7FF8 + 8 ends
+            // exactly at the template's first byte, which is past the last byte it touches.
+            string justBelow = xeng.ExpandChildrenForTest(grp, 0x4C7FF8, "app.exe", xtid);
+            if (CountVa(justBelow) != 2)
+                failures.Add("expand-veto control: a GROUP ending exactly at the template's first byte was "
+                             + "vetoed — it touches none of it");
+
+            // NOT COVERED HERE, and deliberately: the two notes that distinguish "this thread has no
+            // instance yet" from "it has one, at another address" both need a live THR$GetInstance
+            // emulation. The VETO is fully covered above; only its wording varies with that resolve.
         }
 
         /// <summary>
