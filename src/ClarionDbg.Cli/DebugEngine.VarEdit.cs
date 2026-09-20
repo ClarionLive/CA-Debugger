@@ -248,10 +248,19 @@ namespace ClarionDbg.Cli
         /// <summary>Does [<paramref name="va"/>, va+<paramref name="len"/>) touch this image's shared
         /// .cwtls TEMPLATE — and if so, at which byte?
         ///
-        /// THE ONE TEMPLATE-OVERLAP TEST. Three paths ask this question — the write guard, the expand
-        /// veto, and the module-data panel — and the panel asked it with a POINT test on the symbol's
-        /// start RVA while the other two asked it over a span. Same defect class as the note that used to
-        /// drift from the veto: a rule stated in two places is a rule that will be fixed in one of them.
+        /// THE ONE TEST FOR A RANGE. Three paths ask it over a span — the write guard, the expand veto,
+        /// and the module-data panel — and the panel asked with a POINT test on the symbol's start RVA
+        /// until this shared it. Same defect class as the note that used to drift from the veto: a rule
+        /// stated in two places is a rule that will be fixed in one of them.
+        ///
+        /// IT IS NOT, HOWEVER, THE ONLY PLACE THE RULE APPEARS, and this comment used to claim it was.
+        /// The same `Rva >= CwtlsLo && Rva < CwtlsHi` test survives in three files this does NOT cover —
+        /// DebugEngine.Watch.cs, DebugEngine.ThreadScan.cs and DebugEngine.BpAdvanced.cs — each
+        /// classifying a resolved symbol rather than a caller-supplied range. They are NOT routed here,
+        /// and whether they are correct is an open question rather than a settled one: all three have the
+        /// symbol's `loc.Size` in scope at the point of the test, which is exactly what made the panel's
+        /// version wrong. Reported to the PM for its own ticket; those files have no owner in this run and
+        /// must not be edited as a side effect of a comment. Scoped true beats ambitious and false.
         /// <paramref name="hitVa"/> is the FIRST byte of the range inside the template, which is the start
         /// only when the range begins inside it.</summary>
         private static bool TouchesThreadedTemplate(LoadedModule m, uint va, int len, out uint hitVa)
