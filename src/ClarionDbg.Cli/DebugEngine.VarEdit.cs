@@ -259,8 +259,8 @@ namespace ClarionDbg.Cli
         /// classifying a resolved symbol rather than a caller-supplied range. They are NOT routed here,
         /// and whether they are correct is an open question rather than a settled one: all three have the
         /// symbol's `loc.Size` in scope at the point of the test, which is exactly what made the panel's
-        /// version wrong. Reported to the PM for its own ticket; those files have no owner in this run and
-        /// must not be edited as a side effect of a comment. Scoped true beats ambitious and false.
+        /// version wrong. Tracked as ticket ef0a941d; those files have no owner in this run and must not be
+        /// edited as a side effect of a comment. Scoped true beats ambitious and false.
         /// <paramref name="hitVa"/> is the FIRST byte of the range inside the template, which is the start
         /// only when the range begins inside it.</summary>
         private static bool TouchesThreadedTemplate(LoadedModule m, uint va, int len, out uint hitVa)
