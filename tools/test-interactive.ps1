@@ -7,7 +7,15 @@
 param(
     [string]$Engine = "$PSScriptRoot\..\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe",
     [string]$Target = "C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe",
-    [string]$BreakArgs = "--bp clbrws001.clw:11",
+    # A STARTUP line, and that is the whole requirement: this suite runs unattended, so its breakpoint must
+    # be one the target reaches on its own. The old default was clbrws001.clw:11, a DATA DECLARATION inside
+    # BrowseAuthors, which only executes when a human clicks "Filtered Locator (Authors)" — so the run
+    # always timed out at "never paused" and read as an engine or harness fault for as long as it sat red.
+    # It was neither: Piper2 re-ran this suite unchanged against SPLASHSCREEN and got EXIT=0 in 4.7s with
+    # step / step / stepover / stepout all working. clbrws026.clw:42 is the same line test-watch-threaded.ps1
+    # already relies on, so the two suites stand or fall together on it.
+    # NOT a skip. A skip would hide a suite that runs here perfectly well.
+    [string]$BreakArgs = "--bp clbrws026.clw:42",
     [string[]]$Commands = @("step", "step", "stepover", "stepout", "quit"),
     [int]$PauseTimeoutSec = 20
 )
