@@ -63,6 +63,40 @@ namespace ClarionDbg.Cli
         /// rather than something the reader has to infer from never seeing it again.</summary>
         private const string ONCE_SUFFIX = "  [reported once per session]";
 
+        /// <summary>The window-walk cap's dedup key: the root window's own IDENTITY, never its position in
+        /// the enumeration.
+        ///
+        /// THIS SIGNATURE IS THE GUARANTEE. The loop index is not a parameter, so the key cannot be built
+        /// from one however the call site is later rewritten — which is the defect being fixed, not a
+        /// hypothetical: the key was `"wincap|root " + i`, and closing one top-level window renumbered every
+        /// later root, silencing a brand-new pathological window under a key already reported.
+        ///
+        /// AN HWND CAN BE RECYCLED. Windows reuses handles of destroyed windows, so a future window could
+        /// in principle inherit a handle already reported and be suppressed — the same class as the
+        /// pid-reuse bugs this session found four of. It is ACCEPTABLE HERE, and only here, because this
+        /// key gates a console NICETY: the worst outcome is one diagnostic line not printed, not a wrong
+        /// thread read, a wrong process signalled or a write to the wrong memory. Do not lift this key into
+        /// anything that decides authority; build one that fails closed instead.
+        ///
+        /// The class name is in the key for that reason, and it is what makes this better than the HWND
+        /// alone: a recycled handle belonging to a DIFFERENT kind of window gets a different key and is
+        /// reported. What remains is a recycled handle reused by the same window class, which is a residue
+        /// rather than the original bug. The window TEXT is deliberately NOT in the key — a document title
+        /// changes while the window lives, which would un-dedup the very message this is suppressing.</summary>
+        private static string WinCapKey(IntPtr root, string cls)
+        {
+            return "wincap|hwnd " + root.ToInt64() + "|" + (cls ?? "");
+        }
+
+        /// <summary>Test seam for the key. The "not positional" half is settled by the signature above and
+        /// needs no test; what this exercises is the half a signature cannot promise — that the key actually
+        /// SEPARATES two different roots and stays STABLE for the same one, so the dedup both dedups and
+        /// does not over-suppress.</summary>
+        internal static string WinCapKeyForTest(long hwnd, string cls)
+        {
+            return WinCapKey(new IntPtr(hwnd), cls);
+        }
+
         /// <summary>One thread's measured state at a stop. Nothing here is cached across stops.</summary>
         private sealed class ThreadProbe
         {
@@ -224,12 +258,26 @@ namespace ClarionDbg.Cli
             {
                 int before = list.Count;
                 WalkWindow(list, roots[i], IntPtr.Zero, pid, i, 0, before + WIN_MAX_PER_ROOT);
-                // Once per root per session. This fires on EVERY pause otherwise, and a root whose tree was
+                // Once per ROOT per session. This fires on EVERY pause otherwise, and a root whose tree was
                 // too big to walk at the first stop is still too big at the two hundredth — the line is the
                 // same line, so repeating it only buries the stop's real output.
-                if (list.Count - before >= WIN_MAX_PER_ROOT && FirstReportOf("wincap|root " + i))
-                    Console.WriteLine($"  (window walk: root {i} hit the {WIN_MAX_PER_ROOT}-window cap — its "
-                                      + "tree is truncated; later roots are unaffected)" + ONCE_SUFFIX);
+                //
+                // The key names the WINDOW, not its position in this enumeration. It used to be
+                // "wincap|root " + i, and i is the EnumWindows loop index: close the app's first top-level
+                // window and the former root 1 becomes root 0, so a genuinely new pathological root is
+                // silenced under a key already reported — and the message named a root number that by then
+                // identified nothing. Position is not identity, the same lesson as a recycled pid.
+                if (list.Count - before >= WIN_MAX_PER_ROOT)
+                {
+                    // Safe: the cap was reached, so WalkWindow added at least one window, and it adds the
+                    // root itself first.
+                    var root = list[before];
+                    if (FirstReportOf(WinCapKey(roots[i], root.Cls)))
+                        Console.WriteLine($"  (window walk: root 0x{roots[i].ToInt64():X} [{root.Cls}] "
+                                          + $"\"{Trunc(root.Text, 40)}\" hit the {WIN_MAX_PER_ROOT}-window "
+                                          + "cap — its tree is truncated; later roots are unaffected)"
+                                          + ONCE_SUFFIX);
+                }
             }
             return list;
         }
