@@ -290,10 +290,20 @@ namespace ClarionDbg.Cli
         // re-implemented the rule or simply omitted it. So the rule now lives in ONE predicate below, and
         // BOTH writers derive from it — nothing else in the engine decides whether a tid is written.
         //
-        // IF YOU ARE ADDING A FIFTH EMITTER: do not type the member. Call AppendTidMember (or WithTid) and
-        // add your builder to ProtocolCheck.CheckHandBuiltTidEmitters, which runs the REAL builders rather
-        // than copies of their shapes. A hand-typed `,"tid":` is the exact defect this rule holder exists to
-        // stop, and no compiler can stop you typing it — protocolcheck is what catches it.
+        // AND THE RULE IS NOT ABOUT THE NAME (ticket 3b043dfc). a39d9477 closed it for members literally
+        // called "tid" and left three carrying a thread id under another name: the `threads` event's
+        // top-level "stopped" and "selected", and `threadscan`'s top-level "stopped". Those were safe by
+        // ORDERING — PausedWait sets _selectedTid before the pause loop can dispatch — while AcquireView in
+        // this very file already treats _selectedTid == 0 as a state that happens. The engine did not agree
+        // with itself, and that disagreement was the defect; no failure had been observed out of luck.
+        // So the writer below takes the member NAME, and the names it will write are declared here, once.
+        //
+        // IF YOU ARE ADDING AN EMITTER: do not type the member. Call AppendTidValuedMember with one of the
+        // TidMember* constants (or WithTid), and add your builder to ProtocolCheck.CheckHandBuiltTidEmitters,
+        // which runs the REAL builders rather than copies of their shapes. A hand-typed `,"tid":` is the
+        // exact defect this rule holder exists to stop, and no compiler can stop you typing it — but
+        // tools/test-engine-tid-members.ps1 reads THIS SOURCE and fails when one is typed outside the
+        // writer, which is the part protocolcheck cannot do (it has no source tree at runtime).
 
         /// <summary>THE RULE, stated once: is this a thread id worth writing to the wire?
         ///
@@ -302,12 +312,48 @@ namespace ClarionDbg.Cli
         /// like once it reaches a uint tid, so it is rejected here rather than printed as 4294967295.</summary>
         private static bool TidIsKnown(uint tid) { return tid != 0 && tid != uint.MaxValue; }
 
-        /// <summary>Append the tid member to an object that ALREADY has at least one member, or append
-        /// nothing at all when the tid is unknown. The one writer for every hand-built emitter; the leading
-        /// comma is inside the guard on purpose, so an absent tid cannot leave a dangling separator.</summary>
+        /// <summary>The same rule for the CONSOLE, which has no way to omit a field: an unknown id reads as
+        /// "(unknown)" rather than as the number 0, so a human is not sent looking for thread 0 either.</summary>
+        private static string TidText(uint tid) { return TidIsKnown(tid) ? tid.ToString() : "(unknown)"; }
+
+        // The member names a thread id is written under. THREE of them, and the count is checkable against
+        // the wire: "tid" (every stamped event, the `threads` rows and the `threadscan` rows), "stopped"
+        // (the `threads` and `threadscan` events) and "selected" (the `threads` event). Emit sites pass the
+        // constant, never a literal, so tools/test-engine-tid-members.ps1 can say flatly that a thread-id
+        // member name typed as JSON text anywhere but the writer below is a bypass.
+        //
+        // NOT in this set, deliberately: "clarionThread" is the RTL's own thread NUMBER, not a Win32 tid,
+        // and it already has its own absent representation (JSON null, via ClarionThreadJson). "pid" is a
+        // process id. And the PER-ROW "stopped"/"selected" members of the `threads` and `threadscan` rows
+        // are JSON BOOLEANS that merely share these names — the source scanner classifies those by the
+        // value appended after them, not by the name, which is the distinction this note is making.
+        private const string TidMemberTid = "tid";
+        private const string TidMemberStopped = "stopped";
+        private const string TidMemberSelected = "selected";
+
+        /// <summary>The declared names, as one array the source scanner extracts, so the test cannot hold a
+        /// second copy of the set that drifts from this one.</summary>
+        private static readonly string[] TidValuedMemberNames =
+            { TidMemberTid, TidMemberStopped, TidMemberSelected };
+
+        /// <summary>Append a thread-id-valued member to an object that ALREADY has at least one member, or
+        /// append nothing at all when the id is unknown. The one writer for every hand-built emitter; the
+        /// leading comma is inside the guard on purpose, so an absent id cannot leave a dangling separator.
+        ///
+        /// The name is checked against the declared set rather than taken on trust. Every call site passes a
+        /// compile-time constant, so this either throws on the first call the engine ever makes or never —
+        /// it cannot begin throwing mid-session — and protocolcheck makes that first call for all three.</summary>
+        private static void AppendTidValuedMember(StringBuilder sb, string name, uint tid)
+        {
+            if (Array.IndexOf(TidValuedMemberNames, name) < 0)
+                throw new ArgumentException("not a declared thread-id member name: " + name, "name");
+            if (TidIsKnown(tid)) sb.Append(",\"").Append(name).Append("\":").Append(tid);
+        }
+
+        /// <summary>The "tid" case, which is most of them.</summary>
         private static void AppendTidMember(StringBuilder sb, uint tid)
         {
-            if (TidIsKnown(tid)) sb.Append(",\"tid\":").Append(tid);
+            AppendTidValuedMember(sb, TidMemberTid, tid);
         }
 
         /// <summary>Test seams for the two writers. The rule they assert is documented above, so that
@@ -318,6 +364,22 @@ namespace ClarionDbg.Cli
         {
             var sb = new StringBuilder(json.Substring(0, json.Length - 1));
             AppendTidMember(sb, tid);
+            return sb.Append('}').ToString();
+        }
+
+        /// <summary>The name-taking writer, and the declared set it validates against. protocolcheck drives
+        /// BOTH — the set so the count in its summary is read off the code rather than retyped, and the
+        /// writer with a name outside the set so the ArgumentException is a falsifiable claim rather than a
+        /// line nobody has ever executed.</summary>
+        internal static string[] TidValuedMemberNamesForTest()
+        {
+            return (string[])TidValuedMemberNames.Clone();
+        }
+
+        internal static string AppendTidValuedMemberForTest(string json, string name, uint tid)
+        {
+            var sb = new StringBuilder(json.Substring(0, json.Length - 1));
+            AppendTidValuedMember(sb, name, tid);
             return sb.Append('}').ToString();
         }
 

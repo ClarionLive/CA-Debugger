@@ -381,9 +381,13 @@ namespace ClarionDbg.Cli
 
             if (EmitJson) Console.WriteLine("@JSON " + ThreadsJson(stoppedTid, _selectedTid, probes));
 
-            Console.WriteLine($"  threads ({probes.Count}), stopped {stoppedTid}, selected {_selectedTid}:");
+            // The console line says "(unknown)" for the same reason the wire omits the member: 0 is not a
+            // thread, and printing it invites the reader to go looking for thread 0.
+            Console.WriteLine($"  threads ({probes.Count}), stopped {TidText(stoppedTid)}, "
+                              + $"selected {TidText(_selectedTid)}:");
             foreach (var p in probes)
-                Console.WriteLine($"    {(p.IsStopped ? "*" : " ")}{(p.Tid == _selectedTid ? ">" : " ")} tid {p.Tid,-6} "
+                Console.WriteLine($"    {(p.IsStopped ? "*" : " ")}"
+                    + $"{(TidIsKnown(_selectedTid) && p.Tid == _selectedTid ? ">" : " ")} tid {p.Tid,-6} "
                     + $"{p.State,-8} {(p.TopProc ?? "(no Clarion frame)")}"
                     + (p.TopModule != null ? "  " + p.TopModule + ":" + p.TopLine : "")
                     + (p.ClarionThread.HasValue ? "  [Clarion thread " + p.ClarionThread.Value + "]" : ""));
@@ -392,13 +396,25 @@ namespace ClarionDbg.Cli
         /// <summary>The `threads` event for the picker. A pure builder over already-measured probes, so
         /// `ClarionDbg protocolcheck` can assert the absent-tid rule against THIS code rather than against a
         /// hand-written copy of its shape — a fixture that is written twice is a fixture that agrees with
-        /// itself and with nothing else.</summary>
+        /// itself and with nothing else.
+        ///
+        /// The TOP-LEVEL "stopped" and "selected" are thread ids under another name, so they go through the
+        /// same writer as "tid" (ticket 3b043dfc): unknown means the member is ABSENT, and the object opens
+        /// with "event" so there is always a member for the writer's leading comma to follow. The PER-ROW
+        /// "stopped"/"selected" below share the names but are booleans about the row, and are written here.
+        ///
+        /// The row's "selected" is ANDed with the rule's own predicate rather than compared alone: with no
+        /// selection, selectedTid is 0, and a row that somehow carried a 0 tid would otherwise mark itself
+        /// as the selected thread — the sentinel-reads-as-real defect again, one level down and in a
+        /// boolean. TidIsKnown is the same predicate that decides whether the top-level member is written,
+        /// so the row cannot claim a selection the event does not state.</summary>
         private static string ThreadsJson(uint stoppedTid, uint selectedTid, List<ThreadProbe> probes)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"threads\",\"stopped\":").Append(stoppedTid)
-              .Append(",\"selected\":").Append(selectedTid)
-              .Append(",\"threads\":[");
+            sb.Append("{\"event\":\"threads\"");
+            AppendTidValuedMember(sb, TidMemberStopped, stoppedTid);
+            AppendTidValuedMember(sb, TidMemberSelected, selectedTid);
+            sb.Append(",\"threads\":[");
             for (int i = 0; i < probes.Count; i++)
             {
                 var p = probes[i];
@@ -410,7 +426,7 @@ namespace ClarionDbg.Cli
                   .Append(",\"state\":").Append(Json.Str(p.State))
                   .Append(",\"clarionFrames\":").Append(p.ClarionFrames)
                   .Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")
-                  .Append(",\"selected\":").Append(p.Tid == selectedTid ? "true" : "false");
+                  .Append(",\"selected\":").Append(TidIsKnown(selectedTid) && p.Tid == selectedTid ? "true" : "false");
                 AppendTidMember(sb, p.Tid);
                 sb.Append('}');
             }
