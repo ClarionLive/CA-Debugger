@@ -68,6 +68,7 @@ namespace ClarionDbg.Cli
                 CheckThreadedWriteGuard,
                 CheckOnceOnlyDiagnostics,
                 CheckWinCapKeyIsIdentityNotPosition,
+                CheckRefusalsNeverShowARawTid,
             };
 
             foreach (var check in checks)
@@ -994,6 +995,100 @@ namespace ClarionDbg.Cli
                 failures.Add("wincap key: a null class produced no key at all");
             if (nullCls == DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame"))
                 failures.Add("wincap key: an unknown class keyed the same as a known one");
+        }
+
+        /// <summary>
+        /// A user-visible refusal never shows a RAW thread id.
+        ///
+        /// The absent-tid rule has always been about the WIRE: an unknown id is an absent member, never 0
+        /// and never the 4294967295 an int cast produces. Refusal TEXT is the other half of the same rule
+        /// and had no guard at all. A refusal reading "thread 0 is selected" states a falsehood about the
+        /// user's own program, in the one place they are already confused enough to be reading carefully —
+        /// and 4294967295 is worse, because it looks like a real id they could go and check.
+        ///
+        /// TidText is the rule holder, and until now NOTHING in this tree asserted it: no reference in this
+        /// file, none in tools/. Reverting any of the refusal sites to raw interpolation passed every gate
+        /// green. That is the same shape as the expand veto's note, one file over.
+        ///
+        /// HOW THIS AVOIDS ASSERTING ITS OWN EXPECTATION. The unknown rendering is not hard-coded as the
+        /// thing being proved: the check requires that 0 and (uint)-1 produce the SAME string as each other
+        /// and a DIFFERENT one from a known id, which is the actual contract — one representation for
+        /// unknown, distinguishable from any real thread — and only then names it. A version that asserted
+        /// "contains (unknown)" alone would pass against a refusal that said both.
+        ///
+        /// WHAT IT DOES NOT COVER, said plainly: a BRAND NEW refusal site that never calls TidText. This
+        /// drives the refusal producers that are reachable with no debuggee, so it catches a revert of an
+        /// existing site; it cannot catch a site nobody has written yet. That needs a source-level rule —
+        /// "a `\"thread \" +` concatenation must be followed by TidText(" — which belongs in
+        /// tools/test-engine-tid-members.ps1 beside the member-name scanner, not here.
+        /// </summary>
+        private static void CheckRefusalsNeverShowARawTid(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("no user-visible refusal shows a RAW thread id: both unknown values (0 and the "
+                         + "(uint)-1 an int cast produces) collapse to ONE rendering, that rendering is "
+                         + "TidText's \"(unknown)\" and not a number, and a KNOWN id still reads as its "
+                         + "own number - so a refusal can no longer tell the user about a thread 0 or a "
+                         + "thread 4294967295 that does not exist.");
+
+            var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            eng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000, iatRva: 0);
+            const uint known = 4812;
+            const uint minusOne = unchecked((uint)-1);
+            const uint templateVa = 0x4C8000;
+
+            // The refusal producers reachable with no target. A table rather than three copies, so adding
+            // the next drivable one is a line — and so the assertions below are applied to every entry
+            // rather than to whichever one somebody remembered.
+            var producers = new[]
+            {
+                new { Name = "threaded-write refusal", Make = (Func<uint, string>)(t =>
+                {
+                    string why;
+                    eng.ThreadedWriteAllowedForTest(templateVa, 1, t, out why);
+                    return why;
+                }) },
+            };
+
+            foreach (var p in producers)
+            {
+                string forKnown = p.Make(known);
+                string forZero = p.Make(0);
+                string forMinusOne = p.Make(minusOne);
+
+                // CONTROL FIRST: it must actually be refusing, or everything below passes on empty strings.
+                if (string.IsNullOrEmpty(forKnown) || string.IsNullOrEmpty(forZero))
+                    { failures.Add(p.Name + " control: produced no refusal at all, so nothing below asserts anything"); continue; }
+
+                // CONTROL: a KNOWN id still reads as its number. Without this, a refusal that had simply
+                // stopped naming threads would satisfy every other assertion here.
+                if (forKnown.IndexOf("thread " + known, StringComparison.Ordinal) < 0)
+                    failures.Add(p.Name + " control: a KNOWN thread id is no longer named in the refusal — "
+                                 + forKnown);
+
+                // ONE REPRESENTATION FOR UNKNOWN. 0 and (uint)-1 are different values and the same
+                // non-fact, so they must read identically. This is the contract; the wording is downstream.
+                if (forZero != forMinusOne)
+                    failures.Add(p.Name + ": the two unknown ids read differently — 0 gave \"" + forZero
+                                 + "\" and (uint)-1 gave \"" + forMinusOne + "\", so one of them is being "
+                                 + "rendered as itself");
+
+                // ...and DISTINGUISHABLE from a real thread, or "unknown" is not being said at all.
+                if (forZero == forKnown)
+                    failures.Add(p.Name + ": an unknown id reads exactly like a known one — " + forZero);
+
+                // NO RAW SENTINEL REACHES THE USER. Both spellings, because the int-cast one is the one
+                // that looks like a thread they could go and check.
+                foreach (var raw in new[] { "thread 0", "4294967295" })
+                    foreach (var s in new[] { forZero, forMinusOne })
+                        if (s.IndexOf(raw, StringComparison.Ordinal) >= 0)
+                            failures.Add(p.Name + ": an unknown thread id reached the user as \"" + raw
+                                         + "\" — it states a falsehood about their own program: " + s);
+
+                // ...and it DOES name it as unknown, rather than quietly dropping the clause.
+                if (forZero.IndexOf("(unknown)", StringComparison.Ordinal) < 0)
+                    failures.Add(p.Name + ": an unknown thread id is not named at all — the refusal should "
+                                 + "say so through TidText rather than omit the thread: " + forZero);
+            }
         }
 
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
