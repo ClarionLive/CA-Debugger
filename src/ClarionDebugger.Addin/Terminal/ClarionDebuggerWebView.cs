@@ -1080,7 +1080,16 @@ namespace ClarionDebugger.Terminal
         /// <summary>Remove a breakpoint from the pane's "x". Removes the IDE gutter bookmark, which
         /// cascades through BreakPointRemoved → OnGutterBpRemoved (engine/pending + pane refresh) and
         /// clears the editor's red dot. Falls back to a direct removal if no bookmark is found (e.g. a
-        /// pending bp whose editor was closed). Data is "module:line".</summary>
+        /// pending bp whose editor was closed). Data is "module:line".
+        /// <para>
+        /// The page can only name the breakpoint the way the engine does, by bare .clw basename, so this
+        /// resolves the row's FILE before touching the gutter - through the same path map SendBps built
+        /// the row from, so the file removed is the file the row's link would have opened. Without it,
+        /// two DLLs each holding a same-named .clw bookmarked at the same line meant the "x" cleared
+        /// whichever bookmark the IDE enumerated first (task e80072f1). A null path here is not a
+        /// failure: it is the map saying it cannot tell, and RemoveByModuleLine then removes a lone
+        /// bookmark and declines an ambiguous one.
+        /// </para></summary>
         private void RemoveBp(string data)
         {
             if (string.IsNullOrEmpty(data)) return;
@@ -1089,8 +1098,23 @@ namespace ClarionDebugger.Terminal
             string module = data.Substring(0, c);
             int line;
             if (!int.TryParse(data.Substring(c + 1), out line)) return;
-            if (!_gutter.RemoveByModuleLine(module, line))
+            if (!_gutter.RemoveByModuleLine(module, line, PaneBpPath(module, line)))
                 OnGutterBpRemoved(module, line); // no gutter bookmark matched — keep the pane/engine consistent
+        }
+
+        /// <summary>The .clw path of the pane row the page is naming, or null when there is none to
+        /// trust. Reads the same list SendBps rendered and resolves it through the same map, so the
+        /// pane, its filename link and its "x" can never disagree about which file a row means.</summary>
+        private string PaneBpPath(string module, int line)
+        {
+            try
+            {
+                var paths = GutterPathsByModuleLine();
+                foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
+                    if (SameBp(b, module, line)) return GutterPathFor(paths, b);
+            }
+            catch { }
+            return null;
         }
 
         /// <summary>Apply advanced breakpoint properties (condition / hit count / tracepoint) from the
@@ -1237,12 +1261,29 @@ namespace ClarionDebugger.Terminal
         /// dropped. Emitting 0 for "unknown" would make every such reply look like a different thread's.</summary>
         private static string TidJson(uint? tid)
         {
-            // 0 is treated as "unknown" too, not written out: no Win32 thread has id 0, so a 0 reaching here
-            // is a caller that turned an absent tid into a sentinel — which the page would then read as a
-            // real thread and start dropping good replies against. Enforcing it here rather than trusting
-            // every caller is the point; the engine's own writer does the same on its side.
+            return TidMember("tid", tid);
+        }
+
+        /// <summary>THE host's one writer of a thread-id-valued member, whatever the member is called.
+        /// Writes <paramref name="name"/> only when the id is KNOWN, and nothing at all when it is not.
+        /// <para>
+        /// 0 is treated as "unknown" too, not written out: no Win32 thread has id 0, so a 0 reaching here
+        /// is a caller that turned an absent tid into a sentinel — which the page would then read as a
+        /// real thread and start dropping good replies against. Enforcing it here rather than trusting
+        /// every caller is the point; the engine's own writer does the same on its side.
+        /// </para>
+        /// <para>
+        /// It takes the NAME because a thread id does not stop being one when it is called something else.
+        /// The <c>threads</c> message carries three of them — <c>tid</c> per row, plus a top-level
+        /// <c>stopped</c> and <c>selected</c> — and the two that are not called "tid" were written
+        /// unconditionally, so they said "thread 0" where they meant "I do not know" (task 3b043dfc).
+        /// The page already reads a non-number or a 0 as no selection, so an omitted member is the shape
+        /// it was waiting for.
+        /// </para></summary>
+        private static string TidMember(string name, uint? tid)
+        {
             if (!tid.HasValue || tid.Value == 0) return string.Empty;
-            return ",\"tid\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
+            return ",\"" + name + "\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
 
         /// <summary>Push the engine's thread inventory to the page (Call Stack thread picker). Names come from
@@ -1250,8 +1291,12 @@ namespace ClarionDebugger.Terminal
         private void OnThreads(DebugThreadList list)
         {
             if (list == null) return;
-            var sb = new StringBuilder("{\"type\":\"threads\",\"stopped\":").Append(list.StoppedTid)
-                .Append(",\"selected\":").Append(list.SelectedTid).Append(",\"threads\":[");
+            // Both go through the one writer, so an unknown stopped/selected is ABSENT rather than the
+            // thread-0 it used to claim to be — the same rule the per-row tid has always had here.
+            var sb = new StringBuilder("{\"type\":\"threads\"")
+                .Append(TidMember("stopped", list.StoppedTid))
+                .Append(TidMember("selected", list.SelectedTid))
+                .Append(",\"threads\":[");
             for (int i = 0; i < list.Threads.Count; i++)
             {
                 var t = list.Threads[i];
@@ -1376,29 +1421,13 @@ namespace ClarionDebugger.Terminal
             // The engine's bp list carries no source path; the IDE gutter is the source of truth for
             // the .clw file. Build a (module|line) -> path map from the gutter so each row can carry
             // the exact path for click-to-open, in both running and stopped states.
-            var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            try
-            {
-                foreach (var g in _gutter.Snapshot())
-                {
-                    if (string.IsNullOrEmpty(g.Path) || string.IsNullOrEmpty(g.Module)) continue;
-                    paths[g.Module + "|" + g.Line] = g.Path;
-                    paths[g.Module + "|" + g.RequestedLine] = g.Path;
-                }
-            }
-            catch { }
+            var paths = GutterPathsByModuleLine();
 
             for (int i = 0; i < list.Count; i++)
             {
                 if (i > 0) sb.Append(',');
                 var b = list[i];
-                string path = b.Path;
-                if (string.IsNullOrEmpty(path) && b.Module != null)
-                {
-                    string p;
-                    if (paths.TryGetValue(b.Module + "|" + b.Line, out p)
-                        || paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p)) path = p;
-                }
+                string path = GutterPathFor(paths, b);
                 sb.Append("{\"module\":").Append(Str(b.Module))
                   .Append(",\"line\":").Append(b.Line)
                   .Append(",\"requested\":").Append(b.RequestedLine)
@@ -1411,6 +1440,63 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append("]}");
             Post(sb.ToString());
+        }
+
+        /// <summary>The IDE gutter's bookmarks as (module|line) -> the .clw path that claims it, with a
+        /// NULL value meaning "more than one file claims this key, and we cannot tell which".
+        /// <para>
+        /// A module is a bare basename. In a multi-DLL app two DLLs can each hold a <c>clbrws011.clw</c>
+        /// bookmarked at the same line, and this map used to be a plain assignment - so the second
+        /// bookmark silently overwrote the first and a pane row could carry the OTHER file's path.
+        /// Clicking the filename then opened the wrong source with no hint that it had (task e80072f1);
+        /// <c>OpenBp</c> could not catch it either, because both paths exist on disk.
+        /// </para>
+        /// <para>
+        /// Recording the collision instead of resolving it is the honest answer: the engine names the
+        /// breakpoint by basename, so the host genuinely does not know which of the two files it armed.
+        /// A row with no path falls back to the page's <c>jump</c> action and the .red resolution behind
+        /// it - a best effort that is ADMITTEDLY one, rather than a confident wrong file.
+        /// </para></summary>
+        private Dictionary<string, string> GutterPathsByModuleLine()
+        {
+            var paths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var g in _gutter.Snapshot())
+                {
+                    if (string.IsNullOrEmpty(g.Path) || string.IsNullOrEmpty(g.Module)) continue;
+                    ClaimGutterPath(paths, g.Module + "|" + g.Line, g.Path);
+                    ClaimGutterPath(paths, g.Module + "|" + g.RequestedLine, g.Path);
+                }
+            }
+            catch { }
+            return paths;
+        }
+
+        /// <summary>Record that <paramref name="path"/> claims <paramref name="key"/>. The first claim
+        /// wins; a second claim from a DIFFERENT file poisons the key to null, and no later claim can
+        /// un-poison it. (The same file claiming the same key twice is ordinary - a bookmark whose
+        /// requested and planted lines are equal claims it under both.)</summary>
+        private static void ClaimGutterPath(Dictionary<string, string> paths, string key, string path)
+        {
+            string had;
+            if (!paths.TryGetValue(key, out had)) { paths[key] = path; return; }
+            if (had != null && !string.Equals(had, path, StringComparison.OrdinalIgnoreCase)) paths[key] = null;
+        }
+
+        /// <summary>The .clw path to show for one breakpoint row, or null when there is none to trust.
+        /// The entry's OWN path wins when it has one (a gutter-built entry knows the file it came from);
+        /// otherwise the planted line is tried before the requested one, and an ambiguous key is skipped
+        /// rather than returned - a row whose planted line is contested may still have an uncontested
+        /// requested line, and the other way round.</summary>
+        private static string GutterPathFor(Dictionary<string, string> paths, DebugBreakpoint b)
+        {
+            if (!string.IsNullOrEmpty(b.Path)) return b.Path;
+            if (b.Module == null) return null;
+            string p;
+            if (paths.TryGetValue(b.Module + "|" + b.Line, out p) && p != null) return p;
+            if (paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p) && p != null) return p;
+            return null;
         }
 
         /// <summary>An image (EXE or DLL) mapped into the target. Surface debuggable images to the
@@ -1506,9 +1592,30 @@ namespace ClarionDebugger.Terminal
             }
         }
 
+        /// <summary>Does this staged entry name (module, line)? The line every caller passes is a
+        /// REQUESTED line - the gutter's, the Procedures list's, the pane's <c>b.requested</c> - so this
+        /// keys on the requested line, the same key <see cref="ClarionDebuggerService.SameBpIdentity"/>
+        /// and <see cref="ClarionDebuggerService.BpDelMatches"/> use, by calling the same body they do.
+        /// <para>
+        /// It used to also match <c>b.Line == line</c>, a two-way OR that let ONE removal trim a
+        /// DIFFERENT staged entry whose planted line happened to equal the removed one's requested line -
+        /// silently losing it from the next session's launch spec (b1db9a76 item 2). That OR was
+        /// unreachable in-tree, because every _pending entry is created with Line == RequestedLine and
+        /// nothing writes the engine's snapped line back into _pending. It was held back from wave 1
+        /// until 05959085 settled which line is the key; it has, so the OR is gone rather than left as a
+        /// promise the rest of the identity code no longer makes.
+        /// </para>
+        /// <para>
+        /// The absent case is not dropped with it: BpLineMatches still falls back to the planted line for
+        /// an entry with no requested line at all, which is what an echo from an engine older than that
+        /// protocol change leaves behind. Module is compared ignoring case here and not there because one
+        /// side of THIS comparison is a gutter basename (Path.GetFileName keeps the file's own case)
+        /// while both sides of those are engine-lowercased.
+        /// </para></summary>
         private static bool SameBp(DebugBreakpoint b, string module, int line)
         {
-            return string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && (b.RequestedLine == line || b.Line == line);
+            return string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase)
+                && ClarionDebuggerService.BpLineMatches(b, line, line);
         }
 
         // ------------------------------------------------------------------ helpers

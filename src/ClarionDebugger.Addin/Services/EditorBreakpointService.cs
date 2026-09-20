@@ -128,27 +128,60 @@ namespace ClarionDebugger.Services
         /// </summary>
         public bool RemoveByModuleLine(string module, int line)
         {
+            return RemoveByModuleLine(module, line, null);
+        }
+
+        /// <summary>
+        /// Remove the IDE gutter breakpoint bookmark matching (module, 1-based line), preferring the one
+        /// in <paramref name="filePath"/> when the caller knows which file it means.
+        /// <para>
+        /// A module is a BARE .clw BASENAME. In a multi-DLL app two loaded DLLs can each hold a
+        /// <c>clbrws011.clw</c> bookmarked at the same line, and this used to clear whichever of them
+        /// <c>DebuggerService.Breakpoints</c> happened to enumerate first — so the pane's "x" on one
+        /// breakpoint took the OTHER file's red dot away (task e80072f1).
+        /// </para>
+        /// <para>
+        /// The order below is deliberate, and each step is the best answer available at that step:
+        /// an exact file match when the caller named a file; otherwise the single match when there is
+        /// only one, which cannot be the wrong one; and otherwise NOTHING, because several bookmarks
+        /// claim (module, line) and picking one is a coin toss whose losing side silently clears a dot
+        /// the user still wants. Returning false there hands the caller its existing fallback, which
+        /// keeps the pane and the engine consistent without touching the gutter.
+        /// </para>
+        /// </summary>
+        public bool RemoveByModuleLine(string module, int line, string filePath)
+        {
             try
             {
+                var matches = new List<BreakpointBookmark>();
                 foreach (var bb in DebuggerService.Breakpoints)
                 {
                     string m; int l;
                     if (TryMap(bb, out m, out l)
                         && string.Equals(m, module, StringComparison.OrdinalIgnoreCase) && l == line)
-                    {
-                        // Mirror the add path (ToggleAtCaret) so the IDE removes the bookmark AND
-                        // repaints the editor's icon-bar margin — clearing the red dot. RemoveMark
-                        // alone drops the SharpDevelop-level bookmark but leaves the open document's
-                        // gutter showing a stale dot until its next redraw. Toggling an existing
-                        // breakpoint off fires BreakPointRemoved exactly like a manual gutter removal,
-                        // so the engine/pending + pane cascade (OnGutterBpRemoved) still runs.
-                        if (bb.Document != null)
-                            DebuggerService.ToggleBreakpointAt(bb.Document, bb.FileName, bb.LineNumber);
-                        else
-                            ICSharpCode.SharpDevelop.Bookmarks.BookmarkManager.RemoveMark(bb); // editor closed — no visible dot to repaint
-                        return true;
-                    }
+                        matches.Add(bb);
                 }
+
+                BreakpointBookmark target = null;
+                if (!string.IsNullOrEmpty(filePath))
+                    foreach (var bb in matches)
+                        if (string.Equals(bb.FileName, filePath, StringComparison.OrdinalIgnoreCase)) { target = bb; break; }
+                // Only when the caller named no file, or named one no bookmark carries, and there is
+                // exactly one candidate — one candidate is unambiguous whatever the caller knew.
+                if (target == null && matches.Count == 1) target = matches[0];
+                if (target == null) return false;
+
+                // Mirror the add path (ToggleAtCaret) so the IDE removes the bookmark AND
+                // repaints the editor's icon-bar margin — clearing the red dot. RemoveMark
+                // alone drops the SharpDevelop-level bookmark but leaves the open document's
+                // gutter showing a stale dot until its next redraw. Toggling an existing
+                // breakpoint off fires BreakPointRemoved exactly like a manual gutter removal,
+                // so the engine/pending + pane cascade (OnGutterBpRemoved) still runs.
+                if (target.Document != null)
+                    DebuggerService.ToggleBreakpointAt(target.Document, target.FileName, target.LineNumber);
+                else
+                    ICSharpCode.SharpDevelop.Bookmarks.BookmarkManager.RemoveMark(target); // editor closed — no visible dot to repaint
+                return true;
             }
             catch { }
             return false;

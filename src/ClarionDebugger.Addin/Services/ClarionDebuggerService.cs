@@ -108,6 +108,29 @@ namespace ClarionDebugger.Services
         public int Line;            // line actually planted (snapped to nearest code record)
         public string Path;         // full .clw path from the IDE gutter bookmark (null if unknown)
 
+        /// <summary>The OWNING IMAGE (EXE/DLL) the engine armed this breakpoint in, as the engine
+        /// reported it, or null when it did not say.
+        /// <para>
+        /// <c>Module</c> is a BASENAME, and two loaded DLLs can each carry a <c>clbrws011.clw</c>. Without
+        /// the owner, a breakpoint in each of them has the same identity and the two collapse into one pane
+        /// row. This is the second half of the identity key, read by
+        /// <see cref="ClarionDebuggerService.BpOwnerMatches"/>.
+        /// </para>
+        /// <para>
+        /// NULL MEANS UNKNOWN, and unknown matches ANY owner — which is what keeps an engine build older
+        /// than the <c>ownerPath</c> protocol change behaving exactly as it did before. It is also what a
+        /// host-built entry (a gutter bookmark, a pending entry the pad staged) has, since only the engine
+        /// knows which image a compiland came from. The engine writes JSON null for a still-pending
+        /// breakpoint, which reads back the same way and means the same thing.
+        /// </para>
+        /// <para>
+        /// This is an IDENTITY TOKEN, NOT A PATH TO OPEN. It names the image, not the .clw, and it arrives
+        /// in the wire's escaped form (a Windows separator reads back as <c>\</c>, because GetStr does not
+        /// unescape). Both sides of every comparison come from that same wire, so equality is exact; anything
+        /// that wanted a real disk path would have to unescape it first.
+        /// </para></summary>
+        public string OwnerPath;
+
         // ---- advanced breakpoint properties (conditional / hit count / tracepoint) ----
         public string Condition;    // expression; pause only when true (null/empty = unconditional)
         public string HitMode;      // null | "eq" (=N) | "gte" (>=N) | "mod" (every Nth)
@@ -171,8 +194,18 @@ namespace ClarionDebugger.Services
     /// the read paths are currently pointed at, and the list itself (stopped thread first).</summary>
     public sealed class DebugThreadList
     {
-        public uint StoppedTid;
-        public uint SelectedTid;
+        /// <summary>The thread the engine stopped on, and the one it has selected - NULL when the engine
+        /// did not say which.
+        /// <para>
+        /// ABSENT IS NOT 0, for the same reason it is not for a reply's <c>tid</c>: no Win32 thread has id
+        /// 0, so a 0 standing in for "unknown" reads downstream as a REAL thread and makes the consumer
+        /// discard good data against it. The engine writes these members only when the id is known and
+        /// leaves them out otherwise (task 3b043dfc); reading them with GetUIntOrNull and then
+        /// substituting 0u threw that distinction away on arrival, which is the one place a host can undo
+        /// a wire rule unilaterally.
+        /// </para></summary>
+        public uint? StoppedTid;
+        public uint? SelectedTid;
         public List<DebugThread> Threads = new List<DebugThread>();
     }
 
@@ -814,8 +847,13 @@ namespace ClarionDebugger.Services
                     // GetIntOrNull, not GetInt: absent must stay distinguishable from 0, because 0 is a real
                     // RequestedLine for an unresolved raw breakpoint.
                     int? delRequested = GetIntOrNull(json, "requestedLine");
+                    // ...and by its owning image, for the same reason: `module` is a basename, so a bp-del
+                    // that named only (module, requestedLine) would remove the same-named breakpoint in
+                    // EVERY loaded DLL. Absent (an engine that predates ownerPath) matches any owner, which
+                    // is exactly today's behaviour — see BpOwnerMatches.
+                    string delOwner = GetStr(json, "ownerPath");
                     lock (_breakpoints)
-                        _breakpoints.RemoveAll(b => BpDelMatches(b, delMod, delRequested, delLine));
+                        _breakpoints.RemoveAll(b => BpDelMatches(b, delMod, delRequested, delLine, delOwner));
                     BreakpointRemoved?.Invoke(delMod, delRequested ?? delLine);
                     break;
 
@@ -1073,8 +1111,11 @@ namespace ClarionDebugger.Services
                 var list = new DebugThreadList();
                 int arr = json.IndexOf("\"threads\":[", StringComparison.Ordinal);
                 string head = arr > 0 ? json.Substring(0, arr) : json;
-                list.StoppedTid = GetUIntOrNull(head, "stopped") ?? 0u;
-                list.SelectedTid = GetUIntOrNull(head, "selected") ?? 0u;
+                // No "?? 0u": these are thread-id-valued members whatever they are called, so the
+                // absent-means-unknown rule is theirs too. An engine that predates 3b043dfc writes them
+                // unconditionally and a known id still reads as itself, so nothing here changes for it.
+                list.StoppedTid = GetUIntOrNull(head, "stopped");
+                list.SelectedTid = GetUIntOrNull(head, "selected");
                 foreach (Match m in Regex.Matches(ExtractArrayBalanced(json, "threads"), "\\{[^{}]*\\}"))
                 {
                     string t = m.Value;
@@ -1355,6 +1396,11 @@ namespace ClarionDebugger.Services
                 Module = module,
                 Line = GetInt(json, "line"),
                 RequestedLineOrNull = GetIntOrNull(json, "requestedLine"),
+                // The other half of the identity key, and the same absent-is-not-a-value care. GetStr
+                // answers null for an absent member AND for a JSON null, which here mean the same thing:
+                // this echo does not name an owning image. BpOwnerMatches then lets it match any owner,
+                // so an engine that predates the field keeps today's behaviour exactly.
+                OwnerPath = GetStr(json, "ownerPath"),
                 Condition = GetStr(json, "condition"),
                 HitMode = GetStr(json, "hitMode"),
                 HitValue = GetInt(json, "hitValue"),
@@ -1364,7 +1410,7 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>Whether a bp-set echo names a breakpoint the host already lists. Identity is
-        /// (module, requested line): the planted line is where the engine SNAPPED the breakpoint, and
+        /// (owning image, module, requested line): the planted line is where the engine SNAPPED the breakpoint, and
         /// two distinct gutter lines can snap to the same record, so keying identity on it merges two
         /// breakpoints into one row and loses one of them.
         /// <para>
@@ -1380,12 +1426,60 @@ namespace ClarionDebugger.Services
         /// Both sides come from the same engine build in a live session, so both-present and both-absent are
         /// the reachable cases; the mixed case is defined rather than left to a 0 default, and is asserted in
         /// tools/test-addin-json.ps1 against a present requested line of 0.
+        /// </para>
+        /// <para>
+        /// The module is a BASENAME, so <see cref="BpOwnerMatches"/> carries the other half: two loaded DLLs
+        /// can each hold a <c>clbrws011.clw</c>, and without the owning image those two breakpoints have one
+        /// identity and merge into a single pane row (task e80072f1).
+        /// </para>
+        /// <para>
+        /// Both halves are SHARED BODIES, not mirrored ones. This and <see cref="BpDelMatches"/> reach the
+        /// same answer because they run the same two functions, so neither can be edited out of step with
+        /// the other; tools/test-addin-json.ps1 asserts they agree over an enumerated input space as well.
         /// </para></summary>
         internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)
         {
             if (a.Module != b.Module) return false;
-            int? ra = a.RequestedLineOrNull, rb = b.RequestedLineOrNull;
-            return (ra.HasValue && rb.HasValue) ? ra.Value == rb.Value : a.Line == b.Line;
+            if (!BpOwnerMatches(a.OwnerPath, b.OwnerPath)) return false;
+            return BpLineMatches(a, b.RequestedLineOrNull, b.Line);
+        }
+
+        /// <summary>The LINE half of breakpoint identity, and the ONLY copy of it. Both
+        /// <see cref="SameBpIdentity"/> and <see cref="BpDelMatches"/> call this, so the question "do the
+        /// two predicates still agree?" is no longer a claim about two bodies that happen to read alike —
+        /// there is one body. They were structurally identical by review before, which is a property a
+        /// later edit to either one silently ends.
+        /// <para>
+        /// Requested lines are comparable only when BOTH sides have one. When either is absent — an engine
+        /// build older than that protocol change — this falls back to the planted line, which can match
+        /// several breakpoints that snapped to one record. That is the documented cost of talking to an old
+        /// engine, and it beats comparing an absent line as 0, which merged every breakpoint in a module.
+        /// </para></summary>
+        internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)
+        {
+            int? rb = b.RequestedLineOrNull;
+            return (requestedLine.HasValue && rb.HasValue) ? rb.Value == requestedLine.Value
+                                                           : b.Line == plantedLine;
+        }
+
+        /// <summary>The OWNER half of breakpoint identity, and likewise the only copy. A breakpoint's
+        /// <c>module</c> is a bare .clw basename, so two loaded DLLs that each carry a same-named compiland
+        /// produce two breakpoints with one identity; the owning image is what tells them apart.
+        /// <para>
+        /// UNKNOWN MATCHES ANYTHING, deliberately. An owner of null means the sender did not say — an
+        /// engine that predates the <c>ownerPath</c> field, a still-pending breakpoint whose image has not
+        /// mapped, or a host-built gutter entry, which never knows the image at all. Treating unknown as a
+        /// distinct owner would make a new host stop matching an old engine's echoes entirely, i.e. turn a
+        /// missing disambiguator into a total failure to remove or dedupe anything. Falling back to
+        /// today's (module, line) behaviour is the same trade every other absent field here makes.
+        /// </para>
+        /// <para>
+        /// OrdinalIgnoreCase: these are Windows image paths, which are case-insensitive, and the two sides
+        /// can come from different engine sessions via a stale host entry.
+        /// </para></summary>
+        internal static bool BpOwnerMatches(string a, string b)
+        {
+            return a == null || b == null || string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>Which host entries one bp-del removes. The engine deletes exactly one logical
@@ -1403,13 +1497,18 @@ namespace ClarionDebugger.Services
         /// be equal) and leaves the named one behind (they happen not to be). A stale entry from an earlier
         /// session is enough to reach that mix. So the absent case falls back to the planted line here too:
         /// over-broad, and the documented cost of an old echo, rather than silently wrong.
+        /// </para>
+        /// <para>
+        /// <paramref name="ownerPath"/> is the owning image the echo names, or null when it names none. It is
+        /// on bp-del for the same reason it is on bp-set: <paramref name="module"/> is a basename, so without
+        /// it one delete would take the same-named breakpoint out of every loaded DLL. Null matches any
+        /// owner — see <see cref="BpOwnerMatches"/> — so an engine that predates the field behaves as before.
         /// </para></summary>
-        internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)
+        internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine, string ownerPath)
         {
             if (b.Module != module) return false;
-            int? rb = b.RequestedLineOrNull;
-            return (requestedLine.HasValue && rb.HasValue) ? rb.Value == requestedLine.Value
-                                                           : b.Line == plantedLine;
+            if (!BpOwnerMatches(b.OwnerPath, ownerPath)) return false;
+            return BpLineMatches(b, requestedLine, plantedLine);
         }
 
         /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an

@@ -63,7 +63,8 @@ $methods = @(
   (Get-Method 'private static string ScanNumberToken(string json, string key)'),
   (Get-Method 'private static int? GetIntOrNull(string json, string key)'),
   (Get-Method 'private static uint? GetUIntOrNull(string json, string key)'),
-  (Get-Method 'private static string TidJson(uint? tid)' $web)
+  (Get-Method 'private static string TidJson(uint? tid)' $web),
+  (Get-Method 'private static string TidMember(string name, uint? tid)' $web)
 ) -join "`n"
 
 # same bodies, reachable from PowerShell
@@ -161,6 +162,7 @@ Write-Host 'breakpoint identity on the wire: two source lines that snap to ONE p
 # Pull the real bodies out first: keeping the extraction out of the here-string keeps the C# shim readable.
 $wireMethods = @(
   (Get-Method 'public static string Str(string s)' $engine),
+  (Get-Method 'private static string OwnerPath(UserBreakpoint bp)' $engine),
   (Get-Method 'public static string BpSet(UserBreakpoint bp)' $engine),
   (Get-Method 'public static string BpDel(UserBreakpoint bp)' $engine),
   (Get-Method 'public static string BpList(List<UserBreakpoint> bps)' $engine),
@@ -170,7 +172,9 @@ $hostMethods = @(
   (Get-Method 'private static DebugBreakpoint ParseBpFields(string json, string module)'),
   (Get-Method 'private static List<DebugBreakpoint> ParseBpList(string json)'),
   (Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)'),
-  (Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)'),
+  (Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine, string ownerPath)'),
+  (Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)'),
+  (Get-Method 'internal static bool BpOwnerMatches(string a, string b)'),
   (Get-Method 'private static string GetStr(string json, string key)'),
   (Get-Method 'private static int GetInt(string json, string key)'),
   (Get-Method 'private static int? GetIntOrNull(string json, string key)'),
@@ -192,9 +196,13 @@ $bpRecord
 // engine renamed one, the extracted bodies would stop compiling here rather than passing anyway.
 public sealed class UserBreakpoint {
     public string Module; public int RequestedLine; public int Line;
+    public LoadedModule Owner;    // null = pending, exactly as in the engine
     public readonly List<uint> Rvas = new List<uint>();
     public string Condition; public string HitMode; public int HitValue; public string Trace; public int HitCount;
 }
+
+// The owning image, cut down to the one field the writer reads. Asserted against LoadedModule.cs below.
+public sealed class LoadedModule { public string Path; }
 
 public static class BpWire {
 $($wireMethods -replace 'private static', 'public static')
@@ -206,8 +214,10 @@ $($hostMethods -replace 'private static', 'public static' -replace 'internal sta
 "@
 Add-Type -TypeDefinition $bpTypes -Language CSharp | Out-Null
 
-function EngineBp { param($mod, $req, $line)
-  $b = New-Object UserBreakpoint; $b.Module = $mod; $b.RequestedLine = $req; $b.Line = $line; $b
+function EngineBp { param($mod, $req, $line, $ownerPath)
+  $b = New-Object UserBreakpoint; $b.Module = $mod; $b.RequestedLine = $req; $b.Line = $line
+  if ($ownerPath) { $o = New-Object LoadedModule; $o.Path = $ownerPath; $b.Owner = $o }
+  $b
 }
 # the host's bp-set arm: parse the echo, then add-or-refresh under the real identity key
 function HostBpSet { param($list, $json)
@@ -220,8 +230,9 @@ function HostBpDel { param($list, $json)
   $mod = [BpHost]::GetStr($json, 'module')
   $planted = [BpHost]::GetInt($json, 'line')
   $req = [BpHost]::GetIntOrNull($json, 'requestedLine')
+  $owner = [BpHost]::GetStr($json, 'ownerPath')
   $keep = New-Object System.Collections.ArrayList
-  foreach ($b in $list) { if (-not [BpHost]::BpDelMatches($b, $mod, $req, $planted)) { [void]$keep.Add($b) } }
+  foreach ($b in $list) { if (-not [BpHost]::BpDelMatches($b, $mod, $req, $planted, $owner)) { [void]$keep.Add($b) } }
   , $keep
 }
 function Lines { param($list) (($list | ForEach-Object { "$($_.RequestedLine)->$($_.Line)" }) -join ' ') }
@@ -378,22 +389,29 @@ Write-Host 'and the promise is kept in the reader and the identity key themselve
 $parseBody = Get-Method 'private static DebugBreakpoint ParseBpFields(string json, string module)'
 Check 'ParseBpFields preserves ABSENCE (GetIntOrNull, never GetInt, for requestedLine)' `
   (($parseBody -match 'GetIntOrNull\(json, "requestedLine"\)') -and ($parseBody -notmatch 'GetInt\(json, "requestedLine"\)')) ''
-$identBody = Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)'
-Check 'SameBpIdentity falls back to the planted line when a requested line is absent' ($identBody -match 'a\.Line == b\.Line') ''
+# The line rule now lives in ONE body that both predicates call, so these check it there. "Structurally
+# identical by review" was a property of two bodies that happened to read alike, and the next edit to either
+# one ends it silently; one body cannot drift from itself.
+$lineBody = Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)'
+Check 'BpLineMatches falls back to the planted line when a requested line is absent' ($lineBody -match 'b\.Line == plantedLine') ''
 Check 'and it compares requested lines through the nullable carrier, not the 0-defaulting accessor' `
-  ($identBody -match 'RequestedLineOrNull') ''
-# The predicate SameBpIdentity mirrors has to read the carrier for the same reason: b.RequestedLine answers
-# the PLANTED line when the requested one is absent, so reading it compares one kind of line against another.
-$delBody = Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine)'
-Check 'BpDelMatches reads the nullable carrier too, not the substituting getter' `
-  (($delBody -match 'RequestedLineOrNull') -and ($delBody -notmatch 'b\.RequestedLine ==')) ''
+  (($lineBody -match 'RequestedLineOrNull') -and ($lineBody -notmatch 'b\.RequestedLine ==')) ''
 Check 'and it requires a requested line on BOTH sides before comparing them' `
-  ($delBody -match 'requestedLine\.HasValue && rb\.HasValue') ''
+  ($lineBody -match 'requestedLine\.HasValue && rb\.HasValue') ''
+# ...and NEITHER predicate may keep a private copy of that rule, which is what would let them disagree again.
+$identBody = Get-Method 'internal static bool SameBpIdentity(DebugBreakpoint a, DebugBreakpoint b)'
+$delBody = Get-Method 'internal static bool BpDelMatches(DebugBreakpoint b, string module, int? requestedLine, int plantedLine, string ownerPath)'
+Check 'SameBpIdentity decides the line through BpLineMatches and holds no copy of the rule' `
+  (($identBody -match 'BpLineMatches\(') -and ($identBody -notmatch 'HasValue')) ''
+Check 'BpDelMatches decides the line through the same one, and holds no copy either' `
+  (($delBody -match 'BpLineMatches\(') -and ($delBody -notmatch 'HasValue')) ''
+Check 'and both take the owner half from BpOwnerMatches' `
+  (($identBody -match 'BpOwnerMatches\(') -and ($delBody -match 'BpOwnerMatches\(')) ''
 
 Write-Host ''
 Write-Host 'the real handler arms use these same keys, so the mirror above cannot drift'
 Check 'the bp-set arm dedupes through SameBpIdentity' ($src -match 'if \(SameBpIdentity\(b, bp\)\)') ''
-Check 'the bp-del arm removes through BpDelMatches' ($src -match 'RemoveAll\(b => BpDelMatches\(b, delMod, delRequested, delLine\)\)') ''
+Check 'the bp-del arm removes through BpDelMatches, owner and all' ($src -match 'RemoveAll\(b => BpDelMatches\(b, delMod, delRequested, delLine, delOwner\)\)') ''
 # GetInt answers 0 for an absent field, and 0 is a real RequestedLine for an unresolved raw breakpoint,
 # so reading requestedLine with GetInt would turn "old engine" into "delete the raw breakpoints".
 Check 'bp-del reads requestedLine with the absent-aware reader' ($src -match 'GetIntOrNull\(json, "requestedLine"\)') ''
@@ -797,6 +815,178 @@ $doc = $doc.Substring([Math]::Max(0, $doc.Length - 1600))
 Check 'its doc comment no longer instructs new payloads to order their fields' `
   ($doc -notmatch 'must do the same' -and $doc -notmatch 'goes LAST') ''
 Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
+
+Write-Host ''
+Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-named .clw'
+# Task e80072f1. `module` on the wire is a BARE BASENAME (clbrws011.clw), so in a multi-DLL app two loaded
+# images can each carry a compiland of that name. Keyed on (module, requestedLine) alone those are ONE
+# breakpoint: the pane shows a single row for two, the row can carry the other file's path, and one bp-del
+# takes both out. The owning IMAGE is what tells them apart, and it now crosses the wire on all three
+# breakpoint echoes. Everything below runs the REAL writer into the REAL reader, as the section above does.
+$dll1 = 'C:\App\Dll1\dll1.dll'
+$dll2 = 'C:\App\Dll2\dll2.dll'
+$bpD1 = EngineBp 'clbrws011.clw' 50 50 $dll1
+$bpD2 = EngineBp 'clbrws011.clw' 50 50 $dll2
+
+# The one-of-three-paths trap, checked as three paths rather than trusted as a promise: requestedLine was
+# implemented on bp-del only and shipped that way, and ownerPath has exactly the same three emitters.
+$setD1 = [BpWire]::BpSet($bpD1)
+$delD1 = [BpWire]::BpDel($bpD1)
+$ulOwn = New-Object 'System.Collections.Generic.List[UserBreakpoint]'
+$ulOwn.Add($bpD1)
+$listD1 = [BpWire]::BpList($ulOwn)
+$emitters = @($setD1, $delD1, $listD1)
+$carrying = @($emitters | Where-Object { [BpHost]::GetStr($_, 'ownerPath') }).Count
+Check 'all 3 breakpoint echoes carry ownerPath (bp-set, bp-del, bp-list)' ($carrying -eq 3) "$carrying of 3"
+
+$dllRows = New-Object System.Collections.ArrayList
+HostBpSet $dllRows $setD1
+HostBpSet $dllRows ([BpWire]::BpSet($bpD2))
+Check 'two DLLs holding clbrws011.clw:50 are 2 host rows, not 1' ($dllRows.Count -eq 2) (Lines $dllRows)
+# ISOLATION. The 2 above must come from the OWNER differing and nothing else: same module, same requested
+# line, same planted line. Give the two echoes the SAME owner and they are one breakpoint again, so a pass
+# above cannot be the identity key having quietly stopped merging anything.
+$sameOwner = New-Object System.Collections.ArrayList
+HostBpSet $sameOwner ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 50 50 $dll1)))
+HostBpSet $sameOwner ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 50 50 $dll1)))
+Check 'and two echoes from the SAME image at that line are still 1 row' ($sameOwner.Count -eq 1) (Lines $sameOwner)
+
+# ...and the removal half: the "x" on one must not take the other out of the pane.
+$dllSurv = HostBpDel $dllRows $delD1
+Check 'removing the Dll1 breakpoint leaves exactly 1 row' ($dllSurv.Count -eq 1) (Lines $dllSurv)
+Check 'and the row left behind is the Dll2 one' `
+  ($dllSurv.Count -eq 1 -and $dllSurv[0].OwnerPath -match 'dll2') (ShowU $dllSurv[0].OwnerPath)
+
+# What the owner IS, stated so nobody later treats it as a file to open: the IMAGE path, in the wire's
+# escaped form, because GetStr returns the raw JSON text and does not unescape. Both sides of every
+# comparison come off that same wire, so equality is exact - but File.Exists on it would not be.
+Check 'the owner reads back as the escaped wire form, an identity token rather than a usable path' `
+  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -eq 'C:\\App\\Dll1\\dll1.dll') (ShowU $dllRows[0].OwnerPath)
+
+Write-Host ''
+Write-Host 'an engine that predates ownerPath behaves EXACTLY as it did before, on every path that reads it'
+# Derived the way every legacy echo in this file is: the REAL writer's output with the one member an older
+# build would not have emitted taken back out. Module, both lines and every property are untouched.
+function LegacyOwner { param([string] $Json) $Json -replace ',"ownerPath":("[^"]*"|null)', '' }
+
+$legacySetD1 = LegacyOwner $setD1
+$legacySetD2 = LegacyOwner ([BpWire]::BpSet($bpD2))
+Check 'the legacy bp-set echoes really carry no ownerPath' `
+  (($legacySetD1 -notmatch 'ownerPath') -and ($legacySetD2 -notmatch 'ownerPath')) $legacySetD1
+# CONTROL: the rest of the echo survived the derivation, so a pass below is not an unparseable fixture.
+Check 'they still carry module, requested line and planted line' `
+  ((([BpHost]::GetStr($legacySetD1, 'module')) -eq 'clbrws011.clw') -and `
+   ([BpHost]::GetIntOrNull($legacySetD1, 'requestedLine') -eq 50) -and ([BpHost]::GetInt($legacySetD1, 'line') -eq 50)) $legacySetD1
+Check 'an absent ownerPath reads as absent, not as an empty owner' ($null -eq [BpHost]::GetStr($legacySetD1, 'ownerPath')) ''
+
+$legacyDllRows = New-Object System.Collections.ArrayList
+HostBpSet $legacyDllRows $legacySetD1
+HostBpSet $legacyDllRows $legacySetD2
+# The honest cost, stated the way the requestedLine fallback states its own: an engine that cannot name the
+# owning image cannot tell the two DLLs apart, so they merge - which is TODAY's behaviour, unchanged. What
+# matters is that it is today's behaviour and not a new failure.
+Check 'two legacy echoes from two DLLs still merge into 1 row (known fallback cost, = old behaviour)' `
+  ($legacyDllRows.Count -eq 1) (Lines $legacyDllRows)
+# The outright regression this fallback exists to prevent: a delete that matches nothing at all.
+$legacySolo = New-Object System.Collections.ArrayList
+HostBpSet $legacySolo $legacySetD1
+Check 'a legacy bp-del still removes the legacy row, rather than becoming a no-op' `
+  ((HostBpDel $legacySolo (LegacyOwner $delD1)).Count -eq 0) ''
+# ...and the MIXED case, which is what a 0/"" sentinel would get wrong while both cases above still passed:
+# a host row with no owner (legacy, or host-built) against an echo that names one. Unknown matches anything,
+# so the delete still lands - the alternative is a new host silently matching nothing an old engine says.
+$mixedOwner = New-Object System.Collections.ArrayList
+HostBpSet $mixedOwner $legacySetD1
+Check 'an owner-bearing bp-del still removes a row whose owner is unknown' `
+  ((HostBpDel $mixedOwner $delD1).Count -eq 0) ''
+# A still-PENDING breakpoint is the same shape and is not derived at all: the real writer emits JSON null
+# for it, because no image carries its compiland yet.
+$pendingSet = [BpWire]::BpSet((EngineBp 'clbrws011.clw' 50 50))
+Check 'a pending breakpoint writes ownerPath as JSON null, which reads as unknown too' `
+  (($pendingSet -match '"ownerPath":null') -and ($null -eq [BpHost]::GetStr($pendingSet, 'ownerPath'))) $pendingSet
+
+Write-Host ''
+Write-Host 'the two identity predicates AGREE - enumerated, not asserted'
+# SameBpIdentity and BpDelMatches were structurally identical by review in wave 1. That is a property of two
+# bodies that happen to read alike, and it ends the moment either one is edited - which is what this ticket
+# does to both. They now share their two halves, and this enumerates the space to prove the sharing holds:
+# for every pair, "is b already in the list?" must answer the same as "does b's bp-del remove a?".
+$mods = @('clbrws011.clw', 'other.clw')
+$reqs = @($null, 0, 10, 11)
+$lines = @(10, 11)
+$owners = @($null, $dll1, $dll2)
+$space = New-Object System.Collections.ArrayList
+foreach ($m in $mods) { foreach ($r in $reqs) { foreach ($l in $lines) { foreach ($o in $owners) {
+  $b = New-Object DebugBreakpoint
+  $b.Module = $m; $b.RequestedLineOrNull = $r; $b.Line = $l; $b.OwnerPath = $o
+  [void]$space.Add($b)
+} } } }
+$pairs = 0; $agree = 0; $trueCount = 0; $asym = 0
+foreach ($a in $space) { foreach ($b in $space) {
+  $pairs++
+  $ident = [BpHost]::SameBpIdentity($a, $b)
+  $del   = [BpHost]::BpDelMatches($a, $b.Module, $b.RequestedLineOrNull, $b.Line, $b.OwnerPath)
+  if ($ident -eq $del) { $agree++ }
+  if ($ident) { $trueCount++ }
+  if ($ident -ne [BpHost]::SameBpIdentity($b, $a)) { $asym++ }
+} }
+Check "all $pairs (a,b) pairs answer the same under both predicates" ($agree -eq $pairs) "$agree of $pairs agreed"
+# NOT VACUOUS: a predicate that answered false for everything would agree with itself perfectly. Both
+# outcomes have to occur, and the count is checkable rather than "some".
+Check 'and the space actually reaches both answers, so agreement is not two constant falses' `
+  ($trueCount -gt 0 -and $trueCount -lt $pairs) "$trueCount of $pairs matched"
+# Identity is used as a dedupe key in a loop over an unordered list, so it must not depend on which entry
+# the loop reached first.
+Check 'SameBpIdentity is symmetric, so a dedupe cannot depend on list order' ($asym -eq 0) "$asym asymmetric pair(s)"
+
+# The cut-down engine stub gained an Owner; pin the field names it borrows, as the section above does for
+# the line fields, so a rename in the engine fails here instead of passing against a stale imitation.
+$lm = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\LoadedModule.cs')
+Check 'the cut-down stubs match the real UserBreakpoint.Owner and LoadedModule.Path' `
+  (($engineSrc -match 'public LoadedModule Owner;') -and ($lm -match 'public string Path;')) ''
+# ONE writer for the owner on all three echoes, so a fourth emitter cannot carry it on some and not others.
+$ownerBody = Get-Method 'private static string OwnerPath(UserBreakpoint bp)' $engine
+Check 'the engine writes the owner from one function that treats a pending breakpoint as null' `
+  ($ownerBody -match 'bp\.Owner == null') ''
+Check 'and no breakpoint echo hand-writes the member instead' `
+  ((([regex]::Matches($engine, '\\"ownerPath\\":')).Count) -eq 3) `
+  ((([regex]::Matches($engine, '\\"ownerPath\\":')).Count).ToString() + ' site(s), all 3 via OwnerPath(bp)')
+# The host reads it in the ONE place bp-set and bp-list share, which is what keeps the promise off the
+# one-of-three path requestedLine took.
+Check 'the host reads ownerPath in ParseBpFields, the single decoder both bp-set and bp-list use' `
+  ($parseBody -match 'GetStr\(json, "ownerPath"\)') ''
+Check 'and the bp-del arm reads it too, rather than leaving that path owner-blind' `
+  ($src -match 'GetStr\(json, "ownerPath"\)') ''
+
+Write-Host ''
+Write-Host 'the host says "unknown thread" by leaving the member out, whatever the member is called'
+# Task 3b043dfc, host half. The `threads` message carries three thread-id-valued members - a per-row `tid`
+# plus a top-level `stopped` and `selected` - and only the one CALLED tid went through a writer. The other
+# two were appended unconditionally, so an unknown id went out as "thread 0", which downstream reads as a
+# real thread. All three now go through TidMember.
+Check 'an unknown stopped writes no member at all' ([PadJsonProbe]::TidMember('stopped', $null) -eq '') "'$([PadJsonProbe]::TidMember('stopped', $null))'"
+Check 'a 0 is a sentinel for selected as much as for tid - written as absent too' `
+  ([PadJsonProbe]::TidMember('selected', 0) -eq '') "'$([PadJsonProbe]::TidMember('selected', 0))'"
+Check 'a known stopped is written under its own name' `
+  ([PadJsonProbe]::TidMember('stopped', 116932) -eq ',"stopped":116932') ([PadJsonProbe]::TidMember('stopped', 116932))
+Check 'and TidJson is that same writer, not a second copy of the rule' `
+  ((Get-Method 'private static string TidJson(uint? tid)' $web) -match 'TidMember\("tid", tid\)') ''
+# ALL THREE, counted rather than asserted as "every": a fourth member added without the writer is what the
+# count catches. The per-row tid is written inline in OnThreads and is the third.
+$onThreads = Get-Method 'private void OnThreads(DebugThreadList list)' $web
+Check 'both top-level thread-id members in OnThreads go through it' `
+  ((([regex]::Matches($onThreads, 'TidMember\(')).Count) -eq 2) `
+  ((([regex]::Matches($onThreads, 'TidMember\(')).Count).ToString() + ' of 2')
+Check 'and neither is appended as a bare number any more' `
+  (($onThreads -notmatch '\\"stopped\\":\\"\).Append\(list') -and ($onThreads -notmatch 'Append\(list\.StoppedTid\)')) ''
+# The reader half: absent must survive arrival. Substituting 0u on the way in undoes the wire rule in the
+# one place a host can undo it unilaterally, and no writer discipline downstream can get it back.
+$parseThreads = Get-Method 'private static DebugThreadList ParseThreads(string json)'
+Check 'ParseThreads keeps an absent stopped/selected absent, with no 0 substituted on arrival' `
+  (($parseThreads -match 'GetUIntOrNull\(head, "stopped"\)') -and ($parseThreads -notmatch 'GetUIntOrNull\(head, "stopped"\) \?\? 0u') -and `
+   ($parseThreads -match 'GetUIntOrNull\(head, "selected"\)') -and ($parseThreads -notmatch 'GetUIntOrNull\(head, "selected"\) \?\? 0u')) ''
+Check 'and the list carries them as nullable, so "unknown" has somewhere to live' `
+  ((Get-Method 'public sealed class DebugThreadList') -match 'public uint\? StoppedTid;') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

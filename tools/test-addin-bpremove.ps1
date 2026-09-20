@@ -23,12 +23,18 @@
 # Exit code 0 = all checks passed.
 
 param(
-  [string] $WebViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs')
+  [string] $WebViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs'),
+  # SameBp no longer decides a line for itself: it calls the same BpLineMatches that SameBpIdentity and
+  # BpDelMatches call, so the service is now part of what this suite compiles. Stubbing that predicate here
+  # would let the pad's staging list and the engine-echo list drift apart again while both suites stayed
+  # green, which is exactly the shape of contract this project has already been bitten by once.
+  [string] $ServicePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs')
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib-extract.ps1')
 $web = Get-Content -Raw -LiteralPath $WebViewPath
+$svc = Get-Content -Raw -LiteralPath $ServicePath
 
 function Get-Method {
   param([string] $Signature, [string] $From)
@@ -50,13 +56,21 @@ $methods = @(
   (Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)')
 ) -join "`n"
 
-# The real bodies, reachable from PowerShell. Only the collaborators are stubbed: the stub is named
-# DebugBreakpoint so the extracted SameBp compiles verbatim, with nothing rewritten but the access modifier.
+# The real bodies, reachable from PowerShell. Only the collaborators are stubbed - and the breakpoint record
+# and the line predicate are now the SHIPPED ones, lifted out of ClarionDebuggerService.cs, so the extracted
+# SameBp compiles verbatim with nothing rewritten but the access modifier. The old hand-written stub had no
+# RequestedLineOrNull at all, so it could not have told an absent requested line from a present 0 - the
+# distinction the whole identity key rests on.
 $shim = @"
 using System;
 using System.Collections.Generic;
 
-public class DebugBreakpoint { public string Module; public int RequestedLine; public int Line; }
+$(Get-Method 'public sealed class DebugBreakpoint' $svc)
+
+// Named for the class SameBp calls, so its body needs no rewriting.
+public static class ClarionDebuggerService {
+$((Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)' $svc) -replace 'internal static', 'public static')
+}
 
 public class SvcStub {
     public bool IsRunning;
@@ -157,6 +171,58 @@ Write-Host 'the ordering is commented as deliberate, so it is not "tidied" back'
 # order carries a decision. This check is the note's only guard.
 $body = Get-Method 'private void OnGutterBpRemoved(string module, int line)'
 Check 'OnGutterBpRemoved says the ordering is deliberate' ($body -match '(?i)deliberate') ''
+
+Write-Host ''
+Write-Host 'SameBp matches the line the caller ASKED FOR, never one merely planted there'
+# b1db9a76 item 2, held back from wave 1 until 05959085 settled which line is the key. SameBp used to be
+#     b.RequestedLine == line || b.Line == line
+# and that OR let ONE removal trim a DIFFERENT staged entry - one whose SNAPPED line happened to equal the
+# removed breakpoint's requested line - losing it silently from the next session's launch spec.
+#
+# THE OR IS UNREACHABLE THROUGH THE PAD. Every _pending entry is created with Line == RequestedLine and
+# nothing writes the engine's snapped line back into _pending, so the two comparisons collapse into one for
+# every entry the pad can actually build. That is precisely why it needs a check of its own: every other
+# check in this file passes identically with the OR restored, so none of them is testing this.
+#
+# So the entry below is built DIRECTLY, with the two lines apart, and what is asserted is the predicate's
+# contract rather than a path through the pad. A promise no input can currently reach is still a promise,
+# and the next writer into _pending is the one who finds out whether it was kept.
+$staged = New-Object DebugBreakpoint
+$staged.Module = 'MAIN.CLW'; $staged.RequestedLine = 12; $staged.Line = 11   # asked for 12, snapped to 11
+Check 'it matches the line the entry asked for' ([BpRemoveProbe]::SameBp($staged, 'MAIN.CLW', 12)) ''
+Check 'and NOT the line it was planted on' (-not [BpRemoveProbe]::SameBp($staged, 'MAIN.CLW', 11)) ''
+# CONTROL: the same predicate, the same module, a line that is neither. A matcher that had stopped matching
+# anything would pass the check above and fail this one's sibling, so both directions are pinned.
+Check 'and not an unrelated line' (-not [BpRemoveProbe]::SameBp($staged, 'MAIN.CLW', 99)) ''
+Check 'and not another module at the line it did ask for' (-not [BpRemoveProbe]::SameBp($staged, 'OTHER.CLW', 12)) ''
+# Module comparison stays case-insensitive here, unlike in the service: one side of THIS comparison is a
+# gutter basename from Path.GetFileName, which keeps the file's own case, while both sides of the service's
+# are engine-lowercased.
+Check 'the module still compares ignoring case, because the gutter keeps the file name''s case' `
+  ([BpRemoveProbe]::SameBp($staged, 'main.clw', 12)) ''
+
+Write-Host ''
+Write-Host 'and an entry with NO requested line at all still matches on where it was planted'
+# Dropping the OR must not drop the documented absent-requested-line fallback with it. An echo from an
+# engine build older than the requestedLine protocol change leaves RequestedLineOrNull null, and the planted
+# line is then the only thing there is to key on - the same fallback SameBpIdentity and BpDelMatches use.
+$legacy = New-Object DebugBreakpoint
+$legacy.Module = 'MAIN.CLW'; $legacy.Line = 11; $legacy.RequestedLineOrNull = $null
+Check 'a legacy entry matches its planted line' ([BpRemoveProbe]::SameBp($legacy, 'MAIN.CLW', 11)) ''
+Check 'and does not match a line it was never planted on' (-not [BpRemoveProbe]::SameBp($legacy, 'MAIN.CLW', 12)) ''
+# ISOLATION for the two above: 0 is a REAL requested line (an unresolved raw --rva breakpoint has one), so
+# "absent" must not be reachable by writing 0. An entry that asked for 0 is matched at 0, not at its plant.
+$raw0 = New-Object DebugBreakpoint
+$raw0.Module = 'MAIN.CLW'; $raw0.RequestedLine = 0; $raw0.Line = 13
+Check 'a present requested line of 0 is a requested line, not an absent one' `
+  (([BpRemoveProbe]::SameBp($raw0, 'MAIN.CLW', 0)) -and -not ([BpRemoveProbe]::SameBp($raw0, 'MAIN.CLW', 13))) ''
+
+Write-Host ''
+Write-Host 'the pad decides a line through the same body the service does, not a copy of it'
+# Two predicates that happen to read alike drift the moment either is edited. This one calls the service's.
+$sameBp = Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)'
+Check 'SameBp delegates the line decision to BpLineMatches' ($sameBp -match 'ClarionDebuggerService\.BpLineMatches\(b, line, line\)') ''
+Check 'and keeps no comparison of its own' ($sameBp -notmatch 'b\.Line == line' -and $sameBp -notmatch 'b\.RequestedLine ==') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
