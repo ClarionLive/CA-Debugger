@@ -1,4 +1,4 @@
-# Checks the shared harness machinery in engine-session.ps1 WITHOUT an engine, a debuggee or Clarion.
+﻿# Checks the shared harness machinery in engine-session.ps1 WITHOUT an engine, a debuggee or Clarion.
 #
 # The two interactive harnesses can only be run by hand against a real target, so the parts of them
 # that are easy to get quietly wrong - which pid gets signalled, and whether the output pump loses or
@@ -189,16 +189,55 @@ Write-Host '5) every harness that launches the engine cleans up THROUGH this lif
 # Get-Process is detected through the PowerShell PARSER, not a text match: test-watch-threaded.ps1 mentions
 # `Get-Process clbrws` in a comment explaining why it must not do that, and a comment is not a call.
 {
-    function Get-CalledCommands([string]$path) {
+    # One parse per file, shared by both scans below. A file that will not parse is NOT "a file with no
+    # Get-Process call" and NOT "a file that is not a harness" - those are the two silent passes this
+    # section exists to prevent - so it fails closed and says which file and why.
+    function Get-Ast([string]$path) {
         $tok = $null; $err = $null
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tok, [ref]$err)
-        if ($err.Count) { return @('<unparseable>') }
-        $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+        if ($err.Count) {
+            throw ("the harness scan cannot read $(Split-Path -Leaf $path): " +
+                   "$($err[0].Message) (line $($err[0].Extent.StartLineNumber))")
+        }
+        return $ast
+    }
+
+    function Get-CalledCommands([string]$path) {
+        $calls = (Get-Ast $path).FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
         return @($calls | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
     }
 
+    # WHICH files are harnesses is decided by the parser too, for the reason given three lines above the
+    # opening brace. Until wave 2 this line read `(Get-Content -Raw) -match 'ClarionDbg\.exe'` - a text
+    # match sitting directly under the comment that rejects text matches. It classified correctly only by
+    # luck, twice over: engine-session.ps1 happens to write "ClarionDbg break" with no extension, and the
+    # regex literal itself carried a backslash that kept the line from matching its own file. Neither is a
+    # property anyone editing these files would know they had to preserve.
+    #
+    # A harness NAMES the engine binary in CODE - a string literal, which in all three is the $Engine
+    # parameter's default. A comment is not a string literal, so the same mention that must not count as a
+    # Get-Process CALL does not count as launching the engine either.
+    $ENGINE_BINARY = 'ClarionDbg.exe'
+    function Test-NamesEngineBinary([string]$path) {
+        $strings = (Get-Ast $path).FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+            $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+        }, $true)
+        foreach ($s in $strings) { if ($s.Value -like "*$ENGINE_BINARY*") { return $true } }
+        return $false
+    }
+
+    # THIS file is the single exclusion, and it is by name because the reason is particular to it: it holds
+    # the binary's name in $ENGINE_BINARY, and writes it again in the probe harness below, in order to go
+    # looking for it. engine-session.ps1 gets NO exemption - it passes the classifier on its own merits,
+    # which is asserted as a rule further down rather than left as the accident it used to be.
+    $self = Split-Path -Leaf $PSCommandPath
     $all = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' | Sort-Object Name)
-    $harnesses = @($all | Where-Object { (Get-Content -Raw -LiteralPath $_.FullName) -match 'ClarionDbg\.exe' })
+    Check 'every .ps1 here parses, so nothing is classified by failing to be read' `
+        ($self.Length -gt 0 -and @($all | Where-Object { $null -ne (Get-Ast $_.FullName) }).Count -eq $all.Count) `
+        "$($all.Count) file(s)"
+    $harnesses = @($all | Where-Object { $_.Name -ne $self -and (Test-NamesEngineBinary $_.FullName) })
     # A number, not "every": if a fourth harness appears this says so instead of quietly covering three.
     Check 'exactly 3 scripts here launch the engine binary' ($harnesses.Count -eq 3) (($harnesses.Name) -join ', ')
 
@@ -212,6 +251,43 @@ Write-Host '5) every harness that launches the engine cleans up THROUGH this lif
         # the only place that also checks the name and the start time.
         Check "$($h.Name) never resolves a pid to a process itself" ($cmds -notcontains 'Get-Process') `
             (($cmds | Where-Object { $_ -eq 'Get-Process' }) -join ', ')
+    }
+
+    # CONTROL: the harness CLASSIFIER has to fire on something, or "exactly 3" is a count of nothing and a
+    # fourth harness escapes every check in this loop silently. A brand-new one, written to a temp directory
+    # so the scan above is untouched, is what proves it would be caught.
+    $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) ('harness-detect-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    try {
+        $newHarness = Join-Path $probeDir 'test-brand-new.ps1'
+        Set-Content -LiteralPath $newHarness -Encoding ASCII -Value @(
+            'param([string]$Engine = "$PSScriptRoot\..\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe")'
+            '. "$PSScriptRoot\engine-session.ps1"'
+            '$s = New-EngineSession $Engine'
+            'try { Start-Sleep -Milliseconds 1 } finally { Stop-EngineTarget $s }'
+        )
+        Check 'CONTROL: a newly added harness IS detected, by the engine path in its param default' `
+            (Test-NamesEngineBinary $newHarness)
+
+        # ...and this is what the retired text match got wrong. It called a file that merely TALKS about the
+        # binary a harness, and would then have demanded it dot-source the library and call Stop-EngineTarget.
+        $mention = Join-Path $probeDir 'test-mentions-only.ps1'
+        Set-Content -LiteralPath $mention -Encoding ASCII -Value @(
+            '# Explains at length why it must never go near ClarionDbg.exe, and then does not.'
+            'Write-Host ''launches nothing'''
+        )
+        Check 'CONTROL: ...and a file naming the engine only in a COMMENT is not a harness' `
+            (-not (Test-NamesEngineBinary $mention))
+
+        # The shared library is IN the scan and stays out of the harness list on its own merits, not on an
+        # exemption: it names the engine in prose only. Pinned as a rule because it used to be an accident -
+        # "ClarionDbg break" with no extension was the only thing keeping it out of the old text match. If it
+        # ever names the binary in code this fails, which is the moment to decide what the library is.
+        $lib = Join-Path $PSScriptRoot 'engine-session.ps1'
+        Check 'the shared library needs no exemption: it names the engine in prose, not in code' `
+            (((Get-Content -Raw -LiteralPath $lib) -match 'ClarionDbg') -and -not (Test-NamesEngineBinary $lib))
+    } finally {
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     # CONTROL: the rule is worth nothing if the scan cannot see a violation. engine-session.ps1 is the one
