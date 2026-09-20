@@ -1507,11 +1507,22 @@ namespace ClarionDebugger.Terminal
         /// with nothing on screen saying the host had refused to choose. "No path" and "several paths and
         /// I will not guess" call for different UI, and only the host can tell them apart.
         /// </para></summary>
+        /// <remarks>ORDER IS DELIBERATE: the ZERO value is the SAFEST state, not the most trusted one.
+        /// <c>default(BpPathState)</c> is what a field, an array element, an uninitialised struct member or
+        /// anything deserialised gets for free, and for an enum whose failure mode is taking the user to an
+        /// arbitrary same-named file, that free value must not be <c>Ok</c>. Nothing reaches the default
+        /// today - <see cref="GutterPathFor"/>'s out-param is assigned on its first line - so this is a
+        /// fence, not a fix: it means a future caller who forgets gets "I cannot say", which is refusable,
+        /// rather than "trust this path", which is not.
+        /// <para>
+        /// The wire is unaffected: the three tokens come from <see cref="PathStateName"/>, which compares
+        /// by NAME, so the ordering is invisible to the page and the frozen contract is untouched.
+        /// </para></remarks>
         private enum BpPathState
         {
-            Ok,         // exactly one file claims this row; path is that file
+            Unknown,    // no gutter bookmark claims it at all; there is simply nothing to offer
             Ambiguous,  // several DIFFERENT files claim it; the host refuses to choose, path is null
-            Unknown     // no gutter bookmark claims it at all; there is simply nothing to offer
+            Ok          // exactly one file claims this row; path is that file
         }
 
         /// <summary>The wire spelling of a <see cref="BpPathState"/>. One writer, so the three tokens the
