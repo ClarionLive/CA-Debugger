@@ -365,15 +365,20 @@ namespace ClarionDbg.Cli
         /// live target this seam writes into the debuggee.</summary>
         internal void CancelStepForTest() { RefuseSeamIfAttached("CancelStepForTest"); CancelStep(); }
 
-        /// <summary>Arm an IN-FLIGHT step session the way BeginStep leaves one: a mode, the stepping thread,
-        /// the previous trap's EIP (<c>_prevVa</c> — the call-entry detector's anchor) and one call-skip temp
-        /// INT3. BeginStep itself needs a live context and a real line table, and the property under test is
-        /// what a breakpoint hit does to a session that is ALREADY in flight, which is a separate claim.</summary>
-        internal void ArmStepSessionForTest(uint tid, uint prevVa, uint tempVa)
+        /// <summary>Arm an IN-FLIGHT <b>Step Over</b> session the way BeginStep leaves one: the Over mode,
+        /// the stepping thread, the previous trap's EIP (<c>_prevVa</c> — the call-entry detector's anchor)
+        /// and one call-skip temp INT3. BeginStep itself needs a live context and a real line table, and the
+        /// property under test is what a breakpoint hit does to a session that is ALREADY in flight, which
+        /// is a separate claim.
+        /// <para>Named for the ONE mode it arms rather than taking a <c>StepMode</c>: the call-skip temp
+        /// INT3 below is Step Over's shape, no caller varies the mode, and a parameter no check varies is
+        /// an untested degree of freedom asserting nothing. Widen the seam when a case needs Into or Out,
+        /// and widen the name with it.</para></summary>
+        internal void ArmStepOverSessionForTest(uint tid, uint prevVa, uint tempVa)
         {
             // MUTATES the in-flight step session. Against a live target the invented temp entry below makes
             // the next CancelStep write 0x90 into the debuggee at an address it never patched.
-            RefuseSeamIfAttached("ArmStepSessionForTest");
+            RefuseSeamIfAttached("ArmStepOverSessionForTest");
             _mode = StepMode.Over;
             _stepTid = tid;
             _prevVa = prevVa;
