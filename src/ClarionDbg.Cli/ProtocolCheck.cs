@@ -78,19 +78,28 @@ namespace ClarionDbg.Cli
                 failures.Add("empty object: stamping produced malformed JSON");
 
             CheckHandBuiltTidEmitters(failures);
+            CheckTidValuedMembersUnderOtherNames(failures);
             CheckResumeVerbs(failures);
             CheckStepGuards(failures);
             CheckBpHitVsStep(failures);
             CheckSeamsRefuseLiveTarget(failures);
             CheckEditVeto(failures);
             CheckThreadedWriteGuard(failures);
+            CheckOnceOnlyDiagnostics(failures);
 
             foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
             if (failures.Count == 0)
             {
                 Console.WriteLine($"protocolcheck: {shapes.Length} spliced event shapes + all 4 hand-built "
                                   + "emitters OK - a known tid is stamped, "
-                                  + "an unknown tid is absent (never 0 or -1); a vetoed row's INLINE "
+                                  + "an unknown tid is absent (never 0 or -1); the same rule holds under all "
+                                  + $"{DebugEngine.TidValuedMemberNamesForTest().Length} names the engine "
+                                  + "declares for a thread-id member, which puts 3 more top-level ids "
+                                  + "across 2 events under it (`threads`.stopped, `threads`.selected, "
+                                  + "`threadscan`.stopped) - each tested with the others KNOWN, so an "
+                                  + "omission is per member and not the builder giving up, while the "
+                                  + "same-named per-row booleans survive and no row claims a selection the "
+                                  + "event does not state; a vetoed row's INLINE "
                                   + "descendants offer no edit metadata (the expand path is a known gap — "
                                   + "see HandleExpandCommand, ticket cc3ac96e); no write, of any length, "
                                   + "can touch the shared template; the resume-verb set has one owner across "
@@ -101,7 +110,11 @@ namespace ClarionDbg.Cli
                                   + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
                                   + "test seams REFUSE an attached engine, with OnUserBpForTest also "
                                   + "refusing the --once and interactive engines, while all of them still "
-                                  + "work with no target.");
+                                  + "work with no target; and the repeating console diagnostics report once "
+                                  + "per (image, reason) per ENGINE, keyed on the reason CATEGORY and not "
+                                  + "on the message - which interpolates addresses, so keying on it would "
+                                  + "dedup nothing while looking like it worked - with the suppression "
+                                  + "said on the line rather than left to be inferred.");
                 return 0;
             }
             Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
@@ -169,6 +182,134 @@ namespace ClarionDbg.Cli
             CheckNoSentinelRows(failures, "threads", rows, known);
             string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
             CheckNoSentinelRows(failures, "threadscan", scan, known);
+        }
+
+        /// <summary>
+        /// The same rule for thread ids that are NOT called "tid" — ticket 3b043dfc, hole 1.
+        ///
+        /// `threads` writes a top-level "stopped" and "selected"; `threadscan` writes a top-level "stopped".
+        /// All three are thread ids and none of them went through the writer, because the guard that existed
+        /// was written around the NAME. They were safe only by ordering — PausedWait sets _selectedTid
+        /// before the pause loop can dispatch — while AcquireView already treats _selectedTid == 0 as a
+        /// state that happens. The engine disagreed with itself; that, not an observed failure, is the bug.
+        ///
+        /// THREE members over TWO events, and both numbers are checkable against DebugEngine's declared
+        /// TidValuedMemberNames, which this reads rather than retypes.
+        ///
+        /// Each is checked the same three ways the "tid" emitters are — the known CONTROL first, because
+        /// without it a builder that dropped the member entirely would pass the two absence cases for the
+        /// wrong reason — and then INDEPENDENTLY, one unknown at a time with the other known. A pair tested
+        /// only together cannot tell "the rule is applied per member" from "the builder gave up on both".
+        /// </summary>
+        private static void CheckTidValuedMembersUnderOtherNames(List<string> failures)
+        {
+            const uint known = 116932;
+            const uint other = 4812;
+            const uint minusOne = unchecked((uint)-1);
+            var unknowns = new[] { 0u, minusOne };
+
+            // The declared set is the engine's, read back — so "three" below cannot drift from the code.
+            string[] declared = DebugEngine.TidValuedMemberNamesForTest();
+            if (declared.Length != 3)
+                failures.Add("tid-valued names: this check covers 3 declared names but the engine declares "
+                             + declared.Length + " (" + string.Join(", ", declared) + ") — a name was added "
+                             + "without a check to hold it");
+            foreach (var n in new[] { "tid", "stopped", "selected" })
+                if (Array.IndexOf(declared, n) < 0)
+                    failures.Add("tid-valued names: the engine no longer declares \"" + n + "\"");
+
+            // The writer validates the name instead of trusting it. Falsifiable, and this is what falsifies
+            // it: a name outside the set must be refused, and every declared name must be accepted.
+            foreach (var n in declared)
+            {
+                string w = DebugEngine.AppendTidValuedMemberForTest("{\"event\":\"x\"}", n, known);
+                if (w.IndexOf("\"" + n + "\":116932", StringComparison.Ordinal) < 0)
+                    failures.Add("tid writer: the declared name \"" + n + "\" was not written — " + w);
+                foreach (var bad in unknowns)
+                    if (DebugEngine.AppendTidValuedMemberForTest("{\"event\":\"x\"}", n, bad)
+                        != "{\"event\":\"x\"}")
+                        failures.Add("tid writer: \"" + n + "\" with an unknown id " + bad + " changed the "
+                                     + "event — an unknown id must write nothing at all");
+            }
+            try
+            {
+                DebugEngine.AppendTidValuedMemberForTest("{\"event\":\"x\"}", "clarionThread", known);
+                failures.Add("tid writer: it accepted \"clarionThread\", a name outside the declared set — "
+                             + "the set is documentation, not a check");
+            }
+            catch (ArgumentException) { }
+
+            // --- the `threads` event: "stopped" and "selected", each unknown on its own.
+            string bothKnown = DebugEngine.ThreadsJsonForTest(known, other, new[] { known, other });
+            foreach (var m in new[] { "stopped", "selected" })
+                if (!HasTopLevelMember(bothKnown, m))
+                    failures.Add("threads control: a KNOWN top-level \"" + m + "\" was not written — "
+                                 + bothKnown);
+            if (bothKnown.IndexOf("\"stopped\":116932", StringComparison.Ordinal) < 0
+                || bothKnown.IndexOf("\"selected\":4812", StringComparison.Ordinal) < 0)
+                failures.Add("threads control: the two top-level ids were not the ones it was given — "
+                             + bothKnown);
+
+            foreach (var bad in unknowns)
+            {
+                string s = DebugEngine.ThreadsJsonForTest(bad, other, new[] { other });
+                if (HasTopLevelMember(s, "stopped"))
+                    failures.Add("threads: an unknown stopped tid (" + bad + ") was written as a top-level "
+                                 + "\"stopped\" — the pad would read it as the thread execution halted on: " + s);
+                if (!HasTopLevelMember(s, "selected"))
+                    failures.Add("threads: dropping an unknown \"stopped\" also dropped the KNOWN "
+                                 + "\"selected\" — the rule is per member, not per event: " + s);
+
+                string t = DebugEngine.ThreadsJsonForTest(known, bad, new[] { known });
+                if (HasTopLevelMember(t, "selected"))
+                    failures.Add("threads: an unknown selected tid (" + bad + ") was written as a top-level "
+                                 + "\"selected\" — the pad would show a thread nobody selected: " + t);
+                if (!HasTopLevelMember(t, "stopped"))
+                    failures.Add("threads: dropping an unknown \"selected\" also dropped the KNOWN "
+                                 + "\"stopped\": " + t);
+
+                // With no selection, no ROW may claim to be the selected one. A row's "selected" is a
+                // boolean derived from the same id, so an unguarded `p.Tid == selectedTid` would mark a row
+                // with a 0 tid as selected — the sentinel defect again, one level down.
+                string u = DebugEngine.ThreadsJsonForTest(known, bad, new[] { known, bad });
+                if (Count(u, "\"selected\":true") != 0)
+                    failures.Add("threads: a row marked itself selected while the event states no "
+                                 + "selection (" + bad + ") — " + u);
+
+                // And the event must still be a well-formed object with its list intact.
+                if (!s.StartsWith("{\"event\":\"threads\"", StringComparison.Ordinal)
+                    || s.IndexOf(",\"threads\":[", StringComparison.Ordinal) < 0
+                    || !s.EndsWith("]}", StringComparison.Ordinal))
+                    failures.Add("threads: omitting a top-level id left the event malformed — " + s);
+            }
+
+            // CONTROL for the row check above: a KNOWN selection must still mark exactly one row.
+            string sel = DebugEngine.ThreadsJsonForTest(known, other, new[] { known, other });
+            if (Count(sel, "\"selected\":true") != 1)
+                failures.Add("threads control: a known selection marked "
+                             + Count(sel, "\"selected\":true") + " rows, expected exactly 1 — " + sel);
+
+            // --- the `threadscan` event: one top-level "stopped", same rule.
+            string scanKnown = DebugEngine.ThreadScanJsonForTest(known, new[] { known });
+            if (!HasTopLevelMember(scanKnown, "stopped")
+                || scanKnown.IndexOf("\"stopped\":116932", StringComparison.Ordinal) < 0)
+                failures.Add("threadscan control: a KNOWN top-level \"stopped\" was not written — " + scanKnown);
+            foreach (var bad in unknowns)
+            {
+                string s = DebugEngine.ThreadScanJsonForTest(bad, new[] { known });
+                if (HasTopLevelMember(s, "stopped"))
+                    failures.Add("threadscan: an unknown stopped tid (" + bad + ") was written as a "
+                                 + "top-level \"stopped\" — " + s);
+                if (!s.StartsWith("{\"event\":\"threadscan\"", StringComparison.Ordinal)
+                    || s.IndexOf(",\"threads\":[", StringComparison.Ordinal) < 0
+                    || !s.EndsWith("]}", StringComparison.Ordinal))
+                    failures.Add("threadscan: omitting the top-level id left the event malformed — " + s);
+                // The per-row "stopped" is a BOOLEAN and must survive: dropping a top-level id must not
+                // take the row flag with it, and the two are told apart by nesting, not by name.
+                if (Count(s, "\"stopped\":true") + Count(s, "\"stopped\":false") == 0)
+                    failures.Add("threadscan: the per-row boolean \"stopped\" disappeared along with the "
+                                 + "top-level id — they share a name and nothing else: " + s);
+            }
         }
 
         /// <summary>
@@ -608,13 +749,94 @@ namespace ClarionDbg.Cli
             return buf.ToString();
         }
 
+        /// <summary>
+        /// The once-per-session diagnostics (ticket ec45805f item 5), and specifically HOW THEY KEY.
+        ///
+        /// Two console notes fired on a repeating event rather than a changing one: the window-walk cap on
+        /// every pause, and the THREADed-emulation notes on every field read — so a conditional breakpoint
+        /// over an image with no .cwtls span buried the console in identical text, up to 13 lines each.
+        ///
+        /// The interesting half is not "does it dedup". It is WHAT IT DEDUPS ON. These notes interpolate the
+        /// instance address and the block span, so a version that keyed on the MESSAGE would dedup nothing
+        /// at all while looking exactly like a working one — a suppression that never suppresses is the same
+        /// class of unfalsifiable check as the `"tid":-1` search at the top of this file. So this drives the
+        /// REAL reporter through its seam, not the predicate underneath it, and the decisive case is two
+        /// calls with the same (image, reason) and DIFFERENT text.
+        ///
+        /// The set is also per ENGINE, and that is asserted: static state would carry a session's
+        /// suppressions into the next one, and the note that mattered would be the one nobody saw.
+        ///
+        /// The window-cap site needs real windows and is not reachable here; it shares this rule holder, and
+        /// that sharing is the whole reason there is one holder rather than a flag in each file.
+        /// </summary>
+        private static void CheckOnceOnlyDiagnostics(List<string> failures)
+        {
+            // ---- the rule holder, isolated: first sighting true, every later one false, keys independent.
+            var eng = NewEngine();
+            if (!eng.FirstReportOfForTest("k1"))
+                failures.Add("once-only control: the FIRST sighting of a key was suppressed — the "
+                             + "diagnostic would never be printed at all");
+            if (eng.FirstReportOfForTest("k1"))
+                failures.Add("once-only: a repeated key reported again — the console floods");
+            if (!eng.FirstReportOfForTest("k2"))
+                failures.Add("once-only: a DIFFERENT key was suppressed by the first one — one noisy "
+                             + "diagnostic would silence every other");
+
+            // ---- per session, not per process. A static set would hide the second session's first warning.
+            if (!NewEngine().FirstReportOfForTest("k1"))
+                failures.Add("once-only: a NEW engine inherited the previous session's suppressions — the "
+                             + "set must be per engine, or a fresh run starts already silent");
+
+            // ---- THE DECIDING CASE: same image, same reason, different TEXT reports ONCE.
+            var e2 = NewEngine();
+            string first = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "write-outside-block", "kept instance 0x11110000 despite a write outside 0x2000"));
+            string again = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "write-outside-block", "kept instance 0x99990000 despite a write outside 0x7777"));
+
+            if (first.IndexOf("app.dll", StringComparison.Ordinal) < 0
+                || first.IndexOf("0x11110000", StringComparison.Ordinal) < 0)
+                failures.Add("threaded-note control: the FIRST note did not print its image and detail — "
+                             + "got: " + first.Trim());
+            if (again.Trim().Length != 0)
+                failures.Add("threaded-note: the same (image, reason) reported twice because the text "
+                             + "differed — it is keyed on the MESSAGE, which interpolates addresses, so it "
+                             + "dedups nothing: " + again.Trim());
+
+            // ---- and the suppression is ANNOUNCED. This reporter's whole contract is that it is never
+            //      silent; dropping repeats without saying so is a quieter way of being silent.
+            if (first.IndexOf("reported once", StringComparison.OrdinalIgnoreCase) < 0)
+                failures.Add("threaded-note: the note does not say it is reported once per session, so a "
+                             + "reader cannot tell 'happened once' from 'happening constantly, suppressed'");
+
+            // ---- the key's two halves, each isolated with the other held fixed.
+            string otherReason = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "app.dll", "no-cwtls-span", "no .cwtls span to test the write against"));
+            if (otherReason.Trim().Length == 0)
+                failures.Add("threaded-note: a DIFFERENT reason on the same image was suppressed — the two "
+                             + "conditions are different findings and the second would never be seen");
+
+            string otherImage = CaptureConsole(() => e2.NoteThreadedEmulationForTest(
+                "other.dll", "write-outside-block", "kept instance 0x11110000 despite a write outside 0x2000"));
+            if (otherImage.Trim().Length == 0)
+                failures.Add("threaded-note: the SAME reason on a different image was suppressed — one bad "
+                             + "image would mask the same fault in every other");
+        }
+
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
         /// Feeding the builder a known tid alongside 0 and (uint)-1 in the SAME event is the point: it
         /// asserts the rule is applied per row, not decided once for the whole event.</summary>
         private static void CheckNoSentinelRows(List<string> failures, string name, string json, uint known)
         {
-            if (Count(json, "\"tid\":" + known) != 1)
-                failures.Add(name + " control: the one known tid was not written exactly once — " + json);
+            // The control counts the tid WITH ITS TERMINATOR, the way the zero check below already does.
+            // `"tid":116932` alone is a PREFIX: a row writing 1169320 satisfies it, so the control could
+            // pass while the value on the wire was a different thread entirely (ticket ec45805f item 3).
+            // A false pass in the control of the check that enforces the absent-tid rule hides precisely
+            // what the rule exists to catch, so it is worth the two extra Counts.
+            int knownCount = Count(json, "\"tid\":" + known + ",") + Count(json, "\"tid\":" + known + "}");
+            if (knownCount != 1)
+                failures.Add(name + " control: the one known tid was written " + knownCount
+                             + " time(s), expected exactly 1 — " + json);
             int zero = Count(json, "\"tid\":0,") + Count(json, "\"tid\":0}");
             if (zero != 0)
                 failures.Add(name + ": " + zero + " row(s) wrote a 0 tid — a row the pad would attribute to a "
@@ -799,8 +1021,15 @@ namespace ClarionDbg.Cli
         /// <summary>Is there a "tid" member at the TOP level of this object? Deliberately ignores nested
         /// objects and arrays — a per-frame or per-row tid is not the event's own, which is the same
         /// distinction the pad's extractor makes.</summary>
-        private static bool HasTopLevelTid(string json)
+        private static bool HasTopLevelTid(string json) { return HasTopLevelMember(json, "tid"); }
+
+        /// <summary>The same question for any member name, because the thread ids that bypassed the rule
+        /// were called "stopped" and "selected" (ticket 3b043dfc). Nesting is the ONLY thing that separates
+        /// the `threads` event's top-level "stopped" — a thread id — from a row's own "stopped" boolean, so
+        /// asking the question by name alone would answer about the wrong member.</summary>
+        private static bool HasTopLevelMember(string json, string name)
         {
+            string needle = "\"" + name + "\":";
             int depth = 0;
             bool inStr = false;
             for (int i = 0; i < json.Length; i++)
@@ -809,7 +1038,8 @@ namespace ClarionDbg.Cli
                 if (inStr) { if (c == '\\') i++; else if (c == '"') inStr = false; continue; }
                 if (c == '"')
                 {
-                    if (depth == 1 && string.CompareOrdinal(json, i, "\"tid\":", 0, 6) == 0) return true;
+                    if (depth == 1 && string.CompareOrdinal(json, i, needle, 0, needle.Length) == 0)
+                        return true;
                     inStr = true; continue;
                 }
                 if (c == '{' || c == '[') depth++;

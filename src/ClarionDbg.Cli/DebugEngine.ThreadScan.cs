@@ -117,10 +117,15 @@ namespace ClarionDbg.Cli
             }
         }
 
+        /// <summary>The top-level "stopped" here is a thread id under another name, so it goes through the
+        /// shared writer exactly as "tid" does (ticket 3b043dfc) — absent when unknown, never 0. The
+        /// per-row "stopped" below is a boolean about the row and keeps its name and its literal.</summary>
         private static string ThreadScanJson(uint stoppedTid, List<ThreadProbe> probes)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"threadscan\",\"stopped\":").Append(stoppedTid).Append(",\"threads\":[");
+            sb.Append("{\"event\":\"threadscan\"");
+            AppendTidValuedMember(sb, TidMemberStopped, stoppedTid);
+            sb.Append(",\"threads\":[");
             for (int i = 0; i < probes.Count; i++)
             {
                 var p = probes[i];
