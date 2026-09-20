@@ -271,8 +271,14 @@ namespace ClarionDbg.Cli
         /// template). Members of such a row are at template+offset and must not be editable either.</param>
         /// <param name="note">the parent's explanation, repeated on each member so a row read on its own —
         /// the tree can be scrolled anywhere — still says why it cannot be edited.</param>
+        /// <remarks>BOTH ARE REQUIRED, and that is the point. They defaulted to `true, null`, so a third
+        /// caller added later inherited edit pencils by saying nothing — which is exactly the hole
+        /// cc3ac96e closed for the expand path, left open for whoever comes next. A default that is safe
+        /// for today's callers is not a safe default; it is an unasked question with an optimistic answer.
+        /// Making them required turns "did you think about the veto?" into a compile error. Both existing
+        /// callers already passed them, so nothing changed but the fence.</remarks>
         private string GroupChildrenJson(ClarionType g, uint baseVa, string module,
-                                         bool editable = true, string note = null)
+                                         bool editable, string note)
         {
             if (g == null || g.Members == null) return "";
 
@@ -350,8 +356,9 @@ namespace ClarionDbg.Cli
         /// <param name="editable">false when the PARENT row is not this thread's own; elements sit at
         /// baseVa + k*stride inside that same shared block and inherit the veto.</param>
         /// <param name="note">the parent's explanation, carried onto each element row.</param>
+        /// <remarks>Required for the same reason as GroupChildrenJson's — see the note there.</remarks>
         private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module,
-                                         bool editable = true, string note = null)
+                                         bool editable, string note)
         {
             if (arr == null || arr.Length <= 0 || arr.ElemSize == 0) return "";
             const int cap = 1000;
@@ -443,22 +450,22 @@ namespace ClarionDbg.Cli
         {
             note = null;
             int span = (g != null && g.Size > 0 && g.Size <= int.MaxValue) ? (int)g.Size : 1;
-            string ignored;
-            if (ThreadedWriteAllowed(addr, span, tid, out ignored)) return true;
+            // ONE classification decides BOTH the veto and its wording. This used to ask the guard whether
+            // to veto (over the whole SPAN) and then run its own point test on `addr` to decide what to
+            // SAY — so a group starting below a .cwtls template and reaching into it was correctly vetoed
+            // and then labelled "another thread's data", naming the wrong refusal entirely. The address
+            // the note describes is now the guard's own HitVa: the first byte that actually landed in the
+            // protected block, which for a straddling group is not where the group starts.
+            var acc = ClassifyThreadedAccess(addr, span, tid);
+            if (acc.Allowed) return true;
 
-            // Refused. Say which of the two refusals it was, in row vocabulary. The template address is the
-            // overwhelmingly common one and the only one worth a resolve to describe precisely: "no instance
-            // at all" and "an instance exists, but this is not it" read differently to someone looking at a
-            // value and wondering why it is greyed out.
-            foreach (var m in _modules)
-            {
-                if (m == null || m.LoadBase == 0 || m.CwtlsHi <= m.CwtlsLo) continue;
-                uint tmplLo = m.LoadBase + m.CwtlsLo, tmplHi = m.LoadBase + m.CwtlsHi;
-                if (addr < tmplLo || addr >= tmplHi) continue;
-                note = ThreadedTemplateNote(m, addr, tid);
-                return false;
-            }
-            note = "another thread's data — thread " + tid + " is selected";
+            // Row vocabulary, not write vocabulary: nothing has been written, so "not written: ..." would
+            // be wrong here. The template case is worth a resolve to describe precisely — "no instance at
+            // all" and "an instance exists, but this is not it" read differently to someone looking at a
+            // greyed-out value and wondering why.
+            note = acc.Kind == ThreadedRefusal.SharedTemplate
+                 ? ThreadedTemplateNote(acc.Owner, acc.HitVa, tid)
+                 : "thread " + TidText(acc.OwnerTid) + "'s data — thread " + TidText(tid) + " is selected";
             return false;
         }
 
