@@ -284,6 +284,12 @@
   /* advanced breakpoint indicators + properties editor */
   .bp .bpcfg { flex:none; margin-left:auto; cursor:pointer; color:var(--muted,#888); opacity:.55; padding:0 4px; border-radius:3px; font-size:12px; line-height:1; }
   .bp .bpcfg:hover { color:#fff; background:#3a3a3a; opacity:1; }
+  /* Two breakpoints share this module:line, so remove and properties would be acting on a guess. Still
+     RENDERED - an action that vanishes reads as a rendering bug - but visibly inert, and `cursor:help`
+     because the affordance it has left is its own explanation. The :hover rules above are overridden or
+     they would keep promising the action on mouseover. */
+  .bp .rm.disabled, .bp .bpcfg.disabled { cursor:help; opacity:.25; }
+  .bp .rm.disabled:hover, .bp .bpcfg.disabled:hover { color:var(--muted,#888); background:none; opacity:.25; }
   .bp .badge { flex:none; font-size:10px; line-height:1; padding:1px 4px; border-radius:3px; background:var(--btnhover,#2d2d2d); cursor:help; }
   .bp .badge.cond { color:#c586c0; } .bp .badge.hits { color:var(--num,#b5cea8); } .bp .badge.trace { color:#4fc1ff; } .bp .badge.cnt { color:var(--warn); }
   .bp.has-adv .chk.on { background:#c586c0; border-color:#c586c0; }        /* conditional/hit-count bp dot */
@@ -2024,19 +2030,66 @@
   //                         establishes is that we do not know which state this is; the basename fallback is
   //                         precisely the action that must not be taken on a guess.
   // Compared CASE-SENSITIVELY on purpose: these are JSON tokens, and "OK" is not "ok".
+  //
+  // BP_PATH_STATES is the WIRE contract and stays at three tokens. What this function returns is a
+  // PAGE-INTERNAL state, and it has a fourth: 'declined'.
+  //
+  // WHY THE FOURTH. Declining is right for all of these, but the REASON is not the same, and the row
+  // states its reason to the user. 'ambiguous' means the host TOLD us the key is contested - "more than
+  // one file claims this line" is then a fact about their program. The other three mean we could not
+  // trust what the host said, and saying "two files claim it" there would be a FABRICATED fact, arrived
+  // at through the UI instead of through the wire - the exact thing this round exists to stop. So they
+  // render identically and say different things.
+  //   'declined' <- the invariant is broken ("ok" with no path), an unrecognised token, or no row at all.
+  // Only the page can draw this distinction: it is "the host told me it is contested" versus "I could not
+  // trust what the host told me", and the host cannot report the second about itself.
   const BP_PATH_STATES=['ok','ambiguous','unknown'];
   function bpPathState(b){
-    if(!b) return 'ambiguous';
+    if(!b) return 'declined';
     const raw=b.pathState;
     if(raw===undefined||raw===null) return 'unknown';
-    if(BP_PATH_STATES.indexOf(raw)<0) return 'ambiguous';
-    if(raw==='ok' && !b.path) return 'ambiguous';
+    if(BP_PATH_STATES.indexOf(raw)<0) return 'declined';
+    if(raw==='ok' && !b.path) return 'declined';
     return raw;
+  }
+  // The two states that decline the action. One predicate, so the render cannot come to treat them
+  // differently by accident - the whole point is that only the WORDING differs.
+  function bpPathDeclines(st){ return st==='ambiguous' || st==='declined'; }
+  // The key remove and properties are sent under. Both name a breakpoint as module + line and nothing
+  // else, which is the whole reason for the guard below.
+  function bpActionKey(b){ return (b && b.module ? b.module : '') + ':' + ((b && (b.requested||b.line)) || 0); }
+
+  // Which rows share that key with another row in the SAME bplist.
+  //
+  // INTERIM GUARD, and the comment says so because the decline is a placeholder for identity, not the
+  // intended end state. `bpremove` sends module:line and `bpprops` sends {module,line}; host-side,
+  // RemoveBp falls through to OnGutterBpRemoved(module,line), the service sends `bp del module:line`, and
+  // the engine's RemoveBreakpoint takes THE FIRST MATCHING breakpoint. So with two DLLs each holding a
+  // same-named .clw breakpoint at the same line - which now correctly renders as TWO SEPARATE ROWS -
+  // clicking the x on one row could delete the OTHER image's breakpoint, and Apply on one could
+  // reconfigure the other's. An authority decision made on a basename. The real fix is an owner-stable
+  // identifier carried end to end, which needs a host-assigned row token and probably engine protocol
+  // work (`bp del` is module:line today); it is filed as its own ticket.
+  //
+  // THIS IS NOT pathState, and keying on pathState would leave the hole half open while looking closed.
+  // They are different ambiguities that only partly overlap: pathState=="ambiguous" means two FILES claim
+  // this module|line in the GUTTER; this one means two ENGINE BREAKPOINTS share it. If only one of the
+  // two files happens to be bookmarked, the gutter key is not poisoned, pathState is "ok", and remove is
+  // still ambiguous at the engine.
+  // No new wire field is needed: the page has the whole list at render time, so it can see the collision
+  // itself.
+  function bpAmbiguousActionKeys(list){
+    const seen=Object.create(null), dupes=Object.create(null);
+    (list||[]).forEach(b=>{ const k=bpActionKey(b); if(seen[k]) dupes[k]=true; else seen[k]=true; });
+    return dupes;
   }
   let bps=[];
   function buildBps(list){ bps=list||[];
     const el=$('bpList'); el.innerHTML=''; $('bpCount').textContent=bps.length;
     if(!bps.length){ el.innerHTML='<div class="empty">Set breakpoints in the Clarion editor gutter.</div>'; return; }
+    // Computed ONCE per list, not per row: the question is about the list, and asking it per row would
+    // be quadratic for no reason.
+    const dupeKeys=bpAmbiguousActionKeys(bps);
     bps.forEach(b=>{
       const wrap=document.createElement('div'); wrap.className='bpitem';
       const d=document.createElement('div'); d.className='bp';
@@ -2045,15 +2098,20 @@
       const lk=d.querySelector('.bplink');
       if(lk){
         const pstate=bpPathState(b);
-        if(pstate==='ambiguous'){
+        if(bpPathDeclines(pstate)){
           // NO onclick at all. `send('jump', module:line)` re-enters the basename lookup that the host
           // withheld the path to avoid, and would open an arbitrary one of the candidate files — the
           // plausible wrong answer this whole contract exists to stop. Declining is the honest action.
           // Title set as a PROPERTY, never interpolated into innerHTML: b.module comes from the debuggee's
           // TSWD info and is untrusted, and esc() does not escape quotes.
           lk.classList.add('ambig');
-          lk.title='Cannot open: more than one file claims '+b.module+':'+b.line+'. '
-                 +'Open it from the Clarion editor gutter instead.';
+          // SAME behaviour for both, DIFFERENT sentence. Claiming "more than one file claims it" when the
+          // host merely sent something unreadable would state a fact about the user's program that we do
+          // not have - see bpPathState's note on the fourth state.
+          lk.title=(pstate==='ambiguous'
+                      ? 'Cannot open: more than one file claims '+b.module+':'+b.line+'.'
+                      : 'Cannot open: the host did not say which file this is.')
+                 +' Open it from the Clarion editor gutter instead.';
           d.appendChild(badge('ambig','⚠', lk.title));
         } else if(pstate==='ok'){
           lk.onclick=()=>send('openbp', b.line+'\t'+b.path);
@@ -2087,19 +2145,35 @@
       // gear (edit properties) + remove
       const cfg=document.createElement('span'); cfg.className='bpcfg'; cfg.title='Conditions, hit count, tracepoint'; cfg.textContent='⚙';
       const rm=document.createElement('span'); rm.className='rm'; rm.title='Remove breakpoint'; rm.textContent='✕';
-      rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
+      const ed=buildBpEditor(b, !!dupeKeys[bpActionKey(b)]);
+      if(dupeKeys[bpActionKey(b)]){
+        // DISABLED, not absent. An action that vanishes reads as a rendering bug and the user goes
+        // looking for it; a disabled one carrying its reason reads as a decision. Same principle as the
+        // ambiguous path row: decline rather than guess which breakpoint was meant.
+        const why='More than one breakpoint shares '+b.module+':'+(b.requested||b.line)
+                 +' (two images hold the same source file), so the pane cannot tell them apart and will '
+                 +'not guess which to remove or reconfigure. Use the Clarion editor gutter for now.';
+        cfg.classList.add('disabled'); cfg.title=why;
+        rm.classList.add('disabled');  rm.title=why;
+      } else {
+        rm.onclick=(e)=>{ e.stopPropagation(); send('bpremove', b.module+':'+(b.requested||b.line)); };
+        cfg.onclick=(e)=>{ e.stopPropagation(); ed.style.display = ed.style.display==='none' ? 'flex' : 'none'; };
+      }
       d.appendChild(cfg); d.appendChild(rm);
       wrap.appendChild(d);
       // lazily-built inline editor
-      const ed=buildBpEditor(b); wrap.appendChild(ed);
-      cfg.onclick=(e)=>{ e.stopPropagation(); ed.style.display = ed.style.display==='none' ? 'flex' : 'none'; };
+      wrap.appendChild(ed);
       el.appendChild(wrap);
     });
     if(curFile) renderBpDots();
   }
   function badge(cls,text,title){ const s=document.createElement('span'); s.className='badge '+cls; s.textContent=text; s.title=title; return s; }
   function hitLabel(mode,val){ return (mode==='eq'?'= ':mode==='gte'?'≥ ':mode==='mod'?'every ':'')+(val||0)+(mode==='mod'?'th':''); }
-  function buildBpEditor(b){
+  // `locked` = this row shares its module:line with another, so `bpprops` cannot name which breakpoint it
+  // means. The gear that opens this editor is already inert for such a row; the Apply handler refuses as
+  // well, so the guard does not depend on the gear being the only way in. Writer-side, which is what this
+  // codebase prefers over "the only path to it is blocked".
+  function buildBpEditor(b, locked){
     const ed=document.createElement('div'); ed.className='bpedit'; ed.style.display='none';
     ed.innerHTML=
       '<label><span>Condition</span><input type="text" class="bp-cond" placeholder="e.g. count > 10" autocomplete="off"></label>'+
@@ -2112,7 +2186,10 @@
     const cond=ed.querySelector('.bp-cond'), hm=ed.querySelector('.bp-hm'), hv=ed.querySelector('.bp-hv'), tr=ed.querySelector('.bp-trace');
     cond.value=b.condition||''; hm.value=b.hitMode||''; hv.value=b.hitValue||''; tr.value=b.trace||'';
     ed.querySelector('.bp-cancel').onclick=(e)=>{ e.stopPropagation(); cond.value=b.condition||''; hm.value=b.hitMode||''; hv.value=b.hitValue||''; tr.value=b.trace||''; ed.style.display='none'; };
+    if(locked){ const sv=ed.querySelector('.bp-save'); sv.disabled=true;
+      sv.title='More than one breakpoint shares this module and line, so this cannot name which one to reconfigure.'; }
     ed.querySelector('.bp-save').onclick=(e)=>{ e.stopPropagation();
+      if(locked) return;                    // see buildBpEditor's `locked` note: refuse, never guess
       const mode=hm.value, payload={ module:b.module, line:(b.requested||b.line),
         condition:cond.value.trim(), hitMode:mode, hitValue:(mode?(parseInt(hv.value,10)||0):0), trace:tr.value.trim() };
       send('bpprops', JSON.stringify(payload));

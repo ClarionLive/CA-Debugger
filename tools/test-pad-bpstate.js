@@ -76,8 +76,8 @@ console.log('\n3) the invariant is ASSERTED by the page, not trusted');
 // (pathState === "ok") === (path != null) is the host's guarantee. A row breaking it is a broken payload:
 // there is nothing to open, and nothing says the basename fallback is safe either, so it declines.
 {
-  check('"ok" with a null path is not ok', bpPathState({ pathState: 'ok', path: null }) === 'ambiguous');
-  check('"ok" with an empty path is not ok', bpPathState({ pathState: 'ok', path: '' }) === 'ambiguous');
+  check('"ok" with a null path declines', bpPathState({ pathState: 'ok', path: null }) === 'declined');
+  check('"ok" with an empty path declines', bpPathState({ pathState: 'ok', path: '' }) === 'declined');
   check('...and a real path with "ok" still is', bpPathState({ pathState: 'ok', path: 'x.clw' }) === 'ok');
 }
 
@@ -85,13 +85,13 @@ console.log('\n4) a token this page does not know DECLINES rather than guessing'
 // Case matters: these are JSON tokens. Quinn-2 found the host-side harness passing against "OK" because
 // PowerShell's -eq is case-insensitive; the page compares with === and must not quietly accept the variant.
 {
-  check('"OK" is not "ok"', bpPathState({ pathState: 'OK', path: 'x.clw' }) === 'ambiguous');
-  check('"Ambiguous" is not "ambiguous"', bpPathState({ pathState: 'Ambiguous', path: null }) === 'ambiguous');
+  check('"OK" is not "ok"', bpPathState({ pathState: 'OK', path: 'x.clw' }) === 'declined');
+  check('"Ambiguous" is not "ambiguous"', bpPathState({ pathState: 'Ambiguous', path: null }) === 'declined');
   check('"Unknown" is not "unknown" — and does NOT get the fallback',
-        bpPathState({ pathState: 'Unknown', path: null }) === 'ambiguous');
-  check('an unheard-of token declines', bpPathState({ pathState: 'contested', path: null }) === 'ambiguous');
-  check('a non-string declines', bpPathState({ pathState: 3, path: null }) === 'ambiguous');
-  check('a missing row declines', bpPathState(null) === 'ambiguous');
+        bpPathState({ pathState: 'Unknown', path: null }) === 'declined');
+  check('an unheard-of token declines', bpPathState({ pathState: 'contested', path: null }) === 'declined');
+  check('a non-string declines', bpPathState({ pathState: 3, path: null }) === 'declined');
+  check('a missing row declines', bpPathState(null) === 'declined');
   check('the contract names exactly three states', Array.isArray(STATES) && STATES.length === 3
         && STATES.join(',') === 'ok,ambiguous,unknown', String(STATES));
 }
@@ -129,8 +129,12 @@ console.log('\n5) the render: the ambiguous arm offers no action, pinned by POSI
 // relocated call fails even though its text is still present somewhere in the function.
 {
   const body = codeOnly(pad.extract(html, 'buildBps'));
-  const i = body.indexOf("pstate==='ambiguous'");
-  check('buildBps branches on the ambiguous state', i > 0, i > 0 ? '' : 'no ambiguous branch found');
+  // Located by the BRANCH CONDITION, which is the declining predicate - not by the contested wording,
+  // which also appears in the title's ternary INSIDE the arm. (It was `pstate==='ambiguous'` until the
+  // fourth state landed; that then matched the ternary first and silently truncated the slice, so four
+  // checks failed against a correct page. Anchor on the thing that opens the block.)
+  const i = body.indexOf('bpPathDeclines(pstate)');
+  check('buildBps branches on the declining predicate', i > 0, i > 0 ? '' : 'no declining branch found');
 
   // The arm runs from its own `if` to the `else if` that ends it.
   const armEnd = body.indexOf('else if', i);
@@ -158,10 +162,145 @@ console.log('\n5) the render: the ambiguous arm offers no action, pinned by POSI
   // actions) while leaving the code that does them. Without this, every rule above could be passing
   // because codeOnly had emptied the arm.
   const rawArm = pad.extract(html, 'buildBps').slice(
-    pad.extract(html, 'buildBps').indexOf("pstate==='ambiguous'"));
+    pad.extract(html, 'buildBps').indexOf('bpPathDeclines(pstate)'));
   check('CONTROL: the raw arm DOES name jump in prose, so the stripper is doing the work',
         /send\(\s*'jump'/.test(rawArm.slice(0, rawArm.indexOf('else if'))));
   check('CONTROL: ...and the stripper left the arm non-empty', arm.trim().length > 40, arm.trim().length + ' chars');
+}
+
+// ---- 6) remove and properties decline when two breakpoints share a module:line ---------------------
+// A DIFFERENT ambiguity from pathState, and the distinction is the fix. `pathState == "ambiguous"` means
+// two FILES claim this module|line in the gutter; THIS means two ENGINE BREAKPOINTS share it. They only
+// partly overlap: if just one of the two files is bookmarked the gutter key is not poisoned, pathState is
+// "ok", and remove is STILL ambiguous at the engine. Keying the guard on pathState would leave the hole
+// half open while looking closed, which is why the predicate is page-local instead.
+//
+// The hazard: `bpremove` sends module:line and the engine's RemoveBreakpoint takes the FIRST match, so
+// clicking x on one row could delete the OTHER image's breakpoint. Interim guard - the real fix is an
+// owner-stable identifier carried end to end, filed separately.
+const dupFns = ['bpActionKey', 'bpAmbiguousActionKeys'];
+const dupMissing = [];
+const dupSrc = dupFns.map(n => { try { return pad.extract(html, n); } catch (e) { dupMissing.push(n); return 'function ' + n + '(){}'; } }).join('\n');
+if (dupMissing.length) {
+  console.log('  FAIL  not found in ' + pad.resolvePage(pagePath) + ': ' + dupMissing.join(', '));
+  process.exit(1);
+}
+eval(dupSrc);
+
+console.log('\n5b) all four declining inputs decline — but only ONE may claim the contested reason');
+// bpPathState collapses four situations into a declined action, and that is right. The MESSAGE is not
+// interchangeable: "more than one file claims module:line" is a fact about the user's PROGRAM, true only
+// when the host SAID the key is contested. For the other three the honest statement is "the host did not
+// say which file this is". Asserting the action alone would pass a fix that gave all four the contested
+// wording — a fabricated fact arriving through the UI instead of the wire — so the title is the check
+// that matters here.
+{
+  const declineFns = ['bpPathDeclines'];
+  const dm = [];
+  const ds = declineFns.map(n => { try { return pad.extract(html, n); } catch (e) { dm.push(n); return 'function ' + n + '(){}'; } }).join('\n');
+  if (dm.length) { console.log('  FAIL  not found: ' + dm.join(', ')); process.exit(1); }
+  eval(ds);
+
+  const cases = [
+    { name: 'genuinely contested',        row: { pathState: 'ambiguous', path: null }, state: 'ambiguous', claimsContested: true },
+    { name: 'invariant broken (ok/null)', row: { pathState: 'ok', path: null },        state: 'declined',  claimsContested: false },
+    { name: 'unrecognised token',         row: { pathState: 'contested', path: null }, state: 'declined',  claimsContested: false },
+    { name: 'no row at all',              row: null,                                   state: 'declined',  claimsContested: false },
+  ];
+  for (const c of cases) {
+    const st = bpPathState(c.row);
+    check('' + c.name + ' -> ' + c.state, st === c.state, st);
+    check('   ...and the action is DECLINED', bpPathDeclines(st) === true, String(bpPathDeclines(st)));
+  }
+  // ISOLATION: bpPathDeclines must not simply answer true for everything, or every assertion above is free.
+  check('   CONTROL: an ok row does NOT decline', bpPathDeclines(bpPathState({ pathState: 'ok', path: 'x.clw' })) === false);
+  check('   CONTROL: an unknown row does NOT decline (it keeps the best-effort fallback)',
+        bpPathDeclines(bpPathState({ pathState: 'unknown', path: null })) === false);
+
+  // THE WORDING, pinned where the render chooses it: the contested sentence must be reachable ONLY on
+  // pstate === 'ambiguous'.
+  const arm = codeOnly(pad.extract(html, 'buildBps'));
+  const i = arm.indexOf('more than one file claims');
+  check('the contested sentence exists in the render', i > 0);
+  const before = arm.slice(Math.max(0, i - 220), i);
+  check('...and is guarded on pstate === ambiguous, not on the declining predicate',
+        /pstate\s*===\s*'ambiguous'\s*\?/.test(before), before.replace(/\s+/g, ' ').slice(-80));
+  check('the generic sentence is the other branch', /did not say which file this is/.test(arm));
+}
+
+console.log('\n6) the duplicate-action predicate: the key is the PAIR, not the module');
+{
+  const D1 = { module: 'clbrws011.clw', line: 50, requested: 50 };
+  const D2 = { module: 'clbrws011.clw', line: 50, requested: 50 };   // same file name in a second DLL
+  const U  = { module: 'clbrws026.clw', line: 42, requested: 42 };
+
+  // THE RULE: two rows sharing module AND line are both ambiguous for remove/properties.
+  const dup = bpAmbiguousActionKeys([D1, D2, U]);
+  check('two rows sharing module:line are flagged', !!dup[bpActionKey(D1)] && !!dup[bpActionKey(D2)],
+        JSON.stringify(Object.keys(dup)));
+  // THE CONTROL: a guard that flagged everything would pass the line above on its own.
+  check('a row with a UNIQUE module:line is NOT flagged', !dup[bpActionKey(U)], bpActionKey(U));
+
+  // THE NEAR-MISS: same module, DIFFERENT lines. Grouping on the module alone would disable actions on
+  // every breakpoint in a file that has more than one - which is most files.
+  const S1 = { module: 'clbrws011.clw', line: 50, requested: 50 };
+  const S2 = { module: 'clbrws011.clw', line: 60, requested: 60 };
+  const sameFile = bpAmbiguousActionKeys([S1, S2]);
+  check('same module, DIFFERENT lines: neither is flagged', Object.keys(sameFile).length === 0,
+        JSON.stringify(Object.keys(sameFile)));
+
+  // The key follows the same (requested||line) fallback the two senders use, or the guard would be
+  // computed over a different identity than the one that gets sent.
+  const R = { module: 'x.clw', line: 99, requested: 12 };
+  check('the key uses requested when present, like bpremove and bpprops do',
+        bpActionKey(R) === 'x.clw:12', bpActionKey(R));
+  const P = { module: 'x.clw', line: 99 };
+  check('...and falls back to the planted line when it is absent', bpActionKey(P) === 'x.clw:99', bpActionKey(P));
+  // Three rows on one key is still one group, not two.
+  const T = bpAmbiguousActionKeys([D1, D2, { module: 'clbrws011.clw', line: 50, requested: 50 }]);
+  check('three rows on one key is one flagged group', Object.keys(T).length === 1, JSON.stringify(Object.keys(T)));
+}
+
+console.log('\n7) the render: a flagged row offers neither action, pinned by POSITION');
+{
+  const body = codeOnly(pad.extract(html, 'buildBps'));
+  const i = body.indexOf('dupeKeys[bpActionKey(b)]');
+  check('buildBps branches on the duplicate key', i > 0, i > 0 ? '' : 'no duplicate branch found');
+  const armEnd = body.indexOf('} else {', i);
+  const arm = i > 0 && armEnd > i ? body.slice(i, armEnd) : '';
+  check('the arm was located', arm.length > 0, arm.replace(/\s+/g, ' ').slice(0, 70));
+  check("the flagged arm never sends 'bpremove'", !/send\(\s*'bpremove'/.test(arm));
+  check('the flagged arm installs NO onclick at all', !/\.onclick\s*=/.test(arm));
+  check('it marks BOTH controls disabled', (arm.match(/classList\.add\('disabled'\)/g) || []).length === 2,
+        (arm.match(/classList\.add\('disabled'\)/g) || []).length + ' of 2');
+  check('and gives both a reason', (arm.match(/\.title\s*=/g) || []).length === 2,
+        (arm.match(/\.title\s*=/g) || []).length + ' of 2');
+  // ISOLATION: the unflagged path must still wire both actions, or "no action when flagged" is satisfied
+  // by a pane whose buttons never work.
+  const rest = i > 0 ? body.slice(armEnd) : '';
+  check('the ordinary row still wires remove', /send\(\s*'bpremove'/.test(rest));
+  check('the ordinary row still wires the gear', /cfg\.onclick\s*=/.test(rest));
+  // The editor refuses too, so the guard does not rest on the gear being the only way in.
+  const edBody = codeOnly(pad.extract(html, 'buildBpEditor'));
+  check('the properties editor refuses a locked row before sending', /if\s*\(\s*locked\s*\)\s*return\s*;/.test(edBody));
+  check("...and 'bpprops' is sent after that refusal, not before",
+        edBody.indexOf('locked) return') < edBody.indexOf("send('bpprops'"),
+        'refusal at ' + edBody.indexOf('locked) return') + ', send at ' + edBody.indexOf("send('bpprops'"));
+
+  // A ROW CAN BE BOTH, and the two explanations must not fight. They are DIFFERENT ambiguities: the path
+  // one is about which FILE the name opens, the duplicate one about which BREAKPOINT the buttons act on.
+  // They are written onto DIFFERENT elements — the filename link vs the x and the gear — so each control
+  // carries the reason for its own refusal and neither overrides the other. Pinned, because merging them
+  // onto one element later would silently drop one of the two explanations.
+  const bothRow = { module: 'clbrws011.clw', line: 50, requested: 50, pathState: 'ambiguous', path: null };
+  const bothDup = bpAmbiguousActionKeys([bothRow, Object.assign({}, bothRow)]);
+  check('a row can be BOTH path-ambiguous and duplicate-keyed',
+        bpPathDeclines(bpPathState(bothRow)) && !!bothDup[bpActionKey(bothRow)]);
+  check('the path reason is written on the LINK', /lk\.title\s*=/.test(body));
+  check('the action reason is written on the two CONTROLS, not the link',
+        /cfg\.title\s*=\s*why/.test(body) && /rm\.title\s*=\s*why/.test(body));
+  check('...so neither explanation is assigned to the element the other owns',
+        !/lk\.title\s*=\s*why/.test(body));
 }
 
 console.log('');

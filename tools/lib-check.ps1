@@ -5,8 +5,12 @@
 # WHY THIS IS NOT IN lib-extract.ps1.
 #
 # THE MEASUREMENT THAT PROMPTED THE SPLIT, dated so it cannot go stale:
-#   "measured 2026-09-20, before the @() fix at test-engine-session.ps1:380 - dot-sourcing lib-extract.ps1
-#    cost test-engine-session.ps1 8 of its 56 checks, reporting ALL 48 CHECKS PASSED."
+#   "measured 2026-09-20, before the @(Get-PokePidArgs ...) fix in test-engine-session.ps1's poke-site
+#    scan - dot-sourcing lib-extract.ps1 cost that suite 8 of its 56 checks, reporting ALL 48 CHECKS
+#    PASSED."
+# (That said ":380" until the code-reviewer pointed out this header states the dating rule and then breaks
+#  the companion one in its own next clause: the fix is at :372 now and :380 is an unrelated Get-Content.
+#  PIN THE SYMBOL, NOT THE LINE - a line number in a FOREIGN file is the least durable pin there is.)
 # That fault is now fixed and the file IS strict-clean, so the line above is history, not a live failure.
 # It is kept verbatim because a DATED measurement is a fact about the past and cannot rot; an UNDATED claim
 # about present code is a live assertion and goes stale the moment the code moves. This file had the second
@@ -43,7 +47,7 @@ $script:checks = 0
 function Check {
   param([string] $Label, [bool] $Ok, [string] $Detail)
   $script:checks++
-  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  '; }
+  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  ' }
   if (-not $Ok) { $script:failures++ }
   # An empty detail is ABSENT, not present-and-blank: one copy tested `$null -ne $detail` and printed a bare
   # trailing "  ->  " for every check that passed '' as its detail.
@@ -63,25 +67,58 @@ function ShowVal { param($v) if ($null -eq $v) { '(null)' } else { [string] $v }
 # checks gone, exit code says success. Nothing asserted the total, so the only tell was a number nobody
 # compared.
 #
-# TWO GUARDS, DELIBERATELY ORDERED:
-#   (a) LOAD-BEARING - this function. A section that throws yields a FAILED CHECK and therefore a non-zero
-#       exit. It closes the hole on its own and needs no constant kept up to date.
-#   (b) BACKSTOP - Assert-CheckTotal below, which additionally catches a section that returns EARLY without
-#       throwing (an unguarded `return`, a `continue` in the wrong scope). If that constant ever becomes a
-#       maintenance nuisance it can go and (a) still holds. Do not reverse the order: a pinned total alone
-#       would report "the number changed" rather than "this section died, here".
+# FOUR GUARDS, and each one names the route it covers. The earlier version of this comment said (a) "closes
+# the hole on its own"; that was measured against the route then known and a THIRD route was found later
+# (see (c)), which (a) and (b) BOTH miss. Corrected rather than softened, because a guard comment that
+# overstates its coverage is how the next reader stops looking.
+#   (a) a section that THROWS - this function's catch. Reported as a failed check, so a non-zero exit.
+#   (b) a section that RETURNS EARLY without throwing - Assert-CheckTotal, which notices the total is short.
+#       Needs the constant kept up to date; if that ever becomes a nuisance it can go, and (a), (c) and (d)
+#       still hold.
+#   (c) a section that TERMINATES THE SCRIPT without throwing - a bare `break`/`continue` outside a loop.
+#       Uncatchable flow control, and it skips (b) as well, since nothing after it runs at all. Caught in
+#       this function's `finally`, which is the only thing that still executes during that unwind.
+#   (d) a section that RUNS AND ASSERTS NOTHING - the per-section count comparison at the end of this
+#       function. A class rather than a route, and the one (b) can only report as a number.
+# Do not reduce this to (b) alone: a pinned total reports "the number changed" where (a), (c) and (d) each
+# report which section, and how it went wrong.
 function Invoke-CheckSection {
   param([string] $Name, [scriptblock] $Body)
   # The runner prints the heading, so the name in the heading and the name in a failure are the SAME string
   # and cannot drift apart.
   Write-Host $Name
-  try { $Body.Invoke() }
+  $before = $script:checks
+  $returned = $false
+  try { $Body.Invoke(); $returned = $true }
   catch {
     # The InnerException is the one the section actually threw; .Invoke() wraps it in a
     # MethodInvocationException whose own message is about Invoke, not about the bug.
     $err = $_.Exception
     if ($err.InnerException) { $err = $err.InnerException }
     Check "section '$Name' ran to completion" $false "$($err.GetType().Name): $($err.Message)"
+    $returned = $true
+  }
+  finally {
+    if (-not $returned) {
+      # (c) THE THIRD ROUTE. The body neither returned nor threw, so PowerShell FLOW CONTROL is unwinding
+      # the script right now - a bare `break` or `continue` with no enclosing loop. That is not an
+      # exception, so the catch above never sees it, and NOTHING after this point runs: not the remaining
+      # sections, not Assert-CheckTotal, not the summary. Verified: such a script printed no summary and
+      # exited 0.
+      # This `finally` is the only thing that still executes during that unwind (verified likewise), which
+      # is why the report and the exit code are issued from HERE rather than reported as a failed check -
+      # a Check would be counted by a total nothing will ever reach.
+      Write-Host "  FAIL  section '$Name' terminated the script without throwing"
+      Write-Host '        (a `break` or `continue` with no enclosing loop is flow control, not an error:'
+      Write-Host '         it is uncatchable, and everything after it - including the summary - is skipped)'
+      exit 1
+    }
+  }
+  # (d) A section that RAN and asserted nothing. Not this route - it is a whole class, and the commonest
+  # member is a section whose setup silently produced no cases. Positive, per-section, and it sees things
+  # a global total cannot attribute.
+  if ($script:checks -eq $before) {
+    Check "section '$Name' reported at least one check" $false 'it ran and asserted nothing'
   }
 }
 
