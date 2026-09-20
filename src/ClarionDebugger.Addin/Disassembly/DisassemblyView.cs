@@ -343,6 +343,15 @@ namespace ClarionDebugger.Disassembly
                 _awaitRegsSeat = false;   // this seat goes straight to disasm; it needs no registers
                 UpdateThreadBanner();
                 _curSym = p.Sym;   // runtime location for non-TSWD stops (TSWD line comes from the disasm)
+                // ASK, like the other two entry points. This was the only path that set _selTid from what
+                // it happened to be told and never requested the inventory. If p.Tid is ABSENT while the
+                // disasm reply IS stamped, _selTid stays 0 and the (now fail-closed) tid gate drops the
+                // reply — and nothing on this path would recover, where before the gate changed it simply
+                // painted. Reachability is UNPROVEN: the stop event and the disasm reply are stamped
+                // through the same writer, so producing the mismatch needs a live engine and neither
+                // Quinn-2 nor I could construct it statically. It is one line, and it removes a
+                // "cannot happen" from a path that now fails closed.
+                _svc?.RequestThreads();
                 _svc?.RequestDisasmAt(p.Va, WindowCount, MakeTag(WinTag), Context);
             });
         }
@@ -561,14 +570,27 @@ namespace ClarionDebugger.Disassembly
                 uint anchorVa = _anchorRow >= 0 && _anchorRow < _rows.Count ? InstrVaOfRow(_anchorRow) : 0;
                 if (kind == WinTag)
                 {
-                    // THE SEAT IS NOW REAL. This is the only place _seatedTid advances: the listing has
-                    // passed both gates and is about to be painted, so the banner and the "already seated"
-                    // guard are now describing something that is actually on screen. Taken from the REPLY's
-                    // stamp, falling back to _selTid only for an unstamped engine — and the tid gate above
-                    // has already proved the two agree.
-                    _seatedTid = tid ?? _selTid;
-                    _seatingTid = 0;          // no longer in flight
-                    _awaitRegsSeat = false;
+                    // THE SEAT IS REAL ONLY IF SOMETHING WAS DECODED. This is the only place _seatedTid
+                    // advances: the listing has passed both gates and is about to be painted, so the banner
+                    // and the "already seated" guard then describe something actually on screen. Taken from
+                    // the REPLY's stamp, falling back to _selTid only for an unstamped engine — and the tid
+                    // gate above has already proved the two agree.
+                    //
+                    // AN EMPTY REPLY IS NOT A SEAT. The engine answers with zero instructions when it
+                    // cannot decode the address — a thread parked in a system DLL with no readable page is
+                    // the ordinary way to produce one. Marking that painted claims two things that are both
+                    // false: the banner names a thread whose code is not on screen, and because
+                    // _seatedTid == _selTid, SeatOnSelectedThread's already-painted guard then refuses to
+                    // retry, so the view stays blank under a confident banner until the next stop. Leaving
+                    // the seat unfinished is the honest state — a later inventory or switch can retry it.
+                    // This is item 6(c) again by another route: advancing on an answer that contained
+                    // nothing, rather than on intent.
+                    if (instrs.Count > 0)
+                    {
+                        _seatedTid = tid ?? _selTid;
+                        _seatingTid = 0;          // no longer in flight
+                        _awaitRegsSeat = false;
+                    }
                     // fresh window: replace the cache and centre on EIP (the flagged instruction)
                     _instrs = SortedUnique(instrs);
                     _pendFwd = _pendBwd = false;

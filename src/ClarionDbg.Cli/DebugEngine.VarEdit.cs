@@ -158,7 +158,8 @@ namespace ClarionDbg.Cli
                 uint tmplLo = m.LoadBase + m.CwtlsLo;
 
                 // 1. the shared template — unconditional, needs nothing resolved
-                if (Overlaps(wLo, wHi, tmplLo, tmplSpan))
+                uint hit;
+                if (TouchesThreadedTemplate(m, va, len, out hit))
                 {
                     // Point at the first byte of THIS RANGE that actually lands in the template — which
                     // is the start only when the range begins inside it. Testing `va` alone here was a
@@ -167,7 +168,7 @@ namespace ClarionDbg.Cli
                     // small lie at the worst possible moment.
                     res.Kind = ThreadedRefusal.SharedTemplate;
                     res.Owner = m;
-                    res.HitVa = va >= tmplLo ? va : tmplLo;
+                    res.HitVa = hit;
                     // Initialised because the && short-circuits: with no THREADed data TryInstanceBase is
                     // never called and never assigns it. HaveOwnCopy gates every read of it anyway.
                     uint ownBase = 0;
@@ -242,6 +243,29 @@ namespace ClarionDbg.Cli
                          + Owner.Name + " data, but thread " + TidText(SelectedTid) + " is selected";
                 return null;
             }
+        }
+
+        /// <summary>Does [<paramref name="va"/>, va+<paramref name="len"/>) touch this image's shared
+        /// .cwtls TEMPLATE — and if so, at which byte?
+        ///
+        /// THE ONE TEMPLATE-OVERLAP TEST. Three paths ask this question — the write guard, the expand
+        /// veto, and the module-data panel — and the panel asked it with a POINT test on the symbol's
+        /// start RVA while the other two asked it over a span. Same defect class as the note that used to
+        /// drift from the veto: a rule stated in two places is a rule that will be fixed in one of them.
+        /// <paramref name="hitVa"/> is the FIRST byte of the range inside the template, which is the start
+        /// only when the range begins inside it.</summary>
+        private static bool TouchesThreadedTemplate(LoadedModule m, uint va, int len, out uint hitVa)
+        {
+            hitVa = 0;
+            if (m == null || m.LoadBase == 0 || m.CwtlsHi == 0) return false;
+            uint tmplSpan = m.CwtlsHi - m.CwtlsLo;     // file-aligned; over-width here is only padding
+            if (tmplSpan == 0) return false;
+            if (len < 1) len = 1;
+            uint tmplLo = m.LoadBase + m.CwtlsLo;
+            // 64-bit so a range near the top of the address space cannot wrap its end past its start.
+            if (!Overlaps(va, (ulong)va + (ulong)len, tmplLo, tmplSpan)) return false;
+            hitVa = va >= tmplLo ? va : tmplLo;
+            return true;
         }
 
         /// <summary>Do the half-open intervals [wLo,wHi) and [bLo, bLo+bLen) share a byte?</summary>
