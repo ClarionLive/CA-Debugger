@@ -398,7 +398,10 @@ namespace ClarionDbg.Cli
         private static string WithTid(string json, uint tid)
         {
             if (string.IsNullOrEmpty(json) || json[0] != '{' || !TidIsKnown(tid)) return json;
-            string head = "{\"tid\":" + tid;
+            // The name comes from the constant, not from a literal typed here. That is what lets
+            // tools/test-engine-tid-members.ps1 state its rule as an absolute with nothing to except: a
+            // declared thread-id member name appearing as JSON text in the engine is a bypass, full stop.
+            string head = "{\"" + TidMemberTid + "\":" + tid;
             return json.Length == 2 ? head + "}" : head + "," + json.Substring(1);
         }
 
