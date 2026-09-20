@@ -344,6 +344,78 @@ $namelessOk = @($nameless_hits | Where-Object { $_.Allowed })
 Check 'and the rule holder still assembles its own (4 delimiter literals)' ($namelessOk.Count -eq 4) `
       "got $($namelessOk.Count): $(($namelessOk | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ', ')"
 
+# ---------------------------------------------------------------- a thread id headed for a HUMAN
+#
+# WHY THIS IS HERE AS WELL AS IN ProtocolCheck. Piper2's TidText claim (c54f230) drives the real refusal
+# paths, so it catches a REVERTED site: an existing TidText(...) changed back to a raw id. It cannot catch
+# a site NOBODY HAS WRITTEN YET, and he measured that only 2 of the 7 TidText sites are reachable without
+# a live debuggee. This scan reads the source, so it catches the unwritten one. NEITHER ALONE IS THE
+# COVERAGE - the runtime check owns "someone broke this", the source scan owns "someone wrote a new one
+# without it", and the two together are what the rule actually needs.
+#
+# THE RULE: a string literal ending in "thread " and concatenated onward with ` + ` must be concatenated
+# with TidText(...). A bare uint reaches the user as "thread 0" or "thread 4294967295" for exactly the two
+# sentinels TidIsKnown rejects.
+$tidTextFiles = @('DebugEngine.VarEdit.cs', 'DebugEngine.Locals.cs', 'DebugEngine.Threads.cs')
+
+# THREE SITES ARE EXEMPT, for three DIFFERENT reasons, and the count is asserted below so the list cannot
+# grow quietly. Measured 2026-09-20 against integration/w2run2. Keyed on (file, literal) rather than on a
+# line number, which drifts; a fourth exemption is a decision someone has to make, not a chore.
+#   Threads.cs  "  [Clarion thread "        NOT AN OS TID AT ALL. The Clarion thread NUMBER is a different
+#       namespace, where TidIsKnown's 0 / uint.MaxValue sentinels mean nothing - TidText would be wrong
+#       here, not merely unnecessary.
+#   Threads.cs  "unknown or exited thread " ECHOES THE ID THE USER TYPED. "unknown or exited thread
+#       (unknown)" is worse than useless; repeating what they asked for is the honest reply.
+#   Threads.cs  "thread "                   also an echo, in the injected-break-thread refusal, reached
+#       only after _threads.Contains(tid) - so the id is live and TidText would render it identically.
+#       Exempt because it is an ECHO, not because it happens to be harmless: if that message ever moves
+#       off the validated path it needs TidText like any other.
+$tidTextExempt = @(
+  @{ File = 'DebugEngine.Threads.cs'; Literal = '"  [Clarion thread "' },
+  @{ File = 'DebugEngine.Threads.cs'; Literal = '"unknown or exited thread "' },
+  @{ File = 'DebugEngine.Threads.cs'; Literal = '"thread "' }
+)
+
+function Get-ThreadPrefixSites([hashtable] $Sources) {
+  $out = New-Object System.Collections.ArrayList
+  foreach ($f in ($Sources.Keys | Sort-Object)) {
+    $src = $Sources[$f]
+    foreach ($lit in (Get-StringLiterals $src)) {
+      # The literal must END with `thread ` - that is what puts the next token in the user's sentence.
+      # Comments cannot reach here: Get-StringLiterals walks through Skip-CSharpLiteral, which is the same
+      # reason the member-name scan above is comment-proof.
+      if ($lit.Text.Length -lt 9) { continue }
+      if ($lit.Text.Substring($lit.Text.Length - 8) -cne 'thread "') { continue }
+      $tail = $src.Substring($lit.End, [Math]::Min(60, $src.Length - $lit.End))
+      if ($tail -notmatch '^\s*\+') { continue }          # not concatenated onward: nothing follows it
+      [void] $out.Add([pscustomobject] @{
+        File    = $f
+        Line    = ($src.Substring(0, $lit.Start) -split "`n").Count
+        Literal = $lit.Text
+        ViaTidText = ($tail -match '^\s*\+\s*TidText\s*\(')
+        Exempt  = [bool] @($tidTextExempt | Where-Object { $_.File -eq $f -and $_.Literal -eq $lit.Text }).Count
+        Tail    = ($tail -replace '\s+', ' ').Trim()
+      })
+    }
+  }
+  return $out
+}
+
+$tidSrc = @{}
+foreach ($f in $tidTextFiles) { $tidSrc[$f] = [IO.File]::ReadAllText((Join-Path $engineDir $f)) }
+$tidSites = @(Get-ThreadPrefixSites $tidSrc)
+$tidBad = @($tidSites | Where-Object { -not $_.ViaTidText -and -not $_.Exempt })
+Check 'every "thread " message that is not an echo renders its id through TidText' ($tidBad.Count -eq 0) `
+      ($(if ($tidBad.Count) { ($tidBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Literal) $($_.Tail)" }) -join ' | ' } else { '' }))
+# CONTROL: the scan must SEE the real sites, or the rule above is satisfied by finding nothing at all.
+$tidGood = @($tidSites | Where-Object { $_.ViaTidText })
+Check 'and the scan actually reaches them (9 sites go through TidText)' ($tidGood.Count -eq 9) `
+      "found $($tidGood.Count)"
+# A NUMBER, not "some": a fourth exemption must be argued for, not absorbed.
+$tidEx = @($tidSites | Where-Object { $_.Exempt })
+Check 'exactly 3 exempt sites, all of them echoes or a Clarion thread number' ($tidEx.Count -eq 3) `
+      "found $($tidEx.Count): $(($tidEx | ForEach-Object { "$($_.File):$($_.Line)" }) -join ', ')"
+
 # ---------------------------------------------------------------- the scope this check assumes
 #
 # It scans src\ClarionDbg.Cli and nothing else, which is only correct while that is where the wire is
