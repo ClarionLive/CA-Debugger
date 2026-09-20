@@ -813,6 +813,7 @@ Write-Host 'the Disassembly view keeps THREE tag-keyed requests in flight, and a
 # that thread's instruction as current. Still wrong, and silent.
 $fmtTag = Get-Method 'private static string FormatTag(string kind, int epoch)' $disasmView
 $parseTag = Get-Method 'private static bool ParseTag(string tag, out string kind, out int epoch)' $disasmView
+$tidMatch = Get-Method 'private static bool TidMatches(uint? tid, uint selTid)' $disasmView
 $tagShim = @"
 using System;
 using System.Globalization;
@@ -820,7 +821,7 @@ public static class DisasmTagProbe {
   public const string WinTag = "win";
   public const string FwdTag = "winf";
   public const string BwdTag = "winb";
-$(($fmtTag, $parseTag -join "`n") -replace 'private static', 'public static')
+$(($fmtTag, $parseTag, $tidMatch -join "`n") -replace 'private static', 'public static')
 }
 "@
 Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
@@ -873,12 +874,84 @@ $bareTag = @($callLines | Where-Object { $_ -match ',\s*(WinTag|FwdTag|BwdTag)\s
 Check 'the view has the request sites this check expects' ($callLines.Count -eq 7) "$($callLines.Count) call site(s)"
 Check 'no RequestDisasmAt still passes a bare tag constant' ($bareTag.Count -eq 0) "$($bareTag.Count) bare call(s)"
 Check 'every disasm request goes out through MakeTag' ($viaMakeTag.Count -eq $callLines.Count) "$($viaMakeTag.Count) of $($callLines.Count)"
-Check 'OnDisasm gates on the epoch before touching the cache' `
-  ((Get-Method 'private void OnDisasm(string tag, List<DebugDisasmInstr> instrs)' $disasmView) -match 'epoch\s*!=\s*_epoch') ''
+# BOTH epoch checks, counted — not merely "one is present". OnDisasm tests the epoch TWICE on purpose:
+# once on the reader thread, and again INSIDE the UI marshal, because the epoch can move between the two
+# and that is precisely the window a thread switch lands in. A `-match` here passed while the inner check
+# was deleted, because the outer one still satisfied it: the check claimed "gates on the epoch" and only
+# verified half of what that means. Found by mutation, and the count is the fix.
+$onDisasm = Get-Method 'private void OnDisasm(string tag, List<DebugDisasmInstr> instrs, uint? tid)' $disasmView
+$epochGates = [regex]::Matches($onDisasm, 'epoch\s*!=\s*_epoch')
+Check 'OnDisasm gates on the epoch on BOTH sides of the UI marshal' ($epochGates.Count -eq 2) "$($epochGates.Count) epoch gate(s)"
+# ...and the marshal-side gates really are inside the lambda, not stacked ahead of it.
+$marshalBody = if ($onDisasm -match '(?s)UI\(\(\)\s*=>\s*\{(.*)') { $Matches[1] } else { '' }
+Check 'the second epoch gate is INSIDE the marshal, where the race is' `
+  ($marshalBody -match 'epoch\s*!=\s*_epoch') ''
+Check 'and the tid gate is inside it too, on the same side of the race' `
+  ($marshalBody -match 'TidMatchesView\(tid\)') ''
 # The pending flags are cleared by NewEpoch, not by the replies: the dropped ones never arrive to clear
 # them, and a stuck _pendFwd would freeze forward extension for the rest of the session.
 Check 'NewEpoch clears the in-flight flags as well as retiring the replies' `
   ((Get-Method 'private void NewEpoch()' $disasmView) -match '_pendFwd\s*=\s*_pendBwd\s*=\s*false') ''
+
+Write-Host ''
+Write-Host 'TWO gates, and each is asserted with the OTHER one intact'
+# The epoch answers "is this reply still wanted"; the tid answers "whose code is this". They are not
+# redundant: the tid catches a reply decoded for a thread we did not expect even when nothing superseded
+# it, and the epoch catches a superseded reply even when the engine would have decoded the same thread
+# either side of the move. A reply must pass BOTH, and neither overrides the other — if they disagree,
+# the only safe reading of "one of my two checks says this is not what I think it is" is to not paint it.
+#
+# Isolating each matters, because a second gate that never decides anything is exactly the dead guard
+# deleted earlier in this ticket. These cases are constructed so that ONE gate is the sole decider.
+
+# --- the TID gate alone: same epoch throughout, so the epoch gate can never be what dropped anything ---
+$k = ''; $e = 0
+$sameEpochTag = [DisasmTagProbe]::FormatTag('win', 9)
+[DisasmTagProbe]::ParseTag($sameEpochTag, [ref] $k, [ref] $e) | Out-Null
+Check 'isolating the tid gate: the epoch is current, so only the tid can decide' ($e -eq 9) "epoch=$e"
+Check 'a reply stamped for ANOTHER thread is dropped though its epoch is current' `
+  (-not [DisasmTagProbe]::TidMatches([uint] 4812, [uint] 116932)) 'reply tid 4812, view on 116932'
+Check 'CONTROL: the same reply stamped for the thread on screen is accepted' `
+  ([DisasmTagProbe]::TidMatches([uint] 116932, [uint] 116932)) 'reply tid 116932, view on 116932'
+
+# --- the EPOCH gate alone: tid identical on both, so the tid gate can never be what dropped anything ---
+Check 'isolating the epoch gate: the tid matches, so only the epoch can decide' `
+  ([DisasmTagProbe]::TidMatches([uint] 116932, [uint] 116932)) ''
+$k2 = ''; $e2 = 0
+[DisasmTagProbe]::ParseTag([DisasmTagProbe]::FormatTag('winf', 5), [ref] $k2, [ref] $e2) | Out-Null
+Check 'a superseded reply is dropped though it names the RIGHT thread' ($e2 -ne 6) "asked under 5, now 6"
+# This is the case the tid gate provably cannot see, and the reason the epoch is not redundant: a thread
+# switch away and back leaves the tid matching again, while the in-flight winf is still stale.
+Check 'and that holds even when the selection returned to the SAME thread meanwhile' `
+  (($e2 -ne 6) -and [DisasmTagProbe]::TidMatches([uint] 116932, [uint] 116932)) 'tid agrees, epoch does not'
+
+# --- absent is UNKNOWN, not a mismatch: an engine that does not stamp disasm still works ---
+Check 'an UNSTAMPED reply is not treated as a mismatch (pre-381aabd7 engine keeps working)' `
+  ([DisasmTagProbe]::TidMatches($null, [uint] 116932)) 'tid=null'
+Check 'a 0 tid is a sentinel, not thread 0, so it is not a mismatch either' `
+  ([DisasmTagProbe]::TidMatches([uint] 0, [uint] 116932)) 'tid=0'
+Check 'a view that does not yet know its own thread accepts a stamped reply' `
+  ([DisasmTagProbe]::TidMatches([uint] 4812, [uint] 0)) 'view selTid=0'
+# ...and the fail-open cases must not swallow the real mismatch they sit next to.
+Check 'CONTROL: fail-open does not extend to a genuine disagreement' `
+  (-not [DisasmTagProbe]::TidMatches([uint] 1, [uint] 2)) ''
+
+Check 'OnDisasm applies the tid gate as well as the epoch' ($onDisasm -match 'TidMatchesView\(tid\)') ''
+# NEITHER GATE MAY REPLACE THE OTHER. A tid check written in place of the marshal-side epoch check reads
+# like a strengthening and is a silent regression: it restores the exact race the second epoch check
+# exists to close, and the tid cannot see it (a switch away and back leaves the tid agreeing again).
+Check 'the tid gate was ADDED to the marshal, not substituted for the epoch check there' `
+  (($marshalBody -match 'epoch\s*!=\s*_epoch') -and ($marshalBody -match 'TidMatchesView\(tid\)')) ''
+# The service is the only place the engine's stamp can enter: an invoke that drops it leaves the view
+# gating on its own bookkeeping alone, which is what it did before this pass.
+Check 'the service passes the engine stamp to DisasmReceived, not just the tag' `
+  ($src -match 'DisasmReceived\?\.Invoke\(GetStr\(json,\s*"tag"\),\s*dlist,\s*GetUIntOrNull\(json,\s*"tid"\)\)') ''
+Check 'and the event is declared wide enough to carry it' `
+  ($src -match 'event\s+Action<string,\s*List<DebugDisasmInstr>,\s*uint\?>\s+DisasmReceived') ''
+# The tag is POSITIONAL in the stdin command, ahead of `before`. Now that tags are generated rather than
+# literal, the writer validates them so a space cannot shift `before` into the wrong argument.
+Check 'RequestDisasmAt validates the tag it is handed' `
+  ((Get-Method 'public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)') -match 'Regex\.IsMatch\(tag') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

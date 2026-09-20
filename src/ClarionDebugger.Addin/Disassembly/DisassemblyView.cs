@@ -323,6 +323,28 @@ namespace ClarionDebugger.Disassembly
             return int.TryParse(tag.Substring(h + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out epoch);
         }
 
+        /// <summary>Does a reply's stamped thread match the thread this view believes it is showing?
+        ///
+        /// Absent (null) is UNKNOWN, not a mismatch: an engine that does not stamp disasm leaves the epoch
+        /// as the only gate, which is the correct pre-381aabd7 fallback. Treating absent as a mismatch
+        /// would blank the view against an older engine — absent-means-unknown broken from the other side.
+        ///
+        /// A view that does not yet know its own thread (_selTid == 0, before the first stop or inventory)
+        /// also cannot call anything a mismatch: it has nothing to compare against, and refusing every
+        /// reply until the inventory lands would leave the window empty at exactly the moment it is first
+        /// opened. Both fail OPEN for the same reason — they are absence of information, not conflict.</summary>
+        private bool TidMatchesView(uint? tid) { return TidMatches(tid, _selTid); }
+
+        /// <summary>The tid gate's whole rule, as a pure function of the reply's stamp and the thread the
+        /// view believes it is showing — so `protocolcheck`'s add-in counterpart can assert the shipped
+        /// rule rather than a restatement of it.</summary>
+        private static bool TidMatches(uint? tid, uint selTid)
+        {
+            if (tid == null || tid.Value == 0) return true;   // unstamped engine: the epoch is the only gate
+            if (selTid == 0) return true;                     // we do not know our own thread yet
+            return tid.Value == selTid;
+        }
+
         /// <summary>Invalidate every in-flight request: the question they were asked under has changed.
         /// Clearing the pending flags matters as much as bumping the epoch — the dropped replies will
         /// never arrive to clear them, and a stuck _pendFwd would freeze forward extension for good.</summary>
@@ -414,7 +436,28 @@ namespace ClarionDebugger.Disassembly
             return "tid " + tid.ToString(CultureInfo.InvariantCulture);
         }
 
-        private void OnDisasm(string tag, List<DebugDisasmInstr> instrs)
+        /// <summary>Two gates, answering two different questions, and a reply must pass BOTH.
+        ///
+        /// The EPOCH answers "is this reply still wanted?". It is the view's own bookkeeping: it knows the
+        /// selection moved even when the engine would have decoded the same thread either side of the move,
+        /// and it is what makes an in-flight winf/winb from before a switch droppable at all.
+        ///
+        /// The TID answers "whose code is this?". It is the ENGINE'S fact about what it actually read, not
+        /// our model of it, and it catches what the epoch cannot: a reply decoded for a thread other than
+        /// the one we believe is selected — an engine that resolved the selection differently, or a stop
+        /// that moved it under us. Deriving the answer from the other side's real output rather than from
+        /// our own bookkeeping is the whole reason to carry it.
+        ///
+        /// NEITHER OVERRIDES THE OTHER, deliberately. If they disagree, that disagreement is the signal,
+        /// and the only safe reading of "one of my two independent checks says this listing is not what I
+        /// think it is" is to not paint it. A precedence rule would mean choosing to believe one gate while
+        /// the other says the screen would lie.
+        ///
+        /// An ABSENT tid (null) is not a mismatch — it means an engine that does not stamp disasm, where
+        /// the epoch is all there is and the pre-381aabd7 behaviour is the correct fallback. Absent is
+        /// "unknown", never "thread 0"; treating it as a mismatch would black out the view against an older
+        /// engine, which is the absent-means-unknown rule broken from the other side.</summary>
+        private void OnDisasm(string tag, List<DebugDisasmInstr> instrs, uint? tid)
         {
             string kind; int epoch;
             if (!ParseTag(tag, out kind, out epoch)) return;   // not ours
@@ -427,6 +470,7 @@ namespace ClarionDebugger.Disassembly
                 // Re-checked INSIDE the marshal: the epoch can move between the reader thread's test above
                 // and this running on the UI thread, which is exactly the window a thread switch lands in.
                 if (epoch != _epoch) return;
+                if (!TidMatchesView(tid)) return;
                 instrs = instrs ?? new List<DebugDisasmInstr>();
                 var selVas = SelectedInstrVas();   // carry the copy-selection across the rebuild
                 uint anchorVa = _anchorRow >= 0 && _anchorRow < _rows.Count ? InstrVaOfRow(_anchorRow) : 0;
