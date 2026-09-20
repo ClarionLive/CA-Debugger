@@ -726,6 +726,32 @@ namespace ClarionDebugger.Disassembly
                         {
                             uint emptyTid = TidOf(tid);
                             _emptySeatTid = emptyTid != 0 ? emptyTid : _selTid;
+                            // THE LOCATION STRIP IS A THREAD CLAIM TOO, and it was the last one left
+                            // unjustified. The fields below describe the instruction that WAS current;
+                            // this seat found none, and the listing is about to be erased. Leaving them
+                            // let the pane say "no code to show for B" while the strip still read A's
+                            // module:line with Show Source enabled — one click from jumping the IDE to
+                            // another thread's source. Pre-existing, and only visible now that the banner
+                            // no longer lies in the same direction.
+                            //
+                            // _curSym IS DELIBERATELY NOT CLEARED. It comes from the STOP, not from the
+                            // listing, and is the non-TSWD fallback UpdateLocation shows when there is no
+                            // module:line — clearing it would discard a TRUE label to fix a false one.
+                            // Only the wasSeat case does this: it is the one that is thread-scoped AND
+                            // knows the seat failed. After a plain seek the thread really is still stopped
+                            // where the strip says.
+                            _curPath = _curModule = null;
+                            _curLine = 0;
+                        }
+                        else
+                        {
+                            // A NON-SEAT empty window (a coarse seek into unmapped memory). Gating the
+                            // WRITE above stops it FABRICATING a claim; it does not RETIRE one already
+                            // held. Without this, an earlier failed seat's "_emptySeatTid = B" survived
+                            // the seek — OnPaint prioritises it — so the pane went on saying "no code to
+                            // show for Thread B" about a view that is now an address seek and says
+                            // nothing about B. Stale rather than fabricated, and just as wrong.
+                            _emptySeatTid = 0;
                         }
                         // AND RELEASE THE OLD SEAT, because this reply is about to ERASE what it described.
                         // Not clearing it let the painted flag OUTLIVE THE PAINT: thread A painted, seat B,
@@ -1074,6 +1100,12 @@ namespace ClarionDebugger.Disassembly
             // union with no contiguity test. The listing then holds two regions megabytes apart, glued
             // with no marker, and MaybeExtend chases the false edge it just created.
             NewEpoch();
+            // Retire any decode claim NOW, not when the reply lands. From this moment the pane is an
+            // address seek and says nothing about a thread, so "no code to show for Thread B" is stale
+            // for however long the reply takes — and the engine can be seconds behind during a switch.
+            // The matching clear on the reply's else-arm covers any other non-seat sender; this one
+            // covers the gap in between.
+            _emptySeatTid = 0;
             _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, MakeTag(WinTag));   // reseat the window there
         }
 
