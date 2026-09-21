@@ -1,4 +1,4 @@
-# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
+﻿# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
 #
 # Two ways this hurts, both silent:
 #   - a "tid" read out of a nested array or a string value names the wrong thread, so good replies get
@@ -36,6 +36,11 @@ param(
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
   # the disassembly view: its request tags carry the epoch that decides whether a reply is still wanted
   [string] $DisasmViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
+  # the owning image, whose one field the cut-down stub near the top of this file claims to match. A
+  # PARAMETER like every other source this suite reads (Quinn-2's own finding on his wave-2 code): it was
+  # a Join-Path buried at the call site, which works in place and crashes the moment the suite is run from
+  # a copy in another directory - which is how he hit it while shadow-testing a handover.
+  [string] $LoadedModulePath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\LoadedModule.cs'),
   # the captured host output tools/test-pad-source.js drives the page with. Regenerate with the switch below
   # after a deliberate change to SendSource; the checks at the end of this file fail while it is stale.
   [string] $HostSourceFixture = (Join-Path $PSScriptRoot 'fixtures\host-source-messages.json'),
@@ -54,20 +59,15 @@ $engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 
-function Get-Method {
-  param([string] $Signature, [string] $From)
-  if (-not $From) { $From = $src }
-  $block = Get-CSharpBlock $Signature $From
-  if ($null -eq $block) {
-    # Pointed at a version that predates the method under test: say so plainly instead of throwing
-    # halfway through, which reads like a broken test rather than the before/after proof it is.
-    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
-    Write-Host ''
-    Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
-    exit 1
-  }
-  return $block
-}
+# Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
+# lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
+# carried its own ShowVal until 2026-09-20, which SHADOWED the shared one and rendered absence as 'null'
+# where lib-check renders '(null)' - in the one suite whose subject is JSON, where that distinction is the
+# reason the shared version exists.
+# This line names the text a bare Get-Method reads, which each harness used to bury in its own copy's
+# `if (-not $From)` fallback.
+Set-ExtractSource $src
+
 
 $methods = @(
   (Get-Method 'private static string ScanNumberToken(string json, string key)'),
@@ -88,24 +88,15 @@ $($methods -replace 'private static', 'public static')
 
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
 
-$script:failures = 0
-function Check {
-  param([string] $Label, [bool] $Ok, [string] $Detail)
-  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  '; }
-  if (-not $Ok) { $script:failures++ }
-  Write-Host ($mark + $Label + $(if ($Detail) { "  ->  $Detail" } else { '' }))
-}
-function ShowU { param($v) if ($null -eq $v) { 'null' } else { [string] $v } }
-
 Write-Host 'the event''s own tid, and nothing else''s'
 $paused = '{"tid":116932,"event":"paused","reason":"breakpoint","proc":"SPLASHSCREEN","regs":{"eax":"0x0"}}'
-Check 'tid first, before event, with a nested regs object' ([PadJsonProbe]::GetUIntOrNull($paused, 'tid') -eq 116932) (ShowU ([PadJsonProbe]::GetUIntOrNull($paused, 'tid')))
+Check 'tid first, before event, with a nested regs object' ([PadJsonProbe]::GetUIntOrNull($paused, 'tid') -eq 116932) (ShowVal ([PadJsonProbe]::GetUIntOrNull($paused, 'tid')))
 $stack = '{"event":"stack","frames":[{"frame":0,"tid":1}]}'
-Check 'a tid inside the frames array is not the event''s' ($null -eq [PadJsonProbe]::GetUIntOrNull($stack, 'tid')) (ShowU ([PadJsonProbe]::GetUIntOrNull($stack, 'tid')))
+Check 'a tid inside the frames array is not the event''s' ($null -eq [PadJsonProbe]::GetUIntOrNull($stack, 'tid')) (ShowVal ([PadJsonProbe]::GetUIntOrNull($stack, 'tid')))
 $both = '{"frames":[{"tid":1}],"tid":4812}'
-Check 'the top-level one wins over a nested one' ([PadJsonProbe]::GetUIntOrNull($both, 'tid') -eq 4812) (ShowU ([PadJsonProbe]::GetUIntOrNull($both, 'tid')))
+Check 'the top-level one wins over a nested one' ([PadJsonProbe]::GetUIntOrNull($both, 'tid') -eq 4812) (ShowVal ([PadJsonProbe]::GetUIntOrNull($both, 'tid')))
 $instr = '{"value":"x \"tid\":99 y","tid":7}'
-Check 'a tid inside a string VALUE is not the event''s' ([PadJsonProbe]::GetUIntOrNull($instr, 'tid') -eq 7) (ShowU ([PadJsonProbe]::GetUIntOrNull($instr, 'tid')))
+Check 'a tid inside a string VALUE is not the event''s' ([PadJsonProbe]::GetUIntOrNull($instr, 'tid') -eq 7) (ShowVal ([PadJsonProbe]::GetUIntOrNull($instr, 'tid')))
 
 Write-Host ''
 Write-Host 'absent is the only way to say "unknown"'
@@ -118,10 +109,10 @@ Write-Host 'a Win32 thread id is a DWORD: a real one is never degraded to "unsco
 foreach ($tid in 4294967295, 4294967294, 3221225472, 2147483648, 2147483647, 116932) {
   $json = '{"tid":' + $tid + ',"event":"watch","found":true}'
   $got = [PadJsonProbe]::GetUIntOrNull($json, 'tid')
-  Check "tid $tid survives" ($got -eq $tid) (ShowU $got)
+  Check "tid $tid survives" ($got -eq $tid) (ShowVal $got)
 }
 $overflow = '{"tid":4294967296}'   # past a DWORD: malformed protocol, not a thread we could select
-Check 'a value past the DWORD range is refused rather than truncated' ($null -eq [PadJsonProbe]::GetUIntOrNull($overflow, 'tid')) (ShowU ([PadJsonProbe]::GetUIntOrNull($overflow, 'tid')))
+Check 'a value past the DWORD range is refused rather than truncated' ($null -eq [PadJsonProbe]::GetUIntOrNull($overflow, 'tid')) (ShowVal ([PadJsonProbe]::GetUIntOrNull($overflow, 'tid')))
 Check 'the signed reader still refuses a DWORD it cannot hold' ($null -eq [PadJsonProbe]::GetIntOrNull('{"tid":4294967295}', 'tid')) ''
 
 Write-Host ''
@@ -790,8 +781,16 @@ Check 'a key name that is a prefix of another is not confused with it' `
   ((Read1 '{"lineNumber":9,"line":42}' 'line') -eq '42') (Read1 '{"lineNumber":9,"line":42}' 'line')
 Check 'whitespace and newlines around members' `
   ((Read1 "{ `"line`" : 42 ,`n `"name`" : `"x`" }" 'line') -eq '42') ''
-# old JsonVal returned 'au0042c' - it appended the escape letter and then the digits verbatim
-Check 'a \u escape is decoded' ((Read1 '{"name":"aBc"}' 'name') -eq 'aBc') (Read1 '{"name":"aBc"}' 'name')
+# old JsonVal returned 'au0042c' - it appended the escape letter and then the digits verbatim.
+# AND THAT STRING IS THE CLUE TO HOW THIS CHECK WENT VACUOUS. Until 2026-09-20 the input here held a bare
+# B where the escape belongs - no backslash, no u, nothing to decode - so the check asserted that an escape
+# is decoded while handing the reader a plain letter. Quinn-2 proved it by disabling the reader's ENTIRE
+# escape branch and watching this line stay GREEN.
+# 'au0042c' is exactly what you get when the backslash is dropped and the digits pass through, which is
+# the same collapse that mangled this very line twice in chat while it was being handed over. So the
+# literal was most likely mangled at AUTHORING time in 011ea32 by that class of transform: a
+# transmission defect with a three-month latency, not a typo. Re-landed by copying bytes, never retyping.
+Check 'a \u escape is decoded' ((Read1 '{"name":"a\u0042c"}' 'name') -ceq 'aBc') (Read1 '{"name":"a\u0042c"}' 'name')
 
 Write-Host ''
 Write-Host 'absent, null and malformed all read as "not there" - and nothing throws'
@@ -831,7 +830,7 @@ Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-nam
 # A Check's DETAIL argument is evaluated BEFORE Check runs, so an index into a list that a broken build
 # left EMPTY throws and kills the suite mid-run - hiding every failure after it, in the one situation
 # where those failures are what you came for. This reports the owners the list actually has.
-function OwnerOf { param($list) if ($list.Count -eq 0) { '(no rows)' } else { ($list | ForEach-Object { ShowU $_.OwnerPath }) -join ' ' } }
+function OwnerOf { param($list) if ($list.Count -eq 0) { '(no rows)' } else { ($list | ForEach-Object { ShowVal $_.OwnerPath }) -join ' ' } }
 # Task e80072f1. `module` on the wire is a BARE BASENAME (clbrws011.clw), so in a multi-DLL app two loaded
 # images can each carry a compiland of that name. Keyed on (module, requestedLine) alone those are ONE
 # breakpoint: the pane shows a single row for two, the row can carry the other file's path, and one bp-del
@@ -955,7 +954,7 @@ Check 'SameBpIdentity is symmetric, so a dedupe cannot depend on list order' ($a
 
 # The cut-down engine stub gained an Owner; pin the field names it borrows, as the section above does for
 # the line fields, so a rename in the engine fails here instead of passing against a stale imitation.
-$lm = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\LoadedModule.cs')
+$lm = Get-Content -Raw -LiteralPath $LoadedModulePath
 Check 'the cut-down stubs match the real UserBreakpoint.Owner and LoadedModule.Path' `
   (($engineSrc -match 'public LoadedModule Owner;') -and ($lm -match 'public string Path;')) ''
 # ONE writer for the owner on all three echoes, so a fourth emitter cannot carry it on some and not others.
@@ -1132,6 +1131,11 @@ Write-Host 'the Disassembly view keeps THREE tag-keyed requests in flight, and a
 $fmtTag = Get-Method 'private static string FormatTag(string kind, int epoch)' $disasmView
 $parseTag = Get-Method 'private static bool ParseTag(string tag, out string kind, out int epoch)' $disasmView
 $tidMatch = Get-Method 'private static bool TidMatches(uint? tid, uint selTid)' $disasmView
+# TidMatches now READS the view's single uint? -> uint conversion instead of restating the rule, so the
+# probe needs it too. That is the POINT of the change (Owen2, 6505439): the view had four conversions
+# under two disagreeing definitions of "unstamped", and `tid ?? _selTid` seated a literal 0 while the gate
+# treated 0 as a sentinel - so the view was never marked painted. One definition now, read by both.
+$tidOf = Get-Method 'private static uint TidOf(uint? t)' $disasmView
 $tagShim = @"
 using System;
 using System.Globalization;
@@ -1139,7 +1143,7 @@ public static class DisasmTagProbe {
   public const string WinTag = "win";
   public const string FwdTag = "winf";
   public const string BwdTag = "winb";
-$(($fmtTag, $parseTag, $tidMatch -join "`n") -replace 'private static', 'public static')
+$(($fmtTag, $parseTag, $tidMatch, $tidOf -join "`n") -replace 'private static', 'public static')
 }
 "@
 Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
@@ -1189,9 +1193,29 @@ Write-Host 'and the view really uses that tag everywhere, so no request can esca
 $callLines = @($disasmView -split "`n" | Where-Object { $_ -match 'RequestDisasmAt\(' })
 $viaMakeTag = @($callLines | Where-Object { $_ -match 'MakeTag\(' })
 $bareTag = @($callLines | Where-Object { $_ -match ',\s*(WinTag|FwdTag|BwdTag)\s*[,)]' })
-Check 'the view has the request sites this check expects' ($callLines.Count -eq 7) "$($callLines.Count) call site(s)"
+# RUN 2 (Owen2): the absolute count was 7 and is now 6 - the two blind late-open seats (OnHandleCreated,
+# OnActiveChanged) were consolidated into SeatOnLateOpen. A magic number breaks on every legitimate
+# refactor while saying nothing about what actually matters, which is that no request escapes the gate and
+# no seat is made blind. Both of those are pinned by the checks that follow, so this one only has to
+# establish that there is something to check at all.
+Check 'the view still issues disasm requests at all' ($callLines.Count -ge 1) "$($callLines.Count) call site(s)"
 Check 'no RequestDisasmAt still passes a bare tag constant' ($bareTag.Count -eq 0) "$($bareTag.Count) bare call(s)"
 Check 'every disasm request goes out through MakeTag' ($viaMakeTag.Count -eq $callLines.Count) "$($viaMakeTag.Count) of $($callLines.Count)"
+
+# THE LATE-OPEN SEAT MUST ASK WHOSE THREAD IT IS (Owen2, run-2 item 1). `_svc.CurrentVa` is the STOPPED
+# thread's address while the engine decodes the SELECTED one, so seating there blind paints one thread's
+# address range labelled as another's, with no current row and no banner. The inventory is the only thing
+# that reports a selection made before this view existed - and nothing used to request it, so the
+# "window-opened-late" case the code documented was unreachable.
+$lateOpen = Get-Method 'private void SeatOnLateOpen()' $disasmView
+Check 'the late-open seat asks for the thread inventory' ($lateOpen -match 'RequestThreads') ''
+# ...and neither entry point may seat on its own again, which is what stops the blind seat coming back.
+$onHandle = Get-Method 'protected override void OnHandleCreated(EventArgs e)' $disasmView
+$onActive = Get-Method 'private void OnActiveChanged()' $disasmView
+Check 'OnHandleCreated seats only through SeatOnLateOpen' `
+  (($onHandle -match 'SeatOnLateOpen') -and ($onHandle -notmatch 'RequestDisasmAt')) ''
+Check 'OnActiveChanged seats only through SeatOnLateOpen' `
+  (($onActive -match 'SeatOnLateOpen') -and ($onActive -notmatch 'RequestDisasmAt')) ''
 # BOTH epoch checks, counted — not merely "one is present". OnDisasm tests the epoch TWICE on purpose:
 # once on the reader thread, and again INSIDE the UI marshal, because the epoch can move between the two
 # and that is precisely the window a thread switch lands in. A `-match` here passed while the inner check
@@ -1248,8 +1272,119 @@ Check 'an UNSTAMPED reply is not treated as a mismatch (pre-381aabd7 engine keep
   ([DisasmTagProbe]::TidMatches($null, [uint] 116932)) 'tid=null'
 Check 'a 0 tid is a sentinel, not thread 0, so it is not a mismatch either' `
   ([DisasmTagProbe]::TidMatches([uint] 0, [uint] 116932)) 'tid=0'
-Check 'a view that does not yet know its own thread accepts a stamped reply' `
-  ([DisasmTagProbe]::TidMatches([uint] 4812, [uint] 0)) 'view selTid=0'
+# ONE definition of "unstamped", now that TidMatches reads TidOf instead of restating the rule (Owen2,
+# 6505439). The view had FOUR uint? -> uint conversions under two disagreeing definitions: the gate treated
+# a stamped literal 0 as a sentinel while the seat assignment `tid ?? _selTid` seated it as thread 0, so
+# the view was never marked painted.
+#
+# WHAT THESE TWO DO AND DO NOT COVER. Stated from mutations that were RUN, because an earlier version of
+# this note generalised from the single mutation the handover supplied and understated its own coverage -
+# a limitation note that overstates the limitation talks the next reader out of a probe that works, which
+# is the same species of error as one that overstates the coverage.
+# Measured against TidOf's two halves separately:
+#   `return t ?? 0u;`                  (the suggested mutation)  does NOT red - EXACTLY EQUIVALENT to the
+#                                      shipped body over null/0/1/4812/uint.MaxValue.
+#   `return t == null ? 0u : t.Value;` (zero clause dropped)     does NOT red - unwrapping 0 gives 0 for
+#                                      free, so the 0-is-a-sentinel half is not falsifiable HERE.
+#   `return t == null ? 1u : t.Value;` (null arm changed)        DOES red. The null arm is load-bearing.
+# So these two are not merely a contract restatement: they discriminate on the null arm. What they cannot
+# see is the zero half - and that is the half the defect turned on, because the disagreement was between
+# TidOf and callers writing `tid ?? _selTid`. Hence the third check below, which pins the CALL SITES.
+Check 'a stamped 0 is unstamped, exactly as an absent tid is' `
+  ([DisasmTagProbe]::TidOf([uint] 0) -eq 0 -and [DisasmTagProbe]::TidOf($null) -eq 0) ''
+# CONTROL: a TidOf that answered 0 for everything would satisfy the line above and erase every real tid.
+Check 'CONTROL: a real tid survives TidOf unchanged' ([DisasmTagProbe]::TidOf([uint] 4812) -eq 4812) ''
+# THE ONE THAT CATCHES THE DEFECT CLASS. `?? _selTid` is the exact idiom the seat used to disagree with the
+# gate on: it makes a stamped literal 0 seat as the SELECTED thread instead of reading as unstamped. Named
+# rather than counted - no magic bound on how many `.Value` unwraps a file may contain, which would break
+# on every legitimate refactor while saying nothing (the same objection that retired the hardcoded
+# request-site count earlier in this run).
+# COMMENTS STRIPPED FIRST. The raw scan found TWO hits here and both were comments saying "not
+# `tid ?? _selTid`" - the better the comment, the more likely it quotes the exact idiom being banned. Third
+# time this trap has caught a check in this repo, so the walker now lives in lib-extract.ps1.
+$disasmCode = Get-CSharpCodeOnly $disasmView
+$seatIdiom = [regex]::Matches($disasmCode, '\?\?\s*_selTid\b')
+Check 'no tid is unwrapped with `?? _selTid`, the idiom the seat and the gate disagreed on' `
+  ($seatIdiom.Count -eq 0) "$($seatIdiom.Count) site(s) in code"
+# CONTROL: the scan can see that idiom at all - otherwise the zero above is a zero nobody looked for.
+Check 'CONTROL: the idiom scan matches it in code' `
+  ([regex]::Matches((Get-CSharpCodeOnly 'uint x = tid ?? _selTid;'), '\?\?\s*_selTid\b').Count -eq 1) ''
+# ...and the stripper is what makes the zero mean something: the same idiom in a COMMENT must not count,
+# which is precisely the two hits the raw scan produced.
+Check 'CONTROL: ...and does NOT match it in a comment' `
+  ([regex]::Matches((Get-CSharpCodeOnly '// not `tid ?? _selTid` here'), '\?\?\s*_selTid\b').Count -eq 0) ''
+
+# ---- an empty WinTag reply releases the painted flag, BEFORE it erases what that flag described ------
+#
+# THIS PINS THE SHAPE, NOT THE BEHAVIOUR - and the useful form of that sentence is the concrete one, not
+# the category. A SHAPE PIN SEES A WRONG PLACE, NEVER A WRONG VALUE. Measured against these six checks:
+#     `bool wasSeat = true;`   passes ALL of them.
+# Every statement stays exactly where it belongs and the meaning is inverted, so a seek's empty reply
+# would claim "this thread's code could not be decoded" about a thread nobody was seating. No position
+# assertion can ever catch that; only 8f352618's transition test can. Written out because the
+# honest-limitation note is the thing a future reader trusts, and "pins the shape, not the behaviour" is
+# true and vague where "a constant-true wasSeat passes all six" is true and actionable.
+#
+# The behavioural seam three gates asked for is NOT CONSTRUCTIBLE today: these are instance methods on a
+# WinForms Control and three of them wrap their whole body in UI(...), which returns immediately without a
+# created handle, so the code under test never runs. Owen2 established that rather than estimating it; it
+# is blocked on ticket 8f352618.
+# WHEN 8f352618 LANDS, REPLACE THIS CHECK - do not keep both. Two checks on one mechanism, one structural
+# and one behavioural, is how a suite starts disagreeing with itself about what it is guarding.
+#
+# THE DEFECT: thread A painted, a seat for B comes back EMPTY. The screen is about to be erased by the
+# cache replacement, so a _seatedTid still naming A outlives the paint it described - the banner claims A
+# while nothing is on screen, and the already-painted guard then refuses to reseat A.
+# POSITION, not text. The clear being PRESENT but moved AFTER the cache replacement is exactly the
+# regression, and a `-match '_seatedTid = 0'` would pass against it happily.
+$winCode = Get-CSharpCodeOnly $onDisasm
+$winAt = $winCode.IndexOf('if (kind == WinTag)')
+$emptyArm = if ($winAt -ge 0) { $winCode.Substring($winAt) } else { '' }
+$iWasSeat   = $emptyArm.IndexOf('bool wasSeat')
+$iRelease   = $emptyArm.IndexOf('_seatingTid = 0')
+$iCountTest = $emptyArm.IndexOf('if (instrs.Count > 0)')
+$iClear     = $emptyArm.IndexOf('_seatedTid = 0')
+$iCache     = $emptyArm.IndexOf('_instrs = SortedUnique')
+$iIfWasSeat = $emptyArm.IndexOf('if (wasSeat)')
+$iEmptySet  = $emptyArm.IndexOf('_emptySeatTid = emptyTid')
+$iBanner    = $emptyArm.IndexOf('UpdateThreadBanner()')
+# ANCHORS FIRST. Every check below is an ORDER comparison, and -1 < anything, so a renamed method or a
+# missing statement would make them pass VACUOUSLY rather than fail. Owen2's own first draft of this
+# printed "ALL SHAPE CHECKS PASSED" while every assertion had thrown, which is what this guards.
+Check 'every anchor these shape checks need is present in OnDisasm' `
+  (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iCountTest -ge 0) -and ($iClear -ge 0) `
+   -and ($iCache -ge 0) -and ($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iBanner -ge 0)) `
+  "wasSeat=$iWasSeat release=$iRelease count=$iCountTest clear=$iClear cache=$iCache if=$iIfWasSeat set=$iEmptySet banner=$iBanner"
+# THE PAINTED FLAG MUST NOT OUTLIVE THE PAINT.
+Check 'the empty WinTag branch clears _seatedTid BEFORE replacing the listing' `
+  (($iClear -ge 0) -and ($iCache -ge 0) -and ($iClear -lt $iCache)) "clear=$iClear cache=$iCache"
+Check 'and that clear sits in the EMPTY branch, after the instrs.Count test' `
+  (($iCountTest -ge 0) -and ($iClear -gt $iCountTest)) "count=$iCountTest clear=$iClear"
+# A coarse SEEK is a WinTag reply too, and `wasSeat` is the ONLY thing distinguishing the two callers.
+# Capturing it after the release is not merely a shape break - it makes wasSeat always false, so a seat
+# that decoded nothing would stop recording it and retry forever.
+Check 'wasSeat is captured BEFORE _seatingTid is released' `
+  (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iWasSeat -lt $iRelease)) "wasSeat=$iWasSeat release=$iRelease"
+# ...and only a SEAT may claim "this thread's code could not be decoded". A seek's empty result says
+# nothing about the thread's own address.
+Check 'the _emptySeatTid claim is gated on wasSeat' `
+  (($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iIfWasSeat -lt $iEmptySet)) "if=$iIfWasSeat set=$iEmptySet"
+# THE HALF THAT STOPS THE VIEW LYING. Both branches above have just changed _seatedTid, and the banner
+# DERIVES from it - so re-deriving it here, after the listing is replaced, is the other half of the fix. A
+# correct _seatedTid that the banner has not re-read yet is the same defect one frame later. Measured: the
+# five pins above were all green with this call DELETED, so the user-visible symptom was unpinned while
+# the bookkeeping around it was not.
+Check 'the banner is re-derived AFTER the listing is replaced' `
+  (($iBanner -ge 0) -and ($iCache -ge 0) -and ($iBanner -gt $iCache)) "banner=$iBanner cache=$iCache"
+# INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
+# simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
+# which the cross-model adversary reported as HIGH: that is not an absence of information, it is
+# information the view DISCARDS in order to paint something it cannot label. The two fail-open cases are
+# not symmetric - an absent tid means the ENGINE said nothing; an unknown _selTid means WE have not asked
+# yet, and the fix for not having asked is to ask (SeatOnLateOpen now calls RequestThreads), not to accept
+# whatever turns up meanwhile.
+Check 'a STAMPED reply is DROPPED while the view does not know its own thread' `
+  (-not [DisasmTagProbe]::TidMatches([uint] 4812, [uint] 0)) 'view selTid=0'
 # ...and the fail-open cases must not swallow the real mismatch they sit next to.
 Check 'CONTROL: fail-open does not extend to a genuine disagreement' `
   (-not [DisasmTagProbe]::TidMatches([uint] 1, [uint] 2)) ''
@@ -1271,7 +1406,22 @@ Check 'and the event is declared wide enough to carry it' `
 Check 'RequestDisasmAt validates the tag it is handed' `
   ((Get-Method 'public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)') -match 'Regex\.IsMatch\(tag') ''
 
+# THE COUNT, ASSERTED AND PRINTED. This suite ran 222 checks and said only "ALL CHECKS PASSED" - a
+# sentence that is true of 222 checks and equally true of 69, which is what a skipped block actually
+# leaves. cb9324f2 fixed that class in Invoke-CheckSection, and this file - the largest consumer, 192
+# Check calls - never opted in, so every "ALL CHECKS PASSED" it printed was as unfalsifiable as before.
+#
+# WHAT THIS CLOSES AND WHAT IT DOES NOT, because the distinction is the whole lesson of cb9324f2:
+#   CLOSES  a block that is skipped, or returns early, while execution CONTINUES - the total is short and
+#           this says so, naming the number instead of asserting an adjective.
+#   DOES NOT CLOSE  a top-level `break`, which terminates the script HERE: nothing below it runs, this
+#           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
+#           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
+#           `finally` can still fire - filed as its own job rather than pretended away here.
+$EXPECTED_CHECKS = 228
+Assert-CheckTotal $EXPECTED_CHECKS
+
 Write-Host ''
-if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }
-Write-Host 'ALL CHECKS PASSED'
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+Write-Host "ALL $($script:checks) CHECKS PASSED"
 exit 0

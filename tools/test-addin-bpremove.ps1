@@ -36,20 +36,11 @@ $ErrorActionPreference = 'Stop'
 $web = Get-Content -Raw -LiteralPath $WebViewPath
 $svc = Get-Content -Raw -LiteralPath $ServicePath
 
-function Get-Method {
-  param([string] $Signature, [string] $From)
-  if (-not $From) { $From = $web }
-  $block = Get-CSharpBlock $Signature $From
-  if ($null -eq $block) {
-    # Pointed at a version that predates the method under test: say so plainly instead of throwing
-    # halfway through, which reads like a broken test rather than the before/after proof it is.
-    Write-Host "  FAIL  absent from this version of the add-in: $Signature"
-    Write-Host ''
-    Write-Host 'This add-in predates the code these checks cover. 1 FAILURE(S)'
-    exit 1
-  }
-  return $block
-}
+# Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
+# lib-check.ps1, which lib-extract dot-sources in turn. This names the text a
+# bare Get-Method reads, which each harness used to bury in its own copy's `if (-not $From)` fallback.
+Set-ExtractSource $web
+
 
 $methods = @(
   (Get-Method 'private void OnGutterBpRemoved(string module, int line)'),
@@ -94,13 +85,7 @@ $($methods -replace 'private void OnGutterBpRemoved', 'public void OnGutterBpRem
 
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
 
-$script:failures = 0
-function Check {
-  param([string] $Label, [bool] $Ok, [string] $Detail)
-  $mark = if ($Ok) { '  PASS  ' } else { '  FAIL  '; }
-  if (-not $Ok) { $script:failures++ }
-  Write-Host ($mark + $Label + $(if ($Detail) { "  ->  $Detail" } else { '' }))
-}
+
 
 function New-Probe {
   param([bool] $Running, [bool] $RemoveSucceeds)

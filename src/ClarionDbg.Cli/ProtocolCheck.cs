@@ -21,10 +21,105 @@ namespace ClarionDbg.Cli
     /// </summary>
     internal static class ProtocolCheck
     {
+        /// <summary>
+        /// What the run is allowed to SAY it verified. One claim per check, registered by the check itself.
+        ///
+        /// The success message used to be a single ~1,400-character eight-clause sentence, assembled by hand
+        /// and structurally unrelated to the list of checks below it. Nothing forced a new check to add a
+        /// clause or a retired check to drop one, and it showed: the sentence went on advertising "the expand
+        /// path is a known gap" for a whole wave after another branch had closed that gap, and the clause was
+        /// eventually removed by a human noticing. A success message that overstates coverage is this
+        /// project's recurring defect, and that one was the defect in its purest form — a paragraph nobody
+        /// re-reads, making claims nothing could falsify.
+        ///
+        /// So a claim is now DATA, emitted where the work happens. The registry cannot be written from a
+        /// parallel list kept alongside the checks — that would be the same defect in a new shape — because
+        /// the only thing that adds to it is a check, while it is running.
+        /// </summary>
+        private sealed class ClaimLog
+        {
+            private readonly List<string> _claims = new List<string>();
+            internal int Count { get { return _claims.Count; } }
+            internal IList<string> Lines { get { return _claims; } }
+
+            /// <summary>State what THIS check verified, in the present tense, with any count taken from the
+            /// code rather than retyped. It becomes one line of the summary, in check order.</summary>
+            internal void Claim(string what) { _claims.Add(what); }
+        }
+
         internal static int Run()
         {
             var failures = new List<string>();
+            var claims = new ClaimLog();
 
+            // THE CHECK LIST IS THE INVOCATION LIST. There is no second list of names, counts or clauses to
+            // drift out of step with it: adding a line here runs a check AND obliges it to register a claim,
+            // deleting one removes both, and the summary is printed from what actually ran.
+            var checks = new Action<List<string>, ClaimLog>[]
+            {
+                CheckSplicedEventShapes,
+                CheckHandBuiltTidEmitters,
+                CheckTidValuedMembersUnderOtherNames,
+                CheckResumeVerbs,
+                CheckStepGuards,
+                CheckBpHitVsStep,
+                CheckSeamsRefuseLiveTarget,
+                CheckEditVeto,
+                CheckThreadedWriteGuard,
+                CheckOnceOnlyDiagnostics,
+                CheckWinCapKeyIsIdentityNotPosition,
+                CheckRefusalsNeverShowARawTid,
+            };
+
+            foreach (var check in checks)
+            {
+                int before = claims.Count;
+                check(failures, claims);
+                int added = claims.Count - before;
+
+                // EXACTLY ONE, checked here so the failure NAMES the method rather than reporting a total
+                // that leaves someone counting. A check that claims nothing is the case the old sentence
+                // could not express; a check that claims twice is how a claim moves house during a refactor
+                // and starts describing the wrong code.
+                if (added != 1)
+                    failures.Add("claim registry: " + check.Method.Name + " registered " + added
+                                 + " claim(s), expected exactly 1 — the summary prints one line per check, "
+                                 + "so a check with no claim is a check nobody can see ran");
+                for (int k = before; k < claims.Count; k++)
+                    if (string.IsNullOrWhiteSpace(claims.Lines[k]))
+                        failures.Add("claim registry: " + check.Method.Name + " registered a BLANK claim — "
+                                     + "it would print as an empty summary line, which is the 1,400-char "
+                                     + "sentence's defect in miniature: it appears, and says nothing");
+            }
+
+            // The TOTAL, which is not implied by the per-check assertion above and catches what that one
+            // cannot see: a claim registered from Run itself, or anywhere outside a check. Each check would
+            // still have added exactly one relative to its own starting count, so only this notices.
+            if (claims.Count != checks.Length)
+                failures.Add("claim registry: " + claims.Count + " claims from " + checks.Length
+                             + " checks — a claim was registered outside a check, so the summary would "
+                             + "assert something no check backs");
+
+            foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
+            if (failures.Count == 0)
+            {
+                Console.WriteLine("protocolcheck: " + claims.Count + " checks, all OK.");
+                for (int i = 0; i < claims.Count; i++)
+                    Console.WriteLine("  " + (i + 1).ToString().PadLeft(2) + ". " + claims.Lines[i]);
+                return 0;
+            }
+            Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
+            return 1;
+        }
+
+        /// <summary>
+        /// The eight spliced event shapes — every event WithTid stamps whole, rather than by appending a
+        /// member. Lifted out of Run so that it, like every other check, owns the claim it makes: the count
+        /// in that claim is `shapes.Length`, read off the array beside it instead of retyped into a sentence
+        /// somewhere else.
+        /// </summary>
+        private static void CheckSplicedEventShapes(List<string> failures, ClaimLog claims)
+        {
             // The real event shapes the engine emits, one per stamped event in the frozen protocol.
             var shapes = new[]
             {
@@ -77,51 +172,10 @@ namespace ClarionDbg.Cli
             if (DebugEngine.WithTidForTest("{}", 42) != "{\"tid\":42}")
                 failures.Add("empty object: stamping produced malformed JSON");
 
-            CheckHandBuiltTidEmitters(failures);
-            CheckTidValuedMembersUnderOtherNames(failures);
-            CheckResumeVerbs(failures);
-            CheckStepGuards(failures);
-            CheckBpHitVsStep(failures);
-            CheckSeamsRefuseLiveTarget(failures);
-            CheckEditVeto(failures);
-            CheckThreadedWriteGuard(failures);
-            CheckOnceOnlyDiagnostics(failures);
-
-            foreach (var f in failures) Console.WriteLine("  FAIL  " + f);
-            if (failures.Count == 0)
-            {
-                Console.WriteLine($"protocolcheck: {shapes.Length} spliced event shapes + all 4 hand-built "
-                                  + "emitters OK - a known tid is stamped, "
-                                  + "an unknown tid is absent (never 0 or -1); the same rule holds under all "
-                                  + $"{DebugEngine.TidValuedMemberNamesForTest().Length} names the engine "
-                                  + "declares for a thread-id member, which puts 3 more top-level ids "
-                                  + "across 2 events under it (`threads`.stopped, `threads`.selected, "
-                                  + "`threadscan`.stopped) - each tested with the others KNOWN, so an "
-                                  + "omission is per member and not the builder giving up, while the "
-                                  + "same-named per-row booleans survive and no row claims a selection the "
-                                  + "event does not state; a vetoed row's descendants "
-                                  + "offer no edit metadata, INLINE and through `expand`, whose veto is "
-                                  + "derived from the address over the whole group's span while an "
-                                  + "ordinary group keeps its pencils; no write, of any length, "
-                                  + "can touch the shared template; the resume-verb set has one owner across "
-                                  + "its 2 remaining sites; Step Over's ESP gate and its prologue bypass "
-                                  + "each hold with the other one out of the way; and a breakpoint hit "
-                                  + "supersedes an in-flight step only when it PAUSES — both pausing routes "
-                                  + "cancel the step, and a silently-resumed hit leaves the session, its "
-                                  + "temp INT3s and its call-entry anchor untouched; and all 6 mutating "
-                                  + "test seams REFUSE an attached engine, with OnUserBpForTest also "
-                                  + "refusing the --once and interactive engines, while all of them still "
-                                  + "work with no target, and ArmUserBpForTest refusing a load base that "
-                                  + "disagrees with the module its va resolves to; and the repeating "
-                                  + "console diagnostics report once per (image, reason) per ENGINE, keyed "
-                                  + "on the reason CATEGORY and not on the message - which interpolates "
-                                  + "addresses, so keying on it would dedup nothing while looking like it "
-                                  + "worked - with the suppression said on the line rather than left to "
-                                  + "be inferred.");
-                return 0;
-            }
-            Console.WriteLine($"protocolcheck: {failures.Count} failure(s).");
-            return 1;
+            claims.Claim(shapes.Length + " spliced event shapes: a KNOWN tid is stamped and the rest of the "
+                         + "event survives byte-identical, while an unknown tid - 0 or the (uint)-1 an int "
+                         + "cast produces - writes no tid member at all; an empty object still stamps as "
+                         + "well-formed JSON.");
         }
 
         /// <summary>
@@ -145,8 +199,12 @@ namespace ClarionDbg.Cli
         /// event, the `threads` rows and the `threadscan` rows. If a fifth hand-built emitter appears, this
         /// check does not grow to meet it — add it here, and see the rule holder's note in DebugEngine.cs.
         /// </summary>
-        private static void CheckHandBuiltTidEmitters(List<string> failures)
+        private static void CheckHandBuiltTidEmitters(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("all 4 hand-built tid emitters - threadselected, the pause-choice log, the "
+                         + "`threads` rows and the `threadscan` rows - driven through their REAL builders: a "
+                         + "known tid is written exactly once, and neither 0 nor (uint)-1 writes a member.");
+
             const uint known = 116932;
             const uint minusOne = unchecked((uint)-1);
 
@@ -204,8 +262,16 @@ namespace ClarionDbg.Cli
         /// wrong reason — and then INDEPENDENTLY, one unknown at a time with the other known. A pair tested
         /// only together cannot tell "the rule is applied per member" from "the builder gave up on both".
         /// </summary>
-        private static void CheckTidValuedMembersUnderOtherNames(List<string> failures)
+        private static void CheckTidValuedMembersUnderOtherNames(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("the same rule holds under all "
+                         + DebugEngine.TidValuedMemberNamesForTest().Length + " names the engine declares "
+                         + "for a thread-id member, putting 3 more top-level ids across 2 events under it "
+                         + "(`threads`.stopped, `threads`.selected, `threadscan`.stopped) - each tested with "
+                         + "the OTHERS KNOWN, so an omission is per member rather than the builder giving "
+                         + "up, while the same-named per-row booleans survive and no row claims a selection "
+                         + "the event does not state.");
+
             const uint known = 116932;
             const uint other = 4812;
             const uint minusOne = unchecked((uint)-1);
@@ -333,8 +399,12 @@ namespace ClarionDbg.Cli
         /// the dangerous one: that switch implements it, and it once WAS in this list, where it reset the
         /// selection and then fell through to "unknown command".
         /// </summary>
-        private static void CheckResumeVerbs(List<string> failures)
+        private static void CheckResumeVerbs(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("the resume-verb set has ONE owner across its 2 remaining sites: all 18 spellings "
+                         + "the pause loop dispatches are accepted, and the verbs the running-state switch "
+                         + "implements itself are refused, so none of them is diverted from its own case.");
+
             // The set, spelled out: 5 commands, 18 spellings. The pause loop dispatches every one of these.
             string[] resume =
             {
@@ -391,8 +461,11 @@ namespace ClarionDbg.Cli
         /// switch generation). So each case below moves ONE input and leaves the rest where a real step
         /// would have them.
         /// </summary>
-        private static void CheckStepGuards(List<string> failures)
+        private static void CheckStepGuards(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("Step Over's ESP gate and its prologue bypass each hold with the OTHER one out of "
+                         + "the way, so neither is a dead guard passing on the other's behalf.");
+
             // ---- guard 1: THE ESP GATE, isolated from the bypass (bypass OFF, everything else real).
             // A candidate 0x40 below the starting frame is deeper than ESP_SLACK (0x10) allows.
             const uint startEsp = 0x0012F000;
@@ -506,8 +579,12 @@ namespace ClarionDbg.Cli
         /// breakpoint that never enters the gate, and an advanced one whose gate said pause. A fix that
         /// handled only one of those would pass the other's case.
         /// </summary>
-        private static void CheckBpHitVsStep(List<string> failures)
+        private static void CheckBpHitVsStep(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("a breakpoint hit supersedes an in-flight step only when it PAUSES: both pausing "
+                         + "routes cancel the step, and a silently-resumed hit leaves the step session, its "
+                         + "temp INT3s and its call-entry anchor untouched.");
+
             // Not a multiple of 4, so Windows never assigns it: OpenThread fails, haveCtx stays false, and
             // no thread on this machine is touched. Everything asserted below is engine bookkeeping.
             const uint tid = 0xFFFFFFF1;
@@ -625,8 +702,13 @@ namespace ClarionDbg.Cli
         /// and the no-target ISOLATION case below is what keeps "refuses when attached" distinguishable from
         /// "refuses always".
         /// </summary>
-        private static void CheckSeamsRefuseLiveTarget(List<string> failures)
+        private static void CheckSeamsRefuseLiveTarget(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("all 6 mutating test seams REFUSE an attached engine - OnUserBpForTest also "
+                         + "refusing the --once and interactive engines, and ArmUserBpForTest a load base "
+                         + "that disagrees with the module its va resolves to - while every one of them "
+                         + "still WORKS with no target, so none is a seam that refuses everything.");
+
             // Nothing but a real Attach/Launch sets _hProcess, so an attached engine cannot be built through
             // any public path; it is set directly here. 0x1234 is not a handle this process owns, so every
             // write an UNGUARDED handler would attempt through it fails — running the pre-fix code to watch
@@ -796,8 +878,13 @@ namespace ClarionDbg.Cli
         /// The window-cap site needs real windows and is not reachable here; it shares this rule holder, and
         /// that sharing is the whole reason there is one holder rather than a flag in each file.
         /// </summary>
-        private static void CheckOnceOnlyDiagnostics(List<string> failures)
+        private static void CheckOnceOnlyDiagnostics(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("the repeating console diagnostics report once per (image, reason) per ENGINE, "
+                         + "keyed on the reason CATEGORY and not on the message - which interpolates "
+                         + "addresses, so keying on it would dedup nothing while looking like it worked - "
+                         + "with the suppression stated on the line rather than left to be inferred.");
+
             // ---- the rule holder, isolated: first sighting true, every later one false, keys independent.
             var eng = NewEngine();
             if (!eng.FirstReportOfForTest("k1"))
@@ -850,6 +937,160 @@ namespace ClarionDbg.Cli
                              + "image would mask the same fault in every other");
         }
 
+        /// <summary>
+        /// The window-walk cap's dedup key names the WINDOW, not its place in the enumeration.
+        ///
+        /// The key was `"wincap|root " + i`, the EnumWindows loop index. Close the app's first top-level
+        /// window and the former root 1 becomes root 0, so a genuinely new pathological root is silenced
+        /// under a key already reported — and the line it would have printed named a root number that by
+        /// then identified nothing. Position is not identity; this session found four bugs of that shape
+        /// in recycled pids alone.
+        ///
+        /// HALF OF THIS IS NOT TESTED HERE, AND DOES NOT NEED TO BE. That the key cannot be built from a
+        /// position is guaranteed by WinCapKey's SIGNATURE, which has no index parameter — a compile-time
+        /// fact, stronger than any assertion this file could make and not something a mutation could sneak
+        /// past. What a signature cannot promise is that the key SEPARATES distinct roots and stays STABLE
+        /// for one, and that is what is checked below: without separation the dedup suppresses a real
+        /// second window, and without stability it suppresses nothing at all.
+        ///
+        /// The walk itself needs live windows and is unreachable from here. This covers the key, says so,
+        /// and does not imply the walk.
+        /// </summary>
+        private static void CheckWinCapKeyIsIdentityNotPosition(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("the window-walk cap's dedup key is the root window's IDENTITY (its handle and "
+                         + "class), not its index in the enumeration - so closing one top-level window no "
+                         + "longer silences a different one; distinct roots get distinct keys and one root "
+                         + "keys the same every time. The key cannot be positional by construction: "
+                         + "WinCapKey takes no index. The walk itself needs live windows and is NOT covered.");
+
+            const long hwndA = 0x000407C2;
+            const long hwndB = 0x0011045A;
+
+            // STABLE: the same window must key identically on every pause, or the suppression never happens
+            // and the flood this exists to stop comes back.
+            if (DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame")
+                != DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame"))
+                failures.Add("wincap key: the same root keyed differently twice — nothing would ever dedup");
+
+            // SEPARATES on the handle: this is the case the positional key got wrong. Two roots that
+            // happened to occupy the same index across two stops shared a key and silenced each other.
+            if (DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame")
+                == DebugEngine.WinCapKeyForTest(hwndB, "ClarionFrame"))
+                failures.Add("wincap key: two DIFFERENT root windows produced the same key — a new "
+                             + "pathological root is silenced under one already reported, which is the "
+                             + "defect the positional key had");
+
+            // SEPARATES on the class too, which is what makes a recycled handle survivable: the same handle
+            // reused by a different kind of window is a different window and must be reported.
+            if (DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame")
+                == DebugEngine.WinCapKeyForTest(hwndA, "#32770"))
+                failures.Add("wincap key: a RECYCLED handle reused by a different window class kept the "
+                             + "old key — the one mitigation the key has against handle reuse is gone");
+
+            // A null class must not throw and must not collide with a real one. FillWindowEvidence builds
+            // Cls from GetClassName, which can come back empty for a window that died mid-walk.
+            string nullCls = DebugEngine.WinCapKeyForTest(hwndA, null);
+            if (string.IsNullOrEmpty(nullCls))
+                failures.Add("wincap key: a null class produced no key at all");
+            if (nullCls == DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame"))
+                failures.Add("wincap key: an unknown class keyed the same as a known one");
+        }
+
+        /// <summary>
+        /// A user-visible refusal never shows a RAW thread id.
+        ///
+        /// The absent-tid rule has always been about the WIRE: an unknown id is an absent member, never 0
+        /// and never the 4294967295 an int cast produces. Refusal TEXT is the other half of the same rule
+        /// and had no guard at all. A refusal reading "thread 0 is selected" states a falsehood about the
+        /// user's own program, in the one place they are already confused enough to be reading carefully —
+        /// and 4294967295 is worse, because it looks like a real id they could go and check.
+        ///
+        /// TidText is the rule holder, and until now NOTHING in this tree asserted it: no reference in this
+        /// file, none in tools/. Reverting any of the refusal sites to raw interpolation passed every gate
+        /// green. That is the same shape as the expand veto's note, one file over.
+        ///
+        /// HOW THIS AVOIDS ASSERTING ITS OWN EXPECTATION. The unknown rendering is not hard-coded as the
+        /// thing being proved: the check requires that 0 and (uint)-1 produce the SAME string as each other
+        /// and a DIFFERENT one from a known id, which is the actual contract — one representation for
+        /// unknown, distinguishable from any real thread — and only then names it. A version that asserted
+        /// "contains (unknown)" alone would pass against a refusal that said both.
+        ///
+        /// WHAT IT DOES NOT COVER, said plainly: a BRAND NEW refusal site that never calls TidText. This
+        /// drives the refusal producers that are reachable with no debuggee, so it catches a revert of an
+        /// existing site; it cannot catch a site nobody has written yet. That needs a source-level rule —
+        /// "a `\"thread \" +` concatenation must be followed by TidText(" — which belongs in
+        /// tools/test-engine-tid-members.ps1 beside the member-name scanner, not here.
+        /// </summary>
+        private static void CheckRefusalsNeverShowARawTid(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("no user-visible refusal shows a RAW thread id: both unknown values (0 and the "
+                         + "(uint)-1 an int cast produces) collapse to ONE rendering, that rendering is "
+                         + "TidText's \"(unknown)\" and not a number, and a KNOWN id still reads as its "
+                         + "own number - so a refusal can no longer tell the user about a thread 0 or a "
+                         + "thread 4294967295 that does not exist.");
+
+            var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            eng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000, iatRva: 0);
+            const uint known = 4812;
+            const uint minusOne = unchecked((uint)-1);
+            const uint templateVa = 0x4C8000;
+
+            // The refusal producers reachable with no target. A table rather than three copies, so adding
+            // the next drivable one is a line — and so the assertions below are applied to every entry
+            // rather than to whichever one somebody remembered.
+            var producers = new[]
+            {
+                new { Name = "threaded-write refusal", Make = (Func<uint, string>)(t =>
+                {
+                    string why;
+                    eng.ThreadedWriteAllowedForTest(templateVa, 1, t, out why);
+                    return why;
+                }) },
+            };
+
+            foreach (var p in producers)
+            {
+                string forKnown = p.Make(known);
+                string forZero = p.Make(0);
+                string forMinusOne = p.Make(minusOne);
+
+                // CONTROL FIRST: it must actually be refusing, or everything below passes on empty strings.
+                if (string.IsNullOrEmpty(forKnown) || string.IsNullOrEmpty(forZero))
+                    { failures.Add(p.Name + " control: produced no refusal at all, so nothing below asserts anything"); continue; }
+
+                // CONTROL: a KNOWN id still reads as its number. Without this, a refusal that had simply
+                // stopped naming threads would satisfy every other assertion here.
+                if (forKnown.IndexOf("thread " + known, StringComparison.Ordinal) < 0)
+                    failures.Add(p.Name + " control: a KNOWN thread id is no longer named in the refusal — "
+                                 + forKnown);
+
+                // ONE REPRESENTATION FOR UNKNOWN. 0 and (uint)-1 are different values and the same
+                // non-fact, so they must read identically. This is the contract; the wording is downstream.
+                if (forZero != forMinusOne)
+                    failures.Add(p.Name + ": the two unknown ids read differently — 0 gave \"" + forZero
+                                 + "\" and (uint)-1 gave \"" + forMinusOne + "\", so one of them is being "
+                                 + "rendered as itself");
+
+                // ...and DISTINGUISHABLE from a real thread, or "unknown" is not being said at all.
+                if (forZero == forKnown)
+                    failures.Add(p.Name + ": an unknown id reads exactly like a known one — " + forZero);
+
+                // NO RAW SENTINEL REACHES THE USER. Both spellings, because the int-cast one is the one
+                // that looks like a thread they could go and check.
+                foreach (var raw in new[] { "thread 0", "4294967295" })
+                    foreach (var s in new[] { forZero, forMinusOne })
+                        if (s.IndexOf(raw, StringComparison.Ordinal) >= 0)
+                            failures.Add(p.Name + ": an unknown thread id reached the user as \"" + raw
+                                         + "\" — it states a falsehood about their own program: " + s);
+
+                // ...and it DOES name it as unknown, rather than quietly dropping the clause.
+                if (forZero.IndexOf("(unknown)", StringComparison.Ordinal) < 0)
+                    failures.Add(p.Name + ": an unknown thread id is not named at all — the refusal should "
+                                 + "say so through TidText rather than omit the thread: " + forZero);
+            }
+        }
+
         /// <summary>A row-bearing event must carry the one KNOWN tid it was given and neither sentinel.
         /// Feeding the builder a known tid alongside 0 and (uint)-1 in the SAME event is the point: it
         /// asserts the rule is applied per row, not decided once for the whole event.</summary>
@@ -894,8 +1135,14 @@ namespace ClarionDbg.Cli
         /// THREADed module-scope data while a thread with no instance of it is selected, which the debuggee
         /// does not readily produce.
         /// </summary>
-        private static void CheckEditVeto(List<string> failures)
+        private static void CheckEditVeto(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("a vetoed row's descendants offer no edit metadata, INLINE and through `expand` - "
+                         + "whose veto is derived from the address over the whole group's SPAN - while an "
+                         + "ordinary group keeps its pencils; and the veto and the NOTE that explains it "
+                         + "come from ONE classification, so a group straddling into the template is told "
+                         + "the template reason and not another thread's.");
+
             // A DebugEngine with no target: rows still build, the values just read as nothing.
             var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
 
@@ -987,6 +1234,29 @@ namespace ClarionDbg.Cli
             if (CountVa(straddling) != 0)
                 failures.Add("expand-veto: a GROUP at 0x4C7FFC has a member ON the template's first byte "
                              + "but " + CountVa(straddling) + " member row(s) were still offered a pencil");
+            // AND IT MUST NAME THE RIGHT REFUSAL — the guarantee ticket 49538b78 item 3 created, which
+            // nothing asserted until now.
+            //
+            // The veto was span-based and correct. The NOTE was decided by a SECOND, INDEPENDENT point
+            // test on the row's START address, so this group — outside the template at its first byte,
+            // inside it at its last — was vetoed correctly and then labelled "another thread's data",
+            // a different refusal entirely. Counting `va` cannot see that: the row is vetoed either way,
+            // so the check stayed green while the user was told the wrong thing.
+            //
+            // THIS IS THE DISCRIMINATING CASE. A group whose start is outside the block and whose SPAN
+            // straddles in is the only shape where a point test and a span test disagree; every other
+            // case agrees by accident and proves nothing. An address inside a .cwtls block can earn only
+            // the template refusal, so that is what the wording must name.
+            //
+            // It asserts on TEXT, which this file otherwise avoids, and the reason is worth stating: the
+            // note reaches the pad as a string and nothing else about it is observable from here. The
+            // structural version wants a seam over ClassifyThreadedAccess's Kind, in another owner's
+            // file — noted rather than quietly settled for.
+            if (straddling.IndexOf("template", StringComparison.OrdinalIgnoreCase) < 0)
+                failures.Add("expand-veto: a GROUP straddling into the shared template was vetoed but "
+                             + "labelled with the WRONG REFUSAL — the veto is derived over the span and "
+                             + "the note is not, so they no longer come from one classification: "
+                             + straddling);
             // ...and the group that really does stay below it keeps its pencils: 0x4C7FF8 + 8 ends
             // exactly at the template's first byte, which is past the last byte it touches.
             string justBelow = xeng.ExpandChildrenForTest(grp, 0x4C7FF8, "app.exe", xtid);
@@ -1013,8 +1283,10 @@ namespace ClarionDbg.Cli
         /// other-thread branch needs a live THR$GetInstance emulation and so is NOT covered here — it is
         /// exercised against a real target instead; see the ticket notes.
         /// </summary>
-        private static void CheckThreadedWriteGuard(List<string> failures)
+        private static void CheckThreadedWriteGuard(List<string> failures, ClaimLog claims)
         {
+            claims.Claim("no write, of any length, can touch the shared THREADed template.");
+
             var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
             // An image mapped at 0x400000 whose .cwtls template block is RVA 0xC8000..0xCC000.
             eng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000);

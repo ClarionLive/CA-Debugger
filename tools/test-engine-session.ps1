@@ -7,14 +7,10 @@
 #   pwsh -File tools\test-engine-session.ps1
 # Exit code 0 = all checks passed.
 . "$PSScriptRoot\engine-session.ps1"
-
-$script:fails = 0
-$script:checks = 0
-function Check([string]$label, [bool]$cond, $detail) {
-    $script:checks++
-    if ($cond) { Write-Host "  PASS  $label" }
-    else { $script:fails++; Write-Host "  FAIL  $label$(if ($null -ne $detail) { '  ->  ' + $detail })" }
-}
+# Check / ShowVal / Invoke-CheckSection / Assert-CheckTotal. lib-check.ps1 DIRECTLY and not lib-extract.ps1:
+# this suite scans PowerShell, not C#, so it has nothing to extract - and lib-extract imposes
+# Set-StrictMode on its callers, under which this file throws (see EXPECTED_CHECKS below).
+. "$PSScriptRoot\lib-check.ps1"
 
 # A session with no process behind it: a plain list stands in for the synchronized sink the real
 # OutputDataReceived handler fills.
@@ -24,8 +20,7 @@ function New-FakeSession([string]$target = 'C:\apps\clbrws.exe') {
 }
 function Emit($session, [string]$line) { [void]$session.Sink.Add($line) }
 
-Write-Host '1) the pump returns each line exactly once'
-{
+Invoke-CheckSection '1) the pump returns each line exactly once' {
     $s = New-FakeSession
     Emit $s 'one'; Emit $s 'two'
     $first = Read-EngineLines $s
@@ -35,10 +30,9 @@ Write-Host '1) the pump returns each line exactly once'
     Emit $s 'three'
     $third = Read-EngineLines $s
     Check 'a line arriving later is picked up' ($third.Count -eq 1 -and $third[0] -eq 'three') ($third -join '|')
-}.Invoke()
+}
 
-Write-Host '2) the debuggee pid is learned from the engine''s own output'
-{
+Invoke-CheckSection '2) the debuggee pid is learned from the engine''s own output' {
     $s = New-FakeSession
     Check 'no pid before the engine has said anything' ($null -eq $s.TargetPid) $s.TargetPid
     [void](Read-EngineLines $s)
@@ -55,10 +49,9 @@ Write-Host '2) the debuggee pid is learned from the engine''s own output'
     Emit $s2 '@JSON {"event":"loaded","pid":999,"loadBase":"0x400000"}'
     [void](Read-EngineLines $s2)
     Check 'a later pid does not replace it' ($s2.TargetPid -eq 777) $s2.TargetPid
-}.Invoke()
+}
 
-Write-Host '3) Wait-EnginePaused reports the stop, the exit, and the timeout'
-{
+Invoke-CheckSection '3) Wait-EnginePaused reports the stop, the exit, and the timeout' {
     $s = New-FakeSession
     Emit $s 'noise'
     Emit $s '@JSON {"event":"paused","ebp":"0x18FF00","va":"0x847A76"}'
@@ -78,10 +71,9 @@ Write-Host '3) Wait-EnginePaused reports the stop, the exit, and the timeout'
     Check 'silence times out rather than hanging' (-not $timedOut)
     Check 'and it actually waited the timeout' ($sw.Elapsed.TotalSeconds -ge 0.9) $sw.Elapsed.TotalSeconds
     Check 'EachTick ran while it waited' ($script:tickCount -gt 1) $script:tickCount
-}.Invoke()
+}
 
-Write-Host '4) the target process is identified by pid, never by name (337b3222 item 9)'
-{
+Invoke-CheckSection '4) the target process is identified by pid, never by name (337b3222 item 9)' {
     # The live PowerShell process stands in for a debuggee: a real pid, with a real name and start time.
     $me = Get-Process -Id $PID
     $s = New-FakeSession
@@ -105,9 +97,8 @@ Write-Host '4) the target process is identified by pid, never by name (337b3222 
     $s.StartedAt = $me.StartTime.AddSeconds(-1)
     $s.TargetPid = 999999
     Check 'a pid that no longer exists is not the target' ($null -eq (Get-EngineTargetProcess $s))
-}.Invoke()
+}
 
-Write-Host '4b) a start time that cannot be READ is an identity failure, not a detail to skip'
 # ISOLATED on purpose. In section 4 the StartTime guard sits behind the name check and in front of its own
 # comparison, so a SWALLOWED read failure hides between them: pid and name still agreed, and the helper
 # returned the process. Everything below agrees except that the start time cannot be read.
@@ -123,7 +114,7 @@ Write-Host '4b) a start time that cannot be READ is an identity failure, not a d
 # coercion; it fails against a helper that swallows the failure and returns the process, which is what the
 # guard is there to prevent. Run under both $ErrorActionPreference values because the helper is dot-sourced
 # into whatever the harness has set (test-bp-threaded.ps1 sets 'Stop') and neither may behave differently.
-{
+Invoke-CheckSection '4b) a start time that cannot be READ is an identity failure, not a detail to skip' {
     if (-not ('FakeStartTimeProc' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -175,9 +166,8 @@ public class FakeStartTimeProc {
     # ...and the guard is not simply rejecting everything now: readable again, accepted again.
     $script:fakeProc.Readable = $true
     Check 'CONTROL: a readable start time is accepted again afterwards' ($null -ne (Get-EngineTargetProcess $s))
-}.Invoke()
+}
 
-Write-Host '5) every harness that launches the engine cleans up THROUGH this lifecycle'
 # Section 4 proves the identity check is right. It says nothing about whether the harnesses use it, and a
 # harness that resolves a pid itself gets no benefit from it: the third recorded instance of "a pid is not
 # an identity" in this repo was a NEW harness doing `Get-Process -Id $targetPid; $p.Kill()` in its finally
@@ -188,7 +178,7 @@ Write-Host '5) every harness that launches the engine cleans up THROUGH this lif
 # key on the word "interactive" because this file contains it while launching nothing.
 # Get-Process is detected through the PowerShell PARSER, not a text match: test-watch-threaded.ps1 mentions
 # `Get-Process clbrws` in a comment explaining why it must not do that, and a comment is not a call.
-{
+Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH this lifecycle' {
     # One parse per file, shared by both scans below. A file that will not parse is NOT "a file with no
     # Get-Process call" and NOT "a file that is not a harness" - those are the two silent passes this
     # section exists to prevent - so it fails closed and says which file and why.
@@ -299,16 +289,15 @@ Write-Host '5) every harness that launches the engine cleans up THROUGH this lif
     $watch = Join-Path $PSScriptRoot 'test-watch-threaded.ps1'
     Check 'and it does not fire on a comment that only mentions Get-Process' `
         (((Get-Content -Raw -LiteralPath $watch) -match 'Get-Process') -and ((Get-CalledCommands $watch) -notcontains 'Get-Process'))
-}.Invoke()
+}
 
-Write-Host '6) a POKE is a signal too, so it goes through the same identity check'
 # EnumWindows keyed on a bare pid posts WM_COMMAND / WM_NULL to every visible window that pid owns AT THAT
 # INSTANT. Commit a29b613 removed the bare-pid KILL path but left the poke sites resolving nothing: if the
 # debuggee exited and Windows recycled its pid, the harness typed into an unrelated developer's GUI.
 #
 # Section 5's rule is about resolving a pid to a PROCESS. This one is about the pid a harness hands to a
 # window poke, which is a different thing to get wrong and was got wrong separately.
-{
+Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same identity check' {
     $hasResolver = $null -ne (Get-Command Get-EngineTargetPid -ErrorAction SilentlyContinue)
     Check 'Get-EngineTargetPid exists as the one shared answer to "which pid may I signal?"' $hasResolver
     if ($hasResolver) {
@@ -376,7 +365,11 @@ Write-Host '6) a POKE is a signal too, so it goes through the same identity chec
     }
 
     $pokers = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' | Sort-Object Name |
-                Where-Object { (Get-PokePidArgs $_.FullName).Count -gt 0 })
+                # @() around the call: a ONE-element result unrolls to a scalar, and `.Count` on a scalar
+                # is a convenience PowerShell withdraws under Set-StrictMode 3.0+. The count was right
+                # either way, so this is an idiom fix, not a behaviour fix - but it was the only thing
+                # making this file unloadable alongside a strict library (see tools/lib-check.ps1).
+                Where-Object { @(Get-PokePidArgs $_.FullName).Count -gt 0 })
     # A number, not "every": a harness that grows a third poke site says so here.
     $allArgs = @($pokers | ForEach-Object { Get-PokePidArgs $_.FullName })
     Check 'exactly 4 window-poke sites across the harnesses, in 2 files' `
@@ -411,9 +404,24 @@ Write-Host '6) a POKE is a signal too, so it goes through the same identity chec
         Check 'CONTROL: ...and accepts a pid that came from the resolver' `
             ((Test-PokeArg '$pokePid' @('pokePid')) -and (Test-PokeArg '$cp.Id' @('cp')))
     } finally { Remove-Item -LiteralPath $banned -Force -ErrorAction SilentlyContinue }
-}.Invoke()
+}
 
+# (b) THE BACKSTOP, in lib-check.ps1's terms. (a) - Invoke-CheckSection turning a thrown section into a
+# failed check - is what actually closes ticket cb9324f2 and needs nothing maintained. This catches the
+# remaining case (a) cannot: a section that returns EARLY without throwing raises nothing to catch, and
+# its checks simply never happen. Update the number deliberately when adding or removing a check.
+#
+# It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
+# checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
+# 56, with nothing comparing the two.
+$EXPECTED_CHECKS = 56
+Assert-CheckTotal $EXPECTED_CHECKS
+
+# $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean
+# run printed "ALL 56 CHECKS PASSED" while 57 had run - the assertion does not count itself for the
+# COMPARISON, but it is still a check, and it is still reported. A suite whose subject is silently missing
+# checks should not mis-state its own count by one.
 Write-Host ''
-if ($script:fails) { Write-Host "$($script:fails) of $($script:checks) CHECKS FAILED"; exit 1 }
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"
 exit 0
