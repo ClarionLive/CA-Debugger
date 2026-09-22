@@ -1257,15 +1257,49 @@ namespace ClarionDbg.Core
             _dataNames = new Dictionary<string, DataLocation>(StringComparer.OrdinalIgnoreCase);
             foreach (var ds in DataSymbols)
             {
-                if (!_dataNames.ContainsKey(ds.Name))
-                    _dataNames[ds.Name] = new DataLocation { Rva = ds.Rva, TypeCode = ds.TypeCode, Size = ds.Size, Container = null, ModuleIdx = ds.ModuleIdx };
+                RegisterDataName(ds.Name, new DataLocation { Rva = ds.Rva, TypeCode = ds.TypeCode, Size = ds.Size, Container = null, ModuleIdx = ds.ModuleIdx });
                 if (ds.Type != null && ds.Type.Members != null)
                     RegisterTypeLeaves(ds.Name, ds.Rva, ds.Type, ds.ModuleIdx);   // byte-exact, recurses nested groups
                 else if (ds.Fields != null)
                     foreach (var f in ds.Fields)
-                        if (!_dataNames.ContainsKey(f.Name))
-                            _dataNames[f.Name] = new DataLocation { Rva = ds.Rva + f.Offset, TypeCode = f.TypeCode, Size = f.Size, Container = ds.Name, ModuleIdx = ds.ModuleIdx };
+                        RegisterDataName(f.Name, new DataLocation { Rva = ds.Rva + f.Offset, TypeCode = f.TypeCode, Size = f.Size, Container = ds.Name, ModuleIdx = ds.ModuleIdx });
             }
+        }
+
+        /// <summary>
+        /// Register <paramref name="name"/> unless a location that OUTRANKS this one already holds it.
+        /// A field name is not unique: a form's HISTORY::COU:RECORD is declared LIKE(COU:RECORD), so it
+        /// carries COU:COUNTRY too, and a bare COU:COUNTRY must mean the FILE's record buffer. Keeping the
+        /// first registration picked whichever group the symbol table listed first — on demoleg.exe
+        /// (2026-09-22) that was the non-THREADed history buffer, so every table field read as zeros and
+        /// offered a pencil that would have written the form's history instead of the record.
+        /// Equal ranks keep the first registration, as before.
+        /// </summary>
+        private void RegisterDataName(string name, DataLocation loc) { RegisterDataName(_dataNames, name, loc); }
+
+        /// <summary>The rule itself, over any index — public so protocolcheck drives the SAME code the
+        /// name index is built with, in both registration orders.</summary>
+        public static void RegisterDataName(IDictionary<string, DataLocation> index, string name, DataLocation loc)
+        {
+            DataLocation held;
+            if (index.TryGetValue(name, out held) && DataNameRank(held.Container) <= DataNameRank(loc.Container)) return;
+            index[name] = loc;
+        }
+
+        /// <summary>Lower wins. 0: a static in its own right (no container), or a FILE record buffer in the
+        /// exact shape Clarion gives one, FILE$PRE:RECORD — unscoped, carrying '$', ending ":RECORD". 1: every
+        /// other container, and they keep first-registration order among themselves. Deliberately only two
+        /// ranks: the field-name question this settles is "the FILE's record or a copy of it", and a third rank
+        /// for scoped names also reordered unrelated collisions — on demoleg.exe (2026-09-22) the M_* members of
+        /// eleven BRW1::FORMATMANAGER instances flipped to a global CLS_FILE of &amp;REFs. Nor does '$' alone buy
+        /// rank 0: VMT$ and other mangled names carry it too.</summary>
+        private static int DataNameRank(string container)
+        {
+            if (container == null) return 0;
+            bool fileRecord = container.IndexOf("::", StringComparison.Ordinal) < 0
+                              && container.IndexOf('$') >= 0
+                              && container.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase);
+            return fileRecord ? 0 : 1;
         }
 
         // Register every leaf member of a resolved GROUP by name -> absolute RVA, so watch-by-name resolves
@@ -1279,10 +1313,10 @@ namespace ClarionDbg.Core
                 uint rva = (uint)(groupRva + mb.Offset);
                 if (mb.Type.Kind == TypeKind.Group)
                     RegisterTypeLeaves(container, rva, mb.Type, moduleIdx);
-                else if (!_dataNames.ContainsKey(mb.Name))
+                else
                 {
                     mb.Type.RenderHint(out byte code, out uint size, out int places);
-                    _dataNames[mb.Name] = new DataLocation { Rva = rva, TypeCode = code, Size = size, Container = container, ModuleIdx = moduleIdx };
+                    RegisterDataName(mb.Name, new DataLocation { Rva = rva, TypeCode = code, Size = size, Container = container, ModuleIdx = moduleIdx });
                 }
             }
         }
