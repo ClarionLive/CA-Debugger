@@ -69,6 +69,7 @@ namespace ClarionDbg.Cli
                 CheckOnceOnlyDiagnostics,
                 CheckWinCapKeyIsIdentityNotPosition,
                 CheckRefusalsNeverShowARawTid,
+                CheckFieldNameResolvesToFileRecord,
             };
 
             foreach (var check in checks)
@@ -995,6 +996,48 @@ namespace ClarionDbg.Cli
                 failures.Add("wincap key: a null class produced no key at all");
             if (nullCls == DebugEngine.WinCapKeyForTest(hwndA, "ClarionFrame"))
                 failures.Add("wincap key: an unknown class keyed the same as a known one");
+        }
+
+        /// <summary>
+        /// A bare field name means the FILE's record buffer, however the symbol table orders the groups
+        /// that repeat it (6b48ad7c). demoleg.exe lists UpdateCountries' HISTORY::COU:RECORD, declared
+        /// LIKE(COU:RECORD), ahead of COUNTRIES$COU:RECORD; first-registration-wins resolved COU:COUNTRY to
+        /// the history copy, so table fields read as zeros and offered a pencil into the wrong buffer.
+        /// </summary>
+        private static void CheckFieldNameResolvesToFileRecord(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("a field name repeated by several groups resolves to the FILE record buffer "
+                         + "(FILE$PRE:RECORD) in EITHER registration order, ahead of an unscoped GROUP and of a "
+                         + "form's scoped HISTORY:: copy; equal ranks keep the first registration. Driven through "
+                         + "the index's own RegisterDataName; the call sites that feed it are NOT covered here.");
+
+            var file    = new TswdDebugInfo.DataLocation { Rva = 0x3C3AC0, Container = "COUNTRIES$COU:RECORD" };
+            var history = new TswdDebugInfo.DataLocation { Rva = 0x049D10, Container = "HISTORY::COU:RECORD" };
+            var plain   = new TswdDebugInfo.DataLocation { Rva = 0x100000, Container = "SAVE:COUNTRY" };
+
+            Func<TswdDebugInfo.DataLocation[], uint> winner = order =>
+            {
+                var index = new Dictionary<string, TswdDebugInfo.DataLocation>(StringComparer.OrdinalIgnoreCase);
+                foreach (var loc in order) TswdDebugInfo.RegisterDataName(index, "COU:COUNTRY", loc);
+                return index["cou:country"].Rva;
+            };
+
+            // The reported order: the history copy registers FIRST. This is the one first-wins got wrong.
+            if (winner(new[] { history, file }) != file.Rva)
+                failures.Add("field name: the history copy registered first and KEPT COU:COUNTRY — table fields "
+                             + "read the form's HISTORY:: buffer instead of the record (6b48ad7c)");
+            if (winner(new[] { file, history }) != file.Rva)
+                failures.Add("field name: a later HISTORY:: copy displaced the FILE record buffer");
+            if (winner(new[] { plain, file }) != file.Rva || winner(new[] { file, plain }) != file.Rva)
+                failures.Add("field name: an unscoped GROUP outranked the FILE record buffer");
+            if (winner(new[] { history, plain }) != plain.Rva)
+                failures.Add("field name: a scoped HISTORY:: copy outranked an unscoped GROUP");
+
+            // Equal ranks: the first stays. Without this the rule would be free to flip between two images'
+            // equally-good records on every rebuild of the index.
+            var file2 = new TswdDebugInfo.DataLocation { Rva = 0x200000, Container = "OTHER$COU:RECORD" };
+            if (winner(new[] { file, file2 }) != file.Rva || winner(new[] { file2, file }) != file2.Rva)
+                failures.Add("field name: two equal-rank registrations did not keep the FIRST");
         }
 
         /// <summary>
