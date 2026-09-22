@@ -1114,7 +1114,16 @@ namespace ClarionDebugger.Terminal
             {
                 var paths = GutterPathsByModuleLine();
                 foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
-                    if (SameBp(b, module, line)) return GutterPathFor(paths, b);
+                    if (SameBp(b, module, line))
+                    {
+                        // The STATE is deliberately discarded here: ambiguous and unknown both mean "I
+                        // cannot name a file", and RemoveByModuleLine already treats a null path as
+                        // "match on module:line, and decline if several bookmarks do". The distinction
+                        // exists for the PAGE, which renders the two differently; the removal path has
+                        // only one sensible behaviour for both.
+                        BpPathState ignored;
+                        return GutterPathFor(paths, b, out ignored);
+                    }
             }
             catch { }
             return null;
@@ -1430,11 +1439,16 @@ namespace ClarionDebugger.Terminal
             {
                 if (i > 0) sb.Append(',');
                 var b = list[i];
-                string path = GutterPathFor(paths, b);
+                // The state comes back from the SAME call that resolved the path, so the page can never be
+                // handed a reason that does not describe the path beside it. ALWAYS emitted - a row with no
+                // pathState would leave the page guessing again, which is the defect this closes.
+                BpPathState pathState;
+                string path = GutterPathFor(paths, b, out pathState);
                 sb.Append("{\"module\":").Append(Str(b.Module))
                   .Append(",\"line\":").Append(b.Line)
                   .Append(",\"requested\":").Append(b.RequestedLine)
                   .Append(",\"path\":").Append(Str(path))
+                  .Append(",\"pathState\":").Append(Str(PathStateName(pathState)))
                   .Append(",\"condition\":").Append(Str(b.Condition))
                   .Append(",\"hitMode\":").Append(Str(b.HitMode))
                   .Append(",\"hitValue\":").Append(b.HitValue)
@@ -1487,18 +1501,79 @@ namespace ClarionDebugger.Terminal
             if (had != null && !string.Equals(had, path, StringComparison.OrdinalIgnoreCase)) paths[key] = null;
         }
 
-        /// <summary>The .clw path to show for one breakpoint row, or null when there is none to trust.
-        /// The entry's OWN path wins when it has one (a gutter-built entry knows the file it came from);
-        /// otherwise the planted line is tried before the requested one, and an ambiguous key is skipped
-        /// rather than returned - a row whose planted line is contested may still have an uncontested
-        /// requested line, and the other way round.</summary>
-        private static string GutterPathFor(Dictionary<string, string> paths, DebugBreakpoint b)
+        /// <summary>Why a breakpoint row has the path it has - or has none. Sent to the page as
+        /// <c>pathState</c> on every bplist row.
+        /// <para>
+        /// The page needs the REASON, not just the absence. The host withholding a path for an ambiguous
+        /// row was only half a fix: the page still rendered <c>path:null</c> as an ordinary link and fell
+        /// back to a basename lookup, so the user could still be taken to an arbitrary same-named file
+        /// with nothing on screen saying the host had refused to choose. "No path" and "several paths and
+        /// I will not guess" call for different UI, and only the host can tell them apart.
+        /// </para></summary>
+        /// <remarks>ORDER IS DELIBERATE: the ZERO value is the SAFEST state, not the most trusted one.
+        /// <c>default(BpPathState)</c> is what a field, an array element, an uninitialised struct member or
+        /// anything deserialised gets for free, and for an enum whose failure mode is taking the user to an
+        /// arbitrary same-named file, that free value must not be <c>Ok</c>. Nothing reaches the default
+        /// today - <see cref="GutterPathFor"/>'s out-param is assigned on its first line - so this is a
+        /// fence, not a fix: it means a future caller who forgets gets "I cannot say", which is refusable,
+        /// rather than "trust this path", which is not.
+        /// <para>
+        /// The wire is unaffected: the three tokens come from <see cref="PathStateName"/>, which compares
+        /// by NAME, so the ordering is invisible to the page and the frozen contract is untouched.
+        /// </para></remarks>
+        private enum BpPathState
         {
-            if (!string.IsNullOrEmpty(b.Path)) return b.Path;
+            Unknown,    // no gutter bookmark claims it at all; there is simply nothing to offer
+            Ambiguous,  // several DIFFERENT files claim it; the host refuses to choose, path is null
+            Ok          // exactly one file claims this row; path is that file
+        }
+
+        /// <summary>The wire spelling of a <see cref="BpPathState"/>. One writer, so the three tokens the
+        /// page switches on cannot drift from the three states the host can produce.</summary>
+        private static string PathStateName(BpPathState state)
+        {
+            return state == BpPathState.Ok ? "ok"
+                 : state == BpPathState.Ambiguous ? "ambiguous"
+                 : "unknown";
+        }
+
+        /// <summary>The .clw path to show for one breakpoint row, with the REASON reported from the SAME
+        /// lookup that resolved it.
+        /// <para>
+        /// ONE PASS, TWO ANSWERS, DELIBERATELY. Deriving the state in a second pass over the map would let
+        /// the two disagree - a row could carry a path while being labelled ambiguous, or the reverse -
+        /// and the page would then be acting on a reason that does not describe the path it was given.
+        /// The contract the page relies on is <c>(pathState == "ok") == (path != null)</c>, and it holds
+        /// here BY CONSTRUCTION: every return that yields a path sets Ok, and the only return that yields
+        /// null sets Ambiguous or Unknown.
+        /// </para>
+        /// <para>
+        /// The entry's OWN path wins when it has one (a gutter-built entry knows the file it came from);
+        /// otherwise the planted line is tried before the requested one, and a contested key is SKIPPED
+        /// rather than returned - a row whose planted line is contested may still have an uncontested
+        /// requested line, and the other way round. Contested-anywhere is remembered, so a row that found
+        /// no usable path but DID meet a contested key reports Ambiguous rather than Unknown: the
+        /// difference is exactly "I will not guess" versus "there is nothing here".
+        /// </para></summary>
+        private static string GutterPathFor(Dictionary<string, string> paths, DebugBreakpoint b, out BpPathState state)
+        {
+            state = BpPathState.Unknown;
+            if (!string.IsNullOrEmpty(b.Path)) { state = BpPathState.Ok; return b.Path; }
             if (b.Module == null) return null;
+
+            bool contested = false;
             string p;
-            if (paths.TryGetValue(b.Module + "|" + b.Line, out p) && p != null) return p;
-            if (paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p) && p != null) return p;
+            if (paths.TryGetValue(b.Module + "|" + b.Line, out p))
+            {
+                if (p != null) { state = BpPathState.Ok; return p; }
+                contested = true;                      // the key exists but two files claim it
+            }
+            if (paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p))
+            {
+                if (p != null) { state = BpPathState.Ok; return p; }
+                contested = true;
+            }
+            state = contested ? BpPathState.Ambiguous : BpPathState.Unknown;
             return null;
         }
 

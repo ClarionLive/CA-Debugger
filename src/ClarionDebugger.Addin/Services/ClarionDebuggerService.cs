@@ -871,6 +871,7 @@ namespace ClarionDebugger.Services
                         else
                         {
                             known.Line = bp.Line;      // a re-plant can snap the same requested line elsewhere
+                            LearnBpOwner(known, bp);   // a row that had no owner takes the one the engine just named
                             CopyBpProps(bp, known);    // refresh props/hit count on a re-confirm (properties edit)
                         }
                     }
@@ -1551,8 +1552,48 @@ namespace ClarionDebugger.Services
             return BpLineMatches(b, requestedLine, plantedLine);
         }
 
+        /// <summary>Teach an existing row the owning image the engine has just named, when it did not have
+        /// one. THE ROW'S OWNER IS LEARNED ONCE AND NEVER UNLEARNED.
+        /// <para>
+        /// A null <see cref="DebugBreakpoint.OwnerPath"/> means "unknown", and
+        /// <see cref="BpOwnerMatches"/> deliberately lets unknown match ANY owner so an engine that
+        /// predates the field keeps working. That fallback is correct for a row that has never been told
+        /// an owner, and WRONG the moment it has: a breakpoint starts pending (the engine emits
+        /// <c>ownerPath</c> null because no image carries its compiland yet), and if the row kept that null
+        /// after the engine armed it and said where, the row would stay a PERMANENT WILDCARD. It would then
+        /// match every later bp-set for that module and requested line - so two images collapse into one
+        /// pane row - and every bp-del, so a removal in one image takes the other one's row with it. The
+        /// disambiguator would have been supplied by the engine and thrown away on arrival.
+        /// </para>
+        /// <para>
+        /// ONLY null -> value. The reverse would re-open the wildcard, and value -> different value cannot
+        /// occur, because <see cref="SameBpIdentity"/> would not have matched two rows with different known
+        /// owners in the first place. So the only reachable case is the one this fixes.
+        /// </para>
+        /// <para>
+        /// RAW WIRE TEXT IS COMPARED, AND THAT IS SUFFICIENT HERE RATHER THAN LUCKY - stating it because
+        /// nothing else in the file says so. <c>GetStr</c> returns the raw JSON text without unescaping, so
+        /// a Windows separator reads back doubled (<c>C:\\App\\x.dll</c>). Every OwnerPath in this list
+        /// arrives through that one reader from the engine's own <c>Json.Str</c> output, so both sides of
+        /// every comparison carry identical escaping; and a Windows path cannot contain a quote, so
+        /// GetStr's stop-at-quote capture cannot truncate one. WHAT WOULD BREAK IT: any future path that
+        /// sets OwnerPath from a NON-WIRE source - a host-derived project path (dd35dd7e) is exactly that -
+        /// since it would hold an unescaped spelling that compares unequal to the engine's. That must be
+        /// canonicalized where the mapping is built, not smoothed over by loosening the comparison here.
+        /// </para></summary>
+        private static void LearnBpOwner(DebugBreakpoint known, DebugBreakpoint echo)
+        {
+            if (known.OwnerPath == null && echo.OwnerPath != null) known.OwnerPath = echo.OwnerPath;
+        }
+
         /// <summary>Copy the advanced properties + live hit count from a freshly parsed breakpoint onto an
-        /// existing list entry (a re-confirmed bp-set is how a properties edit reaches the host).</summary>
+        /// existing list entry (a re-confirmed bp-set is how a properties edit reaches the host).
+        /// <para>
+        /// LOCATION AND IDENTITY ARE NOT PROPERTIES and are deliberately not copied here: the planted line
+        /// is assigned by the caller, and the owning image goes through <see cref="LearnBpOwner"/>, which
+        /// is monotonic. Adding OwnerPath to this list instead would let a later echo overwrite a known
+        /// owner with null and silently restore the wildcard this pair exists to prevent.
+        /// </para></summary>
         private static void CopyBpProps(DebugBreakpoint from, DebugBreakpoint to)
         {
             to.Condition = from.Condition;

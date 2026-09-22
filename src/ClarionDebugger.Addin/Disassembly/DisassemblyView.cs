@@ -83,7 +83,32 @@ namespace ClarionDebugger.Disassembly
         private uint _selTid;        // the thread every panel is currently reading (0 = unknown)
         private List<DebugThread> _threads = new List<DebugThread>();   // for naming a thread in the banner
         private ToolStripLabel _thread;   // "viewing Thread N — not the stopped thread", or blank
-        private uint _seatedTid;          // the thread the window is currently seated on (0 = none yet)
+        // THE SEAT LIFECYCLE HAS THREE STATES, and keeping them apart is what stops the view believing
+        // something it has not been shown. A seat is: asked for (_seatingTid), possibly awaiting the
+        // registers that say WHERE to seat (_awaitRegsSeat), and finally PAINTED (_seatedTid).
+        private uint _seatedTid;          // the thread whose code is actually ON SCREEN (0 = none yet).
+                                          // Advanced only in OnDisasm, from a reply that passed both gates
+                                          // — never on intent. Advancing it on intent left the banner
+                                          // naming a thread whose code was not painted when the disasm
+                                          // failed, AND made SeatOnSelectedThread's guard treat the
+                                          // unfinished seat as done, blocking every later reseat to it.
+        private uint _seatingTid;         // a seat is IN FLIGHT for this thread (0 = none). Stops a second
+                                          // reseat being started for a thread already being seated — which
+                                          // is what keeps the `threads` reply from re-seating after a stop
+                                          // has already asked for the same thread's window.
+        private uint _emptySeatTid;       // this thread's seat came back with NOTHING to decode, this stop.
+                                          // A COMPLETED-BUT-UNSEATED state: the latch is released so a
+                                          // later inventory CAN retry, but the seat is not claimed. Kept so
+                                          // the retry happens ONCE per thread per episode rather than on
+                                          // every inventory — an undecodable address stays undecodable
+                                          // within a stop, and the view requests inventories itself now.
+                                          // Cleared when the selection CHANGES, and by a new stop, rebind
+                                          // or exit: each of those is a reason to believe the answer moved.
+        private bool _awaitRegsSeat;      // ...and specifically: WE asked for the registers, so a regs
+                                          // reply may move the window. The pad requests registers for its
+                                          // own reasons (beginThreadSwitch sends one AFTER rewatch), and
+                                          // without this every one of them re-centred the listing on EIP
+                                          // and threw away the scroll position the user had moved to.
 
         // Bumped whenever the answer to "whose execution point is this?" changes — a thread switch, a new
         // stop, a session rebind. It is carried in the request TAG, which the engine echoes back verbatim,
@@ -145,7 +170,7 @@ namespace ClarionDebugger.Disassembly
             _svc = svc;
             // A different session (or none) knows nothing about the thread the old one was showing.
             NewEpoch();
-            _stoppedTid = _selTid = _seatedTid = 0;
+            _stoppedTid = _selTid = _seatedTid = _emptySeatTid = 0;
             _threads = new List<DebugThread>();
             if (_svc != null)
             {
@@ -160,6 +185,11 @@ namespace ClarionDebugger.Disassembly
                 // How the view learns the NEW thread's EIP after a switch: the inventory names threads but
                 // carries no EIP, so the seat comes from the registers, which are already tid-stamped.
                 _svc.RegsReceived += OnRegs;
+                // A FAILED disasm produces NO disasm event at all — the engine answers "read failed"
+                // on the error channel (DebugEngine.Disassembly.cs, the ReadCleanBlock guard). Without
+                // this the seat latch is held by a reply that is never coming, which is the same
+                // never-painted state an empty reply used to produce, reached by a quieter route.
+                _svc.EngineError += OnEngineError;
             }
             UpdateThreadBanner();
             UpdateButtons(_svc?.State ?? DebugSessionState.Idle);
@@ -175,18 +205,19 @@ namespace ClarionDebugger.Disassembly
             _svc.ThreadsReceived -= OnThreads;
             _svc.ThreadSelected -= OnThreadSelected;
             _svc.RegsReceived -= OnRegs;
+            _svc.EngineError -= OnEngineError;
             _svc = null;
         }
 
         /// <summary>A pad started a new session (Active flipped). Rebind to it; if it is already paused,
-        /// pull a window at the live EIP. Fires on the StartSession caller (the UI thread) — marshal anyway.</summary>
+        /// fill the window the same way a late open does — asking whose thread is selected rather than
+        /// assuming the stopped one. Fires on the StartSession caller (the UI thread) — marshal anyway.</summary>
         private void OnActiveChanged()
         {
             if (InvokeRequired) { try { BeginInvoke((Action)OnActiveChanged); } catch { } return; }
             Unbind();
             Bind(ClarionDebuggerService.Active);
-            if (_svc != null && _svc.State == DebugSessionState.Paused && !string.IsNullOrEmpty(_svc.CurrentVa))
-                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);
+            SeatOnLateOpen();
         }
 
         // ----- stepping toolbar -----
@@ -267,10 +298,56 @@ namespace ClarionDebugger.Disassembly
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            // Opened (or reopened) mid-session while already paused — fetch at the live EIP now instead
-            // of waiting for the next step.
-            if (_svc != null && _svc.State == DebugSessionState.Paused && !string.IsNullOrEmpty(_svc.CurrentVa))
-                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);
+            SeatOnLateOpen();
+        }
+
+        /// <summary>Opened, reopened or rebound MID-STOP. The window has to be filled without waiting for
+        /// the next step — but it must not guess whose code it is filling with.
+        ///
+        /// `_svc.CurrentVa` is the STOPPED thread's address, and since 381aabd7 the engine decodes the
+        /// SELECTED thread. If another pad already selected a non-stopped thread, seating on CurrentVa
+        /// paints one thread's address range decoded for another, with no current row and no banner —
+        /// which is the exact mismatch this view exists to prevent, arriving through the one door that
+        /// does not go past a stop event.
+        ///
+        /// So: ASK. The inventory is the only thing that reports a selection made before this view
+        /// existed, and nothing used to request it — OnThreads was driven solely by the pad's own
+        /// requests, so the "window-opened-late case" its comment described was unreachable.
+        ///
+        /// The CurrentVa seat below is a DEGRADATION PATH, not a second way of doing this. It is issued
+        /// AFTER the inventory and is expected to lose: against a STAMPED engine its reply is dropped by
+        /// the tid gate (we do not know our thread yet) and the inventory drives the real seat. It earns
+        /// its place only against an engine that stamps nothing AND answers no inventory, where it is the
+        /// only thing that fills the window and there is no selection for it to contradict.
+        ///
+        /// DO NOT PROMOTE IT. Moving it ahead of the inventory, making it unconditional, or "simplifying"
+        /// this method down to it re-opens the blind-seat defect in full: it seats on the STOPPED thread's
+        /// address while the engine decodes the SELECTED one. It will look like it works, because it does
+        /// — on the common path where the two are the same thread. Nothing here can assert an ordering
+        /// preference, so this comment is the guard.</summary>
+        private void SeatOnLateOpen()
+        {
+            if (_svc == null || _svc.State != DebugSessionState.Paused) return;
+            _svc.RequestThreads();            // FIRST: the only thing that reports a pre-existing selection
+            // THE DEGRADATION SEAT STATES ITS OWN PRECONDITION rather than trusting a caller to establish
+            // it. It is only safe while the view knows NOTHING — no selection, nothing painted, nothing in
+            // flight — because CurrentVa is the STOPPED thread's address.
+            //
+            // Quinn-2 attacked this and judged it dead, reasoning that a wrongly-seated reply would need a
+            // stamp matching a stale _selTid, which would mean the view already believed the right thread.
+            // The hole: THE ENGINE STAMPS WITH THE SELECTED THREAD REGARDLESS OF THE VA IT WAS ASKED FOR.
+            // A matching stamp proves which THREAD the engine answered about, not which ADDRESS it answered
+            // with — and this request is entirely about an address. So the reply passes BOTH gates and
+            // paints the stopped thread's code under the selected thread's banner.
+            // And the epoch does not save it: with a thread already known, SeatOnSelectedThread returns at
+            // its already-seated/already-seating guard BEFORE reaching NewEpoch, so nothing retires this
+            // request. Reachable through a second OnHandleCreated — an undock/redock recreates the handle,
+            // and unlike OnActiveChanged nothing resets _seatedTid first — while viewing a non-stopped
+            // thread. Relying on a caller to bump the epoch is the assumption that failed; this tests the
+            // condition itself.
+            if (_selTid != 0 || _seatedTid != 0 || _seatingTid != 0) return;
+            if (!string.IsNullOrEmpty(_svc.CurrentVa))
+                _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);   // degradation path
         }
 
         private void OnPaused(DebugPause p)
@@ -287,9 +364,27 @@ namespace ClarionDebugger.Disassembly
                 // reseat on every stop when the selection is (as it almost always is) the stopped thread.
                 // A null Tid means an engine that does not name it: fall back to knowing nothing, where the
                 // banner stays blank rather than naming a thread we would be guessing at.
-                _selTid = _stoppedTid = _seatedTid = p.Tid ?? 0;
+                _selTid = _stoppedTid = TidOf(p.Tid);
+                // A new stop is a new answer to "can this address be decoded?" — the thread has moved.
+                _emptySeatTid = 0;
+                // NOT seated yet — the request below has not been answered. _seatedTid now means "painted",
+                // so it stays 0 until a reply passes both gates. _seatingTid records that this stop has
+                // ALREADY asked for that thread's window, which is what stops the `threads` reply that
+                // follows a stop from starting a second, identical reseat.
+                _seatedTid = 0;
+                _seatingTid = _selTid;
+                _awaitRegsSeat = false;   // this seat goes straight to disasm; it needs no registers
                 UpdateThreadBanner();
                 _curSym = p.Sym;   // runtime location for non-TSWD stops (TSWD line comes from the disasm)
+                // ASK, like the other two entry points. This was the only path that set _selTid from what
+                // it happened to be told and never requested the inventory. If p.Tid is ABSENT while the
+                // disasm reply IS stamped, _selTid stays 0 and the (now fail-closed) tid gate drops the
+                // reply — and nothing on this path would recover, where before the gate changed it simply
+                // painted. Reachability is UNPROVEN: the stop event and the disasm reply are stamped
+                // through the same writer, so producing the mismatch needs a live engine and neither
+                // Quinn-2 nor I could construct it statically. It is one line, and it removes a
+                // "cannot happen" from a path that now fails closed.
+                _svc?.RequestThreads();
                 _svc?.RequestDisasmAt(p.Va, WindowCount, MakeTag(WinTag), Context);
             });
         }
@@ -329,10 +424,30 @@ namespace ClarionDebugger.Disassembly
         /// as the only gate, which is the correct pre-381aabd7 fallback. Treating absent as a mismatch
         /// would blank the view against an older engine — absent-means-unknown broken from the other side.
         ///
-        /// A view that does not yet know its own thread (_selTid == 0, before the first stop or inventory)
-        /// also cannot call anything a mismatch: it has nothing to compare against, and refusing every
-        /// reply until the inventory lands would leave the window empty at exactly the moment it is first
-        /// opened. Both fail OPEN for the same reason — they are absence of information, not conflict.</summary>
+        /// A view that does not yet know its own thread (_selTid == 0) is the case that USED to fail open
+        /// too, and that was wrong. A STAMPED reply arriving at such a view is not an absence of
+        /// information — it is information the view would be DISCARDING in order to paint something it
+        /// cannot label. That is how a late-opened window painted the stopped thread's VA, decoded for a
+        /// different selected thread, with no current row and no banner. The two cases are not symmetric:
+        /// an absent tid means the ENGINE said nothing, an unknown _selTid means WE have not asked yet —
+        /// and the fix for not having asked is to ask, which the view now does (RequestThreads on late
+        /// open and rebind), not to accept whatever turns up in the meantime.</summary>
+        /// <summary>THE view's ONE uint? -> uint conversion, and the ONE definition of "unstamped".
+        ///
+        /// On the wire, "the engine did not say" is ABSENT, and 0 is a sentinel that must never be read as
+        /// a real thread. The view keeps its own `uint` fields with a local `0 = unknown` convention, which
+        /// is legitimate because it is not on the wire — but the conversion between the two has to happen
+        /// in exactly one place, and it had drifted into four, of which one disagreed with the others: the
+        /// seat assignment used `tid ?? _selTid`, so a stamped literal 0 became a seat of 0 and the view
+        /// was then never marked painted, which is a second route into the same never-painted state the
+        /// empty-reply latch produces. <see cref="TidMatches"/> had already been treating a stamped 0 as
+        /// unstamped, so the two were 180 lines apart and disagreeing.
+        ///
+        /// This is here as a FUNCTION rather than a sentence because the sentence was already written, in
+        /// the comment on OnThreads, and four authors eroded it without anyone deciding to. A claim a grep
+        /// can check outlives a claim a reader has to honour.</summary>
+        private static uint TidOf(uint? t) { return (t == null || t.Value == 0) ? 0u : t.Value; }
+
         private bool TidMatchesView(uint? tid) { return TidMatches(tid, _selTid); }
 
         /// <summary>The tid gate's whole rule, as a pure function of the reply's stamp and the thread the
@@ -340,9 +455,10 @@ namespace ClarionDebugger.Disassembly
         /// rule rather than a restatement of it.</summary>
         private static bool TidMatches(uint? tid, uint selTid)
         {
-            if (tid == null || tid.Value == 0) return true;   // unstamped engine: the epoch is the only gate
-            if (selTid == 0) return true;                     // we do not know our own thread yet
-            return tid.Value == selTid;
+            uint t = TidOf(tid);
+            if (t == 0) return true;        // unstamped engine (absent OR a 0 sentinel): epoch is the only gate
+            if (selTid == 0) return false;  // STAMPED, but we cannot say whose it is — drop
+            return t == selTid;
         }
 
         /// <summary>Invalidate every in-flight request: the question they were asked under has changed.
@@ -352,6 +468,11 @@ namespace ClarionDebugger.Disassembly
         {
             _epoch++;
             _pendFwd = _pendBwd = false;
+            // A seat asked for under the old epoch is no longer in flight — its replies will be dropped.
+            // Leaving _seatingTid set would make SeatOnSelectedThread refuse to start the seat that
+            // replaces it, and leaving _awaitRegsSeat set would let a stray regs reply move the window.
+            _seatingTid = 0;
+            _awaitRegsSeat = false;
         }
 
         // ----- following the pad's thread selection -----
@@ -362,17 +483,23 @@ namespace ClarionDebugger.Disassembly
         {
             if (list == null) return;
             _threads = list.Threads ?? new List<DebugThread>();
-            // StoppedTid/SelectedTid became uint? in the same wave (task 3b043dfc): on the WIRE and in the
-            // host's model, "the engine did not say" is ABSENT, never 0. This view keeps its own uint fields
-            // with the local `0 = unknown` convention documented at their declaration, so the conversion
-            // happens HERE, once, at the boundary — deliberately, not by a cast that hides it. `?? 0` is the
-            // same idiom OnPaused already uses for p.Tid.
-            // `SelectedTid ?? StoppedTid` preserves what the old `SelectedTid != 0 ? ... : StoppedTid` meant:
-            // show the selected thread if there is one, else the stopped one. The old test read 0 as "no
-            // selection", which is exactly the sentinel the wire rule abolished — so it had to change shape
-            // rather than just gain a cast.
-            _stoppedTid = list.StoppedTid ?? 0;
-            _selTid = list.SelectedTid ?? list.StoppedTid ?? 0;
+            // StoppedTid/SelectedTid are uint? (task 3b043dfc): on the WIRE and in the host's model, "the
+            // engine did not say" is ABSENT, never 0. This view keeps its own uint fields with the local
+            // `0 = unknown` convention documented at their declaration, and THE CONVERSION HAPPENS IN
+            // TidOf AND NOWHERE ELSE — a claim a grep can check, which is why it replaced the sentence
+            // that used to sit here saying the conversion happened "once, at the boundary". It said that
+            // while already naming a second site in its own next clause, and by the time four authors had
+            // been through this file there were four, one of which disagreed with the others.
+            // Selected-else-stopped is preserved: show the selected thread if there is one, else the
+            // stopped one.
+            _stoppedTid = TidOf(list.StoppedTid);
+            // A SelectedTid of literal 0 is a sentinel, not a selection, so it falls back to the stopped
+            // thread exactly as an absent one does — which `?? 0` did not do.
+            uint sel = TidOf(list.SelectedTid);
+            uint nextSel = sel != 0 ? sel : _stoppedTid;
+            // A DIFFERENT thread says nothing about the one whose decode came back empty.
+            if (nextSel != _selTid) _emptySeatTid = 0;
+            _selTid = nextSel;
             UpdateThreadBanner();
             // THE WINDOW-OPENED-LATE CASE. A selection made before this view existed (or before it was
             // rebound) is reported here and nowhere else: without this the listing would sit on the stopped
@@ -386,8 +513,17 @@ namespace ClarionDebugger.Disassembly
         /// flight is dropped first, because it was asked under the previous seat.</summary>
         private void SeatOnSelectedThread()
         {
-            if (_svc == null || _selTid == 0 || _selTid == _seatedTid) return;
-            NewEpoch();
+            if (_svc == null || _selTid == 0) return;
+            if (_selTid == _seatedTid) return;    // already painted for this thread
+            if (_selTid == _seatingTid) return;   // already on its way — do not start a second one
+            // Already asked this episode and the engine had nothing to decode. Asking again on every
+            // inventory would be a round trip per arrival for an address that will not become readable
+            // within a stop — and the view requests inventories itself now, so that is not rare. A new
+            // stop, a rebind, or the user selecting a different thread all clear this and allow a retry.
+            if (_selTid == _emptySeatTid) return;
+            NewEpoch();                           // clears both flags, so it must come FIRST
+            _seatingTid = _selTid;
+            _awaitRegsSeat = true;
             _svc.RequestRegs();
         }
 
@@ -399,24 +535,69 @@ namespace ClarionDebugger.Disassembly
         {
             // A refused or malformed select leaves the view exactly where it was. Re-rendering the banner
             // from unchanged state is deliberate: it must not start naming a thread the engine declined.
-            if (!ok || tid == null || tid.Value == 0) { UpdateThreadBanner(); return; }
-            _selTid = tid.Value;
+            uint chosen = TidOf(tid);
+            if (!ok || chosen == 0) { UpdateThreadBanner(); return; }
+            if (chosen != _selTid) _emptySeatTid = 0;   // deliberate switch: allow this thread a fresh try
+            _selTid = chosen;
             UpdateThreadBanner();
             SeatOnSelectedThread();
         });
 
-        /// <summary>Registers for a thread. Used only to learn where the newly selected thread is frozen,
-        /// and only when the reply is for the thread now on screen — the pad requests registers for its own
-        /// reasons too, and an older reply names an older thread.</summary>
+        /// <summary>Registers for a thread. Used ONLY to learn where a thread this view is currently
+        /// seating is frozen — never as a reason to move the window on its own.
+        ///
+        /// <see cref="_awaitRegsSeat"/> is the "I asked for this" flag, and it is load-bearing: the pad
+        /// requests registers for its own reasons (beginThreadSwitch sends one AFTER rewatch), so two
+        /// regs replies arrive per thread switch. Without the flag the second, late one re-centred the
+        /// listing on EIP and discarded whatever scroll position the user had moved to since.
+        ///
+        /// It is consumed on the FIRST matching reply, so the seat is driven once per request.</summary>
         private void OnRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
         {
-            if (regs == null || tid == null || _selTid == 0 || tid.Value != _selTid) return;
+            if (!_awaitRegsSeat) return;                              // we did not ask; not ours to act on
+            uint rt = TidOf(tid);
+            if (regs == null || rt == 0) return;
+            if (_seatingTid == 0 || rt != _seatingTid) return;        // a different thread's registers
             string eip;
             if (!regs.TryGetValue("eip", out eip) || string.IsNullOrEmpty(eip)) return;
             uint va;
             if (!TryParseVa(eip, out va) || va == 0) return;
-            _seatedTid = tid.Value;
+            // Consumed: the registers have done their job. _seatingTid stays set until the LISTING lands,
+            // because the seat is still in flight — it is now waiting on the disasm rather than the regs.
+            _awaitRegsSeat = false;
             _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, MakeTag(WinTag), Context);
+        });
+
+        /// <summary>An engine-level error ends any seat this view is waiting on.
+        ///
+        /// A disasm the engine cannot read emits NO disasm event — it reports on the error channel and
+        /// returns — so the request that was in flight simply never lands. Releasing the latch here is what
+        /// makes the "a later inventory can retry" claim true for that route as well; without it the empty
+        /// reply is handled and the failed read is not, which is the same defect with a quieter cause.
+        ///
+        /// DELIBERATELY UNCONDITIONAL on the error text. Engine errors are not tagged, so this cannot tell
+        /// a disasm failure from any other, and HOLDING the latch on a real disasm failure costs the pane
+        /// for the rest of the stop.
+        ///
+        /// WHAT IT ACTUALLY COSTS, corrected — the first version of this comment said "one extra retry",
+        /// which was optimistic. NOTHING re-requests on its own, so an unrelated error arriving mid-seat
+        /// loses that seat until the next stop or selection change. That is more likely than it looks,
+        /// because a declined variable edit emits on this same channel. It is still the right trade: a lost
+        /// seat is recoverable by selecting the thread again, a held latch is not recoverable at all.
+        ///
+        /// AND IT DOES NOT RECORD A DECODE FAILURE. Setting _emptySeatTid here would make the pane announce
+        /// "the engine could not decode this thread's address" on the strength of an untagged error that may
+        /// have been about something else entirely — the same fabricated fact the coarse-seek path was just
+        /// fixed for. The pane falls back to "nothing to disassemble at this address", which is true whatever
+        /// the error was. Leaving it unset also leaves the thread eligible for a retry, which is correct:
+        /// unlike an empty reply, an error is no evidence that the address is undecodable.</summary>
+        private void OnEngineError(string message) => UI(() =>
+        {
+            if (_seatingTid == 0 && !_awaitRegsSeat) return;   // nothing waiting; not ours to clear
+            _seatingTid = 0;
+            _awaitRegsSeat = false;
+            UpdateThreadBanner();
+            Invalidate();
         });
 
         /// <summary>Say whose execution point is on screen, in the pad's own words, and only when it is
@@ -427,8 +608,15 @@ namespace ClarionDebugger.Disassembly
         {
             if (_thread == null) return;
             string text = "";
-            if (_selTid != 0 && _stoppedTid != 0 && _selTid != _stoppedTid)
-                text = "viewing " + ThreadName(_selTid) + " — not the stopped thread";
+            // DERIVED FROM _seatedTid, THE PAINTED THREAD — never from _selTid, the one we INTEND to show.
+            // 842d913 redefined _seatedTid to mean PAINTED, and this, the one consumer that makes the
+            // painted claim to the user, went on reading _selTid. So while a seat was stuck the PREVIOUS
+            // thread's listing stayed on screen under a banner naming the NEW one: exactly the mismatch
+            // item 6 was fixed to prevent, moved from _seatedTid to _seatingTid rather than removed.
+            // Blank while nothing is painted, or while what IS painted is not what we are now selecting —
+            // silence is the only honest banner for "the screen does not yet show what you asked for".
+            if (_seatedTid != 0 && _seatedTid == _selTid && _stoppedTid != 0 && _seatedTid != _stoppedTid)
+                text = "viewing " + ThreadName(_seatedTid) + " — not the stopped thread";
             _thread.Text = text;
             _thread.Visible = text.Length > 0;
         }
@@ -485,6 +673,96 @@ namespace ClarionDebugger.Disassembly
                 uint anchorVa = _anchorRow >= 0 && _anchorRow < _rows.Count ? InstrVaOfRow(_anchorRow) : 0;
                 if (kind == WinTag)
                 {
+                    // THE SEAT IS REAL ONLY IF SOMETHING WAS DECODED. This is the only place _seatedTid
+                    // advances: the listing has passed both gates and is about to be painted, so the banner
+                    // and the "already seated" guard then describe something actually on screen. Taken from
+                    // the REPLY's stamp, falling back to _selTid only for an unstamped engine — and the tid
+                    // gate above has already proved the two agree.
+                    //
+                    // AN EMPTY REPLY IS NOT A SEAT. The engine answers with zero instructions when it
+                    // cannot decode the address — a thread parked in a system DLL with no readable page is
+                    // the ordinary way to produce one. Marking that painted claims two things that are both
+                    // false: the banner names a thread whose code is not on screen, and because
+                    // _seatedTid == _selTid, SeatOnSelectedThread's already-painted guard then refuses to
+                    // retry, so the view stays blank under a confident banner until the next stop. Leaving
+                    // the seat unfinished is the honest state — a later inventory or switch can retry it.
+                    // This is item 6(c) again by another route: advancing on an answer that contained
+                    // nothing, rather than on intent.
+                    // THE LATCH IS RELEASED EITHER WAY. Holding _seatingTid across an empty reply was the
+                    // first fix's own defect: SeatOnSelectedThread refuses to start a seat while one is in
+                    // flight for the same thread, so an empty decode left the view unable to retry for the
+                    // rest of the stop — blank under a confident banner, with the comment above claiming a
+                    // later inventory could recover it while the guard prevented exactly that. An empty
+                    // decode is not an error case (a thread parked in unreadable or system memory is the
+                    // ordinary way to get one), so it is reachable through normal use, not just by a reply
+                    // that never arrives. COMPLETED-BUT-UNSEATED is the honest third state: the request
+                    // finished, and it seated nothing.
+                    // CAPTURED BEFORE THE RELEASE, because a WinTag reply serves TWO callers with different
+                    // meanings and only this distinguishes them. A coarse SEEK is also a WinTag request, and
+                    // on that path _seatingTid and _awaitRegsSeat are both 0. Without this, a seek to an
+                    // unmapped address came back empty and the pane announced "the engine could not decode
+                    // its CURRENT ADDRESS" — a fabricated fact, since the thread's EIP was fine and the user
+                    // had simply scrolled somewhere with nothing in it — while also latching the seat retry
+                    // off for a thread that was never being seated.
+                    bool wasSeat = _seatingTid != 0 || _awaitRegsSeat;
+                    _seatingTid = 0;
+                    _awaitRegsSeat = false;
+                    if (instrs.Count > 0)
+                    {
+                        // TidOf, not `tid ?? _selTid`: a stamped literal 0 is unstamped, exactly as
+                        // TidMatches already treated it, and must fall back rather than seat 0 — which
+                        // would leave the view never marked painted by a second route.
+                        uint replyTid = TidOf(tid);
+                        _seatedTid = replyTid != 0 ? replyTid : _selTid;
+                        _emptySeatTid = 0;        // it decodes after all
+                    }
+                    else
+                    {
+                        // Do NOT claim the seat. Remember the thread instead, so the retry SeatOnSelectedThread
+                        // can now make happens once per episode rather than on every inventory that arrives.
+                        // Only a SEAT may claim "this thread's code could not be decoded". A seek's empty
+                        // result says nothing about the thread's own address.
+                        if (wasSeat)
+                        {
+                            uint emptyTid = TidOf(tid);
+                            _emptySeatTid = emptyTid != 0 ? emptyTid : _selTid;
+                            // THE LOCATION STRIP IS A THREAD CLAIM TOO, and it was the last one left
+                            // unjustified. The fields below describe the instruction that WAS current;
+                            // this seat found none, and the listing is about to be erased. Leaving them
+                            // let the pane say "no code to show for B" while the strip still read A's
+                            // module:line with Show Source enabled — one click from jumping the IDE to
+                            // another thread's source. Pre-existing, and only visible now that the banner
+                            // no longer lies in the same direction.
+                            //
+                            // _curSym IS DELIBERATELY NOT CLEARED. It comes from the STOP, not from the
+                            // listing, and is the non-TSWD fallback UpdateLocation shows when there is no
+                            // module:line — clearing it would discard a TRUE label to fix a false one.
+                            // Only the wasSeat case does this: it is the one that is thread-scoped AND
+                            // knows the seat failed. After a plain seek the thread really is still stopped
+                            // where the strip says.
+                            _curPath = _curModule = null;
+                            _curLine = 0;
+                        }
+                        else
+                        {
+                            // A NON-SEAT empty window (a coarse seek into unmapped memory). Gating the
+                            // WRITE above stops it FABRICATING a claim; it does not RETIRE one already
+                            // held. Without this, an earlier failed seat's "_emptySeatTid = B" survived
+                            // the seek — OnPaint prioritises it — so the pane went on saying "no code to
+                            // show for Thread B" about a view that is now an address seek and says
+                            // nothing about B. Stale rather than fabricated, and just as wrong.
+                            _emptySeatTid = 0;
+                        }
+                        // AND RELEASE THE OLD SEAT, because this reply is about to ERASE what it described.
+                        // Not clearing it let the painted flag OUTLIVE THE PAINT: thread A painted, seat B,
+                        // B comes back empty — the screen is now empty and _seatedTid still said A. Selecting
+                        // A again then found the already-painted guard satisfied, so it would not reseat, and
+                        // the banner could claim A while nothing was on screen. The invariant this file now
+                        // rests on is "the banner reflects what is PAINTED", and a stale _seatedTid defeats it
+                        // from the other end — the flag surviving the listing rather than running ahead of it.
+                        // Ordered BEFORE the cache replacement below so no path can read the two disagreeing.
+                        _seatedTid = 0;
+                    }
                     // fresh window: replace the cache and centre on EIP (the flagged instruction)
                     _instrs = SortedUnique(instrs);
                     _pendFwd = _pendBwd = false;
@@ -492,6 +770,11 @@ namespace ClarionDebugger.Disassembly
                     _hasCur = cur != null && TryParseVa(cur.Va, out _curVa);
                     if (cur != null) { _curPath = cur.ResolvedPath; _curLine = cur.Line; _curModule = cur.Module; }
                     UpdateLocation();
+                    // The banner reads _seatedTid, which BOTH branches above have just changed — set on a
+                    // successful seat, cleared on an empty one. Re-deriving it here rather than leaving it
+                    // to the next unrelated event is the other half of the fix: a correct _seatedTid that
+                    // the banner has not re-read yet is the same defect one frame later.
+                    UpdateThreadBanner();
                     Rebuild();
                     RemapSelection(selVas);
                     _anchorRow = anchorVa != 0 ? RowOfVa(anchorVa) : (_anchorRow < _rows.Count ? _anchorRow : -1);
@@ -528,7 +811,7 @@ namespace ClarionDebugger.Disassembly
             // The process is gone, so there are no threads to be viewing and nothing in flight can be
             // answered. NewEpoch clears the pending flags as well as retiring the outstanding replies.
             NewEpoch();
-            _stoppedTid = _selTid = _seatedTid = 0;
+            _stoppedTid = _selTid = _seatedTid = _emptySeatTid = 0;
             _threads = new List<DebugThread>();
             UpdateThreadBanner();
             UpdateLocation();
@@ -810,6 +1093,19 @@ namespace ClarionDebugger.Disassembly
             uint lo = Lo(), hi = Hi();
             if (hi <= lo) return;
             uint va = (uint)(lo + (long)((double)e.NewValue / CoarseMax * (hi - lo)));
+            // A SEEK IS A RESEAT, and this was the only one that did not retire what was in flight.
+            // The WinTag branch clears _pendFwd/_pendBwd, but clearing the FLAGS does not recall the
+            // requests already sent: an edge extension asked for at the old window's last VA carries the
+            // same epoch and the same tid, so it passes BOTH gates and reaches Merge — which is a sorted
+            // union with no contiguity test. The listing then holds two regions megabytes apart, glued
+            // with no marker, and MaybeExtend chases the false edge it just created.
+            NewEpoch();
+            // Retire any decode claim NOW, not when the reply lands. From this moment the pane is an
+            // address seek and says nothing about a thread, so "no code to show for Thread B" is stale
+            // for however long the reply takes — and the engine can be seconds behind during a switch.
+            // The matching clear on the reply's else-arm covers any other non-seat sender; this one
+            // covers the gap in between.
+            _emptySeatTid = 0;
             _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, MakeTag(WinTag));   // reseat the window there
         }
 
@@ -849,7 +1145,23 @@ namespace ClarionDebugger.Disassembly
 
             if (_rows.Count == 0)
             {
-                TextRenderer.DrawText(g, "(no disassembly — start a debug session and pause)",
+                // THREE DIFFERENT EMPTIES, AND EACH SAYS ONLY WHAT IT CAN SUPPORT. They were one message,
+                // which asserted "no session" while often meaning something else entirely. Same
+                // absent-versus-sentinel discipline the wire has, applied to the surface — and the same
+                // rule that stopped `_emptySeatTid` being set by a coarse seek: a message is a claim, and
+                // a claim needs the state that justifies it.
+                //   1. a SEAT came back empty — the engine could not decode THAT THREAD's address. Only
+                //      set when wasSeat, so this never speaks for a seek.
+                //   2. we have a paused session and nothing is on screen — true after a seek into unmapped
+                //      memory, and after an engine error abandoned a seat. It claims nothing about why.
+                //   3. no session at all.
+                string msg = _emptySeatTid != 0
+                    ? "(no code to show for " + ThreadName(_emptySeatTid)
+                      + " — the engine could not decode its current address)"
+                    : (_svc != null && _svc.State == DebugSessionState.Paused)
+                      ? "(nothing to disassemble at this address)"
+                      : "(no disassembly — start a debug session and pause)";
+                TextRenderer.DrawText(g, msg,
                     _font, new Point(_coarse.Width + 8, TopOffset() + 8), FgHint, TextFormatFlags.NoPadding);
                 return;
             }

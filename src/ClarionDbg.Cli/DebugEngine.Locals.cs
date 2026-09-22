@@ -47,8 +47,11 @@ namespace ClarionDbg.Cli
 						&& l.TypeCode == 0x16)
 						continue;
 					uint slotVa = (uint)((long)frameEbp + l.FrameOff);
+					// note:null, editable:true stated rather than defaulted. A frame local lives on the
+					// STACK, never in .cwtls, so there is no shared-template value to veto and nothing to
+					// explain — which is an answer, not an absence of one.
 					rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places,
-									  slotVa, l.FrameOff, m.Name));
+									  slotVa, l.FrameOff, m.Name, null, true));
 				}
 			return rows;
 		}
@@ -194,8 +197,14 @@ namespace ClarionDbg.Cli
             return NodeJson(name, type, code, target, size, places, va, null, module, note, editable);
         }
 
+        /// <remarks>`note` and `editable` are REQUIRED, like the two child builders this delegates to.
+        /// They were fenced there first, which left the fence one level ABOVE the thing it was fencing:
+        /// THIS is the function that actually writes `editable` into the payload, so a caller that said
+        /// nothing here still got a pencil by default. The rule is the same one and it belongs at the
+        /// writer — a default that is safe for today's callers is an unasked question with an optimistic
+        /// answer.</remarks>
         private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module,
-                                string note = null, bool editable = true)
+                                string note, bool editable)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
@@ -271,8 +280,14 @@ namespace ClarionDbg.Cli
         /// template). Members of such a row are at template+offset and must not be editable either.</param>
         /// <param name="note">the parent's explanation, repeated on each member so a row read on its own —
         /// the tree can be scrolled anywhere — still says why it cannot be edited.</param>
+        /// <remarks>BOTH ARE REQUIRED, and that is the point. They defaulted to `true, null`, so a third
+        /// caller added later inherited edit pencils by saying nothing — which is exactly the hole
+        /// cc3ac96e closed for the expand path, left open for whoever comes next. A default that is safe
+        /// for today's callers is not a safe default; it is an unasked question with an optimistic answer.
+        /// Making them required turns "did you think about the veto?" into a compile error. Both existing
+        /// callers already passed them, so nothing changed but the fence.</remarks>
         private string GroupChildrenJson(ClarionType g, uint baseVa, string module,
-                                         bool editable = true, string note = null)
+                                         bool editable, string note)
         {
             if (g == null || g.Members == null) return "";
 
@@ -350,8 +365,9 @@ namespace ClarionDbg.Cli
         /// <param name="editable">false when the PARENT row is not this thread's own; elements sit at
         /// baseVa + k*stride inside that same shared block and inherit the veto.</param>
         /// <param name="note">the parent's explanation, carried onto each element row.</param>
+        /// <remarks>Required for the same reason as GroupChildrenJson's — see the note there.</remarks>
         private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module,
-                                         bool editable = true, string note = null)
+                                         bool editable, string note)
         {
             if (arr == null || arr.Length <= 0 || arr.ElemSize == 0) return "";
             const int cap = 1000;
@@ -443,22 +459,22 @@ namespace ClarionDbg.Cli
         {
             note = null;
             int span = (g != null && g.Size > 0 && g.Size <= int.MaxValue) ? (int)g.Size : 1;
-            string ignored;
-            if (ThreadedWriteAllowed(addr, span, tid, out ignored)) return true;
+            // ONE classification decides BOTH the veto and its wording. This used to ask the guard whether
+            // to veto (over the whole SPAN) and then run its own point test on `addr` to decide what to
+            // SAY — so a group starting below a .cwtls template and reaching into it was correctly vetoed
+            // and then labelled "another thread's data", naming the wrong refusal entirely. The address
+            // the note describes is now the guard's own HitVa: the first byte that actually landed in the
+            // protected block, which for a straddling group is not where the group starts.
+            var acc = ClassifyThreadedAccess(addr, span, tid);
+            if (acc.Allowed) return true;
 
-            // Refused. Say which of the two refusals it was, in row vocabulary. The template address is the
-            // overwhelmingly common one and the only one worth a resolve to describe precisely: "no instance
-            // at all" and "an instance exists, but this is not it" read differently to someone looking at a
-            // value and wondering why it is greyed out.
-            foreach (var m in _modules)
-            {
-                if (m == null || m.LoadBase == 0 || m.CwtlsHi <= m.CwtlsLo) continue;
-                uint tmplLo = m.LoadBase + m.CwtlsLo, tmplHi = m.LoadBase + m.CwtlsHi;
-                if (addr < tmplLo || addr >= tmplHi) continue;
-                note = ThreadedTemplateNote(m, addr, tid);
-                return false;
-            }
-            note = "another thread's data — thread " + tid + " is selected";
+            // Row vocabulary, not write vocabulary: nothing has been written, so "not written: ..." would
+            // be wrong here. The template case is worth a resolve to describe precisely — "no instance at
+            // all" and "an instance exists, but this is not it" read differently to someone looking at a
+            // greyed-out value and wondering why.
+            note = acc.Kind == ThreadedRefusal.SharedTemplate
+                 ? ThreadedTemplateNote(acc.Owner, acc.HitVa, tid)
+                 : "thread " + TidText(acc.OwnerTid) + "'s data — thread " + TidText(tid) + " is selected";
             return false;
         }
 
@@ -477,7 +493,7 @@ namespace ClarionDbg.Cli
                 {
                     case ThreadedResolve.Ok:
                         // The thread HAS a copy — this address is simply the template it was made from.
-                        return "shared " + m.Name + " template — thread " + tid + "'s own copy is at 0x"
+                        return "shared " + m.Name + " template — thread " + TidText(tid) + "'s own copy is at 0x"
                                + instanceVa.ToString("X");
                     case ThreadedResolve.Unallocated:
                         return "not yet used on this thread — initial value";
@@ -580,23 +596,46 @@ namespace ClarionDbg.Cli
                         // One variable showing two values is worse than either value alone, so this mirrors
                         // the watch path: same resolution, same vocabulary, same refusal to offer an edit on
                         // a value that is not this thread's own.
+                        //
+                        // THE DETECTION IS THE SHARED ONE, over the symbol's SPAN. It used to be a point
+                        // test on ds.Rva alone, with ds.Size sitting unused six lines below: a static GROUP
+                        // beginning below CwtlsLo and extending INTO the template was not detected at all,
+                        // so the row showed the shared template value with a pencil and no explanation. The
+                        // write still bounced off the span-based guard, so it was a UI lie rather than a bad
+                        // write — but the comment above claims parity with the watch path, and a weaker test
+                        // than the path you claim parity with makes the comment the lie instead.
                         uint templateVa = m.LoadBase + ds.Rva;
                         uint va = templateVa;
                         string note = null; bool editable = true;
-                        if (m.CwtlsHi != 0 && ds.Rva >= m.CwtlsLo && ds.Rva < m.CwtlsHi)
+                        uint hitVa;
+                        if (TouchesThreadedTemplate(m, templateVa, (int)ds.Size, out hitVa))
                         {
-                            uint instanceVa; string reason;
-                            switch (TryResolveThreadedInstance(m, templateVa, tid, hThread, out instanceVa, out reason))
+                            if (hitVa != templateVa)
                             {
-                                case ThreadedResolve.Ok:
-                                    va = instanceVa;
-                                    break;
-                                case ThreadedResolve.Unallocated:
-                                    note = "not yet used on this thread — initial value"; editable = false;
-                                    break;
-                                default:   // Template, or a resolution we could not complete
-                                    note = reason ?? "no thread instance — shared template value"; editable = false;
-                                    break;
+                                // STRADDLING: the symbol starts OUTSIDE the threaded block and reaches into
+                                // it. It cannot be relocated — only part of it is per-thread, and
+                                // TryResolveThreadedInstance maps a whole address by its offset INSIDE the
+                                // block, which this symbol's start is not (that subtraction would underflow).
+                                // Section alignment makes this hard to produce, which is exactly why it must
+                                // be refused deliberately rather than left to arithmetic nobody checked.
+                                note = "partly in the shared " + m.Name + " template — not this thread's own data";
+                                editable = false;
+                            }
+                            else
+                            {
+                                uint instanceVa; string reason;
+                                switch (TryResolveThreadedInstance(m, templateVa, tid, hThread, out instanceVa, out reason))
+                                {
+                                    case ThreadedResolve.Ok:
+                                        va = instanceVa;
+                                        break;
+                                    case ThreadedResolve.Unallocated:
+                                        note = "not yet used on this thread — initial value"; editable = false;
+                                        break;
+                                    default:   // Template, or a resolution we could not complete
+                                        note = reason ?? "no thread instance — shared template value"; editable = false;
+                                        break;
+                                }
                             }
                         }
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
