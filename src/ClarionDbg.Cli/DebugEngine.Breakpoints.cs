@@ -333,34 +333,43 @@ namespace ClarionDbg.Cli
         private void ResolvePendingFor(LoadedModule m)
         {
             if (m == null || m.Dbg == null) return;
-            // ToArray: the copy loop below appends to _bps, and the copies must not themselves be
-            // re-examined by this same pass.
-            foreach (var bp in _bps.ToArray())
+            // ToArray: the copy pass appends to _bps, and the copies must not themselves be re-examined.
+            // TWO PASSES, binds before copies (af81c054, pipeline run 1): interleaved in list order, an armed
+            // sibling earlier in the list copied itself into m BEFORE a pending entry for the same line was
+            // bound here too, and CopyUnqualifiedInto's coverage check could not see an entry not yet bound.
+            var snapshot = _bps.ToArray();
+            foreach (var bp in snapshot)
+                if (bp.Pending) BindPendingTo(m, bp);
+            foreach (var bp in snapshot)
+                if (!bp.Pending) CopyUnqualifiedInto(m, bp);
+        }
+
+        /// <summary>Bind one pending breakpoint to the image that just mapped, if it carries the compiland
+        /// and the breakpoint did not ask for a different image. The first job of <see cref="ResolvePendingFor"/>.</summary>
+        private void BindPendingTo(LoadedModule m, UserBreakpoint bp)
+        {
+            if (!string.IsNullOrEmpty(bp.OwnerSpec) && !ImageMatches(m, bp.OwnerSpec)) return; // asked for a different image
+            int mi = m.Dbg.FindModuleIdx(bp.Module);
+            if (mi < 0) return; // this image doesn't carry that compiland
+
+            int planted = bp.RequestedLine;
+            var rvas = m.Dbg.LineToRvasInModuleIdx(mi, planted);
+            if (rvas.Count == 0)
             {
-                if (!bp.Pending) { CopyUnqualifiedInto(m, bp); continue; }
-                if (!string.IsNullOrEmpty(bp.OwnerSpec) && !ImageMatches(m, bp.OwnerSpec)) continue; // asked for a different image
-                int mi = m.Dbg.FindModuleIdx(bp.Module);
-                if (mi < 0) continue; // this image doesn't carry that compiland
-
-                int planted = bp.RequestedLine;
-                var rvas = m.Dbg.LineToRvasInModuleIdx(mi, planted);
-                if (rvas.Count == 0)
-                {
-                    int snapped = NearestIn(m.Dbg.BreakableLinesInModuleIdx(mi), planted);
-                    if (snapped > 0) { planted = snapped; rvas = m.Dbg.LineToRvasInModuleIdx(mi, snapped); }
-                }
-                if (rvas.Count == 0) continue;
-
-                bp.Owner = m;
-                bp.ModuleIdx = mi;
-                bp.Module = m.Dbg.ModuleNameForIdx(mi) ?? bp.Module;
-                bp.Line = planted;
-                bp.Rvas.Clear();
-                bp.Rvas.AddRange(rvas);
-                if (m.LoadBase != 0) PlantBp(bp);
-                Console.WriteLine($"bp: armed pending {bp.Module}:{bp.Line} ({bp.Rvas.Count} address(es)) in {m.Name}");
-                EmitBpSet(bp);
+                int snapped = NearestIn(m.Dbg.BreakableLinesInModuleIdx(mi), planted);
+                if (snapped > 0) { planted = snapped; rvas = m.Dbg.LineToRvasInModuleIdx(mi, snapped); }
             }
+            if (rvas.Count == 0) return;
+
+            bp.Owner = m;
+            bp.ModuleIdx = mi;
+            bp.Module = m.Dbg.ModuleNameForIdx(mi) ?? bp.Module;
+            bp.Line = planted;
+            bp.Rvas.Clear();
+            bp.Rvas.AddRange(rvas);
+            if (m.LoadBase != 0) PlantBp(bp);
+            Console.WriteLine($"bp: armed pending {bp.Module}:{bp.Line} ({bp.Rvas.Count} address(es)) in {m.Name}");
+            EmitBpSet(bp);
         }
 
         /// <summary>An image just mapped that carries a compiland an UNQUALIFIED breakpoint is already

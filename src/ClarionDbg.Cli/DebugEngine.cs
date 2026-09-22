@@ -27,9 +27,9 @@ namespace ClarionDbg.Cli
         /// user's gutter dot silently never fired (task af81c054).
         /// </para>
         /// <para>
-        /// NULL MEANS UNQUALIFIED, not "no image": the caller did not name one, and the engine then behaves
-        /// exactly as it does today. That is what keeps an older host - which sends nothing but a bare
-        /// basename - working unchanged.
+        /// NULL MEANS UNQUALIFIED, not "no image": the caller did not name one, and the engine arms the
+        /// breakpoint in every loaded image carrying the compiland (one image, for |one=1). An older host,
+        /// which sends nothing but a bare basename, gets exactly that.
         /// </para></summary>
         public string Image;
 
@@ -44,7 +44,7 @@ namespace ClarionDbg.Cli
         /// <para>
         /// DEFAULT FALSE IS DELIBERATE. An older host sends neither <c>img=</c> nor <c>one=</c>, and it
         /// must get the fixed behaviour rather than opt into it - a host that cannot be updated is exactly
-        /// the one whose breakpoints are silently not firing today.
+        /// the one whose second-DLL breakpoints silently never fired before this change.
         /// </para></summary>
         public bool One;
 
@@ -59,7 +59,7 @@ namespace ClarionDbg.Cli
         /// no <c>default:</c>, so a segment this build does not know about is skipped and the segments
         /// AFTER it are still read. That is what makes the spec extensible in BOTH directions with no
         /// version negotiation: an engine older than <c>img=</c> ignores it and arms the way it always did,
-        /// and this engine given no <c>img=</c> takes exactly today's path. Verified against the real
+        /// and this engine given no <c>img=</c> arms unqualified. Verified against the real
         /// pre-change parser in tools/test-engine-bpowner.ps1 rather than assumed - it is the entire
         /// compatibility argument for the grammar, so it is checked instead of being reasoned about.
         /// </para></summary>
@@ -92,11 +92,33 @@ namespace ClarionDbg.Cli
                     // space-split. It cannot travel in the module field either - the host's
                     // IsValidModuleName allows only [A-Za-z0-9_.-], which is the guard against argument
                     // smuggling and stays.
-                    case "img": bp.Image = DecodeB64(val); break;
+                    // FAILS CLOSED (af81c054, pipeline run 1): a PRESENT img= that is empty, oversized, not
+                    // base64 or carries a control character rejects the whole spec. Decoding it to null made
+                    // it "unqualified", so a del meant for one image removed every copy.
+                    case "img":
+                        string img;
+                        if (!TryDecodeImage(val, out img)) return false;
+                        bp.Image = img;
+                        break;
                     case "one": bp.One = (val == "1" || val == "true"); break;
                 }
             }
             result = bp;
+            return true;
+        }
+
+        /// <summary>Longest encoded img= accepted: 4096 base64 chars, about 3 KB of path, well above
+        /// MAX_PATH and bounded so a pending entry cannot pin an arbitrarily large string.</summary>
+        public const int MaxImageB64 = 4096;
+
+        public static bool TryDecodeImage(string b64, out string image)
+        {
+            image = null;
+            if (string.IsNullOrEmpty(b64) || b64.Length > MaxImageB64) return false;
+            string s = DecodeB64(b64);
+            if (string.IsNullOrEmpty(s)) return false;
+            foreach (char c in s) if (c < 0x20 || c == 0x7F) return false;
+            image = s;
             return true;
         }
 
@@ -136,7 +158,7 @@ namespace ClarionDbg.Cli
         /// <c>ResolvePendingFor</c> must then bind it to the image that was ASKED FOR rather than to the
         /// first one that happens to carry the compiland.
         /// <para>
-        /// Null = unqualified = today's behaviour. See <see cref="BpSpec.Image"/>.
+        /// Null = unqualified = armed in every carrying image. See <see cref="BpSpec.Image"/>.
         /// </para></summary>
         public string OwnerSpec;
 

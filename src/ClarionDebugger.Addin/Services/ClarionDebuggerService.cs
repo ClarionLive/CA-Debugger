@@ -137,13 +137,6 @@ namespace ClarionDebugger.Services
         public int HitValue;        // N for the hit-count rule
         public string Trace;        // non-null ⇒ tracepoint: {var}-interpolated message logged on hit, never pauses
         public int HitCount;        // engine-reported hit count (display only; updated via bp-set)
-
-        /// <summary>The caller asked for this breakpoint in exactly ONE image (run-to-cursor), rather than
-        /// in every loaded image carrying the .clw. Sent as <c>|one=1</c>; see
-        /// <see cref="ClarionDebuggerService.AddBreakpoint(string,int,bool)"/> for why the engine cannot
-        /// work it out for itself. Host-side only - the engine never echoes it back, because it is a
-        /// request about how to resolve the add and not a fact about the resulting breakpoint.</summary>
-        public bool SingleTargetRequested;
     }
 
     /// <summary>One resolved call-stack frame (Phase 3 'stack' command). proc/module null = unknown.</summary>
@@ -1610,10 +1603,6 @@ namespace ClarionDebugger.Services
         {
             var sb = new System.Text.StringBuilder();
             sb.Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
-            // The single-target REQUEST is part of the spec, not a property of the breakpoint, so it
-            // travels with every add that rebuilds one - otherwise a properties edit on a transient would
-            // silently re-arm it in every image. See ClarionDebuggerService.AddBreakpoint(string,int,bool).
-            if (bp.SingleTargetRequested) sb.Append("|one=1");
             if (!string.IsNullOrEmpty(bp.Condition)) sb.Append("|c=").Append(B64(bp.Condition));
             if (bp.HitMode == "eq" || bp.HitMode == "gte" || bp.HitMode == "mod")
                 sb.Append("|hm=").Append(bp.HitMode).Append("|hv=").Append(bp.HitValue);

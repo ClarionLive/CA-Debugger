@@ -1,6 +1,6 @@
 # Regression check: which IMAGE a breakpoint is armed in, when two loaded DLLs each carry a same-named .clw.
 #
-# A .clw name on the wire is a bare BASENAME. `OwnerOfModule` answered "the first loaded image carrying it",
+# A .clw name on the wire is a bare BASENAME. The old `OwnerOfModule` (removed) answered "the first loaded image carrying it",
 # so in a multi-DLL app the user's second gutter dot was folded into the first breakpoint and NEVER ARMED:
 # a dot on screen asserting it will stop, and a debugger that silently does not. Task af81c054.
 #
@@ -58,6 +58,8 @@ $predicates = @(
   (Get-Method 'private static bool RemovalNames(UserBreakpoint b, string image)'),
   (Get-Method 'private static bool Eq(string a, string b)')
 ) -join "`n"
+# The unload rule (af81c054, pipeline run 1) is an instance method over _bps, so it gets its own shim class.
+$siblingRule = Get-Method 'internal bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)' $mod
 
 $shim = @"
 using System;
@@ -75,6 +77,11 @@ public sealed class UserBreakpoint {
 
 public static class BpOwner {
 $($predicates -replace 'private static', 'public static')
+}
+
+public sealed class UnloadRule {
+    public List<UserBreakpoint> _bps = new List<UserBreakpoint>();
+$($siblingRule -replace 'internal bool', 'public bool')
 }
 "@
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
@@ -106,6 +113,50 @@ $one = $null
 [void][BpSpec]::TryParse('clbrws011.clw:50|one=1', [ref]$one)
 Check 'one=1 parses as a single-target request' ($one.One) ''
 
+# FAILS CLOSED (af81c054, pipeline run 1): a PRESENT img= that cannot be read used to decode to null and
+# so meant "unqualified" - a del aimed at one image removed every copy. Each malformed shape rejects the spec.
+$rej = $null
+Check 'an img= that is not base64 rejects the whole spec' (-not [BpSpec]::TryParse('m.clw:5|img=%%%notb64', [ref]$rej)) ''
+Check 'an EMPTY img= rejects the whole spec' (-not [BpSpec]::TryParse('m.clw:5|img=', [ref]$rej)) ''
+Check 'an img= decoding to a control character rejects the whole spec' `
+  (-not [BpSpec]::TryParse(('m.clw:5|img=' + (B64 "C:\App`nbp del x.clw:1")), [ref]$rej)) ''
+# A long but otherwise VALID printable path, so only the length cap can reject it. An all-'A' string
+# decodes to NUL bytes and was rejected by the control-character test instead - found by mutation: removing
+# the cap survived that version of this check.
+$big = B64 ('C:\' + ('x' * 3100) + '.dll')
+Check "CONTROL: the oversized value is itself valid, printable base64 ($($big.Length) chars)" `
+  ($big.Length -gt [BpSpec]::MaxImageB64) ''
+Check "an img= over MaxImageB64 ($([BpSpec]::MaxImageB64) chars) rejects the whole spec" `
+  (-not [BpSpec]::TryParse("m.clw:5|img=$big", [ref]$rej)) ''
+Check 'CONTROL: a well-formed img= at the same site still parses' `
+  ([BpSpec]::TryParse(('m.clw:5|img=' + (B64 'C:\App\Dll2\shared.dll')), [ref]$rej) -and $rej.Image -eq 'C:\App\Dll2\shared.dll') ''
+
+Write-Host ''
+Write-Host 'an image UNLOADING drops an arm-all copy that lives on elsewhere, and keeps the last one'
+# Pipeline run 1, debugger gate: a copy returned to pending was re-bound on reload WHILE the surviving
+# sibling copied itself in again - two breakpoints in one image, the stale one winning every hit.
+function Rule { param([object[]]$bps) $r = New-Object UnloadRule; foreach ($b in $bps) { $r._bps.Add($b) }; $r }
+$inA = Bp 'shared.clw' 50 50 $dll1 $null
+$inB = Bp 'shared.clw' 50 50 $dll2 $null
+$r = Rule @($inA, $inB)
+Check 'B leaving, with the same line still armed in A: B''s copy is redundant' ($r.HasArmAllSiblingOutside($inB, $dll2)) ''
+$r = Rule @($inB)
+Check 'B leaving with NO sibling: kept, so it returns to pending and re-arms on reload' (-not $r.HasArmAllSiblingOutside($inB, $dll2)) ''
+$pend = Bp 'SHARED.CLW' 50 50 $null $null
+$r = Rule @($inB, $pend)
+Check 'a PENDING sibling counts too (it re-arms and copies), and the module name is case-insensitive' ($r.HasArmAllSiblingOutside($inB, $dll2)) ''
+$r = Rule @($inB, (Bp 'shared.clw' 60 60 $dll1 $null))
+Check 'a different REQUESTED line in another image is not a sibling' (-not $r.HasArmAllSiblingOutside($inB, $dll2)) ''
+$named = Bp 'shared.clw' 50 50 $dll2 'C:\App\Dll2\shared.dll'
+$r = Rule @($inA, $named)
+Check 'a breakpoint that NAMED its image is never dropped - nothing else re-arms it' (-not $r.HasArmAllSiblingOutside($named, $dll2)) ''
+$r = Rule @($inA, (Bp 'shared.clw' 50 50 $dll1 'C:\App\Dll1\shared.dll'), $inB)
+$r._bps.RemoveAt(0)
+Check 'and a NAMED entry elsewhere is not an arm-all sibling - it would not copy itself back into B' (-not $r.HasArmAllSiblingOutside($inB, $dll2)) ''
+$one = Bp 'shared.clw' 50 50 $dll2 $null; $one.SingleTargetRequested = $true
+$r = Rule @($inA, $one)
+Check 'a single-target transient is never dropped by this rule' (-not $r.HasArmAllSiblingOutside($one, $dll2)) ''
+
 Write-Host ''
 Write-Host 'THE COMPATIBILITY CLAIM THE WHOLE GRAMMAR RESTS ON, measured against the REAL old parser'
 # The argument for putting the image in a |segment rather than anywhere else is that BpSpec.TryParse's
@@ -113,12 +164,9 @@ Write-Host 'THE COMPATIBILITY CLAIM THE WHOLE GRAMMAR RESTS ON, measured against
 # claim about code that is no longer in the tree, so it is checked against the version that IS: the parser
 # as it stood before this ticket, lifted out of git and compiled under a different type name so it cannot
 # alias the new one.
-$oldSrc = & git show HEAD~0:src/ClarionDbg.Cli/DebugEngine.cs 2>$null
-if (-not $oldSrc) { $oldSrc = @() }
-$oldText = ($oldSrc | Out-String)
-$prev = & git log --format='%H' -n 1 -- src/ClarionDbg.Cli/DebugEngine.cs 2>$null
-# The parser as of the commit BEFORE this ticket's branch point: task/bpid's tip.
-$baseText = (& git show task/bpid:src/ClarionDbg.Cli/DebugEngine.cs 2>$null | Out-String)
+# The parser as of the commit BEFORE this ticket's branch point: c4e1dba, task/bpid's tip, pinned by hash
+# so pruning that branch cannot turn this check red.
+$baseText = (& git show c4e1dba:src/ClarionDbg.Cli/DebugEngine.cs 2>$null | Out-String)
 if ($baseText -and $baseText.Length -gt 100) {
   $oldCls = Get-CSharpBlock 'internal sealed class BpSpec' $baseText
   $oldCls = $oldCls.Replace('internal sealed class BpSpec', 'public sealed class OldBpSpec')
@@ -138,7 +186,7 @@ if ($baseText -and $baseText.Length -gt 100) {
   Check 'and the segments AFTER the unknown one still reach it' `
     ($oldOk -and $oldSpec.HitMode -eq 'eq' -and $oldSpec.HitValue -eq 3) "$($oldSpec.HitMode)/$($oldSpec.HitValue)"
 } else {
-  Check 'the pre-change parser could be read from task/bpid' $false 'git show failed'
+  Check 'the pre-change parser could be read from c4e1dba' $false 'git show failed'
 }
 
 Write-Host ''
@@ -211,9 +259,21 @@ Check 'and removes EVERY match, not the first' ($del -match 'foreach \(var m in 
 $res = Get-Method 'private void ResolvePendingFor(LoadedModule m)'
 Check 'ResolvePendingFor gives a later image its own copy of an unqualified breakpoint' `
   ($res -match 'CopyUnqualifiedInto\(m, bp\)') ''
-Check 'and it respects a breakpoint that named a DIFFERENT image' ($res -match 'ImageMatches\(m, bp\.OwnerSpec\)') ''
+$bind = Get-Method 'private void BindPendingTo(LoadedModule m, UserBreakpoint bp)'
+Check 'and a pending bind respects a breakpoint that named a DIFFERENT image' ($bind -match 'ImageMatches\(m, bp\.OwnerSpec\)') ''
 Check 'it iterates a SNAPSHOT, so the copies it appends are not re-examined by the same pass' `
   ($res -match '_bps\.ToArray\(\)') ''
+# ORDER, pinned by position (af81c054, pipeline run 1): binds BEFORE copies, or an armed sibling copies
+# itself into the image before a pending entry for the same line is bound there too - a duplicate.
+$iBind = $res.IndexOf('BindPendingTo(m, bp)'); $iCopy = $res.IndexOf('CopyUnqualifiedInto(m, bp)')
+Check 'it binds pending entries in a pass BEFORE the copy pass' ($iBind -ge 0 -and $iCopy -gt $iBind) "bind@$iBind copy@$iCopy"
+$unl = Get-Method 'private void OnDllUnloaded(uint baseVa)' $mod
+$iDrop = $unl.IndexOf('HasArmAllSiblingOutside(bp, m)'); $iNull = $unl.IndexOf('bp.Owner = null')
+Check 'OnDllUnloaded asks the sibling rule BEFORE returning a breakpoint to pending' ($iDrop -ge 0 -and $iNull -gt $iDrop) "rule@$iDrop null@$iNull"
+$dropBlock = Get-CSharpBlock 'if (HasArmAllSiblingOutside(bp, m))' $unl
+Check 'and a dropped copy leaves _bps AND tells the host (bp-del), then skips the pending reset' `
+  ($dropBlock -match '_bps\.Remove\(bp\)' -and $dropBlock -match 'Json\.BpDel\(bp\)' -and $dropBlock -match 'continue;') ''
+Check 'it walks a snapshot, since it removes from _bps as it goes' ($unl -match 'foreach \(var bp in _bps\.ToArray\(\)\)') ''
 $copy = Get-Method 'private void CopyUnqualifiedInto(LoadedModule m, UserBreakpoint bp)'
 Check 'the copy is skipped for a single-target breakpoint (run to cursor stays one stop)' ($copy -match 'bp\.SingleTargetRequested') ''
 Check 'and for one that named an image' ($copy -match 'IsNullOrEmpty\(bp\.OwnerSpec\)') ''
@@ -274,11 +334,12 @@ Check 'the service writes one=1 only when asked' ($svcAdd -match 'singleTarget \
 $svcAdd2 = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line)' $svc
 Check 'and the 2-argument overload defaults to FALSE, so an unthinking caller gets the fix' `
   ($svcAdd2 -match 'AddBreakpoint\(module, line, false\)') ''
-# A properties edit rebuilds the spec through BuildBpSpec; losing the request there would silently re-arm
-# a transient in every image.
+# A properties edit rebuilds the spec through BuildBpSpec. It edits PERSISTENT rows only - run-to-cursor
+# transients are filtered out of the pane - so it must never ask for one image. (A host-side
+# SingleTargetRequested flag used to be read here and was never set; removed in pipeline run 1.)
 $build = Get-CSharpBlock 'public static string BuildBpSpec(DebugBreakpoint bp)' $svc
-Check 'BuildBpSpec carries the request too, so a properties edit cannot drop it' `
-  ($build -match 'bp\.SingleTargetRequested') ''
+Check 'BuildBpSpec never sends one=1, so a properties edit keeps the breakpoint in every image' ($build -notmatch 'one=1') ''
+Check 'and the dead host-side request flag is gone' ($svc -notmatch 'SingleTargetRequested') ''
 
 Write-Host ''
 Write-Host 'the cut-down stubs match the real records'

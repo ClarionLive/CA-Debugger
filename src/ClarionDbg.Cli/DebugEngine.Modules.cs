@@ -64,19 +64,25 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>The mapped, debuggable module that owns a TSWD compiland by name (e.g. clbrws011.clw),
-        /// or null when no loaded image carries it yet (deferred breakpoint).</summary>
-        private LoadedModule OwnerOfModule(string clwName)
+        /// <summary>Is <paramref name="bp"/> an arm-all copy (no image named, not single-target) whose logical
+        /// breakpoint - same compiland, same REQUESTED line - is also held by an entry outside
+        /// <paramref name="leaving"/>, armed or pending? Then it is redundant once that image unmaps.</summary>
+        internal bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)
         {
-            foreach (var m in _modules)
-                if (m.HasDebug && m.Dbg.FindModuleIdx(clwName) >= 0) return m;
-            return null;
+            if (!string.IsNullOrEmpty(bp.OwnerSpec) || bp.SingleTargetRequested) return false;
+            foreach (var other in _bps)
+                if (other != bp && other.Owner != leaving
+                    && string.IsNullOrEmpty(other.OwnerSpec) && !other.SingleTargetRequested
+                    && other.RequestedLine == bp.RequestedLine
+                    && string.Equals(other.Module, bp.Module, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
         }
 
         /// <summary>EVERY loaded image whose TSWD carries this compiland, not just the first.
         /// <para>
         /// A .clw name is a BASENAME. Two DLLs in one solution can each contain a <c>clbrws011.clw</c>, and
-        /// <see cref="OwnerOfModule"/> answering "the first one" is why a breakpoint set in the second DLL
+        /// the old first-match lookup answering "the first one" is why a breakpoint set in the second DLL
         /// was never armed and the user's gutter dot silently never fired (task af81c054). The list is the
         /// honest answer to "which image owns this name"; the caller decides what to do with more than one.
         /// </para></summary>
@@ -116,7 +122,7 @@ namespace ClarionDbg.Cli
         /// </para>
         /// <para>
         /// KNOWN LIMIT, recorded rather than papered over: the path comparison is exact (bar case). Both
-        /// sides come from the engine today - the host echoes back the <c>ownerPath</c> the engine gave it -
+        /// sides come from the engine (as of 2026-09-22) - the host echoes back the <c>ownerPath</c> the engine gave it -
         /// so they are the same string by construction. A future host that DERIVES the path from the
         /// project model instead could produce a different spelling of the same file (short 8.3 form, a
         /// mapped drive, a <c>\\?\</c> prefix) and would match nothing. That belongs with whatever builds
@@ -213,10 +219,22 @@ namespace ClarionDbg.Cli
             foreach (var im in _modules) if (im.LoadBase == baseVa && im != _exe) { m = im; break; }
             if (m == null) return;
 
-            foreach (var bp in _bps)
+            foreach (var bp in _bps.ToArray())
             {
                 if (bp.Owner != m) continue;
                 foreach (var rva in bp.Rvas) _armed.Remove(bp.Owner.LoadBase + rva);
+                if (HasArmAllSiblingOutside(bp, m))
+                {
+                    // An arm-all copy whose breakpoint lives on in another image is DROPPED, not returned to
+                    // pending (af81c054, pipeline run 1). A pending copy was re-bound on reload AND the
+                    // surviving sibling copied itself in again, so the image got two breakpoints - and the
+                    // stale one, carrying whatever properties it had when the image left, won every hit.
+                    // The sibling re-arms this image when it maps, with the current properties.
+                    _bps.Remove(bp);
+                    Console.WriteLine($"bp: dropped {bp.Module}:{bp.Line} with {m.Name} (armed elsewhere; re-arms on reload)");
+                    if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(bp));   // Owner still set: the host needs its ownerPath
+                    continue;
+                }
                 bp.Owner = null;          // back to pending; re-arms if the DLL reloads
                 bp.ModuleIdx = -1;
             }
