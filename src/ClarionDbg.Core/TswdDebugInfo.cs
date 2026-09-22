@@ -1286,14 +1286,20 @@ namespace ClarionDbg.Core
             index[name] = loc;
         }
 
-        /// <summary>Lower wins. 0: a static in its own right (no container) or a FILE record buffer, which
-        /// Clarion names FILE$PRE:RECORD. 1: any other unscoped GROUP. 2: a scoped copy (PROC::NAME), such
-        /// as a form's HISTORY:: buffer — declared LIKE a record, so it repeats that record's field names.</summary>
+        /// <summary>Lower wins. 0: a static in its own right (no container), or a FILE record buffer in the
+        /// exact shape Clarion gives one, FILE$PRE:RECORD — unscoped, carrying '$', ending ":RECORD". 1: every
+        /// other container, and they keep first-registration order among themselves. Deliberately only two
+        /// ranks: the field-name question this settles is "the FILE's record or a copy of it", and a third rank
+        /// for scoped names also reordered unrelated collisions — on demoleg.exe (2026-09-22) the M_* members of
+        /// eleven BRW1::FORMATMANAGER instances flipped to a global CLS_FILE of &amp;REFs. Nor does '$' alone buy
+        /// rank 0: VMT$ and other mangled names carry it too.</summary>
         private static int DataNameRank(string container)
         {
             if (container == null) return 0;
-            if (container.IndexOf("::", StringComparison.Ordinal) >= 0) return 2;
-            return container.IndexOf('$') >= 0 ? 0 : 1;
+            bool fileRecord = container.IndexOf("::", StringComparison.Ordinal) < 0
+                              && container.IndexOf('$') >= 0
+                              && container.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase);
+            return fileRecord ? 0 : 1;
         }
 
         // Register every leaf member of a resolved GROUP by name -> absolute RVA, so watch-by-name resolves

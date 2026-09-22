@@ -1007,13 +1007,18 @@ namespace ClarionDbg.Cli
         private static void CheckFieldNameResolvesToFileRecord(List<string> failures, ClaimLog claims)
         {
             claims.Claim("a field name repeated by several groups resolves to the FILE record buffer "
-                         + "(FILE$PRE:RECORD) in EITHER registration order, ahead of an unscoped GROUP and of a "
-                         + "form's scoped HISTORY:: copy; equal ranks keep the first registration. Driven through "
-                         + "the index's own RegisterDataName; the call sites that feed it are NOT covered here.");
+                         + "(FILE$PRE:RECORD) in EITHER registration order, ahead of a form's HISTORY:: copy and of "
+                         + "an unscoped GROUP; a '$' without the record shape, or the record shape under a :: scope, "
+                         + "buys no priority; every other collision keeps its first registration, in both orders. "
+                         + "Driven through the index's own RegisterDataName; the call sites that feed it are NOT "
+                         + "covered here.");
 
             var file    = new TswdDebugInfo.DataLocation { Rva = 0x3C3AC0, Container = "COUNTRIES$COU:RECORD" };
             var history = new TswdDebugInfo.DataLocation { Rva = 0x049D10, Container = "HISTORY::COU:RECORD" };
             var plain   = new TswdDebugInfo.DataLocation { Rva = 0x100000, Container = "SAVE:COUNTRY" };
+            var dollar  = new TswdDebugInfo.DataLocation { Rva = 0x300000, Container = "VMT$COUNTRYGROUP" };
+            var scopedFile = new TswdDebugInfo.DataLocation { Rva = 0x400000, Container = "UPDATE::LOCAL$COU:RECORD" };
+            var stat    = new TswdDebugInfo.DataLocation { Rva = 0x500000, Container = null };
 
             Func<TswdDebugInfo.DataLocation[], uint> winner = order =>
             {
@@ -1030,14 +1035,23 @@ namespace ClarionDbg.Cli
                 failures.Add("field name: a later HISTORY:: copy displaced the FILE record buffer");
             if (winner(new[] { plain, file }) != file.Rva || winner(new[] { file, plain }) != file.Rva)
                 failures.Add("field name: an unscoped GROUP outranked the FILE record buffer");
-            if (winner(new[] { history, plain }) != plain.Rva)
-                failures.Add("field name: a scoped HISTORY:: copy outranked an unscoped GROUP");
+            if (winner(new[] { dollar, file }) != file.Rva || winner(new[] { scopedFile, file }) != file.Rva)
+                failures.Add("field name: a '$' name without the record shape, or a record shape under a :: "
+                             + "scope, kept the name against the real FILE record buffer");
 
-            // Equal ranks: the first stays. Without this the rule would be free to flip between two images'
-            // equally-good records on every rebuild of the index.
-            var file2 = new TswdDebugInfo.DataLocation { Rva = 0x200000, Container = "OTHER$COU:RECORD" };
-            if (winner(new[] { file, file2 }) != file.Rva || winner(new[] { file2, file }) != file2.Rva)
-                failures.Add("field name: two equal-rank registrations did not keep the FIRST");
+            // No priority among the non-record containers: each of these pairs keeps whichever registered
+            // FIRST, in both orders. A third rank for scoped names was tried and reordered unrelated collisions
+            // (demoleg's M_* FormatManager members, 2026-09-22); '$' alone would let any mangled name jump ahead.
+            var ties = new[]
+            {
+                new[] { history, plain }, new[] { dollar, plain }, new[] { scopedFile, history },
+                new[] { file, new TswdDebugInfo.DataLocation { Rva = 0x200000, Container = "OTHER$COU:RECORD" } },
+                new[] { stat, file },
+            };
+            foreach (var pair in ties)
+                if (winner(new[] { pair[0], pair[1] }) != pair[0].Rva || winner(new[] { pair[1], pair[0] }) != pair[1].Rva)
+                    failures.Add("field name: equal-rank registrations (" + (pair[0].Container ?? "static") + " / "
+                                 + (pair[1].Container ?? "static") + ") did not keep the FIRST");
         }
 
         /// <summary>
