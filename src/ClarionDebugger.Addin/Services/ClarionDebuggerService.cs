@@ -410,9 +410,60 @@ namespace ClarionDebugger.Services
             Launch(targetExe, args, false);
         }
 
+        /// <summary>What Launch may do, given whether an engine process is still alive and the session state.
+        /// <para>
+        /// The case this exists for (0449e5c9): the DEBUGGEE finished, the engine said "exited", and the state
+        /// went Idle at once - by the Owner's decision, so a run-to-completion reads as over immediately. The
+        /// engine PROCESS can outlive that by a moment, and a Start pressed inside that window used to hit
+        /// "A debug session is already running." for a session the user had just been told was over. It is
+        /// now refused with the truth instead (<see cref="EngineClosingMessage"/>), and
+        /// <see cref="ReapLingeringEngine"/> closes the window from the other side.
+        /// </para></summary>
+        internal enum LaunchGate { Proceed, RefuseClosing, AlreadyRunning }
+
+        internal static LaunchGate DecideLaunch(bool engineAlive, DebugSessionState state)
+        {
+            if (!engineAlive) return LaunchGate.Proceed;
+            return state == DebugSessionState.Idle ? LaunchGate.RefuseClosing : LaunchGate.AlreadyRunning;
+        }
+
+        /// <summary>The one wording of the refusal, shared by the pad's pre-check and Launch's own.</summary>
+        public const string EngineClosingMessage =
+            "the previous session's engine is still closing — press Start again in a moment";
+
+        /// <summary>True in the short window after a session reported itself over (Idle) while its engine
+        /// process has not exited yet. A Start in that window is refused with <see cref="EngineClosingMessage"/>.</summary>
+        public bool IsEngineStillClosing { get { return DecideLaunch(IsRunning, State) == LaunchGate.RefuseClosing; } }
+
+        /// <summary>How long an engine may outlive its own "exited" event before it is stopped for it.</summary>
+        internal const int ReapGraceMs = 1500;
+
+        /// <summary>Give <paramref name="engine"/> <paramref name="graceMs"/> to exit on its own, and if it has
+        /// not, call <paramref name="stop"/>. Blocking: the caller runs it off the UI thread. Returns true when
+        /// it had to stop the engine. A process whose state cannot be read counts as still running, so it is
+        /// stopped rather than trusted (the same "cannot tell is not dead" rule as ProcessConfirmedDead).</summary>
+        internal static bool ReapLingeringEngine(Process engine, int graceMs, Func<bool> stop)
+        {
+            if (engine == null) return false;
+            bool exited;
+            try { exited = engine.WaitForExit(graceMs); }
+            catch { exited = false; }
+            if (exited) return false;
+            stop();
+            return true;
+        }
+
         private void Launch(string targetExe, string args, bool interactive)
         {
-            if (IsRunning) throw new InvalidOperationException("A debug session is already running.");
+            switch (DecideLaunch(IsRunning, State))
+            {
+                case LaunchGate.RefuseClosing:
+                    // Refused, not thrown: this is a moment to wait, not a failure (0449e5c9).
+                    LogReceived?.Invoke(EngineClosingMessage);
+                    return;
+                case LaunchGate.AlreadyRunning:
+                    throw new InvalidOperationException("A debug session is already running.");
+            }
 
             string engine = FindEngine();
             if (engine == null) throw new FileNotFoundException("ClarionDbg.exe not found next to the addin or in the dev build output.");
@@ -480,9 +531,10 @@ namespace ClarionDebugger.Services
         /// Callers that need the guarantee must check the result; callers that ignore it are no worse off than
         /// before, because the state they would have seen as Idle now simply stays where it was.
         ///
-        /// Known remaining path that reports Idle without a process check: the engine's "exited" event (the
-        /// DEBUGGEE finished), handled in OnJson, sets Idle while the engine process itself may still be alive
-        /// for a short window. That is a separate lifecycle from this one and is not addressed here.
+        /// The one path that reports Idle WITHOUT this check is the engine's "exited" event (the DEBUGGEE
+        /// finished): it sets Idle at once by decision (0449e5c9 option C), and covers the engine process's
+        /// remaining lifetime by reaping it (<see cref="ReapLingeringEngine"/>, which calls this) and by
+        /// refusing a Start until it is gone (<see cref="DecideLaunch"/>).
         ///
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
         /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
@@ -990,7 +1042,20 @@ namespace ClarionDebugger.Services
 
                 case "exited":
                     CurrentVa = null;
+                    // Idle at once, by the Owner's decision (0449e5c9 option C): the run is over as far as the
+                    // user is concerned. The engine PROCESS may still be closing, so it is given ReapGraceMs to
+                    // exit and then stopped, off this reader thread; a Start meanwhile is refused honestly.
                     SetState(DebugSessionState.Idle);
+                    var exitedEngine = _proc;
+                    System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try
+                        {
+                            ReapLingeringEngine(exitedEngine, ReapGraceMs,
+                                () => ReferenceEquals(_proc, exitedEngine) && Stop());
+                        }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] reap after exit failed: " + ex.Message); }
+                    });
                     break;
 
                 default:

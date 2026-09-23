@@ -905,6 +905,10 @@ namespace ClarionDebugger.Terminal
                 // only one worth paying for it at.
                 RearmAndReportMonacoHooks();
 
+                // The run just reported itself over, but its engine has not exited yet (0449e5c9): say so and
+                // stop here, before anything below announces a start that is not going to happen.
+                if (_svc.IsEngineStillClosing) { Console("err", ClarionDebuggerService.EngineClosingMessage); return; }
+
                 // The Target EXE field is intentionally gone — Start always sources the target from the app.
                 // On EVERY Start we re-resolve from the active project and use the fresh result. A manual Browse
                 // pick is honoured only as a ONE-SHOT tied to the solution/project context it was chosen for: if
