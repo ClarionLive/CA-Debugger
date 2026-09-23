@@ -1028,6 +1028,7 @@ public sealed class BridgePad {
   $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void Expand(string data)' $web) -replace '^private void', 'public void')
   $(Get-Method 'private void RefuseExpand(int reqId, string why)' $web)
+  $(Get-Method 'private void PostVarSet(string va, bool ok, string value, string error)' $web)
   $arrowHandlers
   public void RunPushProcedures(string exe) { PushProcedures(exe); }
 }
@@ -1066,6 +1067,11 @@ $pad.OnSvcModuleData('clbrws011.clw', $engineRows, 4812)
 $moduleMsg = $pad.Posts[$pad.Posts.Count - 1]
 Check 'CONTROL: the nested row was granted and the group itself was not' ($pad._editGrants.Count -eq 2) "$($pad._editGrants.Count) grant(s) incl. the watch"
 
+# The engine's answer to that edit, as the host posts it: the real OnSvcVariableSet, on a scratch pad.
+$vsPad = New-Object ClarionDebugger.Terminal.BridgePad
+$vsPad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
+$varsetMsg = $vsPad.Posts[$vsPad.Posts.Count - 1]
+
 # ---- the page, run ------------------------------------------------------------------------------------
 $pageJs = @(
   (Get-Method 'function send(action,data)' $page),
@@ -1077,10 +1083,11 @@ $pageJs = @(
   (Get-Method 'function setEditMeta(cell, meta){' $page),
   (Get-Method 'function stripEditQuotes(s){' $page),
   (Get-Method 'function beginEdit(cell){' $page),
-  (Get-Method 'function requestExpand(v, cb){' $page)
+  (Get-Method 'function requestExpand(v, cb){' $page),
+  (Get-Method 'function onVarSet(m){' $page)
 ) -join "`n"
 $inputFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-in-' + [Guid]::NewGuid().ToString('N') + '.json')
-@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
+@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg; varset = $varsetMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
 $bridgeJs = @'
 const fs = require('fs');
 const INPUT = JSON.parse(fs.readFileSync(process.argv[2], 'utf8').replace(/^\uFEFF/, ''));
@@ -1115,6 +1122,11 @@ const wm = JSON.parse(INPUT.watch);
 const wcell = mkEl('span'); setEditMeta(wcell, { va:wm.va, typeCode:wm.typeCode, size:wm.size, places:wm.places });
 selTid = wm.tid;
 out.watchEdit = commit(wcell, 'X","va":"0x1","value":"7');
+// The engine answers; the page's real onVarSet repaints the cell. Then the user edits the SAME row again.
+document.querySelectorAll = function(){ return [wcell]; };
+function dtApply(){}
+onVarSet(JSON.parse(INPUT.varset));
+out.watchEdit2 = commit(wcell, 'second');
 
 // An edit on the NESTED Variables row: editAttrs writes the attributes the tree row is built with.
 const child = JSON.parse(INPUT.moduledata).items[0].children[0];
@@ -1219,6 +1231,24 @@ $pad.EditVar($watchData)
 Check 'an edit on the Watch row the host sent is written' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
 Check 'with the tuple the host issued and the user''s value, untouched by the text inside it' `
   (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A10F0|0x03|4|0|4812|X","va":"0x1","value":"7')) (Sets $pad)
+
+# CONSUMED (codex security gate): the write SPENDS its grant, so the identical request replayed is refused -
+# a grant used to stay good for the whole pause.
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'the identical edit replayed is refused: the grant was spent by the first write' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+# ...and the ENGINE's reply re-issues it, so the user can still edit the same row twice in one pause. The
+# second request is the one the page really sends after its own onVarSet has repainted the cell.
+$watchData2 = if ($pageOut) { DataOf $pageOut.watchEdit2 } else { '' }
+$pad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData2)
+Check 'edit, engine reply, edit again: the second edit through the pad is written' `
+  (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A10F0|0x03|4|0|4812|second')) (Sets $pad)
+# A refusal the HOST makes re-issues nothing: it spent nothing. Replay, refused, then replay again.
+$pad.EditVar($watchData2); $pad._svc.Sets.Clear(); $pad.EditVar($watchData2)
+Check 'a host refusal does not re-issue the grant (only the engine''s reply does)' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+$pad.OnSvcVariableSet('0x4A10F0', $true, 'second', $null)   # the engine answers the second write
 $pad._svc.Sets.Clear()
 $pad.EditVar($treeData)
 Check 'an edit on the NESTED Variables row is written - the grant reached inside children' `
@@ -1251,6 +1281,12 @@ $pad.OnSvcThreadSelected(9001, $true, $null)
 $pad._svc.Sets.Clear()
 $pad.EditVar($watchData)
 Check 'after a thread switch the same edit is refused until the row is re-read' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+# The write made just before that switch is answered AFTER it: the reply must not resurrect a grant for a row
+# that is no longer current (the clear drops spent grants too).
+$pad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'a reply arriving after the rows went stale re-issues nothing' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
 
 # A request the service would not send is said, not dropped: no varset would ever have come.
 $pad.OnWatch($watch)
@@ -1258,6 +1294,10 @@ $pad._svc.AcceptSet = $false; $pad.Posts.Clear()
 $pad.EditVar($watchData)
 Check 'a write SetVariable refused is answered with a failed varset too' `
   (($pad.Posts.Count -ge 1) -and ($pad.Posts[0] -cmatch '"ok":false') -and ($pad.Posts[0] -cmatch 'did not take')) ($pad.Posts -join ' / ')
+# That write never left, so no reply will come to re-issue its grant: it is re-issued at once.
+$pad._svc.AcceptSet = $true; $pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'and a write that never left keeps its grant, so a retry goes through' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
 
 # The three other places a stop, resume or exit makes rows stale. Not reachable from this probe (they sit in
 # UI lambdas with live-editor side effects), so they are pinned by POSITION: the clear must come before the
@@ -1961,7 +2001,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 301
+$EXPECTED_CHECKS = 306
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

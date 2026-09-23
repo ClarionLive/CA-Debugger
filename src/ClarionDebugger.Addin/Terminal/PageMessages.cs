@@ -327,7 +327,45 @@ namespace ClarionDebugger.Terminal
 
         /// <summary>Retire everything: edit grants, expandable rows and forwarded expands. One clear, so no
         /// clear site can retire one family and leave the other live.</summary>
-        public void Clear() { _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); }
+        public void Clear() { _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); _writesInFlight.Clear(); }
+
+        // A grant is CONSUMED by the write it authorises (afbc68c7, codex security gate): otherwise one grant
+        // let the same write be replayed for the rest of the pause. The consumed key waits here, by address,
+        // for the engine's reply to that write - the reply is what re-issues it, so the row the user just
+        // edited can be edited again. A clear drops these too: a reply after a stop must not resurrect a
+        // grant for a row that is no longer on screen.
+        private readonly Dictionary<string, List<string>> _writesInFlight =
+            new Dictionary<string, List<string>>(StringComparer.Ordinal);
+
+        /// <summary>Check AND spend the grant for this tuple: true when it was granted, in which case it is
+        /// no longer granted until <see cref="Regrant"/> is called for its address.</summary>
+        public bool TryConsume(string va, string typeCode, int size, int places, uint? tid)
+        {
+            if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return false;
+            string scoped = tid.HasValue ? Key(va, typeCode, size, places, TidKey(tid)) : null;
+            string key = (scoped != null && _keys.Contains(scoped)) ? scoped
+                       : _keys.Contains(Key(va, typeCode, size, places, Unscoped)) ? Key(va, typeCode, size, places, Unscoped)
+                       : null;
+            if (key == null) return false;
+            _keys.Remove(key);
+            string vaKey = va.ToUpperInvariant();
+            List<string> spent;
+            if (!_writesInFlight.TryGetValue(vaKey, out spent)) _writesInFlight[vaKey] = spent = new List<string>();
+            spent.Add(key);
+            return true;
+        }
+
+        /// <summary>The write to <paramref name="va"/> has been answered (or never left): re-issue the grant(s)
+        /// it spent, so the refreshed row is editable again.</summary>
+        public void Regrant(string va)
+        {
+            if (string.IsNullOrEmpty(va)) return;
+            List<string> spent;
+            string vaKey = va.ToUpperInvariant();
+            if (!_writesInFlight.TryGetValue(vaKey, out spent)) return;
+            _writesInFlight.Remove(vaKey);
+            foreach (var k in spent) if (_keys.Count + _expandable.Count < MaxGrants) _keys.Add(k);
+        }
 
         /// <summary>Record an expandable row (a lazy reference / array-element group node) the host issued.</summary>
         public void GrantExpandable(string module, uint typeRef, string addr)

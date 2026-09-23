@@ -338,12 +338,22 @@ namespace ClarionDebugger.Terminal
                                   + ": " + (error ?? "could not select"));
         });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
+        // The ENGINE's answer to a write the host sent: it re-issues the grant that write spent, so the row can
+        // be edited again (afbc68c7). A refusal the host makes itself goes through PostVarSet and re-issues
+        // nothing - it spent nothing.
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
+        {
+            _editGrants.Regrant(va);
+            PostVarSet(va, ok, value, error);
+        });
+
+        private void PostVarSet(string va, bool ok, string value, string error)
         {
             Post("{\"type\":\"varset\",\"va\":" + Str(va) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"value\":" + Str(value) + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "edit value failed: " + (error ?? "unknown"));
-        });
+        }
+
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() =>
         {
             // Phase 2 of run-to-cursor: the transient is now confirmed armed, so it's safe to resume. There is
@@ -1525,12 +1535,18 @@ namespace ClarionDebugger.Terminal
             if (_svc.State != DebugSessionState.Paused) return;
             var req = EditVarRequest.Parse(data);
             if (req == null) return;
+            // The grant is SPENT by the write it authorises, so the same request cannot be replayed; the
+            // engine's varset reply re-issues it (OnSvcVariableSet). A write that never left re-issues it now,
+            // because no reply is coming.
             string why = null;
-            if (!_editGrants.IsGranted(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
+            if (!_editGrants.TryConsume(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
                 why = "that value is no longer current (or was never offered for editing) — let it refresh, then edit again";
             else if (!_svc.SetVariable(req.Va, req.TypeCode, req.Size, req.Places, req.Value, req.Tid))
+            {
+                _editGrants.Regrant(req.Va);
                 why = "the engine did not take the request";
-            if (why != null) OnSvcVariableSet(req.Va, false, null, why);
+            }
+            if (why != null) PostVarSet(req.Va, false, null, why);
         }
 
         /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
