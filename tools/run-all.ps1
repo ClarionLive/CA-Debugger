@@ -68,6 +68,8 @@ $Suites = @(
   @{ File = 'test-engine-bpowner.ps1'; Success = '^ALL CHECKS PASSED$'
      NoTotal = 'not yet opted in to Assert-CheckTotal and prints no count - ticket 6493d226' }
   @{ File = 'test-engine-session.ps1' }
+  @{ File = 'test-engine-setip-sites.ps1' }
+  @{ File = 'test-engine-setip-sites.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-engine-tid-members.ps1' }
   @{ File = 'test-engine-tid-members.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-engine-hover-sites.ps1' }

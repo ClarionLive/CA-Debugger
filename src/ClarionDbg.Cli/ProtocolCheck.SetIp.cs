@@ -210,14 +210,33 @@ namespace ClarionDbg.Cli
         /// Anything else refuses the whole procedure - including the locally-linked build, whose runtime is
         /// reached by E8 calls to unnamed code in the EXE, and which the old rule passed with no proof.
         /// </summary>
+        /// <summary>The measured list's size (2026-09-23 traces: 24 through call [slot], 17 through a thunk).</summary>
+        private const int MeasuredImportCount = 41;
+
         private static void CheckSetIpCallsBalanced(List<string> failures, ClaimLog claims)
         {
-            claims.Claim("setip proves every call in the procedure has a known effect on ESP: a call to a Clarion "
+            claims.Claim("setip's measured-balanced import list holds exactly " + MeasuredImportCount + " distinct "
+                         + "entries and no event-loop entry; it proves every call in the procedure has a known effect on ESP: a call to a Clarion "
                          + "procedure/routine, to a MEASURED import (directly or through the image's jmp [slot] thunk) "
                          + "and the modelled ACCEPT pair pass; an E8 call to unnamed in-image code (a locally-linked "
                          + "runtime), an unmeasured import either way, an indirect call, the event loop through a "
                          + "thunk, and a decode out of step with the line records or a jump target all refuse. "
                          + "Not covered: that the measured list is right for another ClaRUN version.");
+
+            // THE LIST'S SIZE, PINNED. The notes for 2910d9c said 42 while the code held 41 (the 42nd was
+            // Cla$EndEventLoop, which ran inside balanced steady-state iterations but is the MODELLED ACCEPT
+            // pair and rightly not on the list). A list that grows or loses an entry must now say so here.
+            var listed = DebugEngine.MeasuredBalancedImports;
+            if (listed.Length != MeasuredImportCount)
+                failures.Add("setip calls: MeasuredBalancedImports has " + listed.Length + " entries, but the pinned count is "
+                             + MeasuredImportCount + " - an entry was added or dropped without its evidence being recorded here");
+            var seenImport = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var n in listed)
+            {
+                if (!seenImport.Add(n)) failures.Add("setip calls: MeasuredBalancedImports lists " + n + " twice");
+                if (n.EndsWith("EventLoop") || n.EndsWith("EventLoops"))
+                    failures.Add("setip calls: MeasuredBalancedImports lists " + n + " - the event loop is the modelled pair, never 'balanced'");
+            }
 
             if (!DebugEngine.IsMeasuredBalancedImport(FxListedName))
                 failures.Add("setip calls: CONTROL - the fixture's 'measured' import " + FxListedName + " is not on "
@@ -297,8 +316,11 @@ namespace ClarionDbg.Cli
                          + "another EBP/return/entry/image/tid, a popped frame (EBP below ESP) and an exited thread "
                          + "all refuse; the store keeps at most " + DebugEngine.SetIpObservations.Cap + " entries, "
                          + "oldest out, and a re-visit is not evicted by its own stale slot. In the decision, observed "
-                         + "rescues stack-unproven and accept-boundary, the proof path still works alone, and "
-                         + "other-thread, not-on-statement, other-proc, prologue and code-unreadable bind both paths.");
+                         + "rescues ONLY stack-unproven: accept-unpaired and accept-boundary (sibling loops included) "
+                         + "bind both paths with the others. No observation survives a free run: continue and step-out "
+                         + "drop the thread's, every resume drops other threads', a non-step stop drops them, and a "
+                         + "step prunes by the highest ESP it reached. The proof path is gated on the measured ClaRUN "
+                         + "version. Not covered: that ArmResume calls the rule (tools/test-engine-setip-sites.ps1).");
 
             var k = new DebugEngine.SetIpFrameKey { Tid = 100, LoadBase = 0x400000, EntryRva = 0x75424, Ebp = 0x348FEB8, Ret = 0x42A0B1 };
             const uint line34 = 0x754AF, esp = 0x348FE6C;
@@ -386,10 +408,74 @@ namespace ClarionDbg.Cli
             expect("a proven move that was also observed (proof reported first)", f => f.ObservedMatch = true, "via:proof");
             expect("an unproven move", f => f.StackError = "Cla$BEEP not measured", "refused:stack-unproven");
             expect("an unproven move to an OBSERVED line", f => { f.StackError = "Cla$BEEP not measured"; f.ObservedMatch = true; }, "via:observed");
-            expect("an unpaired-ACCEPT proc, observed line", f => { f.RegionError = "x"; f.ObservedMatch = true; }, "via:observed");
+            // THE ACCEPT RULES BIND BOTH PATHS (pipeline run 2): observed rescues stack-unproven and nothing else.
+            expect("an unpaired-ACCEPT proc, observed line", f => { f.RegionError = "x"; f.ObservedMatch = true; }, "refused:accept-unpaired");
             var loop = new DebugEngine.EventLoopRegion { StartCall = 0x4754F8, Lo = 0x4754FE, Hi = 0x4756AB };
-            expect("an ACCEPT-boundary move to an observed line (ESP equal is the property itself)",
-                   f => { f.Regions.Add(loop); f.StopRva = 0x75503; f.TargetRva = 0x756AB; f.ObservedMatch = true; }, "via:observed");
+            expect("an ACCEPT-boundary move to an observed line",
+                   f => { f.Regions.Add(loop); f.StopRva = 0x75503; f.TargetRva = 0x756AB; f.ObservedMatch = true; }, "refused:accept-boundary");
+            // SIBLING LOOPS: two ACCEPTs, A then B, in one frame, both at the same steady depth. The thread
+            // stopped at T inside A; now it is stopped inside B at the SAME ESP, so the observation matches -
+            // and the move must still refuse: ClaRUN's state on the stack is B's loop, not A's.
+            var loopA = new DebugEngine.EventLoopRegion { StartCall = 0x475500, Lo = 0x475506, Hi = 0x475580 };
+            var loopB = new DebugEngine.EventLoopRegion { StartCall = 0x475600, Lo = 0x475606, Hi = 0x475680 };
+            expect("sibling loops: stopped in B, target T observed in A at the same ESP",
+                   f => { f.Regions.Add(loopA); f.Regions.Add(loopB); f.StopRva = 0x75620; f.TargetRva = 0x75520;
+                          f.ObservedMatch = true; f.RegionError = null; f.StackError = null; }, "refused:accept-boundary");
+            expect("sibling loops, unproven stack: still accept-boundary, not rescued",
+                   f => { f.Regions.Add(loopA); f.Regions.Add(loopB); f.StopRva = 0x75620; f.TargetRva = 0x75520;
+                          f.ObservedMatch = true; f.StackError = "x not measured"; }, "refused:accept-boundary");
+            expect("back within the same loop, unproven stack, observed",
+                   f => { f.Regions.Add(loopA); f.Regions.Add(loopB); f.StopRva = 0x75540; f.TargetRva = 0x75520;
+                          f.ObservedMatch = true; f.StackError = "x not measured"; }, "via:observed");
+
+            // NO OBSERVATION SURVIVES A FREE RUN (pipeline run 2). The resume rule, the stop rule, and the store.
+            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Over")))
+                failures.Add("setip observed: a step-over resume dropped the thread's observations");
+            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Into")))
+                failures.Add("setip observed: a step-into resume dropped the thread's observations");
+            if (!DebugEngine.ResumeKeepsObservations(true, true, DebugEngine.ModeSingleStepsToStopForTest("None")))
+                failures.Add("setip observed: a stepi resume dropped the thread's observations");
+            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("OverInstr")))
+                failures.Add("setip observed: a nexti resume dropped the thread's observations");
+            if (DebugEngine.ResumeKeepsObservations(false, false, DebugEngine.ModeSingleStepsToStopForTest("None")))
+                failures.Add("setip observed: a CONTINUE (free run) kept the thread's observations");
+            if (DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Out")))
+                failures.Add("setip observed: a STEP-OUT (runs on through the return) kept the thread's observations");
+            foreach (var r in new[] { "breakpoint", "pause", "step-limit", "stepi-limit", "" })
+                if (DebugEngine.StopKeepsObservations(r)) failures.Add("setip observed: a stop with reason '" + r + "' (the end of a free run) kept the observations");
+            foreach (var r in new[] { "step", "stepi", "setip" })
+                if (!DebugEngine.StopKeepsObservations(r)) failures.Add("setip observed: a '" + r + "' stop dropped the observations");
+
+            var run = new DebugEngine.SetIpObservations();
+            var kb = k; kb.Tid = 200;
+            run.Record(k, line34, esp); run.Record(kb, line34, esp);
+            run.OnResume(100, true);   // thread 100 steps
+            if (!run.Matches(k, line34, esp)) failures.Add("setip observed: an observation, then a STEP, then setip back: the observation was lost");
+            if (run.Matches(kb, line34, esp)) failures.Add("setip observed: another thread's observation survived a resume - that thread ran freely");
+            run.OnResume(100, false);  // thread 100 continues
+            if (run.Matches(k, line34, esp)) failures.Add("setip observed: an observation, then a FREE-RUN resume, then setip back: still matched");
+
+            // A step that popped a frame and re-entered it at the same EBP: at the stop, ESP is back below that
+            // EBP, so pruning by the CURRENT ESP keeps the stale frame. The prune line is the highest ESP seen.
+            var reenter = new DebugEngine.SetIpObservations();
+            reenter.Record(k, line34, esp);
+            uint popped = DebugEngine.PopLine(true, k.Ebp + 8, esp);
+            reenter.PrunePopped(100, popped);
+            if (reenter.Matches(k, line34, esp))
+                failures.Add("setip observed: a frame the step popped and re-entered (max ESP above its EBP) survived the stop's prune");
+            if (DebugEngine.PopLine(false, k.Ebp + 8, esp) != esp)
+                failures.Add("setip observed: a stop that was not this thread's watched step pruned by a stale step maximum");
+
+            // The runtime-version gate on the PROOF path.
+            if (DebugEngine.ClaRunVersionGate(true, DebugEngine.MeasuredClaRunVersion) != null)
+                failures.Add("setip observed: the measured ClaRUN version was gated");
+            string gate = DebugEngine.ClaRunVersionGate(true, "11.1.13505");
+            if (gate == null || !gate.Contains("11.1.13505 not measured"))
+                failures.Add("setip observed: another ClaRUN version passed the proof path's gate: " + (gate ?? "ALLOWED"));
+            if (DebugEngine.ClaRunVersionGate(true, null) == null)
+                failures.Add("setip observed: an unreadable ClaRUN version passed the gate");
+            if (DebugEngine.ClaRunVersionGate(false, null) != null)
+                failures.Add("setip observed: with no ClaRUN loaded the gate refused (the call proof decides then)");
             expect("observed, but another thread selected", f => { f.ObservedMatch = true; f.SelectedTid = 200; }, "refused:other-thread");
             expect("observed, but the stop is mid-statement", f => { f.ObservedMatch = true; f.Gap = 3; }, "refused:not-on-statement");
             expect("observed, but the target is another symbol", f => { f.ObservedMatch = true; f.TargetEntryRva = 0x752FC; }, "refused:other-proc");
@@ -483,7 +569,8 @@ namespace ClarionDbg.Cli
         {
             var codes = DebugEngine.SetIpRefusalCodes;
             claims.Claim("setip's " + codes.Length + " frozen refusal codes each carry a distinct user-facing "
-                         + "sentence, and the refusal and success replies carry no tid of their own (an unknown "
+                         + "sentence, the step-first hint on exactly the three proof refusals the observed path can "
+                         + "override, and the refusal and success replies carry no tid of their own (an unknown "
                          + "tid stays absent, a known one is stamped once), `candidates` only on ambiguous-line, "
                          + "no module/line when unparsable; the parser takes a bare module:line only; setip is "
                          + "not a resume verb.");
@@ -503,6 +590,20 @@ namespace ClarionDbg.Cli
                 if ((c == DebugEngine.SetIpAmbiguousLine) != j.Contains("\"candidates\":3"))
                     failures.Add("setip wire: `candidates` must appear on ambiguous-line and nowhere else; '" + c + "' gave " + j);
             }
+            // The step-first hint goes on EXACTLY the refusal the observed path can override: stack-unproven.
+            // On any other code it would promise a way round that does not exist (the two ACCEPT refusals bind
+            // both paths since pipeline run 2). And no sentence claims a move is "safe": the reply's `via` and
+            // the refusal text are the contract, not a promise about the program.
+            foreach (var c in codes)
+            {
+                string msg = DebugEngine.SetIpMessage(c) ?? "";
+                bool overridable = c == DebugEngine.SetIpStackUnproven;
+                if (overridable != msg.Contains(DebugEngine.SetIpStepFirstHint))
+                    failures.Add("setip wire: '" + c + "' " + (overridable ? "lacks" : "carries") + " the step-first hint: " + msg);
+                if (System.Text.RegularExpressions.Regex.IsMatch(msg, @"\bsafe", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                    failures.Add("setip wire: '" + c + "' says 'safe': " + msg);
+            }
+
             if (DebugEngine.SetIpMessage("frobnicate") != null)
                 failures.Add("setip wire: an unknown code has a sentence, so a typo in a code would still read as a real refusal");
 

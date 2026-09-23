@@ -13,6 +13,12 @@
 #     stops firing, so the continue that follows runs on to the ACCEPT's breakpoint at 44 instead of stopping at
 #     35. (Measured 2026-09-23 on the earlier 44->45 form of this case: disabling the handover turned the stop
 #     into the wrong line.)
+#   - NO OBSERVATION SURVIVES A FREE RUN (item 4, pipeline run 2): after a continue, a move back to a line seen
+#     on the previous ACCEPT pass - same frame, same steady ESP - refuses; so does one after a step-out, which
+#     ends as a "step" stop and so is caught only by the resume rule at ArmResume;
+#   - THE ACCEPT RULES BIND BOTH PATHS (item 4): into or out of the loop refuses as accept-boundary even where
+#     the target was observed. The sibling-loops case (equal ESP ACROSS a boundary) cannot happen in
+#     SplashScreen's single ACCEPT, so only protocolcheck's fixture covers it;
 #   - the refusals a real image produces: the entry record, a ROUTINE, a line with no code, another module,
 #     bad arguments, and a Pause stop that is not on a statement.
 #
@@ -103,14 +109,40 @@ try {
     }
 
     Invoke-CheckSection 'a step after a setip starts from the new line' {
-        [void](Expect-Move 'clbrws026.clw:34' 34 'observed')
+        # The continue above was a FREE RUN, so every observation before it is gone (a move back to 34 now
+        # refuses). The breakpoint stop on 35 is a fresh observation; step on to 36 and come back to it.
         Send 'step'
         $p = Wait-Event 'paused'
-        Check 'a step after setip 35 -> 34 stops at line 35' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 35) (Show $p)
+        Check 'a step from the breakpoint on 35 reaches line 36' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 36) (Show $p)
+        [void](Expect-Move 'clbrws026.clw:35' 35 'observed')
+        Send 'step'
+        $p = Wait-Event 'paused'
+        Check 'a step after setip 36 -> 35 stops at line 36' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 36) (Show $p)
+    }
+
+    Invoke-CheckSection 'a step-out runs free, so it drops the observations too' {
+        # Step on to line 42 (DO PrepareProcedure), into the routine, and out again. The step-out ends as a
+        # "step" stop, so only the RESUME rule (ArmResume's first statement) can drop what was seen before it:
+        # the routine ran at full speed and could have returned into anything. Line 42 was observed, at the
+        # same ESP, in the same frame - and must still refuse.
+        $script:reached42 = $false
+        for ($i = 0; $i -lt 8 -and -not $script:reached42; $i++) {
+            Send 'step'
+            $p = Wait-Event 'paused'
+            if ($null -ne $p -and $p.line -eq 42) { $script:reached42 = $true }
+        }
+        Check 'steps reach line 42 (DO PrepareProcedure)' $script:reached42 (Show $p)
+        Send 'step'
+        $p = Wait-Event 'paused'
+        Check 'a step goes INTO the PrepareProcedure routine' ($null -ne $p -and $p.proc -eq 'PREPAREPROCEDURE') (Show $p)
+        Send 'stepout'
+        $p = Wait-Event 'paused'
+        Check 'step-out returns to SplashScreen' ($null -ne $p -and $p.proc -eq 'SPLASHSCREEN' -and $p.line -gt 42) (Show $p)
+        Expect-Refusal 'clbrws026.clw:42' 'stack-unproven'
     }
 
     Invoke-CheckSection 'refusals from a statement stop before the ACCEPT' {
-        Expect-Refusal 'clbrws026.clw:44' 'stack-unproven'    # into the loop, never reached: neither proven nor observed
+        Expect-Refusal 'clbrws026.clw:44' 'accept-boundary'   # into the loop: the ACCEPT rules bind both paths
         Expect-Refusal 'clbrws026.clw:8' 'prologue'           # the entry record
         Expect-Refusal 'clbrws026.clw:92' 'other-proc'        # a ROUTINE of this procedure
         Expect-Refusal 'clbrws026.clw:9999' 'no-code'
@@ -126,8 +158,33 @@ try {
         $p = Wait-Event 'paused'
         Check 'a step moves on inside the loop' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -gt 44 -and $p.line -lt 89) (Show $p)
         [void](Expect-Move 'clbrws026.clw:44' 44 'observed')
-        Expect-Refusal 'clbrws026.clw:89' 'stack-unproven'    # past the loop end (what a BREAK does): never observed here
-        Expect-Refusal 'clbrws026.clw:34' 'stack-unproven'    # back out before the ACCEPT: observed, but at the frame's base ESP
+        Expect-Refusal 'clbrws026.clw:89' 'accept-boundary'   # past the loop end (what a BREAK does)
+        Expect-Refusal 'clbrws026.clw:34' 'accept-boundary'   # back out before the ACCEPT, although line 34 WAS observed
+
+        # The TARGET side of the re-arm: line 44 is armed, and the setip above moved EIP onto it, so its byte
+        # was restored and a re-plant scheduled for after it runs. The loop comes round again (the splash's
+        # timer), so a continue must stop at 44's breakpoint once more. If the re-plant were lost, the loop
+        # would run on without stopping there.
+        Send 'continue'
+        $p = Wait-Event 'paused'
+        Check 'continue from the setip target stops at ITS breakpoint, line 44, on the next pass: the target was re-planted' `
+            ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 44) (Show $p)
+    }
+
+    Invoke-CheckSection 'no observation survives a free run' {
+        # Now on a STEADY pass (the first pass runs deeper). Step 44 -> 45, then continue to the next pass's
+        # breakpoint on 44: same frame, same EBP, same return address, and the same steady ESP, so line 45's
+        # observation would match - but the thread ran FREE to get here, and the procedure could have returned
+        # and been re-entered on the way. The continue must have dropped it.
+        Send 'step'
+        $p = Wait-Event 'paused'
+        Check 'a step on the steady pass reaches line 45' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 45) (Show $p)
+        $script:steadyEsp = if ($p) { $p.regs.esp } else { $null }
+        Send 'continue'
+        $p = Wait-Event 'paused'
+        Check 'continue reaches line 44 on the next pass, at the same steady ESP' `
+            ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 44 -and $p.regs.esp -eq $script:steadyEsp) (Show $p)
+        Expect-Refusal 'clbrws026.clw:45' 'stack-unproven'   # observed before the continue: no longer counts
     }
 
     Invoke-CheckSection 'a Pause stop is not on a statement' {
@@ -149,8 +206,8 @@ finally {
     Remove-EngineSession $session
 }
 
-# 7 + 1 + 3 + 6 + 6 + 2, measured on a clean run 2026-09-23.
-$EXPECTED_CHECKS = 25
+# 7 + 1 + 4 + 4 + 6 + 7 + 3 + 2, measured on a clean run 2026-09-23.
+$EXPECTED_CHECKS = 34
 Assert-CheckTotal $EXPECTED_CHECKS
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }

@@ -64,6 +64,7 @@ namespace ClarionDbg.Cli
         private void StepMachine(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx)
         {
             _stepCount++;
+            SetIpNoteStepEsp(tid, ctx.Esp);   // setip: the highest ESP this step reached (a frame it popped)
             uint va = ctx.Eip;
             var m = ModuleAt(va);
             uint rva = m != null ? va - m.LoadBase : va;

@@ -78,6 +78,28 @@ function Get-HoverStopVerdict {
   return [pscustomobject] $v
 }
 
+# THE SECOND SITE (a77abd94 item 4, pipeline run 2). `setip` re-announces the stop from INSIDE the command loop
+# (AnnounceStop with reason "setip"), not through PausedWait's entry, so the top-level call above does not run
+# for it - but the page re-baselines its hover on that `paused` all the same. So the setip case must call
+# HoverNewStop() as the VERY NEXT STATEMENT after that AnnounceStop: nothing between them but whitespace, so it
+# is neither guarded, nor moved before the announce, nor outside the block the announce runs in.
+$script:SetIpAnnounce = 'AnnounceStop(tid, ref ctx, haveCtx, "setip"'
+function Get-SetIpHoverVerdict {
+  param([string] $Src)
+  $v = [ordered]@{ Found = $false; Follows = $false; Reason = '' }
+  $block = Get-CSharpBlock $script:Signature $Src
+  if ($null -eq $block) { $v.Reason = 'PausedWait not found'; return [pscustomobject] $v }
+  $code = Get-CSharpCodeOnly $block
+  $a = $code.IndexOf($script:SetIpAnnounce, [StringComparison]::Ordinal)
+  if ($a -lt 0) { $v.Reason = 'no setip AnnounceStop in PausedWait'; return [pscustomobject] $v }
+  $v.Found = $true
+  $end = $code.IndexOf(';', $a)
+  $after = if ($end -ge 0) { $code.Substring($end + 1).TrimStart() } else { '' }
+  $v.Follows = $after.StartsWith($script:Call, [StringComparison]::Ordinal)
+  if (-not $v.Follows) { $v.Reason = "the statement after the setip AnnounceStop is: $($after.Substring(0, [Math]::Min(50, $after.Length)))" }
+  return [pscustomobject] $v
+}
+
 function Test-HoverStopVerdictOk {
   param($V)
   return $V.Found -and $V.TopLevel -and $V.StatementStart -and $V.BeforeLoop -and $V.NoReturnBefore
@@ -94,15 +116,26 @@ Invoke-CheckSection 'PausedWait resets the hover tracker, unconditionally, befor
   Check '  with no return before it' $v.NoReturnBefore $v.Reason
 }
 
+Invoke-CheckSection 'setip''s re-announce resets the hover tracker too, as the very next statement' {
+  $v = Get-SetIpHoverVerdict $engineSrc
+  Check 'PausedWait re-announces a setip stop' $v.Found $v.Reason
+  Check "  and the next statement is $($script:Call)" $v.Follows $v.Reason
+}
+
 if ($SelfTest) {
   Invoke-CheckSection 'mutation self-test (each must be CAUGHT)' {
     $block = Get-CSharpBlock $script:Signature $engineSrc
     # The call's own line, whatever its comment and line ending. Count-asserted: a find that matches
-    # nothing would make every mutation below a no-op that "passes" by leaving the source clean.
+    # nothing would make every mutation below a no-op that "passes" by leaving the source clean. There are TWO
+    # call lines since the setip site (a77abd94 item 4); this section is about the FIRST, the top-level one, so
+    # it takes the first match and asserts that exact line is unique - a Replace of a line that occurs twice
+    # would mutate both sites and prove nothing about either.
     $lineRx = '(?m)^[ \t]*HoverNewStop\(\);[^\r\n]*\r?\n'
     $n = ([regex]::Matches($block, $lineRx)).Count
-    Check 'the call site is found exactly once, so every mutation below really changes the source' ($n -eq 1) "$n match(es)"
+    Check 'the call lines are found exactly twice (top level, and the setip case)' ($n -eq 2) "$n match(es)"
     $line = [regex]::Match($block, $lineRx).Value
+    $u = ([regex]::Matches($block, [regex]::Escape($line))).Count
+    Check 'the top-level call line is unique, so every mutation below changes that site only' ($u -eq 1) "$u occurrence(s)"
     $indent = '            '
     $nl = if ($line.EndsWith("`r`n")) { "`r`n" } else { "`n" }
     $withoutCall = $block.Replace($line, '')
@@ -124,10 +157,41 @@ if ($SelfTest) {
     $v = Get-HoverStopVerdict ($engineSrc.Replace($block, $block))
     Check 'CONTROL: the unmutated source, through the same splice, passes' (Test-HoverStopVerdictOk $v) $v.Reason
   }
+
+  Invoke-CheckSection 'mutation self-test, the setip site (each must be CAUGHT)' {
+    $block = Get-CSharpBlock $script:Signature $engineSrc
+    $lineRx = '(?m)^[ \t]*HoverNewStop\(\);[^\r\n]*\r?\n'
+    $all = [regex]::Matches($block, $lineRx)
+    $line = if ($all.Count -ge 2) { $all[1].Value } else { '' }
+    $u = if ($line) { ([regex]::Matches($block, [regex]::Escape($line))).Count } else { 0 }
+    Check 'the setip call line is found, and is unique' ($u -eq 1) "$u occurrence(s)"
+    $nl = if ($line.EndsWith("`r`n")) { "`r`n" } else { "`n" }
+    $indent = [regex]::Match($line, '^[ \t]*').Value
+    $announceRx = '(?m)^[ \t]*AnnounceStop\(tid, ref ctx, haveCtx, "setip"[^\r\n]*\r?\n'
+    $announce = [regex]::Match($block, $announceRx).Value
+    $breakRx = '(?m)^[ \t]*break;[^\r\n]*\r?\n'
+    $afterSite = $block.Substring($block.IndexOf($line) + $line.Length)
+    $nextBreak = [regex]::Match($afterSite, $breakRx).Value
+    $mutations = [ordered]@{
+      'the setip call deleted' = $block.Replace($line, '')
+      'the setip call wrapped in if (DateTime.Now.Year < 0)' = $block.Replace($line, "${indent}if (DateTime.Now.Year < 0) HoverNewStop();$nl")
+      'the setip call moved before the AnnounceStop' = $block.Replace($line, '').Replace($announce, "${indent}HoverNewStop();$nl$announce")
+      'the setip call moved out of its block, after the break' = $block.Replace($line, '').Replace($block.Replace($line, '').Substring($block.IndexOf($announce)), $block.Replace($line, '').Substring($block.IndexOf($announce)).Replace($nextBreak, "$nextBreak${indent}HoverNewStop();$nl"))
+    }
+    foreach ($name in $mutations.Keys) {
+      $mutated = $engineSrc.Replace($block, $mutations[$name])
+      $changed = $mutated -cne $engineSrc
+      $v = Get-SetIpHoverVerdict $mutated
+      Check "CAUGHT: $name" ($changed -and -not ($v.Found -and $v.Follows)) $(if ($changed) { $v.Reason } else { 'the mutation did not change the source' })
+    }
+    $v = Get-SetIpHoverVerdict ($engineSrc.Replace($block, $block))
+    Check 'CONTROL: the unmutated source passes the setip-site verdict' ($v.Found -and $v.Follows) $v.Reason
+  }
 }
 
-# Clean: 5 checks. -SelfTest adds 1 find + 5 mutations + 1 control = 7.
-$EXPECTED_CHECKS = if ($SelfTest) { 12 } else { 5 }
+# Clean: 5 + 2 (the setip site) = 7. -SelfTest adds, for the top-level site, 2 finds + 5 mutations + 1 control
+# = 8, and for the setip site 1 find + 4 mutations + 1 control = 6.
+$EXPECTED_CHECKS = if ($SelfTest) { 21 } else { 7 }
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
