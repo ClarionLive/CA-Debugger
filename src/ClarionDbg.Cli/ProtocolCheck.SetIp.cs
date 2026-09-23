@@ -189,7 +189,14 @@ namespace ClarionDbg.Cli
         private const uint FxThunkStart = 0x401100;    // jmp [FxStart]
         private const uint FxUnnamed = 0x401500;       // in-image code that is neither a symbol nor a thunk
 
-        private static string FxSlotNameWithListed(uint abs) { return abs == FxListed ? FxListedName : FxSlotName(abs); }
+        private const uint FxListed2 = 0x4E17F4;       // a second measured import at a fixture slot address
+        private const string FxListed2Name = "ClaRUN.dll!Cla$PushLong";
+        private static string FxSlotNameWithListed(uint abs)
+        {
+            if (abs == FxListed) return FxListedName;
+            if (abs == FxListed2) return FxListed2Name;
+            return FxSlotName(abs);
+        }
         private static bool FxIsEntry(uint va) { return va == FxProcEntry; }
         private static uint FxThunk(uint va)
         {
@@ -264,12 +271,35 @@ namespace ClarionDbg.Cli
             // WHAT THE PROOF USED, for the version gate (pipeline run 3): the slot of the first measured import it
             // relied on, directly or through a thunk, and 0 when it relied on none - so a proof that used ClaRUN
             // cannot pass the gate by finding no module NAMED clarun.dll.
-            Func<Fx, uint> usedSlot = f2 =>
+            Func<Fx, List<uint>> usedSlots = f2 =>
             {
-                var b2 = f2.Bytes; uint slot2;
-                DebugEngine.ProveCallsBalanced(b2, b2.Length, FxBase, FxSlotNameWithListed, FxIsEntry, FxThunk, null, out slot2);
-                return slot2;
+                var b2 = f2.Bytes; List<uint> slots2;
+                DebugEngine.ProveCallsBalanced(b2, b2.Length, FxBase, FxSlotNameWithListed, FxIsEntry, FxThunk, null, out slots2);
+                return slots2;
             };
+            Func<Fx, uint> usedSlot = f2 => { var l = usedSlots(f2); return l.Count > 0 ? l[0] : 0; };
+            // EVERY distinct measured slot, not just the first (run 3, second pass): two calls through one slot
+            // report it once, and a second measured slot is reported too.
+            var two = new Fx().Nop().CallSlot(FxListed).CallSlot(FxListed2).CallRel(FxThunkListed).Nop();
+            var twoSlots = usedSlots(two);
+            if (twoSlots.Count != 2 || twoSlots[0] != FxListed || twoSlots[1] != FxListed2)
+                failures.Add("setip calls: two measured slots (one used twice) were reported as [" + string.Join(",", twoSlots.ConvertAll(x => "0x" + x.ToString("X"))) + "], expected both, once each");
+
+            // THE GATE OVER ALL OF THEM: the first slot's live target is the measured ClaRUN, the second's lands
+            // in a different module (an app hooking its own IAT). It must refuse, naming the second slot.
+            var good = new DebugEngine.RuntimeSlotFact { Slot = FxListed, Read = true, Mapped = true, PathResolved = true, Version = DebugEngine.MeasuredClaRunVersion };
+            var hooked = new DebugEngine.RuntimeSlotFact { Slot = FxListed2, Read = true, Mapped = true, PathResolved = true, Version = "6.3.9600" };
+            string all = DebugEngine.ClaRunVersionGateAll(new List<DebugEngine.RuntimeSlotFact> { good, hooked });
+            if (all == null || !all.Contains("0x" + FxListed2.ToString("X")))
+                failures.Add("setip calls: the first measured slot fine and the SECOND pointing into another module passed the gate: " + (all ?? "ALLOWED"));
+            var unread = new DebugEngine.RuntimeSlotFact { Slot = FxListed2 };
+            // An unread slot would also fail as "not a mapped module"; the detail must say what really happened.
+            string unreadDetail = DebugEngine.ClaRunVersionGateAll(new List<DebugEngine.RuntimeSlotFact> { good, unread });
+            if (unreadDetail == null || !unreadDetail.Contains("could not be read") || !unreadDetail.Contains("0x" + FxListed2.ToString("X")))
+                failures.Add("setip calls: a measured slot whose live value could not be read was not refused as unreadable, naming the slot: " + (unreadDetail ?? "ALLOWED"));
+            if (DebugEngine.ClaRunVersionGateAll(new List<DebugEngine.RuntimeSlotFact> { good, good }) != null
+                || DebugEngine.ClaRunVersionGateAll(new List<DebugEngine.RuntimeSlotFact>()) != null)
+                failures.Add("setip calls: CONTROL - all slots on the measured runtime (or none used) were refused");
             if (usedSlot(new Fx().Nop().CallSlot(FxListed).Nop()) != FxListed)
                 failures.Add("setip calls: a proof through call [measured slot] did not report the slot it relied on");
             if (usedSlot(new Fx().Nop().CallRel(FxThunkListed).Nop()) != FxListed)
