@@ -1544,7 +1544,9 @@ namespace ClarionDebugger.Terminal
             // engine's varset reply re-issues it (OnSvcVariableSet). A write that never left re-issues it now,
             // because no reply is coming.
             string why = null;
-            if (!_editGrants.TryConsume(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
+            if (_editGrants.IsWritePending(req.Va))
+                why = "a write to this address is still pending — wait for its result, then edit again";
+            else if (!_editGrants.TryConsume(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
                 why = "that value is no longer current (or was never offered for editing) — let it refresh, then edit again";
             else if (!_svc.SetVariable(req.Va, req.TypeCode, req.Size, req.Places, req.Value, req.Tid))
             {

@@ -1392,6 +1392,36 @@ Check 'the frame-locals and expand replies grant their rows as module data does'
   (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
    ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
 
+# ---- one write per address at a time (codex security, pipeline run 2) ---------------------------------
+# The varset reply names only the ADDRESS. With two issued tuples on one va (two type or thread views of it)
+# and both writes in flight, the first reply re-issued the second write's grant before its own reply came.
+# So a second write to an address whose write is pending is refused, and each reply restores exactly one.
+$sp = New-Object ClarionDebugger.Terminal.BridgePad
+$sp._editGrants.Grant('0x4A10F0', '0x03', 4, 0, 4812)          # view A of the address
+$sp._editGrants.Grant('0x4A10F0', '0x12', 4, 0, 4812)          # view B of the SAME address
+$editA = '{"va":"0x4A10F0","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"1"}'
+$editB = '{"va":"0x4A10F0","typeCode":"0x12","size":4,"places":0,"tid":4812,"value":"2"}'
+$sp.EditVar($editA)
+Check 'CONTROL: the first write to the address goes out' ($sp._svc.Sets.Count -eq 1) ($sp._svc.Sets -join ' ; ')
+$sp.Posts.Clear()
+$sp.EditVar($editB)
+Check 'a second write to the same address, under its OWN grant, is refused while the first is pending' `
+  (($sp._svc.Sets.Count -eq 1) -and ($sp.Posts.Count -eq 1) -and ($sp.Posts[0] -cmatch 'still pending')) ($sp.Posts -join ' / ')
+$sp.OnSvcVariableSet('0x4A10F0', $true, '1', $null)          # the engine answers write A
+$sp.EditVar($editB)
+Check 'after the reply, the second write proceeds' (($sp._svc.Sets.Count -eq 2) -and ($sp._svc.Sets[1] -cmatch '\|0x12\|')) ($sp._svc.Sets -join ' ; ')
+# ...and the reply to A restored A ONLY: with B now in flight, A is refused as pending, not written twice.
+$sp.Posts.Clear()
+$sp.EditVar($editA)
+Check 'and A is refused while B is pending: each reply restored exactly its own grant' `
+  (($sp._svc.Sets.Count -eq 2) -and ($sp.Posts[0] -cmatch 'still pending')) ($sp.Posts -join ' / ')
+# The WRITER holds the rule too, not only EditVar: TryConsume itself will not spend a second grant on a
+# pending address.
+$g2 = New-Object ClarionDebugger.Terminal.EditGrants
+$g2.Grant('0x10', '0x03', 4, 0, 5); $g2.Grant('0x10', '0x12', 4, 0, 5)
+$first = $g2.TryConsume('0x10', '0x03', 4, 0, 5)
+Check 'EditGrants.TryConsume refuses a second spend on an address whose write is pending' `
+  ($first -and -not $g2.TryConsume('0x10', '0x12', 4, 0, 5)) "first=$first"
 # ---- expand is issued like edit (afbc68c7, codex security gate) --------------------------------------
 # A forged expand needs no host-issued row: name a known group type at ANY address and the engine renders its
 # members WITH edit metadata. Forwarded unchecked, those replies minted grants, and EditVar trusts grants.
@@ -2081,7 +2111,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 319
+$EXPECTED_CHECKS = 324
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
