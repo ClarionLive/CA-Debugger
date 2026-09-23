@@ -4,7 +4,15 @@ using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
-    /// <summary>Tiny hand-rolled JSON for the engine's machine-readable event output.</summary>
+    /// <summary>Tiny hand-rolled JSON for the engine's machine-readable event output.
+    /// <para>
+    /// NOT HERE: the thread-id writers (TidIsKnown, AppendTidMember, AppendTidValuedMember, WithTid). They
+    /// live in DebugEngine.cs, in the block headed "THE RULE, stated once", and were left there on purpose
+    /// (f367a04f item 3, 2026-09-22) rather than moved beside Str/BpSet/BpDel: the thread emitters in
+    /// DebugEngine.Threads.cs and DebugEngine.ThreadScan.cs call them unqualified as DebugEngine members,
+    /// and tools/test-engine-tid-members.ps1 and tools/test-addin-json.ps1 read the rule out of
+    /// DebugEngine.cs's source by file name. Look there before adding a tid writer here.
+    /// </para></summary>
     internal static class Json
     {
         public static string Str(string s)

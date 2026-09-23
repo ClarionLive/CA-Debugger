@@ -59,7 +59,7 @@ $predicates = @(
   (Get-Method 'private static bool Eq(string a, string b)')
 ) -join "`n"
 # The unload rule (af81c054, pipeline run 1) is an instance method over _bps, so it gets its own shim class.
-$siblingRule = Get-Method 'internal bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)' $mod
+$siblingRule = Get-Method 'private bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)' $mod
 
 $shim = @"
 using System;
@@ -81,7 +81,7 @@ $($predicates -replace 'private static', 'public static')
 
 public sealed class UnloadRule {
     public List<UserBreakpoint> _bps = new List<UserBreakpoint>();
-$($siblingRule -replace 'internal bool', 'public bool')
+$($siblingRule -replace 'private bool', 'public bool')
 }
 "@
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
