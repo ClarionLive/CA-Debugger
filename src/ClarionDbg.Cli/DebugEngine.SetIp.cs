@@ -322,13 +322,24 @@ namespace ClarionDbg.Cli
         /// The observed path does not depend on it.</summary>
         internal const string MeasuredClaRunVersion = "10.0.12799";
 
-        /// <summary>Null when the loaded ClaRUN is the measured one (or none is loaded, so no import of it can
-        /// be on the list anyway), else the stack-unproven detail. PURE.</summary>
-        internal static string ClaRunVersionGate(bool claRunLoaded, string fileVersion)
+        /// <summary>
+        /// The version gate, keyed on WHAT THE PROOF USED (pipeline run 3). PURE. When the proof accepted no
+        /// measured import there is no runtime to vouch for, and it passes. When it did, the module that
+        /// actually SERVES that import - found through the live IAT slot, not by name - must be mapped, have a
+        /// resolved path, a readable version, and exactly the measured one. Every other case is a detail.
+        ///
+        /// It was once keyed on "a module NAMED clarun.dll": a LOAD_DLL whose path did not resolve registers
+        /// the image under a synthetic name, the lookup missed, "no ClaRUN loaded" read as nothing to check,
+        /// and the proof passed on an unverified runtime.
+        /// </summary>
+        internal static string ClaRunVersionGate(bool usedMeasuredImport, bool servingModuleMapped, bool pathResolved, string fileVersion)
         {
-            if (!claRunLoaded) return null;
+            if (!usedMeasuredImport) return null;
+            if (!servingModuleMapped) return "the runtime serving the measured imports is not a mapped module";
+            if (!pathResolved) return "the runtime's path is unresolved, so its version cannot be read";
+            if (string.IsNullOrEmpty(fileVersion)) return "runtime version unreadable";
             if (fileVersion == MeasuredClaRunVersion) return null;
-            return "runtime ClaRUN.dll " + (string.IsNullOrEmpty(fileVersion) ? "(version unreadable)" : fileVersion) + " not measured";
+            return "runtime ClaRUN.dll " + fileVersion + " not measured";
         }
 
         private static readonly HashSet<string> _measuredBalanced = BuildMeasuredSet();
@@ -366,6 +377,18 @@ namespace ClarionDbg.Cli
                                                   Func<uint, bool> isSymbolEntry, Func<uint, uint> thunkSlot,
                                                   IEnumerable<uint> recordVas)
         {
+            uint measuredSlot;
+            return ProveCallsBalanced(code, len, baseAddr, slotName, isSymbolEntry, thunkSlot, recordVas, out measuredSlot);
+        }
+
+        /// <summary><see cref="ProveCallsBalanced(byte[],int,uint,Func{uint,string},Func{uint,bool},Func{uint,uint},IEnumerable{uint})"/>,
+        /// also returning the IAT slot (absolute) of the FIRST measured import the proof relied on, or 0 when it
+        /// relied on none - so the version gate checks the runtime that import really comes from.</summary>
+        internal static string ProveCallsBalanced(byte[] code, int len, uint baseAddr, Func<uint, string> slotName,
+                                                  Func<uint, bool> isSymbolEntry, Func<uint, uint> thunkSlot,
+                                                  IEnumerable<uint> recordVas, out uint measuredSlot)
+        {
+            measuredSlot = 0;
             if (code == null || len <= 0 || len > code.Length) return "no code";
             uint end = baseAddr + (uint)len;
             var reader = new Iced.Intel.ByteArrayCodeReader(code, 0, len);
@@ -434,6 +457,7 @@ namespace ClarionDbg.Cli
                     if (EventLoopImportKind(viaThunk) != 0)
                         return viaThunk + " reached through a thunk" + at + ", not in the modelled ACCEPT shape";
                     if (!IsMeasuredBalancedImport(viaThunk)) return viaThunk + " not measured";
+                    if (measuredSlot == 0) measuredSlot = slot;
                     continue;
                 }
                 if (i.Code == Iced.Intel.Code.Call_rm32 && i.Op0Kind == Iced.Intel.OpKind.Memory
@@ -444,6 +468,7 @@ namespace ClarionDbg.Cli
                     if (name == null) return "a call" + at + " through 0x" + s.ToString("X") + ", which is not an import slot";
                     if (EventLoopImportKind(name) != 0) continue;           // the ACCEPT pair: the region rule decides
                     if (!IsMeasuredBalancedImport(name)) return name + " not measured";
+                    if (measuredSlot == 0) measuredSlot = s;
                     continue;
                 }
                 return "an indirect call" + at + " (" + i.ToString() + ")";
@@ -627,9 +652,10 @@ namespace ClarionDbg.Cli
 
         /// <summary>Does a resume keep the resuming thread's observations? PURE. Only the verbs that
         /// single-step that thread all the way to its next stop.</summary>
-        internal static bool ResumeKeepsObservations(bool stepping, bool instrStep, bool modeSingleStepsToStop)
+        internal static bool ResumeKeepsObservations(bool stepping, bool instrStep, bool modeSingleStepsToStop, bool haveCtx)
         {
-            return stepping && (instrStep || modeSingleStepsToStop);
+            // Without a context TF is never set (ArmResume returns first), so the "step" runs free (run 3).
+            return haveCtx && stepping && (instrStep || modeSingleStepsToStop);
         }
 
         /// <summary>The step modes that single-step the thread to its next stop. Out is not one: it runs on
@@ -657,9 +683,9 @@ namespace ClarionDbg.Cli
         private uint _setIpStepMaxEsp;    // the highest ESP the step's traps saw
 
         /// <summary>THE CHOKE POINT, called as ArmResume's first statement for every resume verb.</summary>
-        private void SetIpOnResume(uint tid, bool stepping, uint esp)
+        private void SetIpOnResume(uint tid, bool stepping, bool haveCtx, uint esp)
         {
-            bool keep = ResumeKeepsObservations(stepping, _instrStep, ModeSingleStepsToStop(_mode));
+            bool keep = ResumeKeepsObservations(stepping, _instrStep, ModeSingleStepsToStop(_mode), haveCtx);
             _setIpObs.OnResume(tid, keep);
             _setIpStepping = keep;
             _setIpStepTid = tid;
@@ -672,6 +698,23 @@ namespace ClarionDbg.Cli
         internal static uint PopLine(bool thisThreadStepped, uint stepMaxEsp, uint currentEsp)
         {
             return thisThreadStepped && stepMaxEsp > currentEsp ? stepMaxEsp : currentEsp;
+        }
+
+        /// <summary>Does passing a first-chance exception to the app end the watched step? PURE. Only for the
+        /// thread whose observations were kept: the app's handler can unwind the frame and clear TF, a later
+        /// silent tracepoint can set TF again, and the stop would then report "step" after a free run.</summary>
+        internal static bool ExceptionPassedEndsWatchedStep(bool stepping, uint stepTid, uint tid)
+        {
+            return stepping && tid == stepTid;
+        }
+
+        /// <summary>The debug loop's EXCEPTION branch, where it returns DBG_EXCEPTION_NOT_HANDLED. Position
+        /// pinned by tools/test-engine-setip-sites.ps1.</summary>
+        private void SetIpOnExceptionPassed(uint tid)
+        {
+            if (!ExceptionPassedEndsWatchedStep(_setIpStepping, _setIpStepTid, tid)) return;
+            _setIpObs.DropThread(tid);
+            _setIpStepping = false;
         }
 
         /// <summary>From StepMachine, at every trap of the stepping thread.</summary>
@@ -1005,15 +1048,26 @@ namespace ClarionDbg.Cli
                 if (ReadCleanBlock(va, t) != 6 || t[0] != 0xFF || t[1] != 0x25) return 0;   // jmp dword ptr [disp32]
                 return BitConverter.ToUInt32(t, 2);
             };
-            f.StackError = ProveCallsBalanced(buf, got, loadBase + f.StopEntryRva, slotName, entries.Contains, thunkSlot, records);
+            uint measuredSlot;
+            f.StackError = ProveCallsBalanced(buf, got, loadBase + f.StopEntryRva, slotName, entries.Contains, thunkSlot, records, out measuredSlot);
             if (f.StackError == null)
             {
-                // The measured list is only a proof for the ClaRUN it was measured on.
+                // The measured list is only a proof for the ClaRUN it was measured on - and "the ClaRUN" is the
+                // module that SERVES the import the proof used: the live IAT slot's target, whatever the image
+                // was registered as. Mapped only (LoadBase != 0), the same filter ModuleByName applies.
                 LoadedModule rt = null;
-                foreach (var lm in _modules) if (string.Equals(lm.Name, "clarun.dll", StringComparison.OrdinalIgnoreCase)) { rt = lm; break; }
+                if (measuredSlot != 0)
+                {
+                    var p = new byte[4];
+                    if (ReadBlock(measuredSlot, p) == 4)
+                    {
+                        rt = ModuleAt(BitConverter.ToUInt32(p, 0));
+                        if (rt != null && rt.LoadBase == 0) rt = null;
+                    }
+                }
                 string ver = null;
-                try { if (rt != null && rt.Path != null) ver = System.Diagnostics.FileVersionInfo.GetVersionInfo(rt.Path).FileVersion; } catch { }
-                f.StackError = ClaRunVersionGate(rt != null, ver);
+                try { if (rt != null && !string.IsNullOrEmpty(rt.Path)) ver = System.Diagnostics.FileVersionInfo.GetVersionInfo(rt.Path).FileVersion; } catch { }
+                f.StackError = ClaRunVersionGate(measuredSlot != 0, rt != null, rt != null && !string.IsNullOrEmpty(rt.Path), ver);
             }
         }
 

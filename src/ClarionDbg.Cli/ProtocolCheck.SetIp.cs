@@ -261,6 +261,24 @@ namespace ClarionDbg.Cli
             uint lo = accept.Here; accept.Nop(2).CallSlot(FxEnd).CmpAl0().Je32(lo).Nop();
             expect("the modelled ACCEPT pair through call [slot]", accept, true, null);
 
+            // WHAT THE PROOF USED, for the version gate (pipeline run 3): the slot of the first measured import it
+            // relied on, directly or through a thunk, and 0 when it relied on none - so a proof that used ClaRUN
+            // cannot pass the gate by finding no module NAMED clarun.dll.
+            Func<Fx, uint> usedSlot = f2 =>
+            {
+                var b2 = f2.Bytes; uint slot2;
+                DebugEngine.ProveCallsBalanced(b2, b2.Length, FxBase, FxSlotNameWithListed, FxIsEntry, FxThunk, null, out slot2);
+                return slot2;
+            };
+            if (usedSlot(new Fx().Nop().CallSlot(FxListed).Nop()) != FxListed)
+                failures.Add("setip calls: a proof through call [measured slot] did not report the slot it relied on");
+            if (usedSlot(new Fx().Nop().CallRel(FxThunkListed).Nop()) != FxListed)
+                failures.Add("setip calls: a proof through the thunk of a measured import did not report that import's slot");
+            if (usedSlot(new Fx().Nop().CallRel(FxProcEntry).Nop()) != 0 || usedSlot(new Fx().Nop(3)) != 0)
+                failures.Add("setip calls: a proof that relied on no measured import reported a slot");
+            if (usedSlot(accept) != 0)
+                failures.Add("setip calls: the ACCEPT pair was reported as a measured import (it is the modelled pair)");
+
             expect("an E8 call to unnamed in-image code (a locally-linked runtime)", new Fx().Nop().CallRel(FxUnnamed).Nop(), false, "neither a procedure nor an import");
             expect("a call [slot] to an unmeasured import", new Fx().Nop().CallSlot(FxOther).Nop(), false, "ClaRUN.dll!_malloc not measured");
             expect("an E8 call through a thunk to an unmeasured import", new Fx().Nop().CallRel(FxThunkOther).Nop(), false, "ClaRUN.dll!_malloc not measured");
@@ -429,18 +447,29 @@ namespace ClarionDbg.Cli
                           f.ObservedMatch = true; f.StackError = "x not measured"; }, "via:observed");
 
             // NO OBSERVATION SURVIVES A FREE RUN (pipeline run 2). The resume rule, the stop rule, and the store.
-            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Over")))
+            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Over"), true))
                 failures.Add("setip observed: a step-over resume dropped the thread's observations");
-            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Into")))
+            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Into"), true))
                 failures.Add("setip observed: a step-into resume dropped the thread's observations");
-            if (!DebugEngine.ResumeKeepsObservations(true, true, DebugEngine.ModeSingleStepsToStopForTest("None")))
+            if (!DebugEngine.ResumeKeepsObservations(true, true, DebugEngine.ModeSingleStepsToStopForTest("None"), true))
                 failures.Add("setip observed: a stepi resume dropped the thread's observations");
-            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("OverInstr")))
+            if (!DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("OverInstr"), true))
                 failures.Add("setip observed: a nexti resume dropped the thread's observations");
-            if (DebugEngine.ResumeKeepsObservations(false, false, DebugEngine.ModeSingleStepsToStopForTest("None")))
+            if (DebugEngine.ResumeKeepsObservations(false, false, DebugEngine.ModeSingleStepsToStopForTest("None"), true))
                 failures.Add("setip observed: a CONTINUE (free run) kept the thread's observations");
-            if (DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Out")))
+            if (DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Out"), true))
                 failures.Add("setip observed: a STEP-OUT (runs on through the return) kept the thread's observations");
+            // Without a context TF is never set, so a "step" verb runs free (pipeline run 3): nothing is kept.
+            if (DebugEngine.ResumeKeepsObservations(true, false, DebugEngine.ModeSingleStepsToStopForTest("Over"), false))
+                failures.Add("setip observed: a step-over with NO thread context kept the observations - TF was never set, so it ran free");
+            // A first-chance exception passed to the app while the kept thread steps: its handler can unwind
+            // the frame and clear TF, so the watched step is over. Only for that thread.
+            if (!DebugEngine.ExceptionPassedEndsWatchedStep(true, 100, 100))
+                failures.Add("setip observed: an exception passed to the app during the watched step did not end it");
+            if (DebugEngine.ExceptionPassedEndsWatchedStep(true, 100, 200))
+                failures.Add("setip observed: another thread's exception ended the stepping thread's watched step");
+            if (DebugEngine.ExceptionPassedEndsWatchedStep(false, 100, 100))
+                failures.Add("setip observed: an exception with no watched step in progress was treated as ending one");
             foreach (var r in new[] { "breakpoint", "pause", "step-limit", "stepi-limit", "" })
                 if (DebugEngine.StopKeepsObservations(r)) failures.Add("setip observed: a stop with reason '" + r + "' (the end of a free run) kept the observations");
             foreach (var r in new[] { "step", "stepi", "setip" })
@@ -466,16 +495,23 @@ namespace ClarionDbg.Cli
             if (DebugEngine.PopLine(false, k.Ebp + 8, esp) != esp)
                 failures.Add("setip observed: a stop that was not this thread's watched step pruned by a stale step maximum");
 
-            // The runtime-version gate on the PROOF path.
-            if (DebugEngine.ClaRunVersionGate(true, DebugEngine.MeasuredClaRunVersion) != null)
+            // The runtime-version gate on the PROOF path, keyed on WHAT THE PROOF USED (pipeline run 3): the
+            // module that serves a measured import must be mapped, resolved, readable and the measured version.
+            if (DebugEngine.ClaRunVersionGate(true, true, true, DebugEngine.MeasuredClaRunVersion) != null)
                 failures.Add("setip observed: the measured ClaRUN version was gated");
-            string gate = DebugEngine.ClaRunVersionGate(true, "11.1.13505");
+            string gate = DebugEngine.ClaRunVersionGate(true, true, true, "11.1.13505");
             if (gate == null || !gate.Contains("11.1.13505 not measured"))
                 failures.Add("setip observed: another ClaRUN version passed the proof path's gate: " + (gate ?? "ALLOWED"));
-            if (DebugEngine.ClaRunVersionGate(true, null) == null)
+            if (DebugEngine.ClaRunVersionGate(true, true, true, null) == null)
                 failures.Add("setip observed: an unreadable ClaRUN version passed the gate");
-            if (DebugEngine.ClaRunVersionGate(false, null) != null)
-                failures.Add("setip observed: with no ClaRUN loaded the gate refused (the call proof decides then)");
+            // The run-3 fail-open: the proof used ClaRUN imports, but no mapped module serves them under that
+            // name (an unresolved LOAD_DLL registers under a synthetic one). That is NOT "nothing to check".
+            if (DebugEngine.ClaRunVersionGate(true, false, false, null) == null)
+                failures.Add("setip observed: the proof used a measured import but no mapped module serves it, and the gate passed");
+            if (DebugEngine.ClaRunVersionGate(true, true, false, null) == null)
+                failures.Add("setip observed: the serving module's path is unresolved, and the gate passed");
+            if (DebugEngine.ClaRunVersionGate(false, false, false, null) != null)
+                failures.Add("setip observed: a proof that used NO measured import was gated (there is no runtime to vouch for)");
             expect("observed, but another thread selected", f => { f.ObservedMatch = true; f.SelectedTid = 200; }, "refused:other-thread");
             expect("observed, but the stop is mid-statement", f => { f.ObservedMatch = true; f.Gap = 3; }, "refused:not-on-statement");
             expect("observed, but the target is another symbol", f => { f.ObservedMatch = true; f.TargetEntryRva = 0x752FC; }, "refused:other-proc");
