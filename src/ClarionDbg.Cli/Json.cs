@@ -68,9 +68,13 @@ namespace ClarionDbg.Cli
             return sb.ToString();
         }
 
-        /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module.</summary>
+        /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module, and for a
+        /// procedure or method with a known extent, its last source line (<c>endLine</c>, 6fa242ae). An
+        /// unknown extent OMITS the member rather than writing 0; see <see cref="ProcExtents"/> for what
+        /// unknown means and why routines never carry one.</summary>
         public static string Symbols(List<ProcSymbol> syms, TswdDebugInfo dbg)
         {
+            var extents = new ProcExtents(dbg);   // indexed from dbg's WHOLE table, not the (maybe filtered) syms
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"symbols\",\"count\":").Append(syms.Count).Append(",\"symbols\":[");
             for (int i = 0; i < syms.Count; i++)
@@ -84,8 +88,10 @@ namespace ClarionDbg.Cli
                   .Append(",\"raw\":").Append(Str(s.RawName))
                   .Append(",\"kind\":").Append(Str(s.Kind.ToString().ToLowerInvariant()))
                   .Append(",\"rva\":\"0x").Append(s.EntryRva.ToString("X")).Append('"')
-                  .Append(",\"line\":").Append(line)
-                  .Append(",\"moduleIdx\":").Append(s.ModuleIdx)
+                  .Append(",\"line\":").Append(line);
+                int endLine = extents.EndLine(s);
+                if (endLine > 0) sb.Append(",\"endLine\":").Append(endLine);
+                sb.Append(",\"moduleIdx\":").Append(s.ModuleIdx)
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append('}');
             }

@@ -76,6 +76,7 @@ namespace ClarionDbg.Cli
                 CheckRefusalsNeverShowARawTid,
                 CheckFieldNameResolvesToFileRecord,
                 CheckStepAnchorBelongsToSteppingThread,
+                CheckSymbolsEndLine,
                 CheckTemplateSpanDiscriminator,
                 CheckFileRecordShape,
                 CheckDataNameIndexFromParsedBlob,
