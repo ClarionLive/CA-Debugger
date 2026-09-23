@@ -342,6 +342,33 @@ namespace ClarionDbg.Cli
             return "runtime ClaRUN.dll " + fileVersion + " not measured";
         }
 
+        /// <summary>What one measured IAT slot the proof used resolves to, live.</summary>
+        internal struct RuntimeSlotFact
+        {
+            public uint Slot;            // absolute IAT slot address
+            public bool Read;            // the slot's live value was read
+            public bool Mapped;          // ...and lands in a mapped module
+            public bool PathResolved;
+            public string Version;
+        }
+
+        /// <summary>The gate over EVERY distinct measured slot the proof used (pipeline run 3, second pass):
+        /// each one's live target must be a mapped module with a resolved path and the measured version. An app
+        /// that hooks its own IAT can point a LATER slot somewhere else, so checking only the first is not
+        /// enough. Null when all pass (or there are none), else a detail naming the slot. PURE.</summary>
+        internal static string ClaRunVersionGateAll(IList<RuntimeSlotFact> slots)
+        {
+            if (slots == null) return null;
+            foreach (var f in slots)
+            {
+                string at = " (IAT slot 0x" + f.Slot.ToString("X") + ")";
+                if (!f.Read) return "the live value of a measured import's slot could not be read" + at;
+                string d = ClaRunVersionGate(true, f.Mapped, f.PathResolved, f.Version);
+                if (d != null) return d + at;
+            }
+            return null;
+        }
+
         private static readonly HashSet<string> _measuredBalanced = BuildMeasuredSet();
         private static HashSet<string> BuildMeasuredSet()
         {
@@ -377,18 +404,19 @@ namespace ClarionDbg.Cli
                                                   Func<uint, bool> isSymbolEntry, Func<uint, uint> thunkSlot,
                                                   IEnumerable<uint> recordVas)
         {
-            uint measuredSlot;
-            return ProveCallsBalanced(code, len, baseAddr, slotName, isSymbolEntry, thunkSlot, recordVas, out measuredSlot);
+            List<uint> measuredSlots;
+            return ProveCallsBalanced(code, len, baseAddr, slotName, isSymbolEntry, thunkSlot, recordVas, out measuredSlots);
         }
 
         /// <summary><see cref="ProveCallsBalanced(byte[],int,uint,Func{uint,string},Func{uint,bool},Func{uint,uint},IEnumerable{uint})"/>,
-        /// also returning the IAT slot (absolute) of the FIRST measured import the proof relied on, or 0 when it
-        /// relied on none - so the version gate checks the runtime that import really comes from.</summary>
+        /// also returning the DISTINCT IAT slots (absolute) of every measured import the proof relied on, in
+        /// first-use order, empty when it relied on none - so the version gate checks the runtime each one
+        /// really comes from.</summary>
         internal static string ProveCallsBalanced(byte[] code, int len, uint baseAddr, Func<uint, string> slotName,
                                                   Func<uint, bool> isSymbolEntry, Func<uint, uint> thunkSlot,
-                                                  IEnumerable<uint> recordVas, out uint measuredSlot)
+                                                  IEnumerable<uint> recordVas, out List<uint> measuredSlots)
         {
-            measuredSlot = 0;
+            measuredSlots = new List<uint>();
             if (code == null || len <= 0 || len > code.Length) return "no code";
             uint end = baseAddr + (uint)len;
             var reader = new Iced.Intel.ByteArrayCodeReader(code, 0, len);
@@ -457,7 +485,7 @@ namespace ClarionDbg.Cli
                     if (EventLoopImportKind(viaThunk) != 0)
                         return viaThunk + " reached through a thunk" + at + ", not in the modelled ACCEPT shape";
                     if (!IsMeasuredBalancedImport(viaThunk)) return viaThunk + " not measured";
-                    if (measuredSlot == 0) measuredSlot = slot;
+                    if (!measuredSlots.Contains(slot)) measuredSlots.Add(slot);
                     continue;
                 }
                 if (i.Code == Iced.Intel.Code.Call_rm32 && i.Op0Kind == Iced.Intel.OpKind.Memory
@@ -468,7 +496,7 @@ namespace ClarionDbg.Cli
                     if (name == null) return "a call" + at + " through 0x" + s.ToString("X") + ", which is not an import slot";
                     if (EventLoopImportKind(name) != 0) continue;           // the ACCEPT pair: the region rule decides
                     if (!IsMeasuredBalancedImport(name)) return name + " not measured";
-                    if (measuredSlot == 0) measuredSlot = s;
+                    if (!measuredSlots.Contains(s)) measuredSlots.Add(s);
                     continue;
                 }
                 return "an indirect call" + at + " (" + i.ToString() + ")";
@@ -1048,26 +1076,29 @@ namespace ClarionDbg.Cli
                 if (ReadCleanBlock(va, t) != 6 || t[0] != 0xFF || t[1] != 0x25) return 0;   // jmp dword ptr [disp32]
                 return BitConverter.ToUInt32(t, 2);
             };
-            uint measuredSlot;
-            f.StackError = ProveCallsBalanced(buf, got, loadBase + f.StopEntryRva, slotName, entries.Contains, thunkSlot, records, out measuredSlot);
+            List<uint> measuredSlots;
+            f.StackError = ProveCallsBalanced(buf, got, loadBase + f.StopEntryRva, slotName, entries.Contains, thunkSlot, records, out measuredSlots);
             if (f.StackError == null)
             {
                 // The measured list is only a proof for the ClaRUN it was measured on - and "the ClaRUN" is the
-                // module that SERVES the import the proof used: the live IAT slot's target, whatever the image
+                // module that SERVES each import the proof used, every one of them: the live IAT slot's target, whatever the image
                 // was registered as. Mapped only (LoadBase != 0), the same filter ModuleByName applies.
-                LoadedModule rt = null;
-                if (measuredSlot != 0)
+                var facts = new List<RuntimeSlotFact>();
+                foreach (uint slot in measuredSlots)
                 {
+                    var fact = new RuntimeSlotFact { Slot = slot };
                     var p = new byte[4];
-                    if (ReadBlock(measuredSlot, p) == 4)
+                    if (ReadBlock(slot, p) == 4)
                     {
-                        rt = ModuleAt(BitConverter.ToUInt32(p, 0));
-                        if (rt != null && rt.LoadBase == 0) rt = null;
+                        fact.Read = true;
+                        var rt = ModuleAt(BitConverter.ToUInt32(p, 0));
+                        fact.Mapped = rt != null && rt.LoadBase != 0;
+                        fact.PathResolved = fact.Mapped && !string.IsNullOrEmpty(rt.Path);
+                        try { if (fact.PathResolved) fact.Version = System.Diagnostics.FileVersionInfo.GetVersionInfo(rt.Path).FileVersion; } catch { }
                     }
+                    facts.Add(fact);
                 }
-                string ver = null;
-                try { if (rt != null && !string.IsNullOrEmpty(rt.Path)) ver = System.Diagnostics.FileVersionInfo.GetVersionInfo(rt.Path).FileVersion; } catch { }
-                f.StackError = ClaRunVersionGate(measuredSlot != 0, rt != null, rt != null && !string.IsNullOrEmpty(rt.Path), ver);
+                f.StackError = ClaRunVersionGateAll(facts);
             }
         }
 
