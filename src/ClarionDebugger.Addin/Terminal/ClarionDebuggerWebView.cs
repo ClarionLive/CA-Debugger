@@ -614,7 +614,7 @@ namespace ClarionDebugger.Terminal
                             if (fl != null) _svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp);
                         }
                         break;
-                    case "mem":   // Memory panel read: data = "reqId|0xADDR|len"
+                    case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
                         if (_svc.State == DebugSessionState.Paused)
                         {
                             var mr = MemRequest.Parse(data);

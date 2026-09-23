@@ -758,16 +758,23 @@ namespace ClarionDebugger.Services
         /// <para>
         /// SECURITY. This is the one request that takes an address the page chose freely: the address box, and
         /// "View memory" on any row. That freedom is the feature, so there is no table of issued addresses as
-        /// there is for edits and expands. What bounds it:
-        ///  * READ-ONLY. `mem` has no write path. A row's `addr` is a different member from the `va` the edit
-        ///    grants key on (EditGrants), so nothing read here can turn into a write.
-        ///  * CAPPED at 4096 bytes a request, checked here and again by the engine.
-        ///  * PAUSED-ONLY. The pad forwards it only while Paused, and the engine refuses it while running.
-        ///  * VALIDATED here: ^0x[0-9A-Fa-f]{1,8}$ and an integer len, so the page cannot add a word or a
-        ///    second command to the engine's space-separated stdin.
-        /// The user can already read the debuggee's memory: they launched it under a debugger, and every
-        /// panel shows its data. What changes is what the page can be shown, not what anyone can do to the
-        /// target.
+        /// there is for edits and expands.
+        /// </para>
+        /// <para>
+        /// TRUST MODEL (Owner's decision, 2026-09-23, after the codex security gate raised "the page can drive
+        /// arbitrary mem reads" as a MEDIUM): our own packaged debugger.html is TRUSTED for memory reads. Typing
+        /// an address is the feature, and the user is debugging their own process.
+        ///  * WHO CAN ASK. OnWebMessage drops every message whose source is not our packaged page
+        ///    (IsExpectedSource, ClarionDebuggerWebView.cs), so the only in-page attacker left is an XSS in
+        ///    debugger.html itself.
+        ///  * WHAT THEY GET. READ-ONLY: `mem` has no write path, and a row's `addr` is a different member from
+        ///    the `va` the edit grants key on (EditGrants), so nothing read here can turn into a write.
+        ///    PAUSED-ONLY: the pad forwards it only while Paused, and the engine refuses it while running.
+        ///    CAPPED at 4096 bytes a request, here and again in the engine. VALIDATED here as
+        ///    ^0x[0-9A-Fa-f]{1,8}$ plus an integer len, so nothing can add a word or a second command to the
+        ///    engine's space-separated stdin.
+        ///  * RESIDUAL RISK: an XSS in debugger.html could read the paused debuggee's memory, 4 KB at a time.
+        ///    That is tracked on the XSS audit ticket e1dea0d9, not closed here.
         /// </para></summary>
         public bool RequestMem(int reqId, string addrHex, int len)
         {
