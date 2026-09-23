@@ -73,20 +73,21 @@ function Get-TopLevelVerdict {
   return $null
 }
 
-# 3. (pipeline run 3) Run's EXCEPTION branch hands a first-chance exception back to the app with
+# 3. (pipeline run 3) The debug loop's EXCEPTION branch hands a first-chance exception back to the app with
 #    `status = Native.DBG_EXCEPTION_NOT_HANDLED;` - the app's handler can unwind a watched step - and the VERY
-#    NEXT statement must be SetIpOnExceptionPassed(tid);. The assignment must occur exactly once in Run, so a
+#    NEXT statement must be SetIpOnExceptionPassed(tid);. The assignment must occur exactly once in the loop, so a
 #    second hand-back cannot appear without this check noticing.
-$script:RunSig = 'public int Run('
+# The loop moved out of Run into DebugLoop on 2026-09-23 (3f2d747f, so protocolcheck can drive the real loop).
+$script:RunSig = 'private void DebugLoop('
 $script:PassStmt = 'status = Native.DBG_EXCEPTION_NOT_HANDLED;'
 $script:PassCall = 'SetIpOnExceptionPassed(tid);'
 function Get-ExceptionPassVerdict {
   param([string] $Src)
   $block = Get-CSharpBlock $script:RunSig $Src
-  if ($null -eq $block) { return 'Run not found' }
+  if ($null -eq $block) { return 'DebugLoop not found' }
   $code = Get-CSharpCodeOnly $block
   $n = ([regex]::Matches($code, [regex]::Escape($script:PassStmt))).Count
-  if ($n -ne 1) { return "Run hands an exception back $n time(s); expected exactly 1" }
+  if ($n -ne 1) { return "DebugLoop hands an exception back $n time(s); expected exactly 1" }
   $at = $code.IndexOf($script:PassStmt, [StringComparison]::Ordinal) + $script:PassStmt.Length
   $after = $code.Substring($at).TrimStart()
   if ($after.StartsWith($script:PassCall, [StringComparison]::Ordinal)) { return $null }
@@ -108,7 +109,7 @@ Invoke-CheckSection 'every trap of a step records its ESP' {
 
 Invoke-CheckSection 'an exception handed back to the app ends a watched step' {
   $r = Get-ExceptionPassVerdict $engineSrc
-  Check "Run's DBG_EXCEPTION_NOT_HANDLED is followed at once by $($script:PassCall)" ($null -eq $r) $r
+  Check "DebugLoop's DBG_EXCEPTION_NOT_HANDLED is followed at once by $($script:PassCall)" ($null -eq $r) $r
 }
 
 if ($SelfTest) {

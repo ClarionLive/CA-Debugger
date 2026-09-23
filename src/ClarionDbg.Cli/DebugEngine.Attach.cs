@@ -413,6 +413,39 @@ namespace ClarionDbg.Cli
             return json;
         }
 
+        private sealed class EventSourceExhausted : Exception { }
+
+        /// <summary>Run the REAL debug loop against an event source that NEVER goes quiet - every wait returns an
+        /// OUTPUT_DEBUG_STRING at once, as an app spamming OutputDebugString does - with <paramref name="command"/>
+        /// already queued. Returns how many events the loop took before it acted on the command and left, or -1
+        /// when it was still running after <paramref name="maxEvents"/> (the command was starved). Needs an
+        /// interactive engine with no target.</summary>
+        internal int DebugLoopStarvationForTest(string command, int maxEvents)
+        {
+            RefuseSeamIfAttached("DebugLoopStarvationForTest");
+            if (!_interactive) throw new InvalidOperationException("DebugLoopStarvationForTest: needs an interactive engine");
+            int served = 0;
+            _loopWait = (buf, ms) =>
+            {
+                if (served >= maxEvents) throw new EventSourceExhausted();
+                Array.Clear(buf, 0, buf.Length);
+                BitConverter.GetBytes(Native.OUTPUT_DEBUG_STRING_EVENT).CopyTo(buf, 0);
+                served++;
+                return true;
+            };
+            _loopContinue = (p, t, s) => true;
+            _detachWait = (buf, ms) => false;           // nothing queued behind the held event
+            _detachContinue = (p, t, s) => true;
+            _cmds.Enqueue(command);
+            try { DebugLoop(); return served; }
+            catch (EventSourceExhausted) { return -1; }
+            finally
+            {
+                _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent;
+                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
+            }
+        }
+
         /// <summary>A DEBUG_EVENT buffer for the drain seam: an exception (code, address) on <paramref name="tid"/>,
         /// or, with <paramref name="exCode"/> 0, a bare event of <paramref name="eventCode"/>.</summary>
         internal static byte[] DebugEventForTest(uint eventCode, uint tid, uint exCode, uint exAddr)

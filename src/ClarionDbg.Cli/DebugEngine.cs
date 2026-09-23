@@ -611,6 +611,18 @@ namespace ClarionDbg.Cli
                 Native.CloseHandle(pi.hProcess);
             }
 
+            DebugLoop();
+            return Hits;
+        }
+
+        // The loop's wait and continue, as delegates so protocolcheck can run the REAL loop against an event
+        // source that never goes quiet (CheckCommandsNeverStarved). In a session they are the Win32 functions.
+        private Func<byte[], uint, bool> _loopWait = Native.WaitForDebugEvent;
+        private Func<uint, uint, uint, bool> _loopContinue = Native.ContinueDebugEvent;
+
+        /// <summary>The debug loop, from the first event to the target's exit or a detach.</summary>
+        private void DebugLoop()
+        {
             var buf = new byte[1024];
             bool running = true;
             uint pollMs = _interactive ? 200u : (uint)_waitMs;
@@ -618,15 +630,17 @@ namespace ClarionDbg.Cli
             {
                 // Every pass, not only the timeout branch: a stream of debug events never reaches that branch,
                 // and its 200 ms is coarser than the hover's 150. PollHover throttles itself by timestamp.
-                if (_interactive) PollHover(false);
-                if (!Native.WaitForDebugEvent(buf, pollMs))
+                //
+                // The COMMANDS too, for the same reason and with more at stake (3f2d747f, 4b run 1): an app that
+                // raises events with no 200 ms gap - OutputDebugString spam, a thread storm, the attach burst -
+                // left `detach` and `quit` unread, the host gave up after 8 s and killed the app with our bytes
+                // still planted. Here no event is held (the previous one was continued at the bottom of the last
+                // pass), so this is the same state the timeout branch ran in; a detach it accepts takes effect at
+                // the next event's arrival check. Unthrottled: with nothing queued it is one TryDequeue.
+                if (_interactive) { PollHover(false); DrainCommandsWhileRunning(); }
+                if (!_loopWait(buf, pollMs))
                 {
-                    if (_interactive)
-                    {
-                        // no event — service any commands that arrived while the target runs
-                        DrainCommandsWhileRunning();
-                        continue;
-                    }
+                    if (_interactive) continue;   // no event: the commands were serviced at the top of the pass
                     Console.WriteLine("(timeout waiting for debug event — terminating target)");
                     Native.TerminateProcess(_hProcess, 0);
                     // drain until exit
@@ -753,10 +767,8 @@ namespace ClarionDbg.Cli
                 if (running && _detachPending) { DetachAt(buf, status); break; }
 
                 if (running)
-                    Native.ContinueDebugEvent(pid, tid, status);
+                    _loopContinue(pid, tid, status);
             }
-
-            return Hits;
         }
 
         // ------------------------------------------------------------------ programmatic breakpoint
