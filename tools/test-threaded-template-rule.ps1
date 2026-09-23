@@ -11,6 +11,8 @@
 #          against CwtlsLo/CwtlsHi; that each of the four callers takes its answer from ONE
 #          ClassifyTemplateSpan call and never reassigns it; and that each names the Straddling case, so
 #          it made its own decision about it.
+#          Also: the live THREADed resolver takes its verdict from ClassifyEmulatedInstance, the method
+#          protocolcheck's CheckEmulationFaultBranches drives on injected emulations (38b75897).
 #   CANNOT - that a caller does the RIGHT thing with a straddling symbol, or that the rule itself is right.
 #          The rule is asserted by `ClarionDbg protocolcheck` (CheckTemplateSpanDiscriminator); what each
 #          caller renders needs a live debuggee with a symbol crossing CwtlsLo, which nothing here has.
@@ -109,6 +111,24 @@ foreach ($c in $callers) {
   $assigns = [regex]::Matches($code, '\bspan\s*=(?!=)').Count
   Check "$($c.File): one ClassifyTemplateSpan call, assigned once" (($calls -eq 1) -and ($assigns -eq 1)) "calls=$calls assignments=$assigns"
   Check "$($c.File): names TemplateSpan.Straddling" ($code -match '\bTemplateSpan\.Straddling\b') ''
+}
+
+Write-Host ''
+Write-Host 'the live THREADed resolver uses the emulation verdict protocolcheck drives (38b75897)'
+# protocolcheck's CheckEmulationFaultBranches runs ClassifyEmulatedInstance on injected emulations. That proves
+# nothing about the live path unless TryResolveThreadedInstance reaches its verdict through the same method,
+# rather than through a re-inlined copy that the harness never sees.
+$watch = Get-Content -Raw -LiteralPath (Join-Path $EngineDir 'DebugEngine.Watch.cs')
+$live = Get-CSharpBlock 'private ThreadedResolve TryResolveThreadedInstance(' $watch
+Check 'TryResolveThreadedInstance exists' ($null -ne $live) ''
+if ($null -ne $live) {
+  $liveCode = Get-CSharpCodeOnly $live
+  $verdicts = [regex]::Matches($liveCode, '\bvar verdict = ClassifyEmulatedInstance\(').Count
+  $calls = [regex]::Matches($liveCode, '\bemu\.Call\(').Count
+  Check 'it takes ONE verdict from ClassifyEmulatedInstance and runs no emulation of its own' `
+    (($verdicts -eq 1) -and ($calls -eq 0)) "verdicts=$verdicts emu.Call=$calls"
+  Check 'and returns every verdict but Ok straight away' `
+    ($liveCode -match 'if \(verdict != ThreadedResolve\.Ok\) return verdict;') ''
 }
 
 Write-Host ''
