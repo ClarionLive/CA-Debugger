@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
 {
@@ -193,6 +194,73 @@ namespace ClarionDbg.Cli
                 failures.Add("emulation faults: a run that threw without writing was " + failed.Verdict + ", expected Failed");
             else if (failed.Reason == null || failed.Reason.IndexOf("not emulatable", StringComparison.Ordinal) < 0)
                 failures.Add("emulation faults: a refused emulation failed without saying why: " + (failed.Reason ?? "(no reason)"));
+        }
+
+        /// <summary>
+        /// The emulator's import map is cached PER IMAGE, and per MAPPING of it (9b073cf9). BuildEmulator runs
+        /// on every breakpoint hit that reads a THREADed name; the map is the part of it that cannot change
+        /// while an image stays mapped at one base. The one way it CAN go stale is the one asserted here: a
+        /// pre-loaded solution DLL keeps its LoadedModule across an unload and a reload at a different base.
+        ///
+        /// Drives EmulatorImportsForTest over this very executable's PE (it imports mscoree!_CorExeMain), so
+        /// the map is built by the shipped BuildIatNameMap from a real import table.
+        ///
+        /// NOT COVERED: that an instance base is re-resolved after a resume. That is the per-hit clear in
+        /// ShouldPauseAtBp, which this cache does not touch; tools/test-threaded-template-rule.ps1 pins it as
+        /// the method's FIRST statement. A black-box run cannot show it, because in the targets available
+        /// (2026-09-22) a thread's block never moves while the thread lives.
+        /// </summary>
+        private static void CheckEmulatorImportsPerImage(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("the emulator's import map is built once per image mapping: rebased to the image's load "
+                         + "base with bare function names, handed back unchanged on the next hit, rebuilt at the NEW "
+                         + "base when the same module reloads elsewhere, and kept apart per module. Not covered: "
+                         + "re-resolution of a thread's instance base after a resume.");
+
+            var pe = PeImage.Load(typeof(DebugEngine).Assembly.Location);
+            var iat = pe.BuildIatNameMap();
+            if (iat.Count == 0)
+            {
+                failures.Add("emulator imports control: this executable's PE yielded no named imports, so nothing below is tested");
+                return;
+            }
+            var eng = NewEngine();
+            var m = new LoadedModule { Name = "clarun.dll", LoadBase = 0x10000000, Size = 0x200000, Pe = pe };
+
+            Func<Dictionary<uint, string>, uint, string> wrongAt = (map, loadBase) =>
+            {
+                if (map.Count != iat.Count) return map.Count + " entries, expected " + iat.Count;
+                foreach (var kv in iat)
+                {
+                    string got;
+                    if (!map.TryGetValue(loadBase + kv.Key, out got)) return "no entry at 0x" + (loadBase + kv.Key).ToString("X");
+                    if (got.IndexOf('!') >= 0 || !kv.Value.EndsWith("!" + got, StringComparison.Ordinal) && kv.Value != got)
+                        return "slot 0x" + (loadBase + kv.Key).ToString("X") + " named " + got + " for " + kv.Value;
+                }
+                return null;
+            };
+
+            var first = eng.EmulatorImportsForTest(m);
+            string why = wrongAt(first, 0x10000000);
+            if (why != null) failures.Add("emulator imports: the map at base 0x10000000 is wrong - " + why);
+            if (!first.ContainsValue("_CorExeMain"))
+                failures.Add("emulator imports: _CorExeMain, this executable's own import, is not in the map");
+            if (!ReferenceEquals(eng.EmulatorImportsForTest(m), first))
+                failures.Add("emulator imports: the second hit on the same mapping rebuilt the map - nothing is cached");
+
+            // Unload, then reload at a different base: the SAME LoadedModule object, as Modules.cs reuses a
+            // pre-loaded solution DLL's entry.
+            m.LoadBase = 0;
+            m.LoadBase = 0x20000000;
+            var moved = eng.EmulatorImportsForTest(m);
+            why = wrongAt(moved, 0x20000000);
+            if (ReferenceEquals(moved, first) || why != null)
+                failures.Add("emulator imports: after the module reloaded at 0x20000000 the map still answers for the OLD "
+                             + "mapping - " + (why ?? "the very same cached map came back"));
+
+            var other = new LoadedModule { Name = "other.dll", LoadBase = 0x10000000, Size = 0x200000, Pe = pe };
+            if (ReferenceEquals(eng.EmulatorImportsForTest(other), moved))
+                failures.Add("emulator imports: two modules were handed one map");
         }
 
         /// <summary>One injected emulation's outcome, for <see cref="CheckEmulationFaultBranches"/>.</summary>

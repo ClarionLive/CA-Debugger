@@ -132,6 +132,30 @@ if ($null -ne $live) {
 }
 
 Write-Host ''
+Write-Host 'per-hit caching keeps the per-hit clear and the per-episode stack window (9b073cf9)'
+# BuildEmulator's import map is cached per image. What must NOT be cached: a thread's instance block (the
+# .cwtls block cache is cleared at the single entrance to a hit, so a condition never reads a base from
+# before the resume), and the modeled-stack window (free address space changes while the target runs).
+# POSITION, not presence: a clear moved below the condition would still be in the method.
+$bpAdv = Get-Content -Raw -LiteralPath (Join-Path $EngineDir 'DebugEngine.BpAdvanced.cs')
+$gate = Get-CSharpBlock 'private bool ShouldPauseAtBp(' $bpAdv
+Check 'ShouldPauseAtBp exists' ($null -ne $gate) ''
+if ($null -ne $gate) {
+  $gateCode = Get-CSharpCodeOnly $gate
+  $body = $gateCode.Substring($gateCode.IndexOf('{') + 1).TrimStart()
+  Check 'its FIRST statement clears the .cwtls block cache' ($body.StartsWith('ClearThreadedBlockCache();')) `
+    ($body.Substring(0, [Math]::Min(60, $body.Length)) -replace '\s+', ' ')
+}
+$lib = Get-Content -Raw -LiteralPath (Join-Path $EngineDir 'DebugEngine.LibState.cs')
+$build = Get-CSharpBlock 'private RtlEmulator BuildEmulator(' $lib
+Check 'BuildEmulator exists' ($null -ne $build) ''
+if ($null -ne $build) {
+  $buildCode = Get-CSharpCodeOnly $build
+  Check 'BuildEmulator picks a fresh stack window on every call' `
+    ($buildCode -match '(?m)^\s*uint stackBase = EmulatorStackWindow\.Pick\(_hProcess\);') ''
+}
+
+Write-Host ''
 Write-Host 'NOT PROVED HERE, and deliberately not implied by a green run:'
 Write-Host '  what each caller shows or decides for a straddling symbol, and that the rule itself is right.'
 Write-Host '  protocolcheck asserts the rule; the callers need a live debuggee with a symbol crossing CwtlsLo.'
