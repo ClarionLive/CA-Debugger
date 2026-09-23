@@ -186,5 +186,31 @@ namespace ClarionDbg.Cli
 
         [DllImport("kernel32.dll")]
         public static extern IntPtr GetCurrentProcess();
+
+        // --- attach / detach (`ClarionDbg attach <pid>`, DebugEngine.Attach.cs) ---
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool DebugActiveProcess(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool DebugActiveProcessStop(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool DebugSetProcessKillOnExit(bool killOnExit);
+
+        // A DLL's path when its LOAD_DLL event carries no file handle, which DebugActiveProcess's synthetic
+        // events may do. The K32 exports are the kernel32 forms of the psapi functions (Windows 7 and later).
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "K32GetModuleFileNameExW")]
+        public static extern uint GetModuleFileNameEx(IntPtr hProcess, IntPtr hModule, System.Text.StringBuilder lpFilename, uint nSize);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "K32GetMappedFileNameW")]
+        public static extern uint GetMappedFileName(IntPtr hProcess, IntPtr lpv, System.Text.StringBuilder lpFilename, uint nSize);
+
+        // A process's creation time (FILETIME, UTC, 100 ns ticks): the identity check behind `procs` "started"
+        // and `attach --expect-start`, since a pid alone can be reused.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetProcessTimes(IntPtr hProcess, out long creation, out long exit, out long kernel, out long user);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern uint QueryDosDeviceW(string lpDeviceName, System.Text.StringBuilder lpTargetPath, uint ucchMax);
     }
 }

@@ -234,7 +234,8 @@ namespace ClarionDbg.Cli
 
         private IntPtr _hProcess = IntPtr.Zero;
         // The debuggee's pid, from CREATE_PROCESS. INVARIANT: valid exactly when _hProcess is non-zero —
-        // the two are assigned together from the same PROCESS_INFORMATION, on the only path that has one.
+        // the two are assigned together from the same CREATE_PROCESS event (header pid, hProcess at +16), in
+        // launch and attach alike, and cleared together when a detach lets go.
         // ProcessId() enforces that rather than trusting it, because a pid left behind for a process we no
         // longer hold reads as a live process, which is the same defect class as a sentinel thread id.
         private uint _pid;
@@ -556,9 +557,10 @@ namespace ClarionDbg.Cli
 
         public DebugEngine(string exe, PeImage exePe, TswdDebugInfo exeDbg, List<uint> rawRvas,
                            List<BpSpec> specs, bool once, int waitMs, bool interactive,
-                           IEnumerable<string> solutionDlls = null)
+                           IEnumerable<string> solutionDlls = null, uint attachPid = 0)
         {
             _exePath = exe;
+            _attachPid = attachPid;   // 0 = launch; otherwise DebugActiveProcess (DebugEngine.Attach.cs)
             _rawRvas = rawRvas ?? new List<uint>();
             _initialSpecs = specs ?? new List<BpSpec>();
             _once = once; _waitMs = waitMs; _interactive = interactive;
@@ -586,22 +588,42 @@ namespace ClarionDbg.Cli
                 return -1;
             }
 
-            var si = new Native.STARTUPINFO();
-            si.cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf(si);
-            Native.PROCESS_INFORMATION pi;
+            if (IsAttach)
+            {
+                if (!StartAttach()) return 0;
+                CheckAttachedIsTheListedProcess();   // --expect-start: a reused pid detaches before anything is planted
+            }
+            else
+            {
+                var si = new Native.STARTUPINFO();
+                si.cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf(si);
+                Native.PROCESS_INFORMATION pi;
 
-            string workDir = Path.GetDirectoryName(Path.GetFullPath(_exePath));
-            bool ok = Native.CreateProcess(_exePath, null, IntPtr.Zero, IntPtr.Zero, false,
-                Native.DEBUG_ONLY_THIS_PROCESS, IntPtr.Zero, workDir, ref si, out pi);
-            if (!ok)
-                throw new InvalidOperationException("CreateProcess failed, win32 error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+                string workDir = Path.GetDirectoryName(Path.GetFullPath(_exePath));
+                bool ok = Native.CreateProcess(_exePath, null, IntPtr.Zero, IntPtr.Zero, false,
+                    Native.DEBUG_ONLY_THIS_PROCESS, IntPtr.Zero, workDir, ref si, out pi);
+                if (!ok)
+                    throw new InvalidOperationException("CreateProcess failed, win32 error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-            Console.WriteLine($"launched {Path.GetFileName(_exePath)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
-            // Assigned together, from the same PROCESS_INFORMATION, on the only path that has one:
-            // CreateProcess either filled `pi` or threw above. See the invariant on _pid.
-            _hProcess = pi.hProcess;
-            _pid = pi.dwProcessId;
+                Console.WriteLine($"launched {Path.GetFileName(_exePath)} (pid {pi.dwProcessId}); {_bps.Count} breakpoint(s)");
+                // Ours, and needed for nothing: _hProcess and _pid come from the CREATE_PROCESS event in both
+                // modes (see the invariant on _pid), so these two are closed at once rather than held to the end.
+                Native.CloseHandle(pi.hThread);
+                Native.CloseHandle(pi.hProcess);
+            }
 
+            DebugLoop();
+            return Hits;
+        }
+
+        // The loop's wait and continue, as delegates so protocolcheck can run the REAL loop against an event
+        // source that never goes quiet (CheckCommandsNeverStarved). In a session they are the Win32 functions.
+        private Func<byte[], uint, bool> _loopWait = Native.WaitForDebugEvent;
+        private Func<uint, uint, uint, bool> _loopContinue = Native.ContinueDebugEvent;
+
+        /// <summary>The debug loop, from the first event to the target's exit or a detach.</summary>
+        private void DebugLoop()
+        {
             var buf = new byte[1024];
             bool running = true;
             uint pollMs = _interactive ? 200u : (uint)_waitMs;
@@ -609,15 +631,17 @@ namespace ClarionDbg.Cli
             {
                 // Every pass, not only the timeout branch: a stream of debug events never reaches that branch,
                 // and its 200 ms is coarser than the hover's 150. PollHover throttles itself by timestamp.
-                if (_interactive) PollHover(false);
-                if (!Native.WaitForDebugEvent(buf, pollMs))
+                //
+                // The COMMANDS too, for the same reason and with more at stake (3f2d747f, 4b run 1): an app that
+                // raises events with no 200 ms gap - OutputDebugString spam, a thread storm, the attach burst -
+                // left `detach` and `quit` unread, the host gave up after 8 s and killed the app with our bytes
+                // still planted. Here no event is held (the previous one was continued at the bottom of the last
+                // pass), so this is the same state the timeout branch ran in; a detach it accepts takes effect at
+                // the next event's arrival check. Unthrottled: with nothing queued it is one TryDequeue.
+                if (_interactive) { PollHover(false); DrainCommandsWhileRunning(); }
+                if (!_loopWait(buf, pollMs))
                 {
-                    if (_interactive)
-                    {
-                        // no event — service any commands that arrived while the target runs
-                        DrainCommandsWhileRunning();
-                        continue;
-                    }
+                    if (_interactive) continue;   // no event: the commands were serviced at the top of the pass
                     Console.WriteLine("(timeout waiting for debug event — terminating target)");
                     Native.TerminateProcess(_hProcess, 0);
                     // drain until exit
@@ -634,10 +658,19 @@ namespace ClarionDbg.Cli
                 uint tid = Tid(buf);
                 uint status = Native.DBG_CONTINUE;
 
+                // A detach asked for while RUNNING: this event, whatever it is, freezes the process, so detach on
+                // it before any handler can pause on it (DebugEngine.Attach.cs).
+                if (_detachPending) { DetachAt(buf, null); break; }
+
                 switch (code)
                 {
                     case Native.CREATE_PROCESS_DEBUG_EVENT:
                         // union @+12: hFile(+12) hProcess(+16) hThread(+20) lpBaseOfImage(+24)
+                        // hProcess and hThread belong to kernel32, which closes them when EXIT_PROCESS is
+                        // continued or the debugger detaches; hFile is ours to close.
+                        _hProcess = Ptr(U32(buf, 16));
+                        _pid = pid;
+                        CloseHandleValue(U32(buf, 12));
                         _exe.LoadBase = U32(buf, 24);
                         _mainTid = tid; NoteThreadCreated(tid);
                         PlantAll();
@@ -645,7 +678,7 @@ namespace ClarionDbg.Cli
                         Console.WriteLine($"process created: loadBase=0x{_exe.LoadBase:X} (preferred 0x{preferred:X}){(_exe.LoadBase != preferred ? "  [relocated]" : "")}");
                         if (EmitJson)
                         {
-                            Console.WriteLine("@JSON " + Json.Loaded(pi.dwProcessId, _exe.LoadBase));
+                            Console.WriteLine("@JSON " + Json.Loaded(pid, _exe.LoadBase, IsAttach));
                             Console.WriteLine("@JSON " + Json.ModuleLoaded(_exe));
                         }
                         break;
@@ -689,9 +722,14 @@ namespace ClarionDbg.Cli
                                 status = OnUserBp(tid, exAddr);
                             else if (_temp.ContainsKey(exAddr))
                                 status = OnTempBp(tid, exAddr);
+                            else if (IsStaleHitOfOurs(exAddr))
+                                // Ours, removed while this hit was queued (bp del while paused, a cleared temp):
+                                // rewind and run on. Ahead of OnProgrammaticBreak, which would pause at va+1.
+                                status = OnStaleHit(tid, exAddr);
                             else if (!_seenInitialBreak)
                             {
-                                _seenInitialBreak = true; // OS loader breakpoint — swallow it
+                                _seenInitialBreak = true; // OS loader breakpoint (or the attach break) — swallow it
+                                if (IsAttach) ReseedThreadOrderAfterAttach(tid);   // tid = the injected break thread
                                 status = Native.DBG_CONTINUE;
                             }
                             else if (_pauseRequested)
@@ -729,13 +767,13 @@ namespace ClarionDbg.Cli
                         break;
                 }
 
-                if (running)
-                    Native.ContinueDebugEvent(pid, tid, status);
-            }
+                // A detach asked for while PAUSED: PausedWait returned without resuming, and the handler's status
+                // is the one this held event gets (DebugEngine.Attach.cs).
+                if (running && _detachPending) { DetachAt(buf, status); break; }
 
-            Native.CloseHandle(pi.hThread);
-            Native.CloseHandle(pi.hProcess);
-            return Hits;
+                if (running)
+                    _loopContinue(pid, tid, status);
+            }
         }
 
         // ------------------------------------------------------------------ programmatic breakpoint
@@ -1027,7 +1065,18 @@ namespace ClarionDbg.Cli
                         HandleLibStateCommand(parts, view.Tid, view.HThread);
                         break;
 
-                    case "quit": case "q": case "kill":
+                    case "detach":
+                        _detachPending = true;   // the debug loop detaches on THIS held event (DebugEngine.Attach.cs)
+                        return;
+
+                    case "quit": case "q":
+                        // An attached app was running before we came and keeps running after: quit (and stdin
+                        // close, which queues quit) lets go of it. `kill` is the verb that ends it.
+                        if (IsAttach) { _detachPending = true; return; }
+                        Native.TerminateProcess(_hProcess, 0);
+                        return; // the EXIT_PROCESS event ends the loop
+
+                    case "kill":
                         Native.TerminateProcess(_hProcess, 0);
                         return; // the EXIT_PROCESS event ends the loop
 
@@ -1117,7 +1166,14 @@ namespace ClarionDbg.Cli
                     case "hover":   // identify-thread-by-window mode: report-only while running
                         HandleHoverCommand(parts, false);
                         break;
-                    case "quit": case "q": case "kill":
+                    case "detach":
+                        RequestDetach();
+                        break;
+                    case "quit": case "q":
+                        if (IsAttach) { RequestDetach(); break; }   // see the pause loop's quit
+                        if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
+                        break;
+                    case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
                         break;
                     case "setip":   // its own refusal event, so the pad can toast it like any other setip refusal
@@ -1331,7 +1387,8 @@ namespace ClarionDbg.Cli
                         _cmds.Enqueue(line);
                 }
                 catch { /* stdin torn down */ }
-                // stdin closed → the host (IDE addin) went away; kill the target rather than orphan it
+                // stdin closed → the host (IDE addin) went away. A LAUNCHED target is killed rather than
+                // orphaned; an ATTACHED one is detached from, since `quit` means detach in attach mode.
                 _cmds.Enqueue("quit");
             });
             t.IsBackground = true;

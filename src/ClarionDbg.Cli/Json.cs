@@ -472,7 +472,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>`procs --json` (ProcsCommand.cs): the attach picker's process list, one line. The host parses
-        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd}], skipped, and
+        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd,started}], skipped, and
         /// with verbose a trailing skips[{pid,name,reason}].</summary>
         public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)
         {
@@ -485,6 +485,7 @@ namespace ClarionDbg.Cli
                   .Append(",\"name\":").Append(Str(p.Name))
                   .Append(",\"path\":").Append(Str(p.Path))
                   .Append(",\"tswd\":").Append(p.Tswd ? "true" : "false")
+                  .Append(",\"started\":\"").Append(p.Started.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append('"')
                   .Append('}');
             }
             sb.Append("],\"skipped\":").Append(skips.Count);
@@ -503,6 +504,31 @@ namespace ClarionDbg.Cli
                 sb.Append(']');
             }
             return sb.Append('}').ToString();
+        }
+
+        /// <summary>`loaded` for an ATTACHED session (3f2d747f): the launch shape plus an additive
+        /// "attached":true, so a host that does not read it is unaffected.</summary>
+        public static string Loaded(uint pid, uint loadBase, bool attached)
+        {
+            string s = Loaded(pid, loadBase);
+            return attached ? s.Substring(0, s.Length - 1) + ",\"attached\":true}" : s;
+        }
+
+        /// <summary>The engine let go of the target and it keeps running. drained = debug events that were
+        /// already queued and were answered before the stop; restored = breakpoint bytes put back. "error" is
+        /// present only when a restore or the stop itself failed - the app may then crash later, and the host
+        /// must say so rather than report a clean detach.</summary>
+        public static string Detached(uint pid, int drained, int restored, string error)
+        {
+            return "{\"event\":\"detached\",\"pid\":" + pid + ",\"drained\":" + drained + ",\"restored\":" + restored
+                 + (error != null ? ",\"error\":" + Str(error) : "") + "}";
+        }
+
+        /// <summary>An `attach` that could not start: the ordinary error event plus the Win32 error code
+        /// (0 when the failure is not a Win32 one, such as an image with no TSWD).</summary>
+        public static string AttachError(string message, int code)
+        {
+            return "{\"event\":\"error\",\"message\":" + Str(message) + ",\"code\":" + code + "}";
         }
     }
 }

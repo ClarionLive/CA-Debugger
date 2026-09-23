@@ -230,6 +230,97 @@ namespace ClarionDebugger.Terminal
         }
     }
 
+    /// <summary>Attach to a running process (3f2d747f): the data is the pid, in decimal. Null for anything
+    /// else, pid 0 included (no process has it). A parsed pid is only a LOOKUP KEY: the host attaches only to a
+    /// pid it listed itself (<see cref="ListedProcesses"/>).</summary>
+    internal sealed class AttachRequest
+    {
+        public uint Pid;
+
+        public static AttachRequest Parse(string data)
+        {
+            uint pid;
+            if (!PageNumbers.TryUInt(data, out pid) || pid == 0) return null;
+            return new AttachRequest { Pid = pid };
+        }
+    }
+
+    /// <summary>One process the attach picker may offer, as the engine's <c>procs --json</c> listed it.</summary>
+    public sealed class AttachableProcess
+    {
+        public uint Pid;
+        public string Name;
+        public string Path;
+        public bool Tswd;
+        /// <summary>The process's creation time as the engine listed it: a FILETIME (UTC, 100 ns ticks) in decimal,
+        /// or null when the engine did not report one. It is what makes a listed pid an IDENTITY: the attach passes
+        /// it as <c>--expect-start</c>, and the engine refuses a process whose start time differs (pid reused).</summary>
+        public string Started;
+
+        /// <summary>True for a start time the attach can pass on: 1..20 decimal digits (a 64-bit FILETIME) and
+        /// nothing else, so it cannot carry a second argument onto the engine's command line.</summary>
+        public static bool IsStartTime(string s)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length > 20) return false;
+            foreach (char c in s) if (c < '0' || c > '9') return false;
+            ulong v;
+            return ulong.TryParse(s, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out v) && v != 0;
+        }
+    }
+
+    /// <summary>The processes the host last LISTED to the page, by pid (3f2d747f).
+    /// <para>
+    /// An attach names a pid, and a pid is just a number: forwarded unchecked, anything that could put a message
+    /// on the bridge could debug any process this user can open. So the host attaches only to a pid it put in
+    /// its own most recent <c>procs</c> reply, the same way <see cref="ProcedureIds"/> and
+    /// <see cref="EditGrants"/> honour only what the host issued.
+    /// </para>
+    /// <para>
+    /// ONE LISTING, ONE ATTACH. <see cref="Take"/> empties the table, so a listing cannot be replayed into a
+    /// second attach; the picker asks again each time it opens. A refresh BEGINS its generation at once, so
+    /// while a new listing is being read the old pids resolve to nothing, and only that generation's result
+    /// may be installed (a slow, older listing cannot overwrite a newer one).
+    /// </para></summary>
+    internal sealed class ListedProcesses
+    {
+        private Dictionary<uint, AttachableProcess> _byPid = new Dictionary<uint, AttachableProcess>();
+        private int _generation;
+
+        /// <summary>Start listing <paramref name="generation"/>: every pid listed before it stops resolving now.</summary>
+        public void Begin(int generation)
+        {
+            _generation = generation;
+            _byPid = new Dictionary<uint, AttachableProcess>();
+        }
+
+        /// <summary>Install listing <paramref name="generation"/>. False, installing nothing, unless it is still
+        /// the current generation.</summary>
+        public bool Replace(int generation, IEnumerable<AttachableProcess> procs)
+        {
+            if (generation != _generation) return false;
+            var t = new Dictionary<uint, AttachableProcess>();
+            if (procs != null)
+                foreach (var p in procs)
+                    if (p != null && p.Pid != 0) t[p.Pid] = p;
+            _byPid = t;
+            return true;
+        }
+
+        /// <summary>The listed process with <paramref name="pid"/>, or null when the current listing does not
+        /// hold it. A hit EMPTIES the table: one listing authorises one attach.</summary>
+        public AttachableProcess Take(uint pid)
+        {
+            AttachableProcess p;
+            if (!_byPid.TryGetValue(pid, out p)) return null;
+            _byPid = new Dictionary<uint, AttachableProcess>();
+            return p;
+        }
+
+        public int Count { get { return _byPid.Count; } }
+
+        public void Clear() { _byPid = new Dictionary<uint, AttachableProcess>(); }
+    }
+
     /// <summary>The one number parser for page payloads: invariant culture, integer syntax only, null reads
     /// as "not a number".</summary>
     internal static class PageNumbers

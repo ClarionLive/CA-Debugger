@@ -171,8 +171,12 @@ Invoke-CheckSection 'procs --json: a live x86 process, and the filters' {
   $r = Invoke-Procs @('--json', '--all')
   $e = @($r.Json.procs | Where-Object { $_.pid -eq $pp })
   Check '--all: it is listed, tswd false' ($e.Count -eq 1 -and $e[0].tswd -eq $false) (($e | ConvertTo-Json -Compress))
-  $want = '{"pid":' + $pp + ',"name":"PING.EXE","path":' + (ConvertTo-Json $X86Plain) + ',"tswd":false}'
-  Check '--all: the entry is exactly pid,name,path,tswd with the path escaped' ($r.Lines[0].IndexOf($want, [StringComparison]::OrdinalIgnoreCase) -ge 0) $want
+  # "started" (3f2d747f, 4b run 2): the creation FILETIME as a decimal STRING, the identity attach --expect-start
+  # checks. It must be THIS process's creation time, read here from the Process object this suite started.
+  $started = $script:ping.StartTime.ToFileTimeUtc().ToString([Globalization.CultureInfo]::InvariantCulture)
+  $want = '{"pid":' + $pp + ',"name":"PING.EXE","path":' + (ConvertTo-Json $X86Plain) + ',"tswd":false,"started":"' + $started + '"}'
+  Check '--all: the entry is exactly pid,name,path,tswd,started with the path escaped' ($r.Lines[0].IndexOf($want, [StringComparison]::OrdinalIgnoreCase) -ge 0) $want
+  Check '--all: started is a decimal string (not a JSON number)' ($r.Lines[0] -match ('"pid":' + $pp + ',[^}]*"started":"\d+"\}')) ''
 
   $r = Invoke-Procs @('--json', '--all', '--verbose', '--exclude', "$pp")
   $s = @($r.Json.skips | Where-Object { $_.pid -eq $pp })
@@ -199,7 +203,7 @@ if ($WithClarion) {
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-$EXPECTED_CHECKS = 33 + $(if ($haveTswd) { 4 } else { 0 }) + $(if ($WithClarion) { 1 } else { 0 })
+$EXPECTED_CHECKS = 34 + $(if ($haveTswd) { 4 } else { 0 }) + $(if ($WithClarion) { 1 } else { 0 })
 Assert-CheckTotal $EXPECTED_CHECKS
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }

@@ -13,6 +13,9 @@ namespace ClarionDbg.Cli
         public string Name;
         public string Path;
         public bool Tswd;
+        /// <summary>Creation time, FILETIME (UTC, 100 ns ticks). Written as a decimal STRING ("started"), since a
+        /// JSON number loses precision above 2^53 in most readers.</summary>
+        public ulong Started;
     }
 
     /// <summary>A process the enumerator passed over, and why (one of the ProcsCommand.Skip* reasons).</summary>
@@ -146,15 +149,88 @@ namespace ClarionDbg.Cli
             // give us that will not give an attach the far wider rights it needs either.
             IntPtr hq = Native.OpenProcess(Native.PROCESS_QUERY_INFORMATION, false, pid);
             if (hq == IntPtr.Zero) { reason = SkipAccessDenied; return null; }
+            ulong started;
             try
             {
                 bool present;
                 if (!Native.CheckRemoteDebuggerPresent(hq, out present)) { reason = SkipAccessDenied; return null; }
                 if (present) { reason = SkipDebugged; return null; }
+                // The identity the host hands back as `attach --expect-start`. A process whose creation time cannot
+                // be read cannot be proven to be the one listed, so it is not listed.
+                if (!TryGetProcessStart(hq, out started)) { reason = SkipAccessDenied; return null; }
             }
             finally { Native.CloseHandle(hq); }
 
-            return new ProcEntry { Pid = pid, Name = name, Path = path, Tswd = tswd };
+            return new ProcEntry { Pid = pid, Name = name, Path = path, Tswd = tswd, Started = started };
+        }
+
+        /// <summary>For `attach`: the image path of <paramref name="pid"/> and whether it is x86. False with a
+        /// Win32 error when the process cannot be opened or named. x86 is decided by WOW64 FIRST, as in the
+        /// listing: this engine is x86, so opening an x64 process's C:\Windows\System32 path would be silently
+        /// redirected to the x86 copy in SysWOW64 and a PE probe of it would answer "x86". The probe then
+        /// confirms the machine of the file actually named.</summary>
+        internal static bool TryDescribeProcess(uint pid, out string path, out ImageArch arch, out int error)
+        {
+            path = null; arch = ImageArch.Unreadable; error = 0;
+            IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) { error = System.Runtime.InteropServices.Marshal.GetLastWin32Error(); return false; }
+            try
+            {
+                bool wow64;
+                bool x86ByWow = OsIsX86Only() || (Native.IsWow64Process(h, out wow64) && wow64);
+                var sb = new StringBuilder(1024);
+                uint len = (uint)sb.Capacity;
+                if (!Native.QueryFullProcessImageNameW(h, 0, sb, ref len) || len == 0)
+                {
+                    error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    return false;
+                }
+                path = sb.ToString(0, (int)len);
+                ushort machine = 0; bool tswd;
+                bool probed = x86ByWow && PeProbe.TryProbe(path, out machine, out tswd);
+                arch = ClassifyProcessImage(x86ByWow, probed, machine);
+                return true;
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        /// <summary>What `attach` knows about a process's image (4b run 2): only a CONFIRMED non-x86 is "not x86";
+        /// an image that could not be read is its own case, not folded into that one.</summary>
+        internal enum ImageArch { X86, NotX86, Unreadable }
+
+        /// <summary>Pure. A process WOW64 does not run is not x86, whatever its file says; for one it does run, the
+        /// PE Machine field decides, and a probe that failed leaves it unreadable.</summary>
+        internal static ImageArch ClassifyProcessImage(bool x86ByWow, bool probeOk, ushort machine)
+        {
+            if (!x86ByWow) return ImageArch.NotX86;
+            if (!probeOk) return ImageArch.Unreadable;
+            return machine == PeProbe.MachineI386 ? ImageArch.X86 : ImageArch.NotX86;
+        }
+
+        /// <summary>The `code` of an attach refusal for an image that is not attachable: 50 (ERROR_NOT_SUPPORTED)
+        /// for a confirmed non-x86 machine, 0 for an image that could not be read (not a Win32 failure).</summary>
+        internal static int AttachRefusalCode(ImageArch arch)
+        {
+            return arch == ImageArch.NotX86 ? 50 : 0;
+        }
+
+        /// <summary>A process's creation time as a FILETIME (UTC, 100 ns ticks), the identity `procs` lists as
+        /// "started" and `attach --expect-start` checks. False when the process cannot be opened or asked.</summary>
+        internal static bool TryGetProcessStart(uint pid, out ulong filetime)
+        {
+            filetime = 0;
+            IntPtr h = Native.OpenProcess(Native.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (h == IntPtr.Zero) return false;
+            try { return TryGetProcessStart(h, out filetime); }
+            finally { Native.CloseHandle(h); }
+        }
+
+        private static bool TryGetProcessStart(IntPtr h, out ulong filetime)
+        {
+            long c, e, k, u;
+            bool ok = Native.GetProcessTimes(h, out c, out e, out k, out u);
+            filetime = ok ? unchecked((ulong)c) : 0;
+            return ok;
         }
 
         /// <summary>True on 32-bit Windows, where IsWow64Process is false for every process and every process

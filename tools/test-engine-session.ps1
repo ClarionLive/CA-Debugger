@@ -269,7 +269,7 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and $oneShot.Name -notcontains $_.Name -and (Test-NamesEngineBinary $_.FullName) })
     # A number, not "every": if another harness appears this says so instead of quietly covering the old set.
     # 4 since test-setip.ps1 (a77abd94, 2026-09-23).
-    Check 'exactly 4 scripts here launch the engine binary' ($harnesses.Count -eq 4) (($harnesses.Name) -join ', ')
+    Check 'exactly 5 scripts here launch the engine binary' ($harnesses.Count -eq 5) (($harnesses.Name) -join ', ')
 
     foreach ($h in $harnesses) {
         $text = Get-Content -Raw -LiteralPath $h.FullName
@@ -412,8 +412,8 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
                 Where-Object { @(Get-PokePidArgs $_.FullName).Count -gt 0 })
     # A number, not "every": a harness that grows a third poke site says so here.
     $allArgs = @($pokers | ForEach-Object { Get-PokePidArgs $_.FullName })
-    Check 'exactly 4 window-poke sites across the harnesses, in 2 files' `
-        ($allArgs.Count -eq 4 -and $pokers.Count -eq 2) `
+    Check 'exactly 5 window-poke sites across the harnesses, in 3 files' `
+        ($allArgs.Count -eq 5 -and $pokers.Count -eq 3) `
         (($pokers.Name) -join ', ')
 
     foreach ($f in $pokers) {
@@ -468,7 +468,7 @@ Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionNa
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 64   # 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94)
+$EXPECTED_CHECKS = 69   # 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

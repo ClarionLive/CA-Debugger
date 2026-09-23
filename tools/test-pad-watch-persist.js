@@ -59,6 +59,9 @@ function applyNote() { }
 function tidAccepted() { return true; }
 function armPendingSweep() { }
 function logLine() { }
+// setRunState ends attach mode when a session goes idle (3f2d747f); tools/test-pad-attach.js tests that.
+let attachMode = false;
+function setAttachMode(on) { attachMode = !!on; }
 
 const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS', 'WATCH_IDLE_TEXT', 'WATCH_IDLE_TITLE',
 

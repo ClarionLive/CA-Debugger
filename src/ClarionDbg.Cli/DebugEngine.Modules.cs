@@ -170,7 +170,9 @@ namespace ClarionDbg.Cli
         {
             try
             {
-                string path = GetPathFromHandle(hFile);
+                // An attach's synthetic LOAD_DLL events may carry no file handle (and never an image name), so
+                // fall back to asking the target's memory (DebugEngine.Attach.cs).
+                string path = GetPathFromHandle(hFile) ?? PathFromMappedImage(baseVa);
                 string name = !string.IsNullOrEmpty(path)
                     ? System.IO.Path.GetFileName(path).ToLowerInvariant()
                     : $"(0x{baseVa:x})";
@@ -239,6 +241,9 @@ namespace ClarionDbg.Cli
                 bp.ModuleIdx = -1;
             }
             if (EmitJson) Console.WriteLine("@JSON " + Json.ModuleUnloaded(m));
+            // Its addresses no longer hold our code (another image may map there next), so a stale-hit claim on
+            // them would rewind a thread that the NEW image's own INT3 stopped (DebugEngine.Attach.cs).
+            ForgetPlantedIn(m.LoadBase, m.Size);
 
             // Keep the pre-loaded solution entry (Pe/Dbg) around but mark it unmapped so it re-arms on
             // reload; drop runtime-discovered DLLs so the table doesn't grow across load/unload churn.

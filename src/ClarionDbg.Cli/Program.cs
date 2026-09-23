@@ -25,6 +25,7 @@ namespace ClarionDbg.Cli
                     case "globals": return Globals(args);
                     case "locals": return Locals(args);
                     case "break": return Break(args);
+                    case "attach": return Attach(args);
                     case "scanrva": return ScanRva(args);
                     case "scanname": return ScanName(args);
                     case "typemembers": return TypeMembers(args);
@@ -98,6 +99,16 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      watch resolves THREADed (.cwtls) data to the paused thread's live");
             Console.WriteLine("      instance by emulating THR$GetInstance READ-ONLY against that thread's");
             Console.WriteLine("      TLS - no func-eval, no thread hijack - then dumps the value.");
+            Console.WriteLine();
+            Console.WriteLine("  ClarionDbg attach <pid> --interactive [--json] [--expect-start <started>] [--bp MODULE:LINE ...]");
+            Console.WriteLine("                   [--solution-dll PATH ...]");
+            Console.WriteLine("      --expect-start: the \"started\" value `procs` listed; a pid reused since then is refused.");
+            Console.WriteLine("      Attach to a RUNNING x86 Clarion process (see `procs`) and debug it as `break --interactive`");
+            Console.WriteLine("      would. `detach` (either state), `quit` and closing stdin let go of it, restoring every");
+            Console.WriteLine("      breakpoint byte, and the app keeps running; `kill` ends it. Interactive only.");
+            Console.WriteLine();
+            Console.WriteLine("  ClarionDbg procs [--json] [--verbose] [--all] [--exclude <pid>]...");
+            Console.WriteLine("      List running x86 processes whose image carries TSWD debug info (attach candidates).");
         }
 
         private static (PeImage pe, TswdDebugInfo dbg) LoadDebug(string exe)
@@ -598,20 +609,31 @@ namespace ClarionDbg.Cli
             return syms.Count > 0 ? 0 : 3;
         }
 
-        private static int Break(string[] args)
+        /// <summary>The session options `break` and `attach` share: breakpoints (--bp, --rva, --line/--module,
+        /// --entry, --all-entries), --interactive, --once, --timeout, --solution-dll and --json.</summary>
+        private sealed class SessionOptions
         {
-            if (args.Length < 2) { Usage(); return 1; }
-            var (pe, dbg) = LoadDebug(args[1]);
+            public List<uint> Rvas = new List<uint>();
+            public List<BpSpec> Specs = new List<BpSpec>();
+            public bool Interactive, Once, Json;
+            public int WaitMs = 15000;
+            public List<string> SolutionDlls = new List<string>();
+        }
 
-            var rvas = new List<uint>();
+        /// <summary>Parse the shared session options from args[<paramref name="start"/>] on. 0 on success,
+        /// otherwise the exit code, with the reason already written to stderr.</summary>
+        private static int ParseSessionOptions(string[] args, int start, PeImage pe, TswdDebugInfo dbg, out SessionOptions o)
+        {
+            o = new SessionOptions();
+            var rvas = o.Rvas;
             // --rva may appear multiple times
-            for (int i = 2; i < args.Length - 1; i++)
+            for (int i = start; i < args.Length - 1; i++)
                 if (string.Equals(args[i], "--rva", StringComparison.OrdinalIgnoreCase))
                     rvas.Add(ToRva(ParseNum(args[i + 1]), pe));
 
             // --bp MODULE:LINE may appear multiple times; the engine resolves + snaps each one
-            var specs = new List<BpSpec>();
-            for (int i = 2; i < args.Length - 1; i++)
+            var specs = o.Specs;
+            for (int i = start; i < args.Length - 1; i++)
             {
                 if (!string.Equals(args[i], "--bp", StringComparison.OrdinalIgnoreCase)) continue;
                 string v = args[i + 1];
@@ -662,35 +684,104 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"adding {added} module-entry breakpoints (discovery mode)");
             }
 
-            bool interactive = HasFlag(args, "--interactive");
-            if (rvas.Count == 0 && specs.Count == 0 && !interactive)
+            o.Interactive = HasFlag(args, "--interactive");
+            if (rvas.Count == 0 && specs.Count == 0 && !o.Interactive)
             {
                 // interactive sessions may start empty — breakpoints arrive via 'bp add' (gutter clicks)
                 Console.Error.WriteLine("nothing to break on — specify --bp M:L, --rva 0xX, --line N [--module M], or --entry");
                 return 1;
             }
 
-            bool once = HasFlag(args, "--once");
-            int waitMs = 15000;
+            o.Once = HasFlag(args, "--once");
             string to = GetOpt(args, "--timeout");
-            if (to != null) waitMs = (int)ParseNum(to);
+            if (to != null) o.WaitMs = (int)ParseNum(to);
 
             // Solution DLLs the host wants resolved up front so DLL breakpoints bind before launch.
             // --solution-dll may repeat; each value may also be a ';'-separated list of paths.
-            var solutionDlls = new List<string>();
-            for (int i = 2; i < args.Length - 1; i++)
+            for (int i = start; i < args.Length - 1; i++)
                 if (string.Equals(args[i], "--solution-dll", StringComparison.OrdinalIgnoreCase))
                     foreach (var p in args[i + 1].Split(';'))
-                        if (p.Trim().Length > 0) solutionDlls.Add(p.Trim());
+                        if (p.Trim().Length > 0) o.SolutionDlls.Add(p.Trim());
+
+            o.Json = HasFlag(args, "--json");
+            return 0;
+        }
+
+        private static int Break(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            var (pe, dbg) = LoadDebug(args[1]);
+
+            SessionOptions o;
+            int bad = ParseSessionOptions(args, 2, pe, dbg, out o);
+            if (bad != 0) return bad;
 
             // The engine now owns the module table (EXE + DLLs); it derives threaded-eval info
             // (.cwtls + THR$GetInstance IAT) per image, so no SetThreadEvalInfo seeding here.
-            var engine = new DebugEngine(args[1], pe, dbg, rvas, specs, once, waitMs, interactive, solutionDlls);
-            engine.EmitJson = HasFlag(args, "--json");
+            var engine = new DebugEngine(args[1], pe, dbg, o.Rvas, o.Specs, o.Once, o.WaitMs, o.Interactive, o.SolutionDlls);
+            engine.EmitJson = o.Json;
             int hits2 = engine.Run();
             if (hits2 < 0) { Console.Error.WriteLine("no breakpoint could be resolved"); return 2; }
             Console.WriteLine($"\ndone — {hits2} breakpoint hit(s).");
             return hits2 > 0 ? 0 : 3;
+        }
+
+        /// <summary>attach &lt;pid&gt; --interactive --json [--bp M:L]... [--solution-dll P]... (3f2d747f part A).
+        /// Interactive only: batch mode and --once end in TerminateProcess, and an attached app is the user's.
+        /// Every refusal is an @JSON error event and exit code 2, whatever --json says, because the host has to
+        /// be able to read it before anything else has been said.</summary>
+        private static int Attach(string[] args)
+        {
+            if (args.Length < 2) { Usage(); return 1; }
+            if (!HasFlag(args, "--interactive") || HasFlag(args, "--once") || GetOpt(args, "--timeout") != null)
+            {
+                Console.WriteLine("@JSON " + Json.Error("attach requires --interactive"));
+                return 2;
+            }
+            uint pid;
+            if (!uint.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out pid) || pid == 0)
+                return AttachRefused("attach failed: '" + args[1] + "' is not a process id", 87);   // ERROR_INVALID_PARAMETER
+
+            // --expect-start: the creation time `procs` listed ("started"), so a pid reused since the listing is
+            // refused rather than attached (a pid is not an identity). Checked by the engine after
+            // DebugActiveProcess, before anything is planted.
+            ulong? expectStart = null;
+            string es = GetOpt(args, "--expect-start");
+            if (es != null)
+            {
+                ulong v;
+                if (!ulong.TryParse(es, NumberStyles.None, CultureInfo.InvariantCulture, out v))
+                    return AttachRefused("attach failed: --expect-start expects the decimal creation time procs listed, got '" + es + "'", 87);
+                expectStart = v;
+            }
+
+            string exe; ProcsCommand.ImageArch arch; int err;
+            if (!ProcsCommand.TryDescribeProcess(pid, out exe, out arch, out err))
+                return AttachRefused("attach failed: " + new System.ComponentModel.Win32Exception(err).Message, err);
+            if (arch == ProcsCommand.ImageArch.NotX86)
+                return AttachRefused("attach failed: pid " + pid + " is not an x86 (32-bit) process", ProcsCommand.AttachRefusalCode(arch));
+            if (arch == ProcsCommand.ImageArch.Unreadable)
+                return AttachRefused("attach failed: the image of pid " + pid + " could not be read: " + exe, ProcsCommand.AttachRefusalCode(arch));
+
+            PeImage pe; TswdDebugInfo dbg;
+            try { (pe, dbg) = LoadDebug(exe); }
+            catch (Exception ex) { return AttachRefused("attach failed: " + exe + ": " + ex.Message, 0); }
+
+            SessionOptions o;
+            int bad = ParseSessionOptions(args, 2, pe, dbg, out o);
+            if (bad != 0) return bad;
+
+            var engine = new DebugEngine(exe, pe, dbg, o.Rvas, o.Specs, false, o.WaitMs, true, o.SolutionDlls, pid);
+            engine.EmitJson = o.Json;
+            engine.ExpectStart = expectStart;
+            engine.Run();
+            return engine.AttachFailed ? 2 : 0;
+        }
+
+        private static int AttachRefused(string message, int code)
+        {
+            Console.WriteLine("@JSON " + Json.AttachError(message, code));
+            return 2;
         }
 
         private static uint ToRva(uint v, PeImage pe) { return v >= pe.ImageBase ? v - pe.ImageBase : v; }

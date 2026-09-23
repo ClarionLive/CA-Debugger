@@ -287,6 +287,7 @@ namespace ClarionDbg.Cli
         /// <summary>Plant every breakpoint whose owning image is mapped (LoadBase set).</summary>
         private void PlantAll()
         {
+            _plantAllCalls++;   // protocolcheck: an --expect-start refusal must reach no planting at all
             foreach (var bp in _bps)
                 if (bp.Owner != null && bp.Owner.LoadBase != 0) PlantBp(bp);
         }
@@ -307,6 +308,7 @@ namespace ClarionDbg.Cli
                 }
                 WriteByte(va, 0xCC);
                 _armed[va] = orig;
+                NotePlanted(va, orig);   // remembered past its removal: a queued hit on it is still ours (Attach.cs)
             }
         }
 
@@ -638,7 +640,9 @@ namespace ClarionDbg.Cli
         /// handle and fails harmlessly; with one attached the same call patches, retargets or terminates a
         /// real process. The engine already spells "there is no target" as <c>_hProcess == IntPtr.Zero</c>
         /// (DebugEngine.LibState.cs, DebugEngine.cs RequestPause) — this is that test inverted, so the seam
-        /// cannot be misused instead of merely being documented as not-to-be-misused.</summary>
+        /// cannot be misused instead of merely being documented as not-to-be-misused.
+        /// "Attached" here means HOLDING ANY DEBUGGEE, launched or attached with `attach &lt;pid&gt;` alike: the
+        /// name predates the attach verb (3f2d747f), and the test is the handle, not how it was obtained.</summary>
         private void RefuseSeamIfAttached(string seam)
         {
             if (_hProcess != IntPtr.Zero)

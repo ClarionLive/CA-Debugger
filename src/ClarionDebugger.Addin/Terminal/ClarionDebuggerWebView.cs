@@ -68,6 +68,15 @@ namespace ClarionDebugger.Terminal
         // trusted. UI-thread only, like every other piece of pad state.
         private readonly ProcedureIds _procIds = new ProcedureIds();
         private readonly EditGrants _editGrants = new EditGrants();
+        // The attach picker's pids, as the HOST listed them (3f2d747f): `attach` is honoured only for one of these.
+        private readonly ListedProcesses _listedProcs = new ListedProcesses();
+        private int _procsGen;   // generation of the newest process listing; an older one arriving late is dropped
+        // The ATTACH session in progress, or null for a launch / no session. UI-thread only.
+        private AttachContext _attach;
+        // The app last attached to, for the "Detached; <name>" line only. The engine's `detached` event names just the
+        // pid, and when the engine's exit is handled before that buffered line, both the service's target and _attach
+        // are already gone. Display only: nothing decides anything on it.
+        private string _lastAttachName;
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
         private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
@@ -114,6 +123,8 @@ namespace ClarionDebugger.Terminal
             _svc.ModuleUnloaded        += OnSvcModuleUnloaded;
             _svc.LogReceived           += OnSvcLog;
             _svc.Exited                += OnSvcExited;
+            _svc.Detached              += OnSvcDetached;
+            _svc.DetachAbandoned       += OnSvcDetachAbandoned;
 
             _gutter.GutterBreakpointAdded   += OnGutterAdded;
             _gutter.GutterBreakpointRemoved += OnGutterRemoved;
@@ -264,6 +275,8 @@ namespace ClarionDebugger.Terminal
             _svc.ModuleUnloaded         -= OnSvcModuleUnloaded;
             _svc.LogReceived            -= OnSvcLog;
             _svc.Exited                 -= OnSvcExited;
+            _svc.Detached               -= OnSvcDetached;
+            _svc.DetachAbandoned        -= OnSvcDetachAbandoned;
 
             _gutter.GutterBreakpointAdded   -= OnGutterAdded;
             _gutter.GutterBreakpointRemoved -= OnGutterRemoved;
@@ -415,13 +428,67 @@ namespace ClarionDebugger.Terminal
         // cannot act on. Nothing else in the page reads it today.
         private void OnSvcEngineError(string msg) => UI(() =>
         {
+            // An attach that failed says why in this error, and the engine exits right after it. The exit clears the
+            // page's console, so the reason is kept to be said again after that clear (see OnSvcExited).
+            if (_attach != null && msg != null && msg.StartsWith("attach ", StringComparison.Ordinal)) _attach.LastError = msg;
             Console("err", "engine: " + msg);
             Post("{\"type\":\"engineerror\",\"message\":" + Str(msg) + "}");
         });
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
         private void OnSvcLog(string s) => UI(() => Console("info", s));
-        private void OnSvcExited(int code) => UI(() => { _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+        private void OnSvcExited(int code) => UI(() =>
+        {
+            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine();
+            var attach = _attach;
+            _attach = null;
+            if (attach == null) { Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); return; }
+            // An ATTACH session (3f2d747f). After a detach, OnSvcDetached has already cleared the page and said the
+            // app is still running; clearing again here would wipe that line.
+            if (attach.Detached) return;
+            // Otherwise clear FIRST, since `clear` empties the console, and then say why: an attach that failed
+            // reported its reason just before the engine exited, and that line is gone with the clear.
+            Post("{\"type\":\"clear\"}");
+            if (attach.LastError != null) Console("err", "engine: " + attach.LastError);
+            Console("info", "— session ended (exit " + code + ") —");
+        });
+
+        /// <summary>The engine let the attached process go, and it keeps running (3f2d747f). The same reset as a
+        /// session end (OnSvcExited), then the one line the user needs - and a warning when a planted breakpoint
+        /// byte could not be restored, because the app will then hit an INT3 with no debugger and most likely crash.
+        /// The engine's exit follows; OnSvcExited sees <see cref="AttachContext.Detached"/> and leaves this alone.</summary>
+        private void OnSvcDetached(DebugDetach d) => UI(() =>
+        {
+            if (_attach != null) _attach.Detached = true;
+            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine();
+            Post("{\"type\":\"clear\"}");   // first: `clear` empties the console, and the lines below must survive it
+            string name = d != null && !string.IsNullOrEmpty(d.Name) ? d.Name
+                        : !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";
+            // `restored` is a COUNT and informational; -1 = the engine did not say. The crash warning is driven
+            // ONLY by `error`, which the engine sets whenever any restore failed.
+            string count = d != null && d.Restored >= 0
+                ? " (" + d.Restored.ToString(CultureInfo.InvariantCulture) + " breakpoint" + (d.Restored == 1 ? "" : "s") + " restored)"
+                : "";
+            Console("info", "Detached; " + name + " is still running" + count + ".");
+            if (d != null && !string.IsNullOrEmpty(d.Error))
+                Console("err", "detach could not restore every breakpoint (" + d.Error + "): "
+                    + name + " will probably crash when it reaches one. Save your work in it and restart it.");
+        });
+
+        // Stop had to kill an attached engine (the page is live here; a closing pad is covered by TeardownObserver).
+        private void OnSvcDetachAbandoned(AttachableProcess t) => UI(() =>
+            Console("err", DetachWarningText(t != null ? t.Name : _lastAttachName, t != null ? (uint?)t.Pid : null,
+                "the engine did not detach in time and had to be killed, so breakpoints may still be planted")));
+
+        /// <summary>The one wording of an unsafe detach, for the console, the dialog and the log alike.</summary>
+        internal static string DetachWarningText(string name, uint? pid, string error)
+        {
+            string app = string.IsNullOrEmpty(name) ? "the app" : name;
+            return "CA Debugger could not detach cleanly from " + app
+                + (pid.HasValue ? " (pid " + pid.Value.ToString(CultureInfo.InvariantCulture) + ")" : "")
+                + ": " + (string.IsNullOrEmpty(error) ? "unknown error" : error)
+                + ". Save your work in " + app + " and restart it.";
+        }
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
@@ -602,6 +669,8 @@ namespace ClarionDebugger.Terminal
                     case "stepinto": CmdStepInto(); break;
                     case "stepout": CmdStepOut(); break;
                     case "stop": CmdStop(); break;
+                    case "procs": CmdListProcs(); break;           // attach picker: list attachable processes
+                    case "attach": CmdAttach(data); break;         // data = a pid from the host's own last listing
                     case "watch":
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
@@ -703,6 +772,123 @@ namespace ClarionDebugger.Terminal
             // opened). Queue it; NavigationCompleted will run StartSession once the page is live.
             if (!_ready) { _startQueued = true; return; }
             StartSession();
+        }
+
+        /// <summary>The attach picker asked for the processes it may offer (3f2d747f). Listed off the UI thread by the
+        /// engine's one-shot <c>procs</c>, with this IDE's own pid excluded, and posted to the page as a
+        /// <c>procs</c> message. The listing is also what <see cref="CmdAttach"/> checks a pid against, so a
+        /// refresh retires the previous listing's pids AT ONCE, not when the new one arrives.</summary>
+        private void CmdListProcs()
+        {
+            int gen = ++_procsGen;
+            _listedProcs.Begin(gen);
+            int self;
+            try { self = System.Diagnostics.Process.GetCurrentProcess().Id; } catch { self = 0; }
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string error;
+                var procs = ClarionDebuggerService.ListProcesses(self, out error);
+                UI(() =>
+                {
+                    if (!_listedProcs.Replace(gen, procs)) return;   // a newer listing was asked for meanwhile
+                    Post(ProcsJson(procs, error));
+                });
+            });
+        }
+
+        /// <summary>The page's <c>procs</c> message. Names and paths are the processes' own, so they are written as
+        /// JSON strings here and rendered as TEXT by the page, never as markup.</summary>
+        private static string ProcsJson(List<AttachableProcess> procs, string error)
+        {
+            var sb = new StringBuilder("{\"type\":\"procs\",\"procs\":[");
+            if (procs != null)
+                for (int i = 0; i < procs.Count; i++)
+                {
+                    var p = procs[i];
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"pid\":").Append(p.Pid.ToString(CultureInfo.InvariantCulture))
+                      .Append(",\"name\":").Append(Str(p.Name))
+                      .Append(",\"path\":").Append(Str(p.Path)).Append('}');
+                }
+            sb.Append("],\"error\":").Append(Str(error)).Append('}');
+            return sb.ToString();
+        }
+
+        /// <summary>Attach to the process the picker named (3f2d747f). <paramref name="data"/> is a pid, and it is
+        /// honoured ONLY when it is in the listing this host last sent (<see cref="ListedProcesses"/>): anything else
+        /// is dropped with a console line, so nothing on the bridge can point the debugger at an arbitrary process.
+        /// Gated like <see cref="CmdStart"/>: this pad idle AND the global controller idle.</summary>
+        public void CmdAttach(string data)
+        {
+            if (CurrentState != DebugSessionState.Idle) return;
+            if (DebugSessionController.State != DebugControllerState.Idle) return;
+            var req = AttachRequest.Parse(data);
+            if (req == null) { Console("err", "attach: dropped a request that did not name a process id"); return; }
+            var target = _listedProcs.Take(req.Pid);
+            if (target == null)
+            {
+                Console("err", "attach: pid " + req.Pid.ToString(CultureInfo.InvariantCulture)
+                    + " was not in the process list this pad last showed, so it was refused. Refresh the list and pick again.");
+                return;
+            }
+            // A pid is not an identity: without the listed start time the engine cannot check that pid still names
+            // the process the user picked, so the attach is refused rather than made blind (an older engine).
+            if (!AttachableProcess.IsStartTime(target.Started))
+            {
+                Console("err", "attach: the process list gave no start time for " + (target.Name ?? "the process") + " (pid "
+                    + req.Pid.ToString(CultureInfo.InvariantCulture) + "), so the debugger cannot prove that pid is still the process"
+                    + " you picked. It was not attached. The CA Debugger engine may be older than the add-in: reinstall it.");
+                return;
+            }
+            AttachSession(target);
+        }
+
+        /// <summary>Start an ATTACH session on <paramref name="target"/>: StartSession's steps, with the listed process
+        /// in place of a launched EXE.</summary>
+        private void AttachSession(AttachableProcess target)
+        {
+            try
+            {
+                RearmAndReportMonacoHooks();
+                if (_svc.IsEngineStillClosing) { Console("err", ClarionDebuggerService.EngineClosingMessage); return; }
+
+                MergeGutterIntoPending();
+                Post("{\"type\":\"clear\"}");
+                var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
+                string label = (target.Name ?? "process") + " (pid " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
+                Console("info", "attaching to " + label + "  (" + _pending.Count + " breakpoint(s)"
+                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                _attach = new AttachContext { Name = target.Name };
+                _lastAttachName = target.Name;
+                try { _svc.AttachSession(target, _pending.ToArray(), solutionDlls); }
+                catch { _attach = null; throw; }
+                // Stop now DETACHES; the page says so on its Stop control.
+                Post("{\"type\":\"attachmode\",\"on\":true}");
+
+                // Symbols come from the image on disk, as for a launch, when the listed path still resolves.
+                string exe = target.Path;
+                if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
+                {
+                    System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+                    {
+                        string g = ClarionDebuggerService.GetGlobalsJson(exe);
+                        if (!string.IsNullOrEmpty(g))
+                            UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
+                    });
+                    PushProcedures(exe);
+                }
+            }
+            catch (Exception ex) { Console("err", "attach failed: " + ex.Message); }
+        }
+
+        /// <summary>What the pad knows about the attach session in progress (UI-thread only).</summary>
+        private sealed class AttachContext
+        {
+            public string Name;
+            /// <summary>The engine reported <c>detached</c>: the page has been told the app is still running.</summary>
+            public bool Detached;
+            /// <summary>The engine's "attach ..." error, said again after the exit clears the console.</summary>
+            public string LastError;
         }
 
         public void CmdContinue() { if (CurrentState == DebugSessionState.Paused) _svc.Continue(); }
@@ -953,8 +1139,9 @@ namespace ClarionDebugger.Terminal
             if (CurrentState == DebugSessionState.Idle) return;   // nothing to stop
             // Clear the execution-line marker (Monaco + native) on the UI thread (it's a UI operation).
             ClearExecutionLine();
-            // _svc.Stop() blocks (WaitForExit(1500) + Kill); run it off the UI thread so the IDE doesn't
-            // freeze. Results come back via the existing Exited/StateChanged -> UI() path.
+            // _svc.Stop() blocks (quit + WaitForExit + Kill; for an ATTACHED session detach + up to 8 s, so the app
+            // keeps running); run it off the UI thread so the IDE doesn't freeze. Results come back via the existing
+            // Exited/Detached/StateChanged -> UI() path.
             var svc = _svc;
             System.Threading.Tasks.Task.Run(() => { try { svc.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] stop: " + ex.Message); } });
         }
@@ -982,13 +1169,8 @@ namespace ClarionDebugger.Terminal
 
                 // Echo the resolved target so the console always confirms which process is about to launch.
                 Console("info", "target: " + _exe);
-                // merge gutter (red-dot) breakpoints set before launch
-                foreach (var gb in _gutter.Snapshot())
-                {
-                    bool known = false;
-                    foreach (var b in _pending) if (SameBp(b, gb.Module, gb.DisplayLine)) { known = true; break; }
-                    if (!known) _pending.Add(gb);
-                }
+                _attach = null;   // a launch: Stop quits (and ends the target) rather than detaching
+                MergeGutterIntoPending();
                 Post("{\"type\":\"clear\"}");
                 // Pre-load the solution's output DLLs so breakpoints set in DLL source bind before
                 // launch (multi-DLL apps); other DLLs are still picked up automatically as they load.
@@ -1008,6 +1190,17 @@ namespace ClarionDebugger.Terminal
                 PushProcedures(exe);   // refresh the Procedures list against the just-resolved target
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
+        }
+
+        /// <summary>Merge the gutter's (red-dot) breakpoints, set before the session, into _pending.</summary>
+        private void MergeGutterIntoPending()
+        {
+            foreach (var gb in _gutter.Snapshot())
+            {
+                bool known = false;
+                foreach (var b in _pending) if (SameBp(b, gb.Module, gb.DisplayLine)) { known = true; break; }
+                if (!known) _pending.Add(gb);
+            }
         }
 
         /// <summary>Enumerate the target's procedures + methods (static parse, off the UI thread) and send
@@ -2483,16 +2676,25 @@ namespace ClarionDebugger.Terminal
                 if (wasLive)
                 {
                     // A session was live. _svc.Stop() blocks (WaitForExit(1500) + Kill) and runs off the UI
-                    // thread. Do NOT Unregister now — that would let the controller report Idle and re-enable
+                    // thread. For an ATTACHED session Stop() DETACHES rather than quitting, so closing the pad never
+                    // kills an app the user attached to (3f2d747f); and if the IDE exits before this task finishes,
+                    // the engine sees its stdin close and detaches on its own (the engine contract). Do NOT Unregister now — that would let the controller report Idle and re-enable
                     // the toolbar Start while the old engine/target is still dying (close→reopen→re-run-same-exe
                     // would race a still-terminating process / file lock). Keep the controller's current
                     // non-idle state; only AFTER Stop() completes do we signal the controller (NotifyStopped),
                     // which returns to Idle iff the then-current target is genuinely idle, then Unregister this
                     // instance. Order matters: NotifyStopped before Unregister so a no-reopen close still drops
                     // to Idle (NotifyStopped sees _target==this whose session is now idle).
+                    //
+                    // THE PAD'S HANDLERS ARE GONE BY NOW (DetachServiceEvents above), and so is its page. TeardownLive
+                    // keeps its OWN observer on the service until Stop has returned, so a detach that reports an error,
+                    // or an attached engine Stop had to kill, still reaches the user - through the log and a dialog on
+                    // this (UI) thread's context, captured here because the task below runs elsewhere (3f2d747f run 2).
+                    var warn = DurableWarning.ForCurrentThread();
+                    string attachedName = _lastAttachName;
                     System.Threading.Tasks.Task.Run(() =>
                     {
-                        try { svc.Stop(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] dispose stop: " + ex.Message); }
+                        try { TeardownLive(svc, attachedName, warn); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[CADebuggerWeb] dispose stop: " + ex.Message); }
                         try { DebugSessionController.NotifyStopped(this); } catch { }
                         try { DebugSessionController.Unregister(this); } catch { }
                     });
@@ -2508,6 +2710,143 @@ namespace ClarionDebugger.Terminal
                 if (_webView != null) { try { _webView.Dispose(); } catch { } _webView = null; }
             }
             base.Dispose(disposing);
+        }
+
+        /// <summary>End a live session from a pad that is going away (3f2d747f, pipeline run 2). The pad's own handlers
+        /// are already unsubscribed, and its page with them, so the risky outcomes of a teardown - a detach that
+        /// reports an error, or an attached engine that had to be killed (bytes left planted: the app will probably
+        /// crash) - would reach no one. A <see cref="TeardownObserver"/> is subscribed FIRST and stays subscribed until
+        /// Stop has returned, and Stop raises both outcomes before it returns; <paramref name="warn"/> is the durable
+        /// channel that does not need the page. A clean detach, or a launch, warns about nothing.</summary>
+        internal static bool TeardownLive(ClarionDebuggerService svc, string attachedName, Action<string> warn)
+        {
+            using (new TeardownObserver(svc, attachedName, warn))
+            {
+                return svc.Stop();
+            }
+        }
+    }
+
+    /// <summary>Watches ONE teardown for an unsafe detach and reports it through <c>warn</c> (see
+    /// <see cref="ClarionDebuggerWebView.TeardownLive"/>). Subscribes in its constructor, unsubscribes in Dispose.</summary>
+    internal sealed class TeardownObserver : IDisposable
+    {
+        private readonly ClarionDebuggerService _svc;
+        private readonly string _name;
+        private readonly Action<string> _warn;
+
+        public TeardownObserver(ClarionDebuggerService svc, string attachedName, Action<string> warn)
+        {
+            _svc = svc; _name = attachedName; _warn = warn;
+            _svc.Detached += OnDetached;
+            _svc.DetachAbandoned += OnAbandoned;
+        }
+
+        private void OnDetached(DebugDetach d)
+        {
+            // The warning is driven by the engine's `error` alone, exactly as on a live page (OnSvcDetached).
+            if (d == null || string.IsNullOrEmpty(d.Error)) return;
+            _warn(ClarionDebuggerWebView.DetachWarningText(string.IsNullOrEmpty(d.Name) ? _name : d.Name, d.Pid, d.Error));
+        }
+
+        private void OnAbandoned(AttachableProcess t)
+        {
+            _warn(ClarionDebuggerWebView.DetachWarningText(t != null && !string.IsNullOrEmpty(t.Name) ? t.Name : _name,
+                t != null ? (uint?)t.Pid : null,
+                "the engine did not detach in time and had to be killed, so breakpoints may still be planted"));
+        }
+
+        public void Dispose()
+        {
+            _svc.Detached -= OnDetached;
+            _svc.DetachAbandoned -= OnAbandoned;
+        }
+    }
+
+    /// <summary>A warning that must be SEEN although the pad that would have shown it is gone: a dated line in
+    /// %LOCALAPPDATA%\CA Debugger\detach.log (the add-in has no other log), then a dialog posted to the IDE's UI
+    /// thread. Posted, not sent, so it never blocks the teardown that raised it; with no UI context (the IDE is
+    /// already past its message loop) it gets its own STA thread. Either half failing leaves the other.</summary>
+    internal static class DurableWarning
+    {
+        public static string LogPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CA Debugger", "detach.log"); }
+        }
+
+        /// <summary>Make a warner bound to the UI context of the CALLER (call it on the UI thread).</summary>
+        public static Action<string> ForCurrentThread()
+        {
+            var ui = System.Threading.SynchronizationContext.Current;
+            return text => Show(text, ui);
+        }
+
+        /// <summary>Where the log goes when <see cref="LogPath"/> cannot be written (%TEMP%\CA Debugger\detach.log).</summary>
+        public static string FallbackLogPath
+        {
+            get { return Path.Combine(Path.GetTempPath(), "CA Debugger", "detach.log"); }
+        }
+
+        /// <summary>Which channels a warning actually went out on.</summary>
+        [Flags]
+        internal enum Channels { None = 0, Log = 1, FallbackLog = 2, PostedDialog = 4, ThreadDialog = 8 }
+
+        public static Channels Show(string text, System.Threading.SynchronizationContext ui)
+        {
+            return Deliver(text, new[] { LogPath, FallbackLogPath }, ui, StartStaThread, ShowBox);
+        }
+
+        /// <summary>Log to the first of <paramref name="logPaths"/> that can be written, then show the dialog: posted
+        /// to <paramref name="ui"/> when there is one, and on its own STA thread when there is none OR the post THROWS
+        /// (a destroyed handle during IDE shutdown). The dialog does not depend on either log succeeding.</summary>
+        internal static Channels Deliver(string text, IList<string> logPaths, System.Threading.SynchronizationContext ui,
+                                         Action<Action> startStaThread, Action<string> showBox)
+        {
+            var sent = Channels.None;
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + text + Environment.NewLine;
+            for (int i = 0; i < logPaths.Count; i++)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(logPaths[i]));
+                    File.AppendAllText(logPaths[i], line);
+                    sent |= i == 0 ? Channels.Log : Channels.FallbackLog;
+                    break;
+                }
+                catch { }   // try the next location; the dialog below goes out whatever happens here
+            }
+            if (ui != null)
+            {
+                try
+                {
+                    ui.Post(_ => showBox(text), null);
+                    return sent | Channels.PostedDialog;
+                }
+                catch (Exception)
+                {
+                    // The UI context is going (its handle destroyed during IDE shutdown). Not swallowed: the dialog
+                    // falls through to its own thread below.
+                }
+            }
+            try
+            {
+                startStaThread(() => showBox(text));
+                sent |= Channels.ThreadDialog;
+            }
+            catch { }
+            return sent;
+        }
+
+        private static void ShowBox(string text)
+        {
+            try { MessageBox.Show(text, "CA Debugger", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
+        }
+
+        private static void StartStaThread(Action body)
+        {
+            var t = new System.Threading.Thread(() => body()) { IsBackground = false };
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
         }
     }
 }

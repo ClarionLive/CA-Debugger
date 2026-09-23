@@ -15,7 +15,7 @@
 # (see test-engine-session.ps1). Cursor lives in here because PowerShell functions cannot share a
 # caller's `$script:` variable across a dot-sourced file boundary without surprises.
 function New-EngineSessionState {
-    param($Proc, $Sink, $Handlers = @(), [string]$Target)
+    param($Proc, $Sink, $Handlers = @(), [string]$Target, $StartedAt = $null)
     $name = $null
     if ($Target) { $name = [IO.Path]::GetFileNameWithoutExtension($Target) }
     return @{
@@ -27,8 +27,10 @@ function New-EngineSessionState {
         TargetName = $name
         TargetPid  = $null
         # Captured BEFORE the engine starts, so it is always earlier than the debuggee's own start time.
-        # That ordering is what makes the pid-reuse check below meaningful.
-        StartedAt  = (Get-Date)
+        # That ordering is what makes the pid-reuse check below meaningful. An ATTACH session's debuggee is
+        # started by the harness before the engine, so the harness passes the time it captured before
+        # starting it; the ordering, and so the check, is the same.
+        StartedAt  = $(if ($null -ne $StartedAt) { $StartedAt } else { Get-Date })
     }
 }
 
@@ -38,11 +40,16 @@ function New-EngineSession {
         [Parameter(Mandatory = $true)][string]$Target,
         [string]$BreakArgs = '',
         [string]$WorkingDirectory = '',
-        [switch]$CaptureStdErr
+        [switch]$CaptureStdErr,
+        # ATTACH instead of launch: the engine attaches to this pid, which must be the process the harness
+        # started from $Target, with -StartedAt taken before it started (see New-EngineSessionState).
+        [int]$AttachPid = 0,
+        $StartedAt = $null
     )
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Engine
-    $psi.Arguments = "break `"$Target`" $BreakArgs --interactive --json"
+    $psi.Arguments = if ($AttachPid -gt 0) { "attach $AttachPid $BreakArgs --interactive --json" }
+                     else { "break `"$Target`" $BreakArgs --interactive --json" }
     $psi.RedirectStandardInput = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
@@ -63,7 +70,7 @@ function New-EngineSession {
         }
     }
 
-    $session = New-EngineSessionState -Proc $proc -Sink $sink -Handlers $handlers -Target $Target
+    $session = New-EngineSessionState -Proc $proc -Sink $sink -Handlers $handlers -Target $Target -StartedAt $StartedAt
     [void]$proc.Start()
     $proc.BeginOutputReadLine()
     if ($CaptureStdErr) { $proc.BeginErrorReadLine() }
