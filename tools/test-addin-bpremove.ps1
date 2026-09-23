@@ -93,7 +93,7 @@ function New-Probe {
   $p._svc.IsRunning = $Running
   $p._svc.RemoveResult = $RemoveSucceeds
   $bp = New-Object DebugBreakpoint
-  $bp.Module = 'MAIN.CLW'; $bp.RequestedLine = 42; $bp.Line = 42
+  $bp.Module = 'MAIN.CLW'; $bp.RequestedLineOrNull = 42; $bp.Line = 42
   $p._pending.Add($bp)
   return $p
 }
@@ -104,7 +104,7 @@ $p = New-Probe $true $false
 $p.OnGutterBpRemoved('MAIN.CLW', 42)
 Check 'the pending entry survives a failed RemoveBreakpoint' ($p._pending.Count -eq 1) "$($p._pending.Count) entry/entries left"
 Check 'the engine was actually asked' ($p._svc.RemoveCalls -eq 1) "$($p._svc.RemoveCalls) call(s)"
-Check 'the surviving entry is the one that was asked for' ($p._pending.Count -eq 1 -and $p._pending[0].Module -eq 'MAIN.CLW' -and $p._pending[0].RequestedLine -eq 42) ''
+Check 'the surviving entry is the one that was asked for' ($p._pending.Count -eq 1 -and $p._pending[0].Module -eq 'MAIN.CLW' -and $p._pending[0].DisplayLine -eq 42) ''
 # Still on the list means the user can see it in the pane and remove it again; that retry is the
 # recovery path the eager trim destroys.
 $p._svc.RemoveResult = $true
@@ -141,7 +141,7 @@ Write-Host ''
 Write-Host 'a failed removal does not take an unrelated breakpoint with it'
 $p = New-Probe $true $false
 $other = New-Object DebugBreakpoint
-$other.Module = 'OTHER.CLW'; $other.RequestedLine = 42; $other.Line = 42
+$other.Module = 'OTHER.CLW'; $other.RequestedLineOrNull = 42; $other.Line = 42
 $p._pending.Add($other)
 $p.OnGutterBpRemoved('MAIN.CLW', 42)
 Check 'both entries survive' ($p._pending.Count -eq 2) "$($p._pending.Count) entry/entries left"
@@ -173,7 +173,7 @@ Write-Host 'SameBp matches the line the caller ASKED FOR, never one merely plant
 # contract rather than a path through the pad. A promise no input can currently reach is still a promise,
 # and the next writer into _pending is the one who finds out whether it was kept.
 $staged = New-Object DebugBreakpoint
-$staged.Module = 'MAIN.CLW'; $staged.RequestedLine = 12; $staged.Line = 11   # asked for 12, snapped to 11
+$staged.Module = 'MAIN.CLW'; $staged.RequestedLineOrNull = 12; $staged.Line = 11   # asked for 12, snapped to 11
 Check 'it matches the line the entry asked for' ([BpRemoveProbe]::SameBp($staged, 'MAIN.CLW', 12)) ''
 Check 'and NOT the line it was planted on' (-not [BpRemoveProbe]::SameBp($staged, 'MAIN.CLW', 11)) ''
 # CONTROL: the same predicate, the same module, a line that is neither. A matcher that had stopped matching
@@ -198,7 +198,7 @@ Check 'and does not match a line it was never planted on' (-not [BpRemoveProbe]:
 # ISOLATION for the two above: 0 is a REAL requested line (an unresolved raw --rva breakpoint has one), so
 # "absent" must not be reachable by writing 0. An entry that asked for 0 is matched at 0, not at its plant.
 $raw0 = New-Object DebugBreakpoint
-$raw0.Module = 'MAIN.CLW'; $raw0.RequestedLine = 0; $raw0.Line = 13
+$raw0.Module = 'MAIN.CLW'; $raw0.RequestedLineOrNull = 0; $raw0.Line = 13
 Check 'a present requested line of 0 is a requested line, not an absent one' `
   (([BpRemoveProbe]::SameBp($raw0, 'MAIN.CLW', 0)) -and -not ([BpRemoveProbe]::SameBp($raw0, 'MAIN.CLW', 13))) ''
 
@@ -207,7 +207,7 @@ Write-Host 'the pad decides a line through the same body the service does, not a
 # Two predicates that happen to read alike drift the moment either is edited. This one calls the service's.
 $sameBp = Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)'
 Check 'SameBp delegates the line decision to BpLineMatches' ($sameBp -match 'ClarionDebuggerService\.BpLineMatches\(b, line, line\)') ''
-Check 'and keeps no comparison of its own' ($sameBp -notmatch 'b\.Line == line' -and $sameBp -notmatch 'b\.RequestedLine ==') ''
+Check 'and keeps no comparison of its own' ($sameBp -notmatch 'b\.Line == line' -and $sameBp -notmatch 'b\.RequestedLine ==' -and $sameBp -notmatch 'b\.DisplayLine ==') ''
 
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) FAILURE(S)"; exit 1 }

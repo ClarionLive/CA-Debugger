@@ -326,7 +326,8 @@ Check 'and it is the ONLY caller that does - 1 site' ($trueSites.Count -eq 1) "$
 $gutterAdd = Get-CSharpBlock 'private void OnGutterBpAdded(string module, int line)' $web
 Check 'a gutter dot is NOT single-target, so it arms in every image carrying the .clw' `
   ($gutterAdd -match '_svc\.AddBreakpoint\(module, line\)') ''
-$procEntry = Get-CSharpBlock 'public void CmdBreakOnProcEntry(string data)' $web
+# Both break-on-entry paths (the page's id, the editor's position) share BreakOnEntry since e61e4f92.
+$procEntry = Get-CSharpBlock 'private void BreakOnEntry(ProcRef proc)' $web
 Check 'and neither is break-on-proc-entry, which is a persistent breakpoint despite staging like one' `
   ($procEntry -match '_svc\.AddBreakpoint\(module, line\)') ''
 $svcAdd = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line, bool singleTarget)' $svc

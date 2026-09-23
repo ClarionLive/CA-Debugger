@@ -337,6 +337,7 @@ public class PadStub : Control, IDebugSessionTarget {
         RanOnThread = Thread.CurrentThread.ManagedThreadId;
         Calls++;
     }
+    public void CmdBreakOnProcEntryAt(string filePath, int line) { }
 }
 
 public static class Program {
@@ -417,26 +418,41 @@ $((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
         Check("an on-thread caller still runs synchronously, with no extra hop",
               _pad.Calls == 2, _pad.Calls + " call(s)");
 
-        // 4. a target that is not a Control at all must still be forwarded, not silently skipped.
+        // 4. a target that is not a Control at all. Since fc8d63f5 the interface requires ISynchronizeInvoke,
+        //    and the claim is no longer "forwarded on the caller's thread" but "posted through its OWN marshal".
         _target = new PlainTarget();
         Invoke(delegate(IDebugSessionTarget t) { t.CmdRunToCursor(null); }, true, IsPaused);
-        Check("a non-Control target is still forwarded rather than dropped by the thread guard",
-              PlainTarget.Calls == 1, PlainTarget.Calls + " call(s)");
+        Check("a non-Control target is marshalled through its own BeginInvoke, not run on the caller's thread",
+              PlainTarget.BeginInvokeCalls == 1 && PlainTarget.Calls == 1 && PlainTarget.RanPosted,
+              PlainTarget.BeginInvokeCalls + " post(s), " + PlainTarget.Calls + " call(s), posted=" + PlainTarget.RanPosted);
 
         if (_ctx != null) _pad.BeginInvoke((Action) delegate { _ctx.ExitThread(); });
         return _failures == 0 ? 0 : 1;
     }
 
-    /// Not every IDebugSessionTarget has to be a Control. The thread guard must fall through for one that
-    /// is not, instead of treating "cannot marshal" as "do not run".
+    /// Not every IDebugSessionTarget has to be a Control, but every one now carries a marshal (fc8d63f5).
+    /// This one reports "wrong thread" until its own BeginInvoke is running the posted delegate, and records
+    /// whether a command ran inside that post.
     private class PlainTarget : IDebugSessionTarget {
         public static int Calls;
+        public static int BeginInvokeCalls;
+        public static bool RanPosted;
+        [ThreadStatic] private static bool _inPost;
         public bool IsReady { get { return true; } }
         public bool IsSessionIdle { get { return true; } }
+        public bool InvokeRequired { get { return !_inPost; } }
+        public IAsyncResult BeginInvoke(Delegate method, object[] args) {
+            BeginInvokeCalls++; _inPost = true;
+            try { method.DynamicInvoke(args); } finally { _inPost = false; }
+            return null;
+        }
+        public object EndInvoke(IAsyncResult result) { return null; }
+        public object Invoke(Delegate method, object[] args) { return method.DynamicInvoke(args); }
         public void CmdStart() { } public void CmdContinue() { } public void CmdPause() { }
         public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
         public void CmdStop() { }
-        public void CmdRunToCursor(string spec) { Calls++; }
+        public void CmdRunToCursor(string spec) { Calls++; RanPosted = _inPost; }
+        public void CmdBreakOnProcEntryAt(string filePath, int line) { }
     }
 }
 "@

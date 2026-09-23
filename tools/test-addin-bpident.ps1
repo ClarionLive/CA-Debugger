@@ -108,7 +108,7 @@ $line = 50
 
 function New-Bp { param($mod, $req, $planted, $path)
   $b = New-Object DebugBreakpoint
-  $b.Module = $mod; $b.RequestedLine = $req; $b.Line = $planted; $b.Path = $path
+  $b.Module = $mod; $b.RequestedLineOrNull = $req; $b.Line = $planted; $b.Path = $path
   $b
 }
 function New-Map { New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase) }
