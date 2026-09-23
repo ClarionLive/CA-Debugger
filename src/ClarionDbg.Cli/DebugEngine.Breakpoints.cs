@@ -477,7 +477,12 @@ namespace ClarionDbg.Cli
                     // `ret > _prevVa && ret - _prevVa <= CALL_WINDOW`; a _prevVa still holding a pre-hit EIP
                     // can make the re-arm trap below read as a call entry and plant a temp INT3 at a bogus
                     // return address. Same assignment, same reason, as the caller-resume path in OnTempBp.
-                    _prevVa = va;
+                    //
+                    // ONLY FOR THE STEPPING THREAD (f367a04f). _prevVa is the anchor of _stepTid's step and
+                    // nobody else's: OnSingleStep drives StepMachine for `tid == _stepTid` alone, so a
+                    // silent hit on any other thread has no step of its own to re-anchor. Unguarded, a
+                    // tracepoint firing on thread B moved thread A's anchor to an address A never ran.
+                    if (tid == _stepTid) _prevVa = va;
                     if (haveCtx)
                     {
                         Native.GetThreadContext(hThread, ref ctx);
