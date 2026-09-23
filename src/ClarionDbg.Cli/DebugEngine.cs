@@ -18,12 +18,51 @@ namespace ClarionDbg.Cli
         public string HitMode;     // null | "eq" (=N) | "gte" (>=N) | "mod" (every Nth)
         public int HitValue;       // N for the hit-count rule
         public string Trace;       // non-null = tracepoint message
+
+        /// <summary>The OWNING IMAGE the caller means, or null when it did not say.
+        /// <para>
+        /// <see cref="Module"/> is a bare .clw BASENAME, and in a multi-DLL app two loaded images can each
+        /// carry a compiland of that name. Without this, `bp add clbrws011.clw:50` can only ever mean "the
+        /// first image that happens to carry it" - so the second DLL's breakpoint was never armed and the
+        /// user's gutter dot silently never fired (task af81c054).
+        /// </para>
+        /// <para>
+        /// NULL MEANS UNQUALIFIED, not "no image": the caller did not name one, and the engine arms the
+        /// breakpoint in every loaded image carrying the compiland (one image, for |one=1). An older host,
+        /// which sends nothing but a bare basename, gets exactly that.
+        /// </para></summary>
+        public string Image;
+
+        /// <summary>The caller wants this breakpoint in exactly ONE image, even if several carry the
+        /// compiland and it named none (<c>|one=1</c>).
+        /// <para>
+        /// This exists for run-to-cursor, which is composed host-side as <c>bp add</c> + <c>continue</c>
+        /// and so is indistinguishable from an ordinary add down here. "Get me to HERE and stop once"
+        /// must not become "stop somewhere on the way", which is what arming it in every image would do.
+        /// A persistent user breakpoint never sets it - see <see cref="DebugEngine.AddBreakpoint"/>.
+        /// </para>
+        /// <para>
+        /// DEFAULT FALSE IS DELIBERATE. An older host sends neither <c>img=</c> nor <c>one=</c>, and it
+        /// must get the fixed behaviour rather than opt into it - a host that cannot be updated is exactly
+        /// the one whose second-DLL breakpoints silently never fired before this change.
+        /// </para></summary>
+        public bool One;
+
         public BpSpec(string module, int line) { Module = module; Line = line; }
 
         /// <summary>Parse one space-free breakpoint spec token: <c>module:line</c> optionally followed by
-        /// <c>|c=&lt;base64&gt;|hm=eq|hv=5|t=&lt;base64&gt;</c>. Free-text fields (condition, trace) are
-        /// base64(UTF-8) so they survive the line/space-split CLI + stdin protocol without quoting or
-        /// injection risk. Returns false if the head isn't a valid module:line.</summary>
+        /// <c>|img=&lt;base64&gt;|c=&lt;base64&gt;|hm=eq|hv=5|t=&lt;base64&gt;</c>. Free-text fields
+        /// (image, condition, trace) are base64(UTF-8) so they survive the line/space-split CLI + stdin
+        /// protocol without quoting or injection risk. Returns false if the head isn't a valid module:line.
+        /// <para>
+        /// AN UNRECOGNISED SEGMENT IS IGNORED, AND THAT IS LOAD-BEARING, not laziness. The switch below has
+        /// no <c>default:</c>, so a segment this build does not know about is skipped and the segments
+        /// AFTER it are still read. That is what makes the spec extensible in BOTH directions with no
+        /// version negotiation: an engine older than <c>img=</c> ignores it and arms the way it always did,
+        /// and this engine given no <c>img=</c> arms unqualified. Verified against the real
+        /// pre-change parser in tools/test-engine-bpowner.ps1 rather than assumed - it is the entire
+        /// compatibility argument for the grammar, so it is checked instead of being reasoned about.
+        /// </para></summary>
         public static bool TryParse(string spec, out BpSpec result)
         {
             result = null;
@@ -48,9 +87,38 @@ namespace ClarionDbg.Cli
                     case "hm": bp.HitMode = (val == "eq" || val == "gte" || val == "mod") ? val : null; break;
                     case "hv": int hv; bp.HitValue = int.TryParse(val, out hv) ? hv : 0; break;
                     case "t":  bp.Trace = DecodeB64(val); break;
+                    // Base64 for the same reason c= and t= are, and it is not optional here: an image path
+                    // carries backslashes, spaces and a drive colon, and the protocol is line- and
+                    // space-split. It cannot travel in the module field either - the host's
+                    // IsValidModuleName allows only [A-Za-z0-9_.-], which is the guard against argument
+                    // smuggling and stays.
+                    // FAILS CLOSED (af81c054, pipeline run 1): a PRESENT img= that is empty, oversized, not
+                    // base64 or carries a control character rejects the whole spec. Decoding it to null made
+                    // it "unqualified", so a del meant for one image removed every copy.
+                    case "img":
+                        string img;
+                        if (!TryDecodeImage(val, out img)) return false;
+                        bp.Image = img;
+                        break;
+                    case "one": bp.One = (val == "1" || val == "true"); break;
                 }
             }
             result = bp;
+            return true;
+        }
+
+        /// <summary>Longest encoded img= accepted: 4096 base64 chars, about 3 KB of path, well above
+        /// MAX_PATH and bounded so a pending entry cannot pin an arbitrarily large string.</summary>
+        public const int MaxImageB64 = 4096;
+
+        public static bool TryDecodeImage(string b64, out string image)
+        {
+            image = null;
+            if (string.IsNullOrEmpty(b64) || b64.Length > MaxImageB64) return false;
+            string s = DecodeB64(b64);
+            if (string.IsNullOrEmpty(s)) return false;
+            foreach (char c in s) if (c < 0x20 || c == 0x7F) return false;
+            image = s;
             return true;
         }
 
@@ -83,6 +151,27 @@ namespace ClarionDbg.Cli
         public string Module;          // canonical compiland name (e.g. clbrws011.clw)
         public int ModuleIdx;          // index within Owner.Dbg (valid once Owner is set)
         public LoadedModule Owner;     // the mapped/known image whose TSWD carries this compiland; null = pending
+
+        /// <summary>The owning image the CALLER named (<c>bp add m:l|img=...</c>), or null when it named
+        /// none. Distinct from <see cref="Owner"/>, which is the image actually bound: this is the REQUEST
+        /// and it is kept because a breakpoint set before launch is pending until its image maps, and
+        /// <c>ResolvePendingFor</c> must then bind it to the image that was ASKED FOR rather than to the
+        /// first one that happens to carry the compiland.
+        /// <para>
+        /// Null = unqualified = armed in every carrying image. See <see cref="BpSpec.Image"/>.
+        /// </para></summary>
+        public string OwnerSpec;
+
+        /// <summary>The CALLER ASKED for a single target (<see cref="BpSpec.One"/>), so a later image
+        /// carrying the same compiland must NOT get a copy of this breakpoint.
+        /// <para>
+        /// Named for what it is: a demand from whoever created the breakpoint, not a property of the
+        /// breakpoint itself. Nothing about a breakpoint makes it single-target - a run-to-cursor and a
+        /// gutter dot at the same module:line are identical down here, which is exactly why the request
+        /// has to travel with it. Carried on the record because the images that would trigger a copy map
+        /// long after the add was handled.
+        /// </para></summary>
+        public bool SingleTargetRequested;
         public int RequestedLine;      // the line the user asked for
         public int Line;               // the line actually planted (snapped to nearest record line)
         public readonly List<uint> Rvas = new List<uint>();   // code RVAs within Owner
@@ -481,7 +570,7 @@ namespace ClarionDbg.Cli
             if (_interactive) StartStdinReader();
 
             // resolve module:line specs up front so bp-set/bp-error report before launch
-            foreach (var s in _initialSpecs) AddBreakpoint(s.Module, s.Line, s.Condition, s.HitMode, s.HitValue, s.Trace);
+            foreach (var s in _initialSpecs) AddBreakpoint(s);
             // raw RVAs (legacy --rva/--entry/--all-entries) become anonymous breakpoints
             foreach (var rva in _rawRvas) AddRawBreakpoint(rva);
 
@@ -1020,8 +1109,12 @@ namespace ClarionDbg.Cli
                 EmitError("bp " + sub + " expects module:line, got '" + parts[2] + "'");
                 return;
             }
-            if (sub == "add") AddBreakpoint(spec.Module, spec.Line, spec.Condition, spec.HitMode, spec.HitValue, spec.Trace);
-            else if (sub == "del" || sub == "remove" || sub == "rm") RemoveBreakpoint(spec.Module, spec.Line);
+            // The whole spec goes through, never a field list: a breakpoint's identity now includes the
+            // image the caller named, and an argument list is exactly where a new identity field gets
+            // dropped on one of the two paths. This is the same lesson as requestedLine reaching bp-del
+            // and not bp-set.
+            if (sub == "add") AddBreakpoint(spec);
+            else if (sub == "del" || sub == "remove" || sub == "rm") RemoveBreakpoint(spec);
             else EmitError("unknown bp subcommand: " + sub);
         }
 

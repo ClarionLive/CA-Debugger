@@ -540,7 +540,28 @@ namespace ClarionDebugger.Services
         /// <summary>Add a breakpoint (engine snaps to the nearest code-record line and replies bp-set).</summary>
         public bool AddBreakpoint(string module, int line)
         {
-            return IsValidModuleName(module) && SendCommand("bp add " + module + ":" + line);
+            return AddBreakpoint(module, line, false);
+        }
+
+        /// <summary>Add a breakpoint, optionally demanding that the engine resolve it to a SINGLE image.
+        /// <para>
+        /// A .clw name is a bare BASENAME, so in a multi-DLL app several loaded images can carry a
+        /// compiland of that name. An unqualified add arms in ALL of them, which is what makes a gutter dot
+        /// in the second DLL fire at all (task af81c054). That is wrong for RUN-TO-CURSOR, which means
+        /// "get me to HERE and stop once": arming it everywhere turns it into "stop somewhere on the way",
+        /// defeating the feature rather than widening it.
+        /// </para>
+        /// <para>
+        /// The engine cannot tell the two apart by itself - run-to-cursor is composed here as
+        /// <c>bp add</c> + <c>continue</c> and reaches it as an ordinary add - so the caller says which it
+        /// is. <paramref name="singleTarget"/> DEFAULTS FALSE, and that default is the point: every caller
+        /// that does not think about this gets the fixed behaviour, and an engine older than the
+        /// <c>one=</c> segment ignores it and behaves as it always did.
+        /// </para></summary>
+        public bool AddBreakpoint(string module, int line, bool singleTarget)
+        {
+            return IsValidModuleName(module)
+                && SendCommand("bp add " + module + ":" + line + (singleTarget ? "|one=1" : ""));
         }
 
         /// <summary>Remove a breakpoint by module:line (planted or requested line both match).</summary>

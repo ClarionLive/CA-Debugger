@@ -713,7 +713,10 @@ namespace ClarionDebugger.Terminal
             // a "ran to cursor" that silently didn't. So: track the key now (filtered from the pane immediately,
             // and always cleaned up on pause/exit even if confirmation never comes), then defer Continue() to
             // OnSvcBreakpointSet; OnSvcBreakpointError aborts and stays paused.
-            if (!_svc.AddBreakpoint(module, line))
+            // singleTarget: this is a transient "run to cursor", not a user breakpoint. Several loaded
+            // images can carry a same-named .clw, and an unqualified add now arms in ALL of them - which
+            // would stop us somewhere on the way to where the user actually pointed.
+            if (!_svc.AddBreakpoint(module, line, true))
             {
                 Console("err", "run to cursor: could not set a breakpoint at " + module + ":" + line + " — staying paused.");
                 return;
