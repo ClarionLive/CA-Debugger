@@ -215,6 +215,20 @@ namespace ClarionDebugger.Services
         public List<DebugThread> Threads = new List<DebugThread>();
     }
 
+    /// <summary>The engine left an ATTACHED process running (3f2d747f): its <c>detached</c> event.</summary>
+    public sealed class DebugDetach
+    {
+        public uint? Pid;
+        /// <summary>The attached process's image name, from the listing the attach was made from (the event
+        /// itself names only the pid).</summary>
+        public string Name;
+        public int Drained;         // queued debug events the engine drained before it let go
+        public bool Restored;       // every planted breakpoint byte was put back
+        /// <summary>Why a breakpoint byte could not be restored, or null. Non-null means the app still holds
+        /// an INT3 it will hit with no debugger attached, which will most likely crash it.</summary>
+        public string Error;
+    }
+
     /// <summary>A watch-by-name result (Phase 3 'watch' command), value already rendered for display.</summary>
     public sealed class DebugWatch
     {
@@ -271,6 +285,10 @@ namespace ClarionDebugger.Services
         public static event Action ActiveChanged;
 
         private Process _proc;
+        // The process _proc is ATTACHED to (3f2d747f), or null when _proc LAUNCHED its target. Assigned with
+        // _proc and only there, so it always describes the current engine. It is what makes Stop detach instead
+        // of quit - a quit TERMINATES the target, which in attach mode is an app the user did not start here.
+        private AttachableProcess _attachTarget;
         private string _targetDir; // target EXE's directory — anchors relative .red redirection paths
         private readonly object _stateLock = new object();
         private DebugSessionState _state = DebugSessionState.Idle;
@@ -317,8 +335,12 @@ namespace ClarionDebugger.Services
         public event Action<bool, string, string, int, string> SetIpResult; // set next statement: ok, refusal code, module, line, user text
         public event Action<string> LogReceived;
         public event Action<int> Exited;
+        public event Action<DebugDetach> Detached;                 // an attached session let its process go (it keeps running)
 
         public bool IsRunning { get { return _proc != null && !_proc.HasExited; } }
+
+        /// <summary>True when the current engine is ATTACHED to a process rather than having launched it.</summary>
+        public bool IsAttachSession { get { return _attachTarget != null; } }
 
         public DebugSessionState State
         {
@@ -390,6 +412,31 @@ namespace ClarionDebugger.Services
             MemLo = MemHi = 0;   // fresh module span for this session (drives the disasm coarse scrollbar)
             var args = new System.Text.StringBuilder();
             args.Append("break \"").Append(targetExe).Append("\" --interactive --json");
+            AppendSessionOptions(args, breakpoints, solutionDlls);
+            Launch(targetExe, args.ToString(), true, null);
+        }
+
+        /// <summary>
+        /// Attach to a process that is already running (3f2d747f), with the same breakpoint and solution-DLL
+        /// options a launch takes. <paramref name="target"/> must come from <see cref="ListProcesses"/>: the pad
+        /// accepts only a pid it listed itself. The session then behaves as a launched one, except that
+        /// <see cref="Stop"/> DETACHES and leaves the process running.
+        /// </summary>
+        public void AttachSession(AttachableProcess target, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
+            if (target == null || target.Pid == 0) throw new ArgumentException("No process to attach to.");
+            if (!ReferenceEquals(Active, this)) { Active = this; ActiveChanged?.Invoke(); }
+            MemLo = MemHi = 0;
+            var args = new System.Text.StringBuilder();
+            args.Append("attach ").Append(target.Pid.ToString(CultureInfo.InvariantCulture)).Append(" --interactive --json");
+            AppendSessionOptions(args, breakpoints, solutionDlls);
+            Launch(target.Path, args.ToString(), true, target);
+        }
+
+        /// <summary>The <c>--bp</c> and <c>--solution-dll</c> options, shared by a launch and an attach so the two
+        /// can never pass a session different options.</summary>
+        private static void AppendSessionOptions(System.Text.StringBuilder args, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
             if (breakpoints != null)
                 foreach (var bp in breakpoints)
                 {
@@ -405,7 +452,6 @@ namespace ClarionDebugger.Services
                     if (string.IsNullOrEmpty(dll) || dll.IndexOf('"') >= 0) continue;
                     args.Append(" --solution-dll \"").Append(dll).Append('"');
                 }
-            Launch(targetExe, args.ToString(), true);
         }
 
         /// <summary>
@@ -415,7 +461,7 @@ namespace ClarionDebugger.Services
         {
             string args = "break \"" + targetExe + "\" --line " + line + " --module " + module + " --json --timeout 60000";
             if (once) args += " --once";
-            Launch(targetExe, args, false);
+            Launch(targetExe, args, false, null);
         }
 
         /// <summary>What Launch may do, given whether an engine process is still alive and the session state.
@@ -461,7 +507,10 @@ namespace ClarionDebugger.Services
             return true;
         }
 
-        private void Launch(string targetExe, string args, bool interactive)
+        /// <param name="attachTo">The process an ATTACH session attaches to, or null for a launch. An attach
+        /// session's <paramref name="targetExe"/> is that process's image path, as listed: it anchors the .red
+        /// resolver, but an attach does not need the file, so a path that no longer resolves is not an error.</param>
+        private void Launch(string targetExe, string args, bool interactive, AttachableProcess attachTo)
         {
             switch (DecideLaunch(IsRunning, State))
             {
@@ -475,11 +524,12 @@ namespace ClarionDebugger.Services
 
             string engine = FindEngine();
             if (engine == null) throw new FileNotFoundException("ClarionDbg.exe not found next to the addin or in the dev build output.");
-            if (string.IsNullOrEmpty(targetExe) || !File.Exists(targetExe))
+            bool haveImage = !string.IsNullOrEmpty(targetExe) && File.Exists(targetExe);
+            if (!haveImage && attachTo == null)
                 throw new FileNotFoundException("Target executable not found: " + targetExe);
 
             lock (_breakpoints) _breakpoints.Clear();
-            string newTargetDir = Path.GetDirectoryName(Path.GetFullPath(targetExe));
+            string newTargetDir = haveImage ? Path.GetDirectoryName(Path.GetFullPath(targetExe)) : null;
             if (!string.Equals(newTargetDir, _targetDir, StringComparison.OrdinalIgnoreCase))
                 _redFallback = null; // different target → its local .red may differ; re-resolve lazily
             _targetDir = newTargetDir;
@@ -491,7 +541,7 @@ namespace ClarionDebugger.Services
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 RedirectStandardInput = interactive,
-                WorkingDirectory = Path.GetDirectoryName(targetExe)
+                WorkingDirectory = newTargetDir ?? Path.GetDirectoryName(engine)
             };
 
             // Every handler is bound to THIS process, `p`, never to the field. _proc names whichever engine
@@ -502,6 +552,7 @@ namespace ClarionDebugger.Services
             p.ErrorDataReceived += (s, e) => { if (e.Data != null) LogReceived?.Invoke(e.Data); };
             p.Exited += (s, e) => OnEngineProcessExited(p);
             _proc = p;
+            _attachTarget = attachTo;
 
             SetState(DebugSessionState.Launching);
             p.Start();
@@ -517,6 +568,10 @@ namespace ClarionDebugger.Services
             if (!ReferenceEquals(source, _proc)) return;
             int code = 0;
             try { code = source.ExitCode; } catch { }
+            // No attached state outlives its engine. A FAILED attach ends here: the engine reports
+            // {"event":"error","message":"attach failed: ...","code":N} (N may be 0, which is NOT success) and
+            // exits 2. Only `loaded` moves a session out of Launching; an error never does.
+            _attachTarget = null;
             SetState(DebugSessionState.Idle);
             Exited?.Invoke(code);
         }
@@ -535,6 +590,7 @@ namespace ClarionDebugger.Services
             if (ReferenceEquals(source, _proc))
             {
                 CurrentVa = null;
+                _attachTarget = null;   // the session is over, so nothing is attached any more
                 SetState(DebugSessionState.Idle);
             }
             System.Threading.Tasks.Task.Run(() =>
@@ -572,6 +628,23 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>
+        /// How long Stop waits for a launch-mode engine to act on <c>quit</c>.</summary>
+        internal const int QuitWaitMs = 1500;
+
+        /// <summary>How long Stop waits for an ATTACHED engine to act on <c>detach</c>. Longer than
+        /// <see cref="QuitWaitMs"/>: a running target needs a pause round-trip before the engine can restore and
+        /// drain (the frozen engine contract, 3f2d747f).</summary>
+        internal const int DetachWaitMs = 8000;
+
+        /// <summary>The verb that ends a session cleanly: <c>detach</c> leaves an attached process running, and
+        /// <c>quit</c> terminates a launched one. Never <c>quit</c> for an attach: it would kill an app the user
+        /// did not start from here.</summary>
+        internal static string TeardownCommand(bool attached)
+        {
+            return attached ? "detach" : "quit";
+        }
+
+        /// <summary>
         /// Teardown barrier. Prefers a clean engine-side quit (which also kills the target); on timeout it Kills
         /// and waits. It then ASKS whether the process is dead rather than assuming the above worked, and
         /// returns that answer: true means <see cref="IsRunning"/> is confirmed false and State is Idle.
@@ -593,6 +666,10 @@ namespace ClarionDebugger.Services
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
         /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
         /// synchronously but there is no live process to wait on, so it returns immediately).
+        ///
+        /// ATTACH MODE (3f2d747f) sends <c>detach</c> instead of <c>quit</c>, and waits
+        /// <see cref="DetachWaitMs"/>: a running target is paused first, then every planted byte is restored and
+        /// the queued events drained, all before the engine can exit. The app keeps running.
         /// </summary>
         public bool Stop()
         {
@@ -600,12 +677,23 @@ namespace ClarionDebugger.Services
             {
                 if (IsRunning)
                 {
-                    // A successful pipe write does NOT prove the engine consumed 'quit', so verify exit and fall
-                    // back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
+                    // A successful pipe write does NOT prove the engine consumed the command, so verify exit and
+                    // fall back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
                     // (Kill only requests termination).
-                    bool exited = SendCommand("quit") && _proc.WaitForExit(1500);
+                    bool attached = IsAttachSession;
+                    bool exited = SendCommand(TeardownCommand(attached))
+                               && _proc.WaitForExit(attached ? DetachWaitMs : QuitWaitMs);
                     if (!exited && IsRunning)
                     {
+                        // ATTACH MODE: KILL IS THE LAST RESORT, AND IT WILL PROBABLY CRASH THE USER'S APP. A killed
+                        // engine never restores the INT3 bytes it planted or clears the trap flag, so the app
+                        // takes an unhandled breakpoint/single-step exception the next time it reaches one.
+                        // Detach is the clean path; the kill below only runs when the engine did not exit within
+                        // DetachWaitMs, and a wedged engine would otherwise hold the session forever. Owner
+                        // decision 2026-09-23: that crash risk is accepted, and the user is told.
+                        if (attached)
+                            LogReceived?.Invoke("[stop] the engine did not detach within " + (DetachWaitMs / 1000)
+                                + " s, so it is being killed. The attached app may crash at the next breakpoint it reaches.");
                         // Escalate deliberately: wait -> kill -> verify. A Kill that throws is information the
                         // caller needs (the handle may be denied, or the process already reaped), so it is
                         // surfaced instead of swallowed. Neither failure decides the outcome on its own — the
@@ -1157,6 +1245,24 @@ namespace ClarionDebugger.Services
                     OnEngineReportedExit(source);
                     break;
 
+                // An ATTACHED session let its process go (3f2d747f); the app keeps running and the engine exits
+                // next. The session is over at once, exactly as for "exited", and the engine is reaped the same
+                // way: after a detach a kill leaves no planted byte behind, because the detach already restored them.
+                case "detached":
+                    if (ReferenceEquals(source, _proc))
+                    {
+                        var d = ParseDetached(json, _attachTarget);
+                        OnEngineReportedExit(source);
+                        Detached?.Invoke(d);
+                    }
+                    else
+                    {
+                        // An OLDER engine's line, read after a new session began: it must not end the new one.
+                        OnEngineReportedExit(source);
+                        LogReceived?.Invoke("a previous session's engine detached from pid " + GetUIntOrNull(json, "pid"));
+                    }
+                    break;
+
                 default:
                     LogReceived?.Invoke(line);
                     break;
@@ -1460,6 +1566,101 @@ namespace ClarionDebugger.Services
                 return w;
             }
             catch { return null; }
+        }
+
+        /// <summary>The engine's <c>detached</c> event, named from <paramref name="target"/> (the event carries only
+        /// the pid). <c>error</c> is present only when a breakpoint byte could not be restored.</summary>
+        internal static DebugDetach ParseDetached(string json, AttachableProcess target)
+        {
+            return new DebugDetach
+            {
+                Pid = GetUIntOrNull(json, "pid"),
+                Name = target != null ? target.Name : null,
+                Drained = GetInt(json, "drained"),
+                Restored = GetBool(json, "restored"),
+                Error = GetStr(json, "error")
+            };
+        }
+
+        /// <summary>At most this many processes are taken from one listing: the picker is a list a person reads.</summary>
+        internal const int MaxListedProcesses = 1000;
+
+        /// <summary>
+        /// The attach picker's list (3f2d747f): the processes the engine's one-shot <c>procs --json</c> reports as
+        /// attachable - x86, carrying TSWD debug info, not already debugged - with <paramref name="excludePid"/>
+        /// (the IDE itself) left out. Null with <paramref name="error"/> set when the listing could not be read.
+        /// BLOCKS for up to about 15 s: call it off the UI thread.
+        /// </summary>
+        public static List<AttachableProcess> ListProcesses(int excludePid, out string error)
+        {
+            error = null;
+            try
+            {
+                string engine = FindEngine();
+                if (engine == null) { error = "ClarionDbg.exe not found"; return null; }
+                var psi = new ProcessStartInfo(engine, "procs --json --exclude " + excludePid.ToString(CultureInfo.InvariantCulture))
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    WorkingDirectory = Path.GetDirectoryName(engine)
+                };
+                using (var p = Process.Start(psi))
+                {
+                    // Both pipes read on workers, and the wait bounded: a wedged child costs a timeout, never the caller.
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(15000))
+                    {
+                        try { p.Kill(); } catch { }
+                        error = "the process list did not arrive within 15 s";
+                        return null;
+                    }
+                    if (!outTask.Wait(2000)) { error = "the process list could not be read"; return null; }
+                    try { errTask.Wait(500); } catch { }
+                    var list = ParseProcsJson(outTask.Result);
+                    if (list == null)
+                        error = "the engine sent no process list" + (p.ExitCode != 0 ? " (exit " + p.ExitCode + ")" : "");
+                    return list;
+                }
+            }
+            catch (Exception ex) { error = ex.Message; return null; }
+        }
+
+        /// <summary>The processes in the engine's <c>{"event":"procs","procs":[...]}</c> line, or null when there
+        /// is no such line or it is not well-formed. An entry without a positive pid is dropped, and at most
+        /// <see cref="MaxListedProcesses"/> are kept. Names and paths are the process's own and so UNTRUSTED text:
+        /// the page renders them as text only.</summary>
+        internal static List<AttachableProcess> ParseProcsJson(string stdout)
+        {
+            if (string.IsNullOrEmpty(stdout)) return null;
+            foreach (var raw in stdout.Split('\n'))
+            {
+                string line = raw.Trim();
+                if (!line.StartsWith("{", StringComparison.Ordinal) || JsonMessageReader.ReadStringField(line, "event") != "procs") continue;
+                var list = new List<AttachableProcess>();
+                // Innermost first, so the entries come before the envelope, which has no pid and is skipped.
+                bool ok = JsonMessageReader.ForEachObject(line, o =>
+                {
+                    uint pid;
+                    if (list.Count >= MaxListedProcesses) return;
+                    if (!PageNumbers.TryUInt(JsonMessageReader.ReadField(o, "pid"), out pid) || pid == 0) return;
+                    // A listed entry carries "tswd"; a --verbose SKIP entry ({pid,name,reason}) does not, and must
+                    // never become an attachable process.
+                    string tswd = JsonMessageReader.ReadField(o, "tswd");
+                    if (tswd == null) return;
+                    list.Add(new AttachableProcess
+                    {
+                        Pid = pid,
+                        Name = JsonMessageReader.ReadStringField(o, "name"),
+                        Path = JsonMessageReader.ReadStringField(o, "path"),
+                        Tswd = tswd == "true"
+                    });
+                });
+                return ok ? list : null;
+            }
+            return null;
         }
 
         /// <summary>Synchronously query the EXE's static data symbols (globals + file record buffers

@@ -50,7 +50,7 @@ foreach ($s in $states) {
   Check "engine alive, $s -> $want" ([Lifecycle]::DecideLaunch($true, $st) -eq [Lifecycle+LaunchGate]::$want) ([Lifecycle]::DecideLaunch($true, $st))
 }
 
-$launch = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive)')
+$launch = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive, AttachableProcess attachTo)')
 $iGate = $launch.IndexOf('DecideLaunch(IsRunning, State)')
 $iProc = $launch.IndexOf('new ProcessStartInfo')
 Check 'Launch asks DecideLaunch before it starts anything' (($iGate -ge 0) -and ($iProc -gt $iGate)) "gate=$iGate start=$iProc"
@@ -120,6 +120,7 @@ public sealed class RaceProbe {
   public DebugSessionState State = DebugSessionState.Launching;
   public int ExitedRaised = -999;
   public string CurrentVa = "0x1";
+  public object _attachTarget;   // the attach target (3f2d747f) both handlers clear; not what this race is about
   public event Action<string> LogReceived;
   public event Action<int> Exited;
   public RaceProbe() { Exited += c => ExitedRaised = c; LogReceived += s => { }; }
@@ -182,7 +183,7 @@ try {
 }
 
 # Wiring: every handler Launch attaches is bound to ITS process, and the "exited" arm hands over the source.
-$launchCode = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive)')
+$launchCode = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive, AttachableProcess attachTo)')
 Check 'Launch binds output and Exited to the process it created, not to _proc' `
   (($launchCode -match 'OnLine\(p, e\.Data\)') -and ($launchCode -match 'p\.Exited \+= \(s, e\) => OnEngineProcessExited\(p\)') -and `
    ($launchCode -notmatch '_proc\.(ExitCode|OutputDataReceived|Exited)')) ''

@@ -51,6 +51,9 @@
      mirroring how the mini source view's own right-click item greys itself out. */
   #btnRtc { opacity:.4; pointer-events:none; }
   body.paused #btnRtc { opacity:1; pointer-events:auto; }
+  /* Attach… only means anything with no session running (3f2d747f): gated on body.idle, set by setRunState. */
+  #btnAttach { opacity:.4; pointer-events:none; }
+  body.idle #btnAttach { opacity:1; pointer-events:auto; }
   .runstate { margin-left:auto; display:flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-dim); }
   .dot { width:8px; height:8px; border-radius:50%; background:#888; }
   .runstate.paused .dot { background:var(--warn); box-shadow:0 0 6px var(--warn-border); }
@@ -396,6 +399,19 @@
   .kb-act.ghost { background:transparent; color:var(--fg-dim); border:1px solid var(--popup-border); }
   .kb-act.ghost:hover:not([disabled]) { background:var(--btnhover); color:var(--fg); }
   .kb-act[disabled] { opacity:.4; cursor:default; }
+  /* Attach picker (3f2d747f). */
+  .ap-bar { display:flex; align-items:center; gap:8px; margin-top:12px; }
+  .ap-status { flex:1; min-width:0; font-size:11.5px; color:var(--fg-dim); overflow-wrap:anywhere; }
+  .ap-list { margin-top:8px; border:1px solid var(--popup-border); border-radius:4px; max-height:44vh; overflow:auto; }
+  .ap-row { display:grid; grid-template-columns:1fr auto; gap:0 10px; padding:5px 8px; cursor:pointer; }
+  .ap-row + .ap-row { border-top:1px solid var(--popup-border); }
+  .ap-row:hover { background:var(--btnhover); }
+  .ap-row.sel { background:var(--accent); color:#fff; }
+  .ap-name { font-weight:700; overflow-wrap:anywhere; }
+  .ap-pid { font-family:"Cascadia Code",Consolas,monospace; font-size:12px; color:var(--num); }
+  .ap-row.sel .ap-pid, .ap-row.sel .ap-path { color:#fff; }
+  .ap-path { grid-column:1 / -1; font-size:11px; color:var(--fg-dim); overflow-wrap:anywhere; }
+  .ap-foot { display:flex; justify-content:flex-end; gap:8px; margin-top:12px; }
 </style>
 </head>
 <body>
@@ -410,6 +426,8 @@
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
          surface until a Monaco-side context-menu / gutter trigger exists — that one sends this same message. -->
     <button class="tbtn" id="btnRtc" title="Run to Cursor — run to the active editor's cursor line (while paused)" style="margin-left:8px;padding:0 8px" onclick="send('runtocursor')">▶| Run to Cursor</button>
+    <!-- Attach to a running process (3f2d747f); only while no session is running. -->
+    <button class="tbtn" id="btnAttach" title="Attach… — debug a Clarion app that is already running" style="margin-left:2px;padding:0 8px" onclick="openAttach()">⇲ Attach…</button>
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
@@ -523,6 +541,19 @@
     </div>
   </div>
 
+  <!-- Attach picker (3f2d747f). Every process name and path is written with textContent: they are the
+       processes' own strings, and ticket e1dea0d9 audits exactly this surface. -->
+  <div class="modal-backdrop" id="attachBackdrop">
+    <div class="modal" role="dialog" aria-label="Attach to process">
+      <div class="modal-head"><span>Attach to a running process</span><span class="modal-x" id="attachClose" title="Close">✕</span></div>
+      <div class="modal-body">
+        <div class="ap-bar"><span class="ap-status" id="attachStatus"></span><button class="kb-act ghost" id="attachRefresh">Refresh</button></div>
+        <div class="ap-list" id="attachList"></div>
+        <div class="ap-foot"><button class="kb-act ghost" id="attachCancel">Cancel</button><button class="kb-act" id="attachGo" disabled>Attach</button></div>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
 <script>
@@ -581,7 +612,14 @@
     {id:'stepinto', label:'Step Into', tip:'Execute the current line, stepping into any procedure call'},
     {id:'stepout',  label:'Step Out',  tip:'Run until the current procedure returns to its caller'},
     {id:'stop',     label:'Stop',      tip:'Terminate the debug session and the target process'},
+    // Not a host command: it opens the picker, which sends `procs` and then `attach <pid>` (see openAttach).
+    {id:'attach',   label:'Attach…',   tip:'Attach to a Clarion app that is already running'},
   ];
+  // While ATTACHED, Stop detaches and the app keeps running (3f2d747f): the host sends the engine `detach`, never
+  // `quit`. The tip must say so, rather than promise to terminate an app the user did not start here.
+  const STOP_TIP_ATTACHED='Detach (the app keeps running)';
+  let attachMode=false;
+  function cmdTip(c){ return c.id==='stop' && attachMode ? STOP_TIP_ATTACHED : c.tip; }
   let keyBinds = {};      // cmd id -> combo string (e.g. 'Ctrl+Alt+S'); absent/empty = unbound
   let capturing = null;   // cmd id currently being rebound, or null
 
@@ -612,7 +650,7 @@
       const cap=capturing===c.id, bind=keyBinds[c.id];
       const chipCls = cap ? 'kb-chip capturing' : (bind ? 'kb-chip' : 'kb-chip unbound');
       const chipTxt = cap ? 'press a key…  (Esc cancels)' : (bind || 'unbound');
-      rows += '<div class="kb-row"><span class="kb-label">'+esc(c.label)+'</span>'
+      rows += '<div class="kb-row"><span class="kb-label" data-kbl="'+c.id+'">'+esc(c.label)+'</span>'
         + '<span class="'+chipCls+'">'+esc(chipTxt)+'</span>'
         + '<button class="kb-act" data-rebind="'+c.id+'">'+(cap?'Cancel':'Rebind')+'</button>'
         + '<button class="kb-act ghost" data-clear="'+c.id+'"'+(bind?'':' disabled')+'>Clear</button></div>';
@@ -621,6 +659,8 @@
       '<div class="set-section"><div class="set-h">Keyboard Shortcuts</div>'
       + '<div class="set-note">The Clarion IDE claims F5 / F10 / F11, so debug commands ship unbound. Click <b>Rebind</b>, then press a key combination the IDE doesn\'t use.</div>'
       + '<div class="kb-list">'+rows+'</div></div>';
+    // Each label carries its command's tip, set as a property (not markup) so it tracks attach mode.
+    $('settingsBody').querySelectorAll('[data-kbl]').forEach(l=>{ const c=KB_CMDS.find(k=>k.id===l.dataset.kbl); if(c) l.title=cmdTip(c); });
     $('settingsBody').querySelectorAll('[data-rebind]').forEach(b=>b.onclick=()=>{ const id=b.dataset.rebind; capturing===id?endCapture():startCapture(id); });
     $('settingsBody').querySelectorAll('[data-clear]').forEach(b=>b.onclick=()=>{ const id=b.dataset.clear; delete keyBinds[id]; saveBinds(); renderSettings(); });
   }
@@ -719,6 +759,73 @@
   $('aboutClose').onclick=closeAbout;
   $('aboutBackdrop').addEventListener('click',e=>{ if(e.target===$('aboutBackdrop')) closeAbout(); });
 
+  // ---- Attach to a running process (3f2d747f) ------------------------------------------------
+  // The picker asks the host for `procs` and shows what comes back; picking a row sends `attach` with that
+  // row's pid. The host honours only a pid it listed in its latest reply, and one listing authorises one
+  // attach, so the picker asks afresh every time it opens.
+  //
+  // EVERY NAME AND PATH IS TEXT. They are the running processes' own strings, which this page does not
+  // control, so they are written with textContent and title (a property, not markup) and never go through
+  // innerHTML - not even escaped. The rows carry only the pid, a number checked here, as data.
+  let attachSel=null;   // the pid of the selected row, or null
+  function attachOpen(){ return $('attachBackdrop').classList.contains('show'); }
+  function openAttach(){
+    if(runState!=='idle'){ toast('Stop the current session before attaching'); return; }
+    attachSel=null;
+    $('attachGo').disabled=true;
+    $('attachList').textContent='';
+    $('attachStatus').textContent='Looking for running Clarion apps…';
+    $('attachBackdrop').classList.add('show');
+    send('procs');
+  }
+  function closeAttach(){ $('attachBackdrop').classList.remove('show'); }
+  function selectAttachRow(pid){
+    attachSel=pid;
+    $('attachList').querySelectorAll('.ap-row').forEach(r=>r.classList.toggle('sel', r.dataset.pid===String(pid)));
+    $('attachGo').disabled = attachSel==null;
+  }
+  function attachPick(pid){
+    if(pid==null || runState!=='idle') return;
+    closeAttach();
+    send('attach', String(pid));
+  }
+  function renderProcs(m){
+    const list=$('attachList');
+    list.textContent='';
+    attachSel=null; $('attachGo').disabled=true;
+    const procs=(m && Array.isArray(m.procs)) ? m.procs : [];
+    let shown=0;
+    procs.forEach(p=>{
+      // A pid is a positive integer or the row is not shown: it is the one thing the host is sent back.
+      if(!p || !Number.isInteger(p.pid) || p.pid<=0) return;
+      const row=document.createElement('div'); row.className='ap-row'; row.dataset.pid=String(p.pid);
+      const name=document.createElement('span'); name.className='ap-name'; name.textContent=p.name==null?'':String(p.name);
+      const pid=document.createElement('span'); pid.className='ap-pid'; pid.textContent='pid '+p.pid;
+      const path=document.createElement('span'); path.className='ap-path'; path.textContent=p.path==null?'':String(p.path);
+      row.title=p.path==null?'':String(p.path);
+      row.appendChild(name); row.appendChild(pid); row.appendChild(path);
+      row.onclick=()=>selectAttachRow(p.pid);
+      row.ondblclick=()=>attachPick(p.pid);
+      list.appendChild(row);
+      shown++;
+    });
+    $('attachStatus').textContent = m && m.error ? 'Could not list processes: '+String(m.error)
+      : shown ? shown+' running app(s) with Clarion debug info. Pick one and press Attach.'
+      : 'No running app with Clarion debug info was found. Start the app, then press Refresh.';
+  }
+  $('attachClose').onclick=closeAttach;
+  $('attachCancel').onclick=closeAttach;
+  $('attachRefresh').onclick=()=>{ $('attachStatus').textContent='Looking for running Clarion apps…'; send('procs'); };
+  $('attachGo').onclick=()=>attachPick(attachSel);
+  $('attachBackdrop').addEventListener('click',e=>{ if(e.target===$('attachBackdrop')) closeAttach(); });
+  // The host says `attachmode on` once an attach session starts; going idle turns it off (setRunState).
+  function setAttachMode(on){
+    attachMode=!!on;
+    document.body.classList.toggle('attached', attachMode);
+    $('runstate').title = attachMode ? 'Attached to a running app. Stop: '+STOP_TIP_ATTACHED+'.' : '';
+    if(settingsOpen()) renderSettings();   // the Stop row's tip changes with the mode
+  }
+
   document.addEventListener('keydown',e=>{
     // 1) capture mode — record the next combo for the command being rebound
     if(capturing){
@@ -734,6 +841,8 @@
     if(settingsOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeSettings(); } return; }
     // 2b) same for About — a modal must swallow debug shortcuts, not just look modal
     if(aboutOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAbout(); } return; }
+    // 2c) and for the attach picker
+    if(attachOpen()){ if(e.key==='Escape'){ e.preventDefault(); closeAttach(); } return; }
     // 3) normal dispatch — send the command bound to this combo straight to the host. The IDE toolbar's
     // condition evaluator is the source of truth for whether a command is valid in the current state; the
     // host side no-ops a command that doesn't apply, so the pad shortcut just forwards unconditionally.
@@ -743,6 +852,7 @@
     const c=KB_CMDS.find(c=>keyBinds[c.id]===combo);
     if(!c) return;
     e.preventDefault();
+    if(c.id==='attach'){ openAttach(); return; }   // a picker, not a command: the host needs a listed pid
     send(c.id);
   });
 
@@ -929,6 +1039,9 @@
     const rs=$('runstate'), rt=$('runtext');
     rs.className='runstate '+(state==='paused'?'paused':state==='running'||state==='launching'?'running':'idle');
     rt.textContent = state==='launching'?'launching…':state;
+    // Attach is offered only with no session (body.idle gates the button); a session's end also ends attach mode.
+    document.body.classList.toggle('idle', runState==='idle');
+    if(runState==='idle' && attachMode) setAttachMode(false);
     // The run state itself is the indicator above (dot + text) and nothing else needs to restate it:
     // the band that used to sit under the header said the same thing in words, was written from here
     // while the indicator was written two lines up, and the two could disagree — it could read
@@ -2744,6 +2857,8 @@
       case 'regs': if(tidAccepted(m)) buildRegs(m.regs); break;
       case 'source': buildSource(m.file, m.proc, m.startLine, m.lines||[], m.current); break;
       case 'console': logLine(m.level, m.text); break;
+      case 'procs': renderProcs(m); break;
+      case 'attachmode': setAttachMode(m.on===true); break;
       case 'clear': $('clog').innerHTML=''; clearSrc(); buildStack([]); setPaused(false); resetThreadState(); lastLibState=null; lastLibError=null; renderLibState(); break;
     }
   }

@@ -1504,6 +1504,14 @@ Check 'module:line with no module, or no number, is dropped' `
   (($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse(':12')) -and ($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('m.clw:x'))) ''
 $ob = [ClarionDebugger.Terminal.OpenBpRequest]::Parse("42`tC:\src\m.clw")
 Check 'openbp: line<TAB>path' (($null -ne $ob) -and $ob.Line -eq 42 -and $ob.Path -ceq 'C:\src\m.clw') ''
+# attach (3f2d747f part C): the data is the pid in decimal, as the picker sends it. The parsed pid is only a
+# lookup key into the host's own listing; tools/test-addin-attach.ps1 covers that gate.
+$at = [ClarionDebugger.Terminal.AttachRequest]::Parse('4242')
+Check 'attach: a decimal pid reads as a uint' (($null -ne $at) -and $at.Pid -eq 4242) ''
+Check 'attach: pid 0, a sign, a second word, hex or an empty payload is dropped' `
+  ((@('0', '-1', '+7', '4242 quit', '4242;quit', '0x10', '', $null) | ForEach-Object { $null -eq [ClarionDebugger.Terminal.AttachRequest]::Parse($_) }) -notcontains $false) ''
+Check 'attach: the page sends exactly the shape the host parses (the pid as a decimal string)' `
+  ((Get-Content -Raw -LiteralPath $PagePath) -match "send\('attach', String\(pid\)\);") ''
 
 # ---- the Memory panel's read (ticket 633d8b2f) --------------------------------------------------------
 # The one request whose ADDRESS the page chooses freely, so the gate is the shape: hex with its 0x, 32 bits,
@@ -2276,7 +2284,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 367
+$EXPECTED_CHECKS = 370
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
