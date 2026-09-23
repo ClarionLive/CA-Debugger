@@ -1222,18 +1222,20 @@ Check 'OnActiveChanged seats only through SeatOnLateOpen' `
 # was deleted, because the outer one still satisfied it: the check claimed "gates on the epoch" and only
 # verified half of what that means. Found by mutation, and the count is the fix.
 $onDisasm = Get-Method 'private void OnDisasm(string tag, List<DebugDisasmInstr> instrs, uint? tid)' $disasmView
-$epochGates = [regex]::Matches($onDisasm, 'epoch\s*!=\s*_epoch')
+$epochGates = [regex]::Matches($onDisasm, '!_seat\.IsCurrent\(epoch\)')
 Check 'OnDisasm gates on the epoch on BOTH sides of the UI marshal' ($epochGates.Count -eq 2) "$($epochGates.Count) epoch gate(s)"
 # ...and the marshal-side gates really are inside the lambda, not stacked ahead of it.
 $marshalBody = if ($onDisasm -match '(?s)UI\(\(\)\s*=>\s*\{(.*)') { $Matches[1] } else { '' }
 Check 'the second epoch gate is INSIDE the marshal, where the race is' `
-  ($marshalBody -match 'epoch\s*!=\s*_epoch') ''
+  ($marshalBody -match '!_seat\.IsCurrent\(epoch\)') ''
 Check 'and the tid gate is inside it too, on the same side of the race' `
   ($marshalBody -match 'TidMatchesView\(tid\)') ''
 # The pending flags are cleared by NewEpoch, not by the replies: the dropped ones never arrive to clear
 # them, and a stuck _pendFwd would freeze forward extension for the rest of the session.
+# NewEpoch moved into SeatState.cs with the rest of the seat lifecycle (8f352618); same body, same rule.
+$seatStateSrc = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\SeatState.cs')
 Check 'NewEpoch clears the in-flight flags as well as retiring the replies' `
-  ((Get-Method 'private void NewEpoch()' $disasmView) -match '_pendFwd\s*=\s*_pendBwd\s*=\s*false') ''
+  ((Get-Method 'private void NewEpoch()' $seatStateSrc) -match '_pendFwd\s*=\s*_pendBwd\s*=\s*false') ''
 
 Write-Host ''
 Write-Host 'TWO gates, and each is asserted with the OTHER one intact'
@@ -1314,68 +1316,16 @@ Check 'CONTROL: the idiom scan matches it in code' `
 Check 'CONTROL: ...and does NOT match it in a comment' `
   ([regex]::Matches((Get-CSharpCodeOnly '// not `tid ?? _selTid` here'), '\?\?\s*_selTid\b').Count -eq 0) ''
 
-# ---- an empty WinTag reply releases the painted flag, BEFORE it erases what that flag described ------
+# ---- the SEAT lifecycle: moved to tools\test-disasm-seat.ps1 by 8f352618 --------------------------------
 #
-# THIS PINS THE SHAPE, NOT THE BEHAVIOUR - and the useful form of that sentence is the concrete one, not
-# the category. A SHAPE PIN SEES A WRONG PLACE, NEVER A WRONG VALUE. Measured against these six checks:
-#     `bool wasSeat = true;`   passes ALL of them.
-# Every statement stays exactly where it belongs and the meaning is inverted, so a seek's empty reply
-# would claim "this thread's code could not be decoded" about a thread nobody was seating. No position
-# assertion can ever catch that; only 8f352618's transition test can. Written out because the
-# honest-limitation note is the thing a future reader trusts, and "pins the shape, not the behaviour" is
-# true and vague where "a constant-true wasSeat passes all six" is true and actionable.
-#
-# The behavioural seam three gates asked for is NOT CONSTRUCTIBLE today: these are instance methods on a
-# WinForms Control and three of them wrap their whole body in UI(...), which returns immediately without a
-# created handle, so the code under test never runs. Owen2 established that rather than estimating it; it
-# is blocked on ticket 8f352618.
-# WHEN 8f352618 LANDS, REPLACE THIS CHECK - do not keep both. Two checks on one mechanism, one structural
-# and one behavioural, is how a suite starts disagreeing with itself about what it is guarding.
-#
-# THE DEFECT: thread A painted, a seat for B comes back EMPTY. The screen is about to be erased by the
-# cache replacement, so a _seatedTid still naming A outlives the paint it described - the banner claims A
-# while nothing is on screen, and the already-painted guard then refuses to reseat A.
-# POSITION, not text. The clear being PRESENT but moved AFTER the cache replacement is exactly the
-# regression, and a `-match '_seatedTid = 0'` would pass against it happily.
-$winCode = Get-CSharpCodeOnly $onDisasm
-$winAt = $winCode.IndexOf('if (kind == WinTag)')
-$emptyArm = if ($winAt -ge 0) { $winCode.Substring($winAt) } else { '' }
-$iWasSeat   = $emptyArm.IndexOf('bool wasSeat')
-$iRelease   = $emptyArm.IndexOf('_seatingTid = 0')
-$iCountTest = $emptyArm.IndexOf('if (instrs.Count > 0)')
-$iClear     = $emptyArm.IndexOf('_seatedTid = 0')
-$iCache     = $emptyArm.IndexOf('_instrs = SortedUnique')
-$iIfWasSeat = $emptyArm.IndexOf('if (wasSeat)')
-$iEmptySet  = $emptyArm.IndexOf('_emptySeatTid = emptyTid')
-$iBanner    = $emptyArm.IndexOf('UpdateThreadBanner()')
-# ANCHORS FIRST. Every check below is an ORDER comparison, and -1 < anything, so a renamed method or a
-# missing statement would make them pass VACUOUSLY rather than fail. Owen2's own first draft of this
-# printed "ALL SHAPE CHECKS PASSED" while every assertion had thrown, which is what this guards.
-Check 'every anchor these shape checks need is present in OnDisasm' `
-  (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iCountTest -ge 0) -and ($iClear -ge 0) `
-   -and ($iCache -ge 0) -and ($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iBanner -ge 0)) `
-  "wasSeat=$iWasSeat release=$iRelease count=$iCountTest clear=$iClear cache=$iCache if=$iIfWasSeat set=$iEmptySet banner=$iBanner"
-# THE PAINTED FLAG MUST NOT OUTLIVE THE PAINT.
-Check 'the empty WinTag branch clears _seatedTid BEFORE replacing the listing' `
-  (($iClear -ge 0) -and ($iCache -ge 0) -and ($iClear -lt $iCache)) "clear=$iClear cache=$iCache"
-Check 'and that clear sits in the EMPTY branch, after the instrs.Count test' `
-  (($iCountTest -ge 0) -and ($iClear -gt $iCountTest)) "count=$iCountTest clear=$iClear"
-# A coarse SEEK is a WinTag reply too, and `wasSeat` is the ONLY thing distinguishing the two callers.
-# Capturing it after the release is not merely a shape break - it makes wasSeat always false, so a seat
-# that decoded nothing would stop recording it and retry forever.
-Check 'wasSeat is captured BEFORE _seatingTid is released' `
-  (($iWasSeat -ge 0) -and ($iRelease -ge 0) -and ($iWasSeat -lt $iRelease)) "wasSeat=$iWasSeat release=$iRelease"
-# ...and only a SEAT may claim "this thread's code could not be decoded". A seek's empty result says
-# nothing about the thread's own address.
-Check 'the _emptySeatTid claim is gated on wasSeat' `
-  (($iIfWasSeat -ge 0) -and ($iEmptySet -ge 0) -and ($iIfWasSeat -lt $iEmptySet)) "if=$iIfWasSeat set=$iEmptySet"
-# THE HALF THAT STOPS THE VIEW LYING. Both branches above have just changed _seatedTid, and the banner
-# DERIVES from it - so re-deriving it here, after the listing is replaced, is the other half of the fix. A
-# correct _seatedTid that the banner has not re-read yet is the same defect one frame later. Measured: the
-# five pins above were all green with this call DELETED, so the user-visible symptom was unpinned while
-# the bookkeeping around it was not.
-Check 'the banner is re-derived AFTER the listing is replaced' `
-  (($iBanner -ge 0) -and ($iCache -ge 0) -and ($iBanner -gt $iCache)) "banner=$iBanner cache=$iCache"
+# Six POSITION checks used to live here, pinning the order of eight statements in OnDisasm's WinTag branch
+# (the painted flag released before the listing is erased, wasSeat captured before the in-flight release,
+# the decode claim gated on wasSeat, the banner re-derived after the cache replacement). They were a stopgap
+# that said so - "a constant-true wasSeat passes all six" - and asked to be REPLACED, not kept alongside,
+# when 8f352618 landed. It has: those statements are SeatState.WindowLanded now, and
+# tools\test-disasm-seat.ps1 compiles SeatState.cs as it ships and drives each transition, so a WRONG VALUE
+# goes red there as well as a wrong place. The one ordering that is still the view's own (WindowLanded
+# before the cache replacement before the banner) is pinned by position in that suite too.
 # INVERTED BY RUN 2 ITEM 1 (Owen2) - this assertion used to ENCODE the defect, which is why it could not
 # simply be deleted. It asserted the view ACCEPTS a stamped reply while it does not know its own thread,
 # which the cross-model adversary reported as HIGH: that is not an absence of information, it is
@@ -1394,7 +1344,7 @@ Check 'OnDisasm applies the tid gate as well as the epoch' ($onDisasm -match 'Ti
 # like a strengthening and is a silent regression: it restores the exact race the second epoch check
 # exists to close, and the tid cannot see it (a switch away and back leaves the tid agreeing again).
 Check 'the tid gate was ADDED to the marshal, not substituted for the epoch check there' `
-  (($marshalBody -match 'epoch\s*!=\s*_epoch') -and ($marshalBody -match 'TidMatchesView\(tid\)')) ''
+  (($marshalBody -match '!_seat\.IsCurrent\(epoch\)') -and ($marshalBody -match 'TidMatchesView\(tid\)')) ''
 # The service is the only place the engine's stamp can enter: an invoke that drops it leaves the view
 # gating on its own bookkeeping alone, which is what it did before this pass.
 Check 'the service passes the engine stamp to DisasmReceived, not just the tag' `
