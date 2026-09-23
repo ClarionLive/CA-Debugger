@@ -83,6 +83,7 @@ namespace ClarionDbg.Cli
                 CheckEmulationFaultBranches,
                 CheckEmulatorImportsPerImage,
                 CheckStackWindowRevalidated,
+                CheckHoverHitTest,
             };
 
             foreach (var check in checks)
@@ -215,8 +216,8 @@ namespace ClarionDbg.Cli
         /// </summary>
         private static void CheckHandBuiltTidEmitters(List<string> failures, ClaimLog claims)
         {
-            claims.Claim("all 4 hand-built tid emitters - threadselected, the pause-choice log, the "
-                         + "`threads` rows and the `threadscan` rows - driven through their REAL builders: a "
+            claims.Claim("all 5 hand-built tid emitters - threadselected, the pause-choice log, the "
+                         + "`threads` rows, the `threadscan` rows and `hover` - driven through their REAL builders: a "
                          + "known tid is written exactly once, and neither 0 nor (uint)-1 writes a member.");
 
             const uint known = 116932;
@@ -257,6 +258,18 @@ namespace ClarionDbg.Cli
             CheckNoSentinelRows(failures, "threads", rows, known);
             string scan = DebugEngine.ThreadScanJsonForTest(known, new[] { known, 0u, minusOne });
             CheckNoSentinelRows(failures, "threadscan", scan, known);
+
+            // --- 5. hover (f6e547ce): a top-level tid naming the thread under the cursor; none is ABSENT.
+            string hv = DebugEngine.HoverJsonForTest(true, true, known);
+            if (!HasTopLevelTid(hv) || hv.IndexOf("\"tid\":116932", StringComparison.Ordinal) < 0)
+                failures.Add("hover control: a KNOWN tid was not written at all — " + hv);
+            foreach (var bad in new[] { 0u, minusOne })
+            {
+                string r = DebugEngine.HoverJsonForTest(true, false, bad);
+                if (HasTopLevelTid(r))
+                    failures.Add("hover: tid " + bad + " emitted a tid member — the page would name a thread "
+                                 + "under a cursor that is over none: " + r);
+            }
         }
 
         /// <summary>
@@ -438,7 +451,7 @@ namespace ClarionDbg.Cli
 
             // Verbs the RUNNING-STATE switch implements itself. IsResumeVerb is consulted before that switch,
             // so accepting any of these would divert it from the case that handles it.
-            string[] handledWhileRunning = { "pause", "break", "bp", "sym", "thread", "quit", "q", "kill" };
+            string[] handledWhileRunning = { "pause", "break", "bp", "sym", "thread", "hover", "quit", "q", "kill" };
             foreach (var v in handledWhileRunning)
                 if (DebugEngine.IsResumeVerbForTest(v))
                     failures.Add("resume verbs: '" + v + "' is handled by the running-state switch, but "

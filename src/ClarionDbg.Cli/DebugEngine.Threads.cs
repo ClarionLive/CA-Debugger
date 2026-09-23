@@ -209,7 +209,8 @@ namespace ClarionDbg.Cli
         //   * PostMessage does not block, but the message sits in the queue and is delivered when we resume —
         //     a side effect on the program under test, which a debugger must never introduce.
         // Everything used here is a pure window-manager state read: EnumWindows, GetWindow,
-        // GetWindowThreadProcessId, IsWindowVisible, GetClassName, InternalGetWindowText.
+        // GetWindowThreadProcessId, IsWindowVisible, GetClassName, InternalGetWindowText, GetCursorPos,
+        // GetWindowRect, GetWindowLongW, and DwmGetWindowAttribute (a query of DWM, not of the window).
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -227,6 +228,30 @@ namespace ClarionDbg.Cli
         private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder buf, int max);
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
         private static extern int InternalGetWindowText(IntPtr hwnd, System.Text.StringBuilder buf, int max);
+        // GetCursorPos and GetWindowRect are also outside the original set. BLESSED by the PM on 2026-09-23
+        // (ticket f6e547ce item 0, the Owner's engine-side hover design): GetCursorPos reads the input
+        // desktop's cursor position and GetWindowRect reads the window's stored rectangle. Neither sends a
+        // message to the window or its thread. They exist for the hover hit-test in DebugEngine.Hover.cs.
+        //
+        // WindowFromPoint / ChildWindowFromPoint(Ex) / RealChildWindowFromPoint are deliberately NOT here,
+        // though they would do the hit-test in one call: their hit-test can send WM_NCHITTEST to the window
+        // under the cursor, and that window belongs to a thread that is frozen while we are paused.
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out HoverPoint pt);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hwnd, out HoverRect rc);
+        // Two more for the same hit-test, BLESSED by Diana (PM) on 2026-09-23 (ticket f6e547ce item 0), so a
+        // window the user cannot see or click does not swallow the hover:
+        //   * DwmGetWindowAttribute(DWMWA_CLOAKED) asks DWM whether a window is cloaked (a suspended UWP
+        //     frame, a window on another virtual desktop). It reads state, and the party queried is DWM, not
+        //     the window's thread, so it sends no message to the frozen target.
+        //   * GetWindowLongW(GWL_EXSTYLE) reads the window's stored extended style, to recognise a click-through
+        //     overlay (WS_EX_TRANSPARENT and WS_EX_LAYERED). It reads state and sends no message. The plain
+        //     GetWindowLongW, not GetWindowLongPtr: the engine is x86, where user32 exports only the former.
+        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
+        [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        private static extern int GetWindowLong(IntPtr hwnd, int index);
         private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
         private const uint GW_HWNDNEXT = 2;
