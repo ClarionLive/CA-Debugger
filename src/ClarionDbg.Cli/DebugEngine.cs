@@ -828,7 +828,7 @@ namespace ClarionDbg.Cli
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
             // Remember where this thread stood, for setip's observed-ESP path (DebugEngine.SetIp.cs).
-            ObserveStop(tid, ref ctx, haveCtx, m, rva, resolved, gap);
+            ObserveStop(tid, ref ctx, haveCtx, m, rva, resolved, gap, reason);
 
             // `paused` carries the STOPPED thread's tid. It describes one thread's location and registers,
             // so it is thread-scoped like the rest; carrying the tid means the host knows which thread it
@@ -961,7 +961,10 @@ namespace ClarionDbg.Cli
 
                     case "setip":   // set next statement: move the STOPPED thread's EIP (DebugEngine.SetIp.cs)
                         if (HandleSetIpCommand(parts, tid, hThread, ref ctx, haveCtx))
+                        {
                             AnnounceStop(tid, ref ctx, haveCtx, "setip", out m, out resolved, out line, out mi);
+                            HoverNewStop();   // a setip stop is a new stop for the hover tracker too (the page re-baselines on it)
+                        }
                         break;
 
                     case "threads":
@@ -1051,6 +1054,10 @@ namespace ClarionDbg.Cli
         /// <summary>Set TF on the paused thread when the resume needs a single-step (BP re-arm or stepping).</summary>
         private void ArmResume(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, bool stepping)
         {
+            // FIRST, before anything can return: every resume verb comes through here, so this is where setip's
+            // observations are cut back for the run that follows (DebugEngine.SetIp.cs). Position pinned by
+            // tools/test-engine-setip-sites.ps1.
+            SetIpOnResume(tid, stepping, haveCtx ? ctx.Esp : 0);
             if (!haveCtx) return;
             bool needTf = stepping || _rearm.ContainsKey(tid);
             if (!needTf) return;

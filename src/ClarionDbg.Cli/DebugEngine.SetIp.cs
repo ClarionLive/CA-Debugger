@@ -68,6 +68,10 @@ namespace ClarionDbg.Cli
 
         /// <summary>The sentence the pad shows for a refusal code. Null for an unknown code, which
         /// protocolcheck treats as a failure: a code with no sentence would reach the user as a bare slug.</summary>
+        /// <summary>How to get past a proof refusal: the observed path allows a move back to a line this frame
+        /// has already stopped on at the same stack depth.</summary>
+        internal const string SetIpStepFirstHint = "Step to that line first; then you can return to it.";
+
         internal static string SetIpMessage(string code)
         {
             switch (code)
@@ -82,9 +86,11 @@ namespace ClarionDbg.Cli
                 case SetIpAmbiguousLine:  return "That line compiles to more than one place (a loop head, for example), so the target is ambiguous.";
                 case SetIpOtherProc:      return "That line is outside the current procedure or routine. Moving there would corrupt the stack.";
                 case SetIpPrologue:       return "Can't move to or from a procedure's entry line: its stack frame is set up there.";
-                case SetIpCodeUnreadable: return "Can't read the current procedure's code to check that the move is safe.";
-                case SetIpAcceptUnpaired: return "Can't work out this procedure's ACCEPT loops, so no move inside it can be checked as safe.";
-                case SetIpStackUnproven:  return "Can't prove the stack is the same at that line: this procedure calls code whose effect on the stack was never measured. Step to that line first; then you can return to it.";
+                case SetIpCodeUnreadable: return "Can't read the current procedure's code, so the move can't be checked.";
+                // Only stack-unproven carries the step-first hint: it is the ONE refusal the observed path can
+                // override. The two ACCEPT refusals bind both paths (pipeline run 2), so no way round them exists.
+                case SetIpAcceptUnpaired: return "Can't work out this procedure's ACCEPT loops, so the move can't be checked.";
+                case SetIpStackUnproven:  return "Can't prove the stack is the same at that line: this procedure calls code whose effect on the stack was never measured. " + SetIpStepFirstHint;
                 case SetIpAcceptBoundary: return "Can't move across an ACCEPT loop boundary: the runtime keeps the loop's state on the stack.";
                 case SetIpWriteFailed:    return "Couldn't set the thread's instruction pointer.";
                 default:                  return null;
@@ -309,6 +315,21 @@ namespace ClarionDbg.Cli
             "ClaRUN.dll!Cla$StackINSTRING",       // 40
             "ClaRUN.dll!Cla$THREAD",              // 1
         };
+
+        /// <summary>The ClaRUN.dll the list was measured on: clbrws's runtime (C11 HowToClarion\Browses),
+        /// FileVersion read 2026-09-23. Another ClaRUN may compile the same entry differently, so the PROOF
+        /// path applies only to this one; any other loaded version is stack-unproven ("runtime X not measured").
+        /// The observed path does not depend on it.</summary>
+        internal const string MeasuredClaRunVersion = "10.0.12799";
+
+        /// <summary>Null when the loaded ClaRUN is the measured one (or none is loaded, so no import of it can
+        /// be on the list anyway), else the stack-unproven detail. PURE.</summary>
+        internal static string ClaRunVersionGate(bool claRunLoaded, string fileVersion)
+        {
+            if (!claRunLoaded) return null;
+            if (fileVersion == MeasuredClaRunVersion) return null;
+            return "runtime ClaRUN.dll " + (string.IsNullOrEmpty(fileVersion) ? "(version unreadable)" : fileVersion) + " not measured";
+        }
 
         private static readonly HashSet<string> _measuredBalanced = BuildMeasuredSet();
         private static HashSet<string> BuildMeasuredSet()
@@ -535,6 +556,15 @@ namespace ClarionDbg.Cli
                 foreach (var f in dead) Remove(f);
             }
 
+            /// <summary>A resume. EVERY thread but <paramref name="tid"/> runs freely now (the engine suspends
+            /// none), so their observations go; <paramref name="tid"/>'s go too unless <paramref name="keepTid"/>.</summary>
+            internal void OnResume(uint tid, bool keepTid)
+            {
+                var dead = new List<SetIpFrameKey>();
+                foreach (var f in _byFrame.Keys) if (f.Tid != tid || !keepTid) dead.Add(f);
+                foreach (var f in dead) Remove(f);
+            }
+
             /// <summary>EXIT_THREAD: a reused tid must not inherit a dead thread's frames.</summary>
             internal void DropThread(uint tid)
             {
@@ -579,12 +609,87 @@ namespace ClarionDbg.Cli
             return true;
         }
 
-        /// <summary>At every stop (AnnounceStop, including setip's own re-announce): prune this thread's
-        /// popped frames, then record the stop if it sits exactly on a line record.</summary>
-        private void ObserveStop(uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, LoadedModule m, uint rva, bool resolved, uint gap)
+        // ---- NO OBSERVATION SURVIVES A FREE RUN (pipeline run 2).
+        //
+        // PrunePopped only runs at stops. Across a free run a procedure can return and be entered again at
+        // the SAME EBP from the SAME call site with no stop in between, and its old observations would then
+        // match the new call. So a resume keeps a thread's observations only when that thread is
+        // single-stepped the whole way to its next stop, where every trap is watched:
+        //   - at the resume (ONE choke point: ArmResume's first statement, pinned by
+        //     tools/test-engine-setip-sites.ps1): every OTHER thread runs freely, so theirs go; this thread's
+        //     go unless the verb is step-into, step-over, stepi or nexti (step-out runs to the caller, and
+        //     continue runs free);
+        //   - during the step: the highest ESP any trap saw, so a frame the step popped and re-entered is
+        //     pruned at the stop even though ESP is back below its EBP;
+        //   - at the stop: a step that did not end as a step stop ("step"/"stepi") became a free run somewhere
+        //     (a user breakpoint, a Pause, or the step-over-ACCEPT case that never stops, ticket 0f16e12c),
+        //     and its observations go.
+
+        /// <summary>Does a resume keep the resuming thread's observations? PURE. Only the verbs that
+        /// single-step that thread all the way to its next stop.</summary>
+        internal static bool ResumeKeepsObservations(bool stepping, bool instrStep, bool modeSingleStepsToStop)
         {
+            return stepping && (instrStep || modeSingleStepsToStop);
+        }
+
+        /// <summary>The step modes that single-step the thread to its next stop. Out is not one: it runs on
+        /// through the procedure's return into the caller.</summary>
+        private static bool ModeSingleStepsToStop(StepMode mode)
+        {
+            return mode == StepMode.Into || mode == StepMode.Over || mode == StepMode.OverInstr;
+        }
+
+        /// <summary>Test seam: <see cref="ModeSingleStepsToStop"/> by the mode's name (the enum is private).</summary>
+        internal static bool ModeSingleStepsToStopForTest(string mode)
+        {
+            return ModeSingleStepsToStop((StepMode)Enum.Parse(typeof(StepMode), mode));
+        }
+
+        /// <summary>Does a stop with this reason keep the thread's observations? PURE. Only a step's own stop;
+        /// setip re-announces without running anything.</summary>
+        internal static bool StopKeepsObservations(string reason)
+        {
+            return reason == "step" || reason == "stepi" || reason == "setip";
+        }
+
+        private bool _setIpStepping;      // the resuming thread kept its observations: track its ESP until it stops
+        private uint _setIpStepTid;
+        private uint _setIpStepMaxEsp;    // the highest ESP the step's traps saw
+
+        /// <summary>THE CHOKE POINT, called as ArmResume's first statement for every resume verb.</summary>
+        private void SetIpOnResume(uint tid, bool stepping, uint esp)
+        {
+            bool keep = ResumeKeepsObservations(stepping, _instrStep, ModeSingleStepsToStop(_mode));
+            _setIpObs.OnResume(tid, keep);
+            _setIpStepping = keep;
+            _setIpStepTid = tid;
+            _setIpStepMaxEsp = esp;
+        }
+
+        /// <summary>The ESP a stop prunes popped frames by. PURE. After a watched step it is the HIGHEST ESP the
+        /// step reached, not the current one: a frame the step popped and then re-entered at the same EBP has
+        /// ESP back below its EBP by the time the thread stops.</summary>
+        internal static uint PopLine(bool thisThreadStepped, uint stepMaxEsp, uint currentEsp)
+        {
+            return thisThreadStepped && stepMaxEsp > currentEsp ? stepMaxEsp : currentEsp;
+        }
+
+        /// <summary>From StepMachine, at every trap of the stepping thread.</summary>
+        private void SetIpNoteStepEsp(uint tid, uint esp)
+        {
+            if (_setIpStepping && tid == _setIpStepTid && esp > _setIpStepMaxEsp) _setIpStepMaxEsp = esp;
+        }
+
+        /// <summary>At every stop (AnnounceStop, including setip's own re-announce): forget this thread's frames
+        /// if the stop ended a free run, prune the frames it popped (by the highest ESP the step saw), then
+        /// record the stop if it sits exactly on a line record.</summary>
+        private void ObserveStop(uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, LoadedModule m, uint rva, bool resolved, uint gap, string reason)
+        {
+            uint popLine = PopLine(_setIpStepping && tid == _setIpStepTid, _setIpStepMaxEsp, haveCtx ? ctx.Esp : 0);
+            if (tid == _setIpStepTid) _setIpStepping = false;
+            if (!StopKeepsObservations(reason)) _setIpObs.DropThread(tid);
             if (!haveCtx) return;
-            _setIpObs.PrunePopped(tid, ctx.Esp);
+            _setIpObs.PrunePopped(tid, popLine);
             if (!resolved || gap != 0) return;
             SetIpFrameKey key;
             if (TryFrameKey(tid, ref ctx, m, rva, out key)) _setIpObs.Record(key, rva, ctx.Esp);
@@ -660,30 +765,25 @@ namespace ClarionDbg.Cli
             if (IsPrologueRecord(f.TargetRva, f.FirstRecordRva) || IsPrologueRecord(f.StopRva, f.FirstRecordRva)) return SetIpPrologue;
             if (!f.CodeRead) return SetIpCodeUnreadable;
 
-            // Everything above binds BOTH paths. Below, the PROOF path is tried first; when it cannot prove
-            // the move, a matching observation still allows it. Its refusal code is the proof's, because that
-            // is what the user can act on ("step to that line first").
-            string proof = ProofRefusal(f);
-            if (proof == null) { allowedBy = SetIpViaProof; return null; }
-            if (f.ObservedMatch) { allowedBy = SetIpViaObserved; return null; }
-            return proof;
-        }
-
-        /// <summary>The proof path's own refusal, or null when it proves the move.</summary>
-        private static string ProofRefusal(SetIpFacts f)
-        {
+            // THE ACCEPT RULES BIND BOTH PATHS (pipeline run 2, two reviewers). Equal ESP says nothing about
+            // whether the loop state ClaRUN keeps on the stack is the CURRENT loop's: two sibling ACCEPTs in
+            // one frame run at the same steady depth, so an observation inside loop A matches a stop inside
+            // loop B. And an unpaired scan means the structure is not known at all. So these two refuse
+            // whatever was observed; "back within the same innermost loop" still works, which is the use.
             if (f.RegionError != null) return SetIpAcceptUnpaired;
-            // Before the ACCEPT rule, because that rule is only a proof when the ACCEPT pair is the ONLY call
-            // in the procedure that can move ESP. "No detected ACCEPT crossing" says nothing about a call
-            // nobody measured, so a procedure with one refuses every move (pipeline run 1).
-            if (f.StackError != null) return SetIpStackUnproven;
             // THE ACCEPT RULE: the same innermost loop, or both outside every loop. This is also what refuses
             // BREAK out of an ACCEPT and any target past the loop's end from inside it: the target is outside
             // the region, so the innermost regions differ. That refusal is deliberate - leaving the loop by
             // moving EIP orphans ClaRUN's loop state on the stack - so do not "fix" it into a pass.
             if (InnermostEventLoop(f.Regions, f.LoadBase + f.StopRva) != InnermostEventLoop(f.Regions, f.LoadBase + f.TargetRva))
                 return SetIpAcceptBoundary;
-            return null;
+            // The stack itself: PROVEN (every call's effect on ESP is known - the ACCEPT rule above is only a
+            // proof when the ACCEPT pair is the one call that moves ESP, pipeline run 1), or OBSERVED (this
+            // frame stopped at the target with this very ESP). stack-unproven is the one refusal the observed
+            // path overrides.
+            if (f.StackError == null) { allowedBy = SetIpViaProof; return null; }
+            if (f.ObservedMatch) { allowedBy = SetIpViaObserved; return null; }
+            return SetIpStackUnproven;
         }
 
         /// <summary>At or below the procedure's first record: its entry, where the frame is built. A
@@ -824,7 +924,8 @@ namespace ClarionDbg.Cli
             if (refusal != null)
             {
                 EmitSetIpRefusal(tid, refusal, module, line, rvas != null ? rvas.Count : 0,
-                                 refusal == SetIpStackUnproven ? f.StackError : null);
+                                 refusal == SetIpStackUnproven ? f.StackError
+                                 : refusal == SetIpAcceptUnpaired ? f.RegionError : null);
                 return false;
             }
 
@@ -905,6 +1006,15 @@ namespace ClarionDbg.Cli
                 return BitConverter.ToUInt32(t, 2);
             };
             f.StackError = ProveCallsBalanced(buf, got, loadBase + f.StopEntryRva, slotName, entries.Contains, thunkSlot, records);
+            if (f.StackError == null)
+            {
+                // The measured list is only a proof for the ClaRUN it was measured on.
+                LoadedModule rt = null;
+                foreach (var lm in _modules) if (string.Equals(lm.Name, "clarun.dll", StringComparison.OrdinalIgnoreCase)) { rt = lm; break; }
+                string ver = null;
+                try { if (rt != null && rt.Path != null) ver = System.Diagnostics.FileVersionInfo.GetVersionInfo(rt.Path).FileVersion; } catch { }
+                f.StackError = ClaRunVersionGate(rt != null, ver);
+            }
         }
 
         /// <summary>1 MB: far past any real procedure (the largest measured was 0x4188 bytes), and a bound on

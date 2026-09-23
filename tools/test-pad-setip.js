@@ -59,6 +59,8 @@ reset(); rtcLine = 44; curFile = 'clbrws026.clw'; setIpWarned = false;
 setIpFromMenu();
 check('a click sends setip module:line', SENT.length === 1 && SENT[0] === 'setip clbrws026.clw:44', JSON.stringify(SENT));
 check('the first use in a session warns about skipped / repeated code', LOG.length === 1 && /OPEN/.test(LOG[0]), JSON.stringify(LOG));
+// The warning describes what the debugger checks; it must not promise the move is "safe" (pipeline run 2).
+check('...and does not call the move "safe"', LOG.length === 1 && !/\bsafe/i.test(LOG[0]), JSON.stringify(LOG));
 reset(); rtcLine = 45;
 setIpFromMenu();
 check('a second use sends again', SENT.length === 1 && SENT[0] === 'setip clbrws026.clw:45', JSON.stringify(SENT));

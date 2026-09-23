@@ -1080,8 +1080,8 @@
 
   // ---- Source view: right-click "Set next statement" (task a77abd94). Moves the STOPPED thread's instruction
   // pointer to the clicked line; nothing runs. Only while paused AND viewing the stopped thread: the engine
-  // refuses another thread anyway, and a greyed item says so before the round trip. The engine decides what is
-  // safe (same procedure, not across an ACCEPT, ...) and its refusal sentence is shown as is. What it CANNOT
+  // refuses another thread anyway, and a greyed item says so before the round trip. The engine decides which
+  // moves it allows (same procedure, stack proven or observed, ...) and its refusal sentence is shown as is. What it CANNOT
   // decide is what skipping or repeating code means to the program, so the first use in a session says that
   // once, in the console, where it stays readable. ----
   let setIpWarned=false;
@@ -1089,8 +1089,9 @@
   function setIpFromMenu(){ $('srcMenu').classList.remove('show');
     if(!setIpAllowed()||rtcLine==null||isNaN(rtcLine)||!curFile) return;
     if(!setIpWarned){ setIpWarned=true;
-      logLine('pause', 'Set next statement skips or repeats code without running anything in between. The debugger keeps the stack safe, '
-        + 'but not the program\'s own state: skipping an OPEN leaves a file or window closed, and repeating a line repeats its effects.'); }
+      logLine('pause', 'Set next statement skips or repeats code without running anything in between. The debugger only allows a move '
+        + 'where the stack depth is proven or was seen at that line, and it does nothing about the program\'s own state: '
+        + 'skipping an OPEN leaves a file or window closed, and repeating a line repeats its effects.'); }
     send('setip', curFile+':'+rtcLine); }
   $('miSetIp').onclick=setIpFromMenu;
   // The host's relay of the engine's setip reply. Success needs nothing here: the `paused` that follows repaints
