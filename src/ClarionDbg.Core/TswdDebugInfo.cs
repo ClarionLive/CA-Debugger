@@ -1350,6 +1350,27 @@ namespace ClarionDbg.Core
             return _dataNames.TryGetValue(name, out loc);
         }
 
+        // symbol name -> the data symbol itself, built on first use (case-insensitive; first symbol wins)
+        private Dictionary<string, DataSymbol> _dataSymbolsByName;
+
+        /// <summary>The data symbol DECLARED with this exact name (case-insensitive), with its resolved
+        /// <see cref="DataSymbol.Type"/>. Unlike <see cref="ResolveDataName"/> this never answers with a
+        /// member of some other symbol: a watch path (GROUP.MEMBER) walks from its head's own layout, and
+        /// a <see cref="DataLocation"/> carries no type to walk.</summary>
+        public bool TryGetDataSymbol(string name, out DataSymbol symbol)
+        {
+            symbol = null;
+            if (string.IsNullOrEmpty(name) || DataSymbols == null) return false;
+            if (_dataSymbolsByName == null)
+            {
+                var index = new Dictionary<string, DataSymbol>(StringComparer.OrdinalIgnoreCase);
+                foreach (var ds in DataSymbols)
+                    if (!string.IsNullOrEmpty(ds.Name) && !index.ContainsKey(ds.Name)) index[ds.Name] = ds;
+                _dataSymbolsByName = index;
+            }
+            return _dataSymbolsByName.TryGetValue(name, out symbol);
+        }
+
         /// <summary>Clarion type name for a TSWD type code — PROVEN codes only (validated against
         /// the clbrws dictionary); null for codes not yet confirmed. Render unknowns as hex.</summary>
         public static string TypeCodeName(byte code)

@@ -129,9 +129,13 @@ namespace ClarionDbg.Cli
 
         /// <summary>True when <paramref name="name"/> is declared as a local in SOME procedure of any loaded image
         /// (locals are cached, so this is cheap after first build). Lets a watch miss tell "out of scope right now"
-        /// (a known local of a procedure we are not currently paused in) apart from a genuinely unknown name.</summary>
+        /// (a known local of a procedure we are not currently paused in) apart from a genuinely unknown name.
+        /// A watch PATH (HEAD.MEMBER) is judged by its head: the head is the local that is or is not in
+        /// scope, and no local is ever declared with a '.' in its name.</summary>
         private bool IsKnownLocalName(string name)
         {
+            int dot = name == null ? -1 : name.IndexOf('.');
+            if (dot >= 0) name = name.Substring(0, dot);
             if (NameInAnyLocalSet(_exe, name)) return true;
             foreach (var m in _modules)
             {

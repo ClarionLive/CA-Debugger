@@ -83,6 +83,7 @@ namespace ClarionDbg.Cli
                 CheckEmulationFaultBranches,
                 CheckEmulatorImportsPerImage,
                 CheckStackWindowRevalidated,
+                CheckWatchPathWalker,
             };
 
             foreach (var check in checks)
