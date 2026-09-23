@@ -284,31 +284,55 @@ namespace ClarionDebugger.Terminal
             return gen;
         }
 
-        /// <summary>The procedure or method in the current list whose definition is the last one at or above
-        /// <paramref name="line"/> in <paramref name="module"/> - the one a cursor on that line sits in - or
-        /// null when the list has none there. ROUTINEs are skipped: they are in the table so a breakpoint can
-        /// name them, but "break on procedure entry" means the enclosing procedure, and a routine is not
-        /// entered the way a procedure is. Module is compared ignoring case, as every module comparison on
-        /// the host is: it is a Windows file name.
+        /// <summary>The procedure or method in the current list that truly CONTAINS <paramref name="line"/> of
+        /// <paramref name="module"/>, or null with the reason in <paramref name="why"/>.
         /// <para>
-        /// This is how a caller that has only a POSITION (the editor's cursor, e61e4f92) reaches the same
-        /// host-owned answer an id does: the position is a lookup key into what the host listed, and the
-        /// breakpoint goes where the LIST says the procedure starts.
+        /// CONTAINMENT, NEVER "NEAREST PRECEDING" (PM ruling, codex adversary gate). This used to return the last
+        /// procedure starting at or above the line, with no upper bound - so module data, generated trailer code
+        /// or a cursor below the last procedure armed the PREVIOUS procedure's entry. A procedure's range is
+        /// [its start, its end]: the end is the known extent (<see cref="ProcRef.EndLine"/>) when the engine
+        /// reported one, else the line before the next non-routine procedure in the same module. The LAST
+        /// procedure in a module has no next one, so with no known extent it is REFUSED rather than guessed.
+        /// </para>
+        /// <para>
+        /// ROUTINEs are skipped as candidates and as bounds: they sit INSIDE their procedure, so a routine is
+        /// neither what "procedure entry" means nor where the procedure ends. Module is compared ignoring case:
+        /// it is a Windows file name. A position is only a lookup key into what the host listed (e61e4f92).
+        /// </para>
+        /// <para>
+        /// KNOWN LIMIT while the engine sends no extents (as of 2026-09-22): a line between one procedure's real
+        /// end and the next one's start is attributed to the first, because starts alone cannot tell them apart.
         /// </para></summary>
-        public ProcRef Containing(string module, int line)
+        public ProcRef Containing(string module, int line, out string why)
         {
-            if (string.IsNullOrEmpty(module) || line <= 0) return null;
-            ProcRef best = null;
+            why = null;
+            if (string.IsNullOrEmpty(module) || line <= 0) { why = "no usable file or line"; return null; }
+            ProcRef at = null, next = null;
             foreach (var p in _byId.Values)
             {
-                if (p == null || p.Line <= 0 || p.Line > line) continue;
+                if (p == null || p.Line <= 0) continue;
                 if (string.Equals(p.Kind, "routine", StringComparison.OrdinalIgnoreCase)) continue;
                 if (!string.Equals(p.Module, module, StringComparison.OrdinalIgnoreCase)) continue;
-                if (best == null || p.Line > best.Line) best = p;
+                if (p.Line <= line) { if (at == null || p.Line > at.Line) at = p; }
+                else if (next == null || p.Line < next.Line) next = p;
             }
-            return best;
-        }
-    }
+            if (at == null)
+            {
+                why = next == null ? "no listed procedure is in " + module
+                                   : module + ":" + line + " is above the first listed procedure";
+                return null;
+            }
+            if (at.EndLine > 0)
+            {
+                if (line <= at.EndLine) return at;
+                why = module + ":" + line + " is past the end of " + at.Name + " (line " + at.EndLine + "), outside every listed procedure";
+                return null;
+            }
+            if (next != null) return at;     // bounded by the next procedure's start
+            why = module + ":" + line + " is below " + at.Name + ", the last procedure in " + module
+                + ", and the debugger does not know where that procedure ends";
+            return null;
+        }    }
 
     /// <summary>What one listed procedure row means: the definition its id stands for.</summary>
     internal sealed class ProcRef
@@ -317,6 +341,7 @@ namespace ClarionDebugger.Terminal
         public string Module;
         public int Line;
         public string Kind;   // procedure | method | routine
+        public int EndLine;   // last source line when the engine reported one, else 0 = unknown
     }
 
     /// <summary>The edit tuples the host has ISSUED for the rows currently on screen.

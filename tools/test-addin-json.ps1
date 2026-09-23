@@ -1043,8 +1043,8 @@ public sealed class BridgePad {
 Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
 function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
-function Proc { param($name, $module, $line, $kind = 'procedure')
-  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p
+function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0)
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine; $p
 }
 
 # ---- host writers, run --------------------------------------------------------------------------------
@@ -1267,24 +1267,40 @@ Check 'CONTROL: an idle request for a good module is staged once' `
 
 # ---- break on entry by POSITION: the editor's cursor (e61e4f92) ---------------------------------------
 # ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
-# list: the breakpoint goes where the list says the containing procedure starts.
+# list, and it must be CONTAINED by a procedure (PM ruling, codex adversary gate) - never "the nearest one
+# above". clbrws011.clw here: MAIN 42 (no extent; bounded by OTHER), a routine inside it at 45, OTHER 80..120
+# (a known extent), and module data/trailer after 120. clbrws003.clw: LAST 20 with no extent and nothing after.
 $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN::DOIT' 'clbrws011.clw' 45 'routine'))
-[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80 'procedure' 120))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'ELSEWHERE' 'clbrws002.clw' 10))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'LAST' 'clbrws003.clw' 20))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'BOUNDED' 'clbrws004.clw' 10 'procedure' 30))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'AFTERDATA' 'clbrws004.clw' 60))
 $posPad.RunPushProcedures('C:\App\app.exe')
 function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
+function PosRefused { param($path, $line, $reason)
+  $a = PosAdd $path $line
+  ($a -eq '') -and (@(Errs $posPad).Count -eq 1) -and ((@(Errs $posPad)[0]) -match $reason)
+}
 Check 'a cursor inside MAIN, below one of its ROUTINEs, breaks on MAIN''s entry (42), not the routine''s' `
   ((PosAdd 'C:\Src\CLBRWS011.CLW' 50) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
-Check 'a cursor further down breaks on the procedure it is actually in (OTHER, 80)' `
+Check 'a cursor inside a procedure with a known extent resolves (OTHER, 80..120)' `
   ((PosAdd 'C:\Src\clbrws011.clw' 90) -ceq 'clbrws011.clw:80') ($posPad._svc.Adds -join ',')
 Check 'a cursor ON the definition line counts as inside it' ((PosAdd 'C:\Src\clbrws011.clw' 42) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
-$none = PosAdd 'C:\Src\clbrws011.clw' 10
-Check 'a cursor above every listed procedure arms nothing, and says why' `
-  (($none -eq '') -and (@(Errs $posPad).Count -eq 1)) ($posPad.Lines -join ' / ')
-Check 'and neither does a file the list does not cover' ((PosAdd 'C:\Src\unlisted.clw' 50) -eq '') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor above the first procedure' (PosRefused 'C:\Src\clbrws011.clw' 10 'above the first') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor BETWEEN procedures, in module data past a known end (clbrws004 31..59)' `
+  (PosRefused 'C:\Src\clbrws004.clw' 45 'past the end of BOUNDED') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor below a procedure''s known end, with nothing after it (OTHER ends at 120)' `
+  (PosRefused 'C:\Src\clbrws011.clw' 130 'past the end of OTHER') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor below the LAST procedure in a module whose end is unknown' `
+  (PosRefused 'C:\Src\clbrws003.clw' 25 'does not know where that procedure ends') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a file the list does not cover' (PosRefused 'C:\Src\unlisted.clw' 50 'no listed procedure is in') ($posPad.Lines -join ' / ')
+Check 'the service reads an engine endLine when there is one, and treats one before the start as unknown' `
+  (((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
+   ((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'end\.HasValue && end\.Value >= line\) \? end\.Value : 0')) ''
 
 # ---- edits, through the real page ---------------------------------------------------------------------
 function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
@@ -2065,7 +2081,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 315
+$EXPECTED_CHECKS = 319
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

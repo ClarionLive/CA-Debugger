@@ -246,6 +246,10 @@ namespace ClarionDebugger.Services
         /// ROUTINE it sits in and the procedure that encloses it; the Procedures PANEL filters them back out
         /// (a routine is not independently navigable the way a procedure is).</summary>
         public string Kind;
+        /// <summary>The procedure's LAST source line when the engine reports one (an <c>endLine</c> member), else
+        /// 0 = unknown. As of 2026-09-22 the engine's symbols output carries only the start, so this is 0 until
+        /// it does; ProcedureIds.Containing then bounds a procedure by the next one's start instead.</summary>
+        public int EndLine;
     }
 
     /// <summary>
@@ -1496,7 +1500,9 @@ namespace ClarionDebugger.Services
                     if (kind != "procedure" && kind != "method" && kind != "routine") continue;
                     int line = GetInt(obj, "line");
                     if (line <= 0) continue;
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind });
+                    int? end = GetIntOrNull(obj, "endLine");
+                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
+                                                  EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0 });
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }

@@ -836,11 +836,12 @@ namespace ClarionDebugger.Terminal
             string module = null;
             try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
             catch (ArgumentException) { module = null; }
-            var proc = _procIds.Containing(module, line);
+            string why;
+            var proc = _procIds.Containing(module, line, out why);
             if (proc == null)
             {
-                Console("err", "break on entry: no listed procedure contains " + (module ?? "(no file)") + ":" + line
-                    + " — open the app's solution so the Procedures pane is filled, or refresh it.");
+                // A visible refusal, never a guess at the nearest procedure above (codex adversary gate).
+                Console("err", "break on entry: " + why + " — nothing was set. (If the Procedures pane is empty, open the app's solution or refresh it.)");
                 return;
             }
             BreakOnEntry(proc);
@@ -986,7 +987,7 @@ namespace ClarionDebugger.Terminal
                     {
                         var p = procs[i];
                         string id = ProcedureIds.IdFor(gen, i);
-                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind };
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine };
                         if (i > 0) sb.Append(',');
                         sb.Append("{\"id\":").Append(Str(id))
                           .Append(",\"name\":").Append(Str(p.Name))
