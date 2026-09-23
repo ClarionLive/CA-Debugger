@@ -60,6 +60,7 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-engine-bpowner.ps1` | offline | breakpoint ownership across images (not yet total-pinned: ticket 6493d226) |
 | `test-engine-session.ps1` | offline | the shared engine-session lifecycle, and that harnesses use it |
 | `test-engine-tid-members.ps1` (plain and `-SelfTest`) | offline | no thread-id JSON member written by hand; thread ids to users go through TidText |
+| `test-engine-hover-sites.ps1` (plain and `-SelfTest`) | offline | PausedWait resets the hover tracker as an unconditional top-level statement before its command loop (position, not text) |
 | `test-pad-*.js` | offline (node) | the debugger pad page |
 | `test-bp-threaded.ps1` | **live** | a tracepoint over a THREADed name, hit repeatedly without pausing |
 | `test-watch-threaded.ps1` | **live** | a watch reads a THREADed name from its instance, not a HISTORY:: copy |

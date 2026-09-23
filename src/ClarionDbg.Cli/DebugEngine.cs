@@ -845,6 +845,7 @@ namespace ClarionDbg.Cli
             _instrStep = false;       // and consumes a pending instruction-step
             _selectedTid = tid;       // a new stop always starts on the stopped thread — a selection is
                                       // per-stop and is never carried across one
+            HoverNewStop();             // one fresh hover answer per stop, however long the step took
             ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
                                         // rather than trust bases cached while the target was last frozen
 

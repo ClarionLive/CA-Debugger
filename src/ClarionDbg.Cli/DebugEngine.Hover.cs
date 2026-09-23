@@ -44,6 +44,13 @@ namespace ClarionDbg.Cli
         /// session of the mode can never suppress it.</summary>
         internal void Set(bool on) { On = on; _next = 0; _haveLast = false; }
 
+        /// <summary>A new stop: forget the last answer and make the next poll due at once, so every stop gets
+        /// exactly ONE fresh answer. Without this, whether a stop announced itself depended on how long the
+        /// step took: a step under the poll interval ran no running-state poll, so the stop's (tid, paused)
+        /// matched the previous stop's and was suppressed, while a longer step emitted (X, running) and then
+        /// (X, paused). The page treats that first answer as a baseline and never selects from it.</summary>
+        internal void Forget() { _next = 0; _haveLast = false; }
+
         /// <summary>True when a poll is due at <paramref name="now"/>; claims the slot, so the next one is due
         /// <paramref name="interval"/> later. Measured from NOW, not from the previous slot: after a long
         /// debug event the mode must not fire a burst of catch-up polls.</summary>
@@ -111,6 +118,9 @@ namespace ClarionDbg.Cli
             }
             else EmitError("hover expects: hover on|off");
         }
+
+        /// <summary>Every stop, from the top of PausedWait. See HoverTracker.Forget.</summary>
+        private void HoverNewStop() { _hover.Forget(); }
 
         /// <summary>Called on EVERY pass of both loops; cheap unless the mode is on and a poll is due. Never
         /// throws: a failed read answers "none" rather than taking a debug loop down with it.</summary>
@@ -275,6 +285,8 @@ namespace ClarionDbg.Cli
         }
         internal static string HoverJsonForTest(bool on, bool paused, uint tid) { return HoverJson(on, paused, tid); }
         internal static bool IsClickThroughStyleForTest(int exStyle) { return IsClickThroughStyle(exStyle); }
+        internal void HoverNewStopForTest() { HoverNewStop(); }
+        internal void PollHoverForTest(bool paused) { PollHover(paused); }
 
         /// <summary>Drive the verb on an engine with NO process: the poll answers "none" at ProcessId() without
         /// a single window read, so this exercises the handler and the event, and touches nothing.</summary>

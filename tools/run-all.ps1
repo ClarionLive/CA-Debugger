@@ -70,6 +70,8 @@ $Suites = @(
   @{ File = 'test-engine-session.ps1' }
   @{ File = 'test-engine-tid-members.ps1' }
   @{ File = 'test-engine-tid-members.ps1'; Args = @('-SelfTest') }
+  @{ File = 'test-engine-hover-sites.ps1' }
+  @{ File = 'test-engine-hover-sites.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-pad-bpstate.js' }
   @{ File = 'test-pad-contrast.js' }
   @{ File = 'test-pad-editmeta.js' }

@@ -2089,6 +2089,7 @@
     if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
     closeThreadPicker(); renderThreadUi();
     cancelHoverSelect();         // a hover that settled on LAST stop's world must not switch this one
+    hoverBaseline=true;          // and this stop's first answer only reports (see onHover)
   }
 
   // ---- identify thread by window (f6e547ce) ----
@@ -2113,6 +2114,7 @@
   let hoverPaused=false;      // ...and whether the ENGINE was paused when it gave it
   let hoverTimer=null;        // the pending settle
   let hoverRunState='idle';   // last runstate seen, to re-arm the engine when a session starts
+  let hoverBaseline=false;    // the next paused answer is this stop's first: report it, never select from it
 
   function setHoverMode(on){
     hoverOn=!!on;
@@ -2143,6 +2145,12 @@
     // seen the stop, and it describes a window from before the stop. (A null tid needs no check here:
     // selectThread refuses one.)
     if(!hoverOn || !hoverPaused) return;
+    // A NEW STOP NEVER PULLS THE VIEW OFF THE STOPPED THREAD BY ITSELF (pipeline run 1). The engine sends
+    // exactly one fresh answer per stop, and it names whatever window the pointer happened to be resting
+    // on when the step ended. Selecting from it switched away from the stopped thread, and whether that
+    // happened depended on how long the step took. So that answer is the stop's baseline, and only a
+    // later CHANGE of the hovered thread, while paused, selects.
+    if(hoverBaseline){ hoverBaseline=false; return; }
     const tid=hoverTid;
     hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);
   }
