@@ -131,8 +131,8 @@ Write-Host ''
 Write-Host 'and the WRITER says "unknown" the same way the reader hears it: by leaving the member out'
 Check 'an absent tid writes no member at all' ([PadJsonProbe]::TidJson($null) -eq '') "'$([PadJsonProbe]::TidJson($null))'"
 Check 'a 0 is a sentinel, not a thread - written as absent too' ([PadJsonProbe]::TidJson(0) -eq '') "'$([PadJsonProbe]::TidJson(0))'"
-Check 'a real tid is written' ([PadJsonProbe]::TidJson(116932) -eq ',"tid":116932') ([PadJsonProbe]::TidJson(116932))
-Check 'a high DWORD is written whole' ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') ([PadJsonProbe]::TidJson(4294967295))
+Check 'a real tid is written' ([PadJsonProbe]::TidJson(116932) -ceq ',"tid":116932') ([PadJsonProbe]::TidJson(116932))
+Check 'a high DWORD is written whole' ([PadJsonProbe]::TidJson(4294967295) -ceq ',"tid":4294967295') ([PadJsonProbe]::TidJson(4294967295))
 
 Write-Host ''
 Write-Host 'every watch request goes through the path that ANSWERS a refusal'
@@ -483,11 +483,11 @@ $noSource = if ($noSourceCount -ge 1) { [HostSourceProbe]::Posts[0] } else { '' 
 # THE RULE, from the writer's own output: no source means NO lines. A placeholder line here is what the page
 # would render under the new stop's header, which is the whole failure 4891ed2 set out to close.
 Check 'and its lines array is EMPTY, so buildSource is the only thing that can write a listing' `
-  ($noSource -match '"lines":\[\]') $noSource
+  ($noSource -cmatch '"lines":\[\]') $noSource
 Check 'and `file` carries the MODULE name, the only name the stop has left' `
-  ($noSource -match ('"file":"' + [regex]::Escape($noSourceModule) + '"')) $noSource
+  ($noSource -cmatch ('"file":"' + [regex]::Escape($noSourceModule) + '"')) $noSource
 Check 'and startLine is 0 with current on the stop line' `
-  ($noSource -match '"startLine":0' -and $noSource -match ('"current":' + $noSourceLine + '[,}]')) $noSource
+  ($noSource -cmatch '"startLine":0' -and $noSource -cmatch ('"current":' + $noSourceLine + '[,}]')) $noSource
 
 # The with-source case, for the other half of the fixture: a real file on disk, deterministic contents so
 # the captured message is reproducible.
@@ -770,7 +770,9 @@ foreach ($f in $fixtures) {
   $line   = Read1 $data 'line'
   $cond   = Read1 $data 'condition'
   $trace  = Read1 $data 'trace'
-  $ok = ($action -ceq 'bpprops') -and ($module -ceq 'MAIN.CLW') -and ($line -ceq '42') -and ($cond -ceq $f.name) -and ($trace -ceq $f.name)
+  # Case-sensitive for the wire's own tokens and the user's text; case-BLIND for the module, a Windows file
+  # name the host itself compares OrdinalIgnoreCase (09207c17: converting it would contradict shipped behaviour).
+  $ok = ($action -ceq 'bpprops') -and ($module -eq 'MAIN.CLW') -and ($line -ceq '42') -and ($cond -ceq $f.name) -and ($trace -ceq $f.name)
   Check $f.label $ok "module=$module line=$line condition=$cond"
 }
 
@@ -793,7 +795,7 @@ Check 'a key that exists ONLY nested reads as absent, not as the nested value' `
 Check 'a brace inside a string value does not end the object' `
   ((Read1 '{"name":"a}b","line":42}' 'line') -eq '42') (Read1 '{"name":"a}b","line":42}' 'line')
 Check 'an escaped quote does not end the string' `
-  ((Read1 '{"name":"a\"b","line":42}' 'name') -eq 'a"b') (Read1 '{"name":"a\"b","line":42}' 'name')
+  ((Read1 '{"name":"a\"b","line":42}' 'name') -ceq 'a"b') (Read1 '{"name":"a\"b","line":42}' 'name')
 Check 'a key name that is a prefix of another is not confused with it' `
   ((Read1 '{"lineNumber":9,"line":42}' 'line') -eq '42') (Read1 '{"lineNumber":9,"line":42}' 'line')
 Check 'whitespace and newlines around members' `
@@ -826,7 +828,7 @@ Check 'a truncated \u escape' ($null -eq (Read1 '{"a":"x\u00"}' 'a')) ''
 # old JsonVal returned '{"b":1' - a truncated blob a caller would have used as a string
 Check 'an object VALUE is not returned as text' ($null -eq (Read1 '{"a":{"b":1}}' 'a')) (Read1 '{"a":{"b":1}}' 'a')
 Check 'a number still reads as its literal text' ((Read1 '{"a":-3}' 'a') -eq '-3') (Read1 '{"a":-3}' 'a')
-Check 'a bool still reads as its literal text' ((Read1 '{"a":true}' 'a') -eq 'true') (Read1 '{"a":true}' 'a')
+Check 'a bool still reads as its literal text' ((Read1 '{"a":true}' 'a') -ceq 'true') (Read1 '{"a":true}' 'a')
 
 Write-Host ''
 Write-Host 'the retired rule is not lying around waiting to be followed again'
@@ -1279,7 +1281,7 @@ Check 'an owner-bearing bp-del still removes a row whose owner is unknown' `
 # for it, because no image carries its compiland yet.
 $pendingSet = [BpWire]::BpSet((EngineBp 'clbrws011.clw' 50 50))
 Check 'a pending breakpoint writes ownerPath as JSON null, which reads as unknown too' `
-  (($pendingSet -match '"ownerPath":null') -and ($null -eq [BpHost]::GetStr($pendingSet, 'ownerPath'))) $pendingSet
+  (($pendingSet -cmatch '"ownerPath":null') -and ($null -eq [BpHost]::GetStr($pendingSet, 'ownerPath'))) $pendingSet
 
 Write-Host ''
 Write-Host 'the two identity predicates AGREE - enumerated, not asserted'
@@ -1344,7 +1346,7 @@ Check 'an unknown stopped writes no member at all' ([PadJsonProbe]::TidMember('s
 Check 'a 0 is a sentinel for selected as much as for tid - written as absent too' `
   ([PadJsonProbe]::TidMember('selected', 0) -eq '') "'$([PadJsonProbe]::TidMember('selected', 0))'"
 Check 'a known stopped is written under its own name' `
-  ([PadJsonProbe]::TidMember('stopped', 116932) -eq ',"stopped":116932') ([PadJsonProbe]::TidMember('stopped', 116932))
+  ([PadJsonProbe]::TidMember('stopped', 116932) -ceq ',"stopped":116932') ([PadJsonProbe]::TidMember('stopped', 116932))
 Check 'and TidJson is that same writer, not a second copy of the rule' `
   ((Get-Method 'private static string TidJson(uint? tid)' $web) -match 'TidMember\("tid", tid\)') ''
 # ALL THREE, counted rather than asserted as "every": a fourth member added without the writer is what the
@@ -1426,7 +1428,7 @@ CheckWhy 'and it still rejects 0, which is the half both writers already agree o
 # The divergence itself, pinned. This asserts CURRENT behaviour on purpose: it is the "documented" half of
 # the decision above, and it names its own successor so nobody reads it as approval.
 CheckWhy 'the divergence, stated: TidJson writes uint.MaxValue whole where the engine would omit it' `
-  ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') `
+  ([PadJsonProbe]::TidJson(4294967295) -ceq ',"tid":4294967295') `
   'TidJson has adopted the engine rule - good; delete this check and update the note above, on 3b043dfc'
 CheckWhy 'the two writers DO agree on 0, so this is a one-value divergence and not two rules' `
   ([PadJsonProbe]::TidJson(0) -eq '') `
