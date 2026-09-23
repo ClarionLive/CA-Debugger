@@ -1,19 +1,23 @@
 # LIVE: set next statement (task a77abd94) against clbrws.exe's SplashScreen.
 #
 # What only a live run can show, and protocolcheck cannot (ProtocolCheck.SetIp.cs covers the decision, the
-# ACCEPT-region finder and the wire shapes over hand-built inputs):
+# ACCEPT-region finder, the call proof, the observation store and the wire shapes over hand-built inputs):
 #   - a successful setip really moves EIP, and re-announces the stop as `paused` reason "setip" at the new line;
 #   - a Step after a setip starts from the NEW line (the pause loop's locals were recomputed, risk 6);
-#   - THE RE-ARM HANDOVER (risk 5): from a breakpoint stop at line 44, setip onto line 45, which carries its
-#     own breakpoint. The engine keeps ONE re-arm per thread; without the handover the origin breakpoint at 44
-#     is never re-planted and silently stops firing, so the next continue stops at 45. With it, at 44.
-#     Measured 2026-09-23: disabling the handover turned that stop into "breakpoint line=45";
-#   - the refusals a real image produces: ACCEPT boundary both ways, the entry record, a ROUTINE, a line
-#     with no code, another module, bad arguments, and a Pause stop that is not on a statement.
+#   - THE OBSERVED PATH (a77abd94 item 3): SplashScreen calls runtime entries whose stack effect was never
+#     measured (Cla$pmopen, Cla$BEEP, ...), so its moves cannot be PROVEN (census 2026-09-23: 683 of 2003
+#     clbrws symbols provable). A move BACK to a line this frame already stopped on, at the same ESP, is allowed
+#     "via observed"; a move FORWARD to a line not yet reached is refused as stack-unproven;
+#   - THE RE-ARM HANDOVER (risk 5): from a stop on armed line 35, setip back onto armed line 33. The engine keeps
+#     ONE re-arm per thread; without the handover the origin breakpoint at 35 is never re-planted and silently
+#     stops firing, so the continue that follows runs on to the ACCEPT's breakpoint at 44 instead of stopping at
+#     35. (Measured 2026-09-23 on the earlier 44->45 form of this case: disabling the handover turned the stop
+#     into the wrong line.)
+#   - the refusals a real image produces: the entry record, a ROUTINE, a line with no code, another module,
+#     bad arguments, and a Pause stop that is not on a statement.
 #
-# SplashScreen (clbrws026.clw, exe line numbering): 8 is the entry record, 33/34 run before the ACCEPT, 43 is
-# the ACCEPT itself, 44..88 are its body (88 is the back-edge line), 89 follows the loop, 92 is in the
-# PrepareProcedure ROUTINE. The splash loops on a 1 s timer, so line 44 is reached again after a continue.
+# SplashScreen (clbrws026.clw, exe line numbering): 8 is the entry record, 32..42 run before the ACCEPT, 43 is
+# the ACCEPT itself, 44..88 are its body, 89 follows the loop, 92 is in the PrepareProcedure ROUTINE.
 param(
     [string]$Engine = "$PSScriptRoot\..\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe",
     [string]$Target = "C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe",
@@ -23,7 +27,7 @@ param(
 . "$PSScriptRoot\lib-check.ps1"
 
 $session = New-EngineSession -Engine $Engine -Target $Target `
-    -BreakArgs '--bp clbrws026.clw:34 --bp clbrws026.clw:44 --bp clbrws026.clw:45' -WorkingDirectory (Split-Path $Target)
+    -BreakArgs '--bp clbrws026.clw:33 --bp clbrws026.clw:35 --bp clbrws026.clw:44' -WorkingDirectory (Split-Path $Target)
 
 # The next paused / setip event, in arrival order. Read-EngineLines hands over EVERYTHING that has arrived, and
 # a successful setip writes its reply and the re-announced `paused` back to back, so the events are queued:
@@ -58,27 +62,55 @@ function Expect-Refusal([string]$Spec, [string]$Code) {
     Check "setip $Spec is refused as $Code, with a sentence for the user" `
         ($null -ne $r -and $r.ok -eq $false -and $r.reason -ceq $Code -and $r.error) (Show $r)
 }
+# A setip that must succeed via $Via, re-announced as paused reason setip on $Line.
+function Expect-Move([string]$Spec, [int]$Line, [string]$Via) {
+    Send "setip $Spec"
+    $r = Wait-Event 'setip'
+    Check "setip $Spec succeeds via $Via" ($null -ne $r -and $r.ok -eq $true -and $r.line -eq $Line -and $r.via -ceq $Via) (Show $r)
+    $p = Wait-Event 'paused'
+    Check "...and the stop is re-announced as paused reason setip on line $Line" `
+        ($null -ne $p -and $p.reason -ceq 'setip' -and $p.line -eq $Line -and $p.exact -eq $true) (Show $p)
+    return $p
+}
 
 try {
-    Invoke-CheckSection 'setip before the ACCEPT: re-run a line, then step from it' {
+    Invoke-CheckSection 'observed: step forward, then go back to a line this frame stopped on' {
         $p = Wait-Event 'paused'
-        Check 'stopped at the breakpoint on line 34' ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 34) (Show $p)
+        Check 'stopped at the breakpoint on line 33' ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 33) (Show $p)
         $script:baseEsp = if ($p) { $p.regs.esp } else { $null }
-
-        Send 'setip clbrws026.clw:33'
-        $r = Wait-Event 'setip'
-        Check 'setip to line 33 succeeds, from line 34' ($null -ne $r -and $r.ok -eq $true -and $r.line -eq 33 -and $r.fromLine -eq 34) (Show $r)
-        $p = Wait-Event 'paused'
-        Check 'the stop is re-announced as paused reason setip on line 33, ESP unchanged' `
-            ($null -ne $p -and $p.reason -ceq 'setip' -and $p.line -eq 33 -and $p.exact -eq $true -and $p.regs.esp -eq $script:baseEsp) (Show $p)
-
         Send 'step'
         $p = Wait-Event 'paused'
-        Check 'a step after the setip stops at line 34 (it started from the NEW line)' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 34) (Show $p)
+        Check 'a step reaches line 34' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 34) (Show $p)
+        Send 'step'
+        $p = Wait-Event 'paused'
+        Check 'a step reaches line 35 (it carries a breakpoint: the step stop restores its byte)' ($null -ne $p -and $p.line -eq 35) (Show $p)
+
+        # The forward move first, while 36/37 have never been reached in this frame.
+        Send 'setip clbrws026.clw:37'
+        $r = Wait-Event 'setip'
+        Check 'a FORWARD setip to line 37, never reached, is refused as stack-unproven and says to step there first' `
+            ($null -ne $r -and $r.ok -eq $false -and $r.reason -ceq 'stack-unproven' -and $r.error -match 'Step to that line first') (Show $r)
+
+        $p = Expect-Move 'clbrws026.clw:33' 33 'observed'
+        Check 'ESP after the move back is the ESP line 33 had' ($null -ne $p -and $p.regs.esp -eq $script:baseEsp) (Show $p)
+    }
+
+    Invoke-CheckSection 'the re-arm handover: from armed line 35 back onto armed line 33' {
+        Send 'continue'
+        $p = Wait-Event 'paused'
+        Check 'continue stops at the ORIGIN breakpoint on line 35: it was re-planted (without the handover this runs to 44)' `
+            ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 35) (Show $p)
+    }
+
+    Invoke-CheckSection 'a step after a setip starts from the new line' {
+        [void](Expect-Move 'clbrws026.clw:34' 34 'observed')
+        Send 'step'
+        $p = Wait-Event 'paused'
+        Check 'a step after setip 35 -> 34 stops at line 35' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 35) (Show $p)
     }
 
     Invoke-CheckSection 'refusals from a statement stop before the ACCEPT' {
-        Expect-Refusal 'clbrws026.clw:44' 'accept-boundary'   # into the loop
+        Expect-Refusal 'clbrws026.clw:44' 'stack-unproven'    # into the loop, never reached: neither proven nor observed
         Expect-Refusal 'clbrws026.clw:8' 'prologue'           # the entry record
         Expect-Refusal 'clbrws026.clw:92' 'other-proc'        # a ROUTINE of this procedure
         Expect-Refusal 'clbrws026.clw:9999' 'no-code'
@@ -86,38 +118,22 @@ try {
         Expect-Refusal 'garbage' 'bad-args'
     }
 
-    Invoke-CheckSection 'the re-arm handover: setip from one breakpoint onto another' {
+    Invoke-CheckSection 'inside the ACCEPT: back to an observed line, never out' {
         Send 'continue'
         $p = Wait-Event 'paused'
         Check 'continue reaches the breakpoint on line 44, inside the ACCEPT' ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 44) (Show $p)
-
-        Send 'setip clbrws026.clw:45'
-        $r = Wait-Event 'setip'
-        Check 'setip 44 -> 45 inside one ACCEPT succeeds' ($null -ne $r -and $r.ok -eq $true -and $r.line -eq 45) (Show $r)
-        [void](Wait-Event 'paused')
-
-        Send 'continue'
+        Send 'step'
         $p = Wait-Event 'paused'
-        Check 'the next continue stops at the ORIGIN breakpoint, line 44: it was re-planted' `
-            ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 44) (Show $p)
-
-        Send 'continue'
-        $p = Wait-Event 'paused'
-        Check 'and the target breakpoint, line 45, still fires too' ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 45) (Show $p)
-    }
-
-    Invoke-CheckSection 'inside the ACCEPT: stay in, never leave' {
-        Send 'setip clbrws026.clw:88'
-        $r = Wait-Event 'setip'
-        Check 'setip to the back-edge line 88, inside the same loop, succeeds' ($null -ne $r -and $r.ok -eq $true -and $r.line -eq 88) (Show $r)
-        [void](Wait-Event 'paused')
-        Expect-Refusal 'clbrws026.clw:89' 'accept-boundary'   # past the loop end: what a BREAK would do
-        Expect-Refusal 'clbrws026.clw:34' 'accept-boundary'   # back out to before the ACCEPT
+        Check 'a step moves on inside the loop' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -gt 44 -and $p.line -lt 89) (Show $p)
+        [void](Expect-Move 'clbrws026.clw:44' 44 'observed')
+        Expect-Refusal 'clbrws026.clw:89' 'stack-unproven'    # past the loop end (what a BREAK does): never observed here
+        Expect-Refusal 'clbrws026.clw:34' 'stack-unproven'    # back out before the ACCEPT: observed, but at the frame's base ESP
     }
 
     Invoke-CheckSection 'a Pause stop is not on a statement' {
+        Send 'bp del clbrws026.clw:33'
+        Send 'bp del clbrws026.clw:35'
         Send 'bp del clbrws026.clw:44'
-        Send 'bp del clbrws026.clw:45'
         Send 'continue'
         Start-Sleep -Milliseconds 800
         Send 'pause'
@@ -133,8 +149,8 @@ finally {
     Remove-EngineSession $session
 }
 
-# 4 + 6 + 4 + 3 + 2, measured on a clean run 2026-09-23.
-$EXPECTED_CHECKS = 19
+# 7 + 1 + 3 + 6 + 6 + 2, measured on a clean run 2026-09-23.
+$EXPECTED_CHECKS = 25
 Assert-CheckTotal $EXPECTED_CHECKS
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }

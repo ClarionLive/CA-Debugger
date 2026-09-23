@@ -676,6 +676,7 @@ namespace ClarionDbg.Cli
                         // opening an episode — then a reused tid inheriting a dead thread's block is a live
                         // bug and this is the line that prevents it. Cheap; kept.
                         ClearThreadedBlockCache(tid);
+                        ForgetSetIpThread(tid);   // setip observations: a reused tid starts with none
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -825,6 +826,9 @@ namespace ClarionDbg.Cli
             // SPIKE: when stopped in non-TSWD code (the runtime), name the location from the live IAT
             // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
             string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
+
+            // Remember where this thread stood, for setip's observed-ESP path (DebugEngine.SetIp.cs).
+            ObserveStop(tid, ref ctx, haveCtx, m, rva, resolved, gap);
 
             // `paused` carries the STOPPED thread's tid. It describes one thread's location and registers,
             // so it is thread-scoped like the rest; carrying the tid means the host knows which thread it
