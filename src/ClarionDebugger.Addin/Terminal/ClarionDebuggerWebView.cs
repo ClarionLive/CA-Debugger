@@ -2781,31 +2781,72 @@ namespace ClarionDebugger.Terminal
             return text => Show(text, ui);
         }
 
-        public static void Show(string text, System.Threading.SynchronizationContext ui)
+        /// <summary>Where the log goes when <see cref="LogPath"/> cannot be written (%TEMP%\CA Debugger\detach.log).</summary>
+        public static string FallbackLogPath
         {
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(LogPath));
-                File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + text + Environment.NewLine);
-            }
-            catch { }
-            SendOrPostCallbackShow(text, ui);
+            get { return Path.Combine(Path.GetTempPath(), "CA Debugger", "detach.log"); }
         }
 
-        private static void SendOrPostCallbackShow(string text, System.Threading.SynchronizationContext ui)
+        /// <summary>Which channels a warning actually went out on.</summary>
+        [Flags]
+        internal enum Channels { None = 0, Log = 1, FallbackLog = 2, PostedDialog = 4, ThreadDialog = 8 }
+
+        public static Channels Show(string text, System.Threading.SynchronizationContext ui)
         {
-            System.Threading.SendOrPostCallback box = _ =>
+            return Deliver(text, new[] { LogPath, FallbackLogPath }, ui, StartStaThread, ShowBox);
+        }
+
+        /// <summary>Log to the first of <paramref name="logPaths"/> that can be written, then show the dialog: posted
+        /// to <paramref name="ui"/> when there is one, and on its own STA thread when there is none OR the post THROWS
+        /// (a destroyed handle during IDE shutdown). The dialog does not depend on either log succeeding.</summary>
+        internal static Channels Deliver(string text, IList<string> logPaths, System.Threading.SynchronizationContext ui,
+                                         Action<Action> startStaThread, Action<string> showBox)
+        {
+            var sent = Channels.None;
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + text + Environment.NewLine;
+            for (int i = 0; i < logPaths.Count; i++)
             {
-                try { MessageBox.Show(text, "CA Debugger", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
-            };
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(logPaths[i]));
+                    File.AppendAllText(logPaths[i], line);
+                    sent |= i == 0 ? Channels.Log : Channels.FallbackLog;
+                    break;
+                }
+                catch { }   // try the next location; the dialog below goes out whatever happens here
+            }
+            if (ui != null)
+            {
+                try
+                {
+                    ui.Post(_ => showBox(text), null);
+                    return sent | Channels.PostedDialog;
+                }
+                catch (Exception)
+                {
+                    // The UI context is going (its handle destroyed during IDE shutdown). Not swallowed: the dialog
+                    // falls through to its own thread below.
+                }
+            }
             try
             {
-                if (ui != null) { ui.Post(box, null); return; }
-                var t = new System.Threading.Thread(() => box(null)) { IsBackground = false };
-                t.SetApartmentState(System.Threading.ApartmentState.STA);
-                t.Start();
+                startStaThread(() => showBox(text));
+                sent |= Channels.ThreadDialog;
             }
             catch { }
+            return sent;
+        }
+
+        private static void ShowBox(string text)
+        {
+            try { MessageBox.Show(text, "CA Debugger", MessageBoxButtons.OK, MessageBoxIcon.Warning); } catch { }
+        }
+
+        private static void StartStaThread(Action body)
+        {
+            var t = new System.Threading.Thread(() => body()) { IsBackground = false };
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
         }
     }
 }

@@ -123,6 +123,10 @@ if ($SelfTest) {
     # attached exit) is NOT caught by this harness, because it runs on pwsh's .NET, whose TIMED WaitForExit already
     # waits for redirected output. The add-in runs on .NET Framework 4.8, whose timed overload does not, so the drain
     # stays; proving it needs a net48 host, which this suite is not.
+    @{ Id = 'M31'; Suite = 'ps';   File = 'web';     Why = 'a THROWING UI post is swallowed again, so no dialog is shown';
+       Find = "catch (Exception)`n                {`n                    // The UI context is going"; Repl = "catch (Exception)`n                {`n                    return sent;`n                    // The UI context is going" }
+    @{ Id = 'M32'; Suite = 'ps';   File = 'web';     Why = 'the log stops at the first location (no fallback log)';
+       Find = 'catch { }   // try the next location'; Repl = 'catch { break; }   // try the next location' }
     @{ Id = 'M16'; Suite = 'node'; File = 'page';    Why = 'a process name is written as markup';
        Find = "name.textContent=p.name==null?'':String(p.name);"; Repl = "name.innerHTML=p.name==null?'':String(p.name);" }
     @{ Id = 'M17'; Suite = 'node'; File = 'page';    Why = 'a row with a non-integer pid is shown';
@@ -188,8 +192,8 @@ if ($SelfTest) {
   } finally {
     Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
   }
-  # 29 finds + 29 mutations + 2 controls
-  $EXPECTED_CHECKS = 60
+  # 31 finds + 31 mutations + 2 controls
+  $EXPECTED_CHECKS = 64
   Assert-CheckTotal $EXPECTED_CHECKS
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
@@ -220,6 +224,9 @@ $xEngErr = Public (Get-ArrowHandler 'private void OnSvcEngineError(string msg)')
 $xTeardown = Public (Get-Method 'internal static bool TeardownLive(ClarionDebuggerService svc, string attachedName, Action<string> warn)')
 $xObserver = (Get-Method 'internal sealed class TeardownObserver : IDisposable') -replace '^internal', 'public'
 $xWarnText = Public (Get-Method 'internal static string DetachWarningText(string name, uint? pid, string error)')
+# The durable warning's delivery logic, lifted out whole (its callers' MessageBox and thread are injected).
+$xChannels = (Get-Method 'internal enum Channels') -replace '^internal', 'public'
+$xDeliver = Public (Get-Method 'internal static Channels Deliver(string text, IList<string> logPaths, System.Threading.SynchronizationContext ui,')
 
 $padProbe = @"
 using System;
@@ -303,6 +310,30 @@ namespace ClarionDebugger.Terminal
   }
 
   $($xObserver -replace 'ClarionDebuggerWebView\.', 'AttachPad.')
+
+  public static class DurableProbe
+  {
+    [Flags]
+    $xChannels
+    $xDeliver
+    // Recorders for the dialog and the STA thread, both run inline.
+    public static readonly List<string> Boxes = new List<string>();
+    public static int Threads;
+    public static void Box(string t) { Boxes.Add(t); }
+    public static void RunInline(Action a) { Threads++; a(); }
+    public static int Run(string text, IList<string> logs, System.Threading.SynchronizationContext ui) {
+      Boxes.Clear(); Threads = 0;
+      return (int)Deliver(text, logs, ui, RunInline, Box);
+    }
+  }
+  // A UI context that runs a post inline, and one whose Post THROWS (a destroyed handle at IDE shutdown).
+  public sealed class InlineContext : System.Threading.SynchronizationContext {
+    public int Posts;
+    public override void Post(System.Threading.SendOrPostCallback d, object state) { Posts++; d(state); }
+  }
+  public sealed class DeadContext : System.Threading.SynchronizationContext {
+    public override void Post(System.Threading.SendOrPostCallback d, object state) { throw new InvalidOperationException("Invoke or BeginInvoke cannot be called on a control until the window handle has been created."); }
+  }
 
   // Wires a real process's stdout into the service's real (private) OnLine, as Launch does.
   public static class ProbeWire {
@@ -850,8 +881,10 @@ Invoke-CheckSection '8. where the pieces are wired (position and text pins)' {
   Check 'closing a LIVE session tears down through TeardownLive, with the durable warner, and never kills the engine itself' `
     (($dispose -match 'var warn = DurableWarning\.ForCurrentThread\(\);') -and ($dispose -match 'TeardownLive\(svc, attachedName, warn\)') -and ($dispose -notmatch '\.Kill\(')) ''
   $dw = Get-CSharpCodeOnly (Get-Method 'internal static class DurableWarning')
-  Check 'the durable warning writes the dated log line BEFORE posting the dialog (the log survives a dead UI)' `
-    (($dw -match 'File\.AppendAllText\(LogPath') -and ($dw.IndexOf('File.AppendAllText(LogPath') -lt $dw.IndexOf('SendOrPostCallbackShow(text, ui);')) -and ($dw -match '"CA Debugger", "detach\.log"') -and ($dw -match 'ui\.Post\(box, null\)')) ''
+  Check 'the durable warning delivers through Deliver: %LOCALAPPDATA% log first, %TEMP% log second, the real dialog' `
+    (($dw -match 'return Deliver\(text, new\[\] \{ LogPath, FallbackLogPath \}, ui, StartStaThread, ShowBox\);') -and `
+     ($dw -match 'SpecialFolder\.LocalApplicationData\), "CA Debugger", "detach\.log"') -and ($dw -match 'Path\.GetTempPath\(\), "CA Debugger", "detach\.log"') -and `
+     ($dw -match 'MessageBox\.Show\(text, "CA Debugger"') -and ($dw -match 'SetApartmentState\(System\.Threading\.ApartmentState\.STA\)')) ''
   Check 'DetachAbandoned is subscribed and unsubscribed by the pad, once each' `
     ((([regex]::Matches($web, '_svc\.DetachAbandoned\s*\+=\s*OnSvcDetachAbandoned;')).Count -eq 1) -and (([regex]::Matches($web, '_svc\.DetachAbandoned\s*-=\s*OnSvcDetachAbandoned;')).Count -eq 1)) ''
   $cmdStop = Get-CSharpCodeOnly (Get-Method 'public void CmdStop()')
@@ -868,8 +901,44 @@ Invoke-CheckSection '8. where the pieces are wired (position and text pins)' {
   Check 'the only literal "quit" in the service is TeardownCommand''s' (([regex]::Matches((Get-CSharpCodeOnly $svcSrc), '"quit"')).Count -eq 1) ''
 }
 
-# Runtime counts on a clean run, per section (in run order): 25, 11, 12, 9 (3b), 10, 6 (9), 27, 14, 3, 12.
-$EXPECTED_CHECKS = 129
+Invoke-CheckSection '10. the durable warning survives its own failures (DurableWarning.Deliver, fault-injected)' {
+  # The real Deliver, with each channel made to fail in turn. A log location is made UNWRITABLE by putting it
+  # under an existing FILE, so its directory cannot be created. The dialog and the STA thread are recorders.
+  $dir = Join-Path ([IO.Path]::GetTempPath()) ('attach-durable-' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $dir | Out-Null
+  try {
+    $blocker = Join-Path $dir 'not-a-dir'; [IO.File]::WriteAllText($blocker, 'x')
+    $bad1 = Join-Path $blocker 'a\detach.log'; $bad2 = Join-Path $blocker 'b\detach.log'
+    $good1 = Join-Path $dir 'primary\detach.log'; $good2 = Join-Path $dir 'fallback\detach.log'
+    $DP = [ClarionDebugger.Terminal.DurableProbe]
+    $L = 1; $FB = 2; $PD = 4; $TD = 8
+    $msg = 'CA Debugger could not detach cleanly from app.exe (pid 4242): x. Save your work in app.exe and restart it.'
+
+    $ctx = New-Object ClarionDebugger.Terminal.InlineContext
+    $ch = $DP::Run($msg, [string[]] @($good1, $good2), $ctx)
+    Check 'CONTROL: all well: the primary log and the posted dialog, nothing else' `
+      (($ch -eq ($L + $PD)) -and ($ctx.Posts -eq 1) -and ($DP::Boxes.Count -eq 1) -and ($DP::Boxes[0] -ceq $msg) -and ($DP::Threads -eq 0)) "channels=$ch"
+    Check 'the log line is dated and carries the warning' ((Get-Content -Raw -LiteralPath $good1) -match "^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  $([regex]::Escape($msg))") ''
+    Check 'and the fallback log was not touched' (-not (Test-Path -LiteralPath $good2)) ''
+
+    $ch = $DP::Run($msg, [string[]] @($bad1, $good2), (New-Object ClarionDebugger.Terminal.InlineContext))
+    Check 'the primary log unwritable: the FALLBACK log gets the line, and the dialog still goes' `
+      (($ch -eq ($FB + $PD)) -and ((Get-Content -Raw -LiteralPath $good2) -match [regex]::Escape($msg)) -and ($DP::Boxes.Count -eq 1)) "channels=$ch"
+
+    $ch = $DP::Run($msg, [string[]] @($good1, $good2), (New-Object ClarionDebugger.Terminal.DeadContext))
+    Check 'the UI post THROWS (a destroyed handle): the dialog falls back to its own STA thread' `
+      (($ch -eq ($L + $TD)) -and ($DP::Threads -eq 1) -and ($DP::Boxes.Count -eq 1) -and ($DP::Boxes[0] -ceq $msg)) "channels=$ch threads=$($DP::Threads)"
+
+    $ch = $DP::Run($msg, [string[]] @($bad1, $bad2), $null)
+    Check 'BOTH logs unwritable and no UI context: the dialog still shows, on its own thread' `
+      (($ch -eq $TD) -and ($DP::Boxes.Count -eq 1)) "channels=$ch"
+    $ch = $DP::Run($msg, [string[]] @($bad1, $bad2), (New-Object ClarionDebugger.Terminal.DeadContext))
+    Check 'both logs unwritable AND the post throws: the dialog still shows' (($ch -eq $TD) -and ($DP::Boxes.Count -eq 1)) "channels=$ch"
+  } finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Runtime counts on a clean run, per section (in run order): 25, 11, 12, 9 (3b), 10, 6 (9), 27, 14, 3, 12, 7 (10).
+$EXPECTED_CHECKS = 136
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
