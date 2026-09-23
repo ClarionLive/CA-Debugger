@@ -135,6 +135,40 @@ namespace ClarionDbg.Cli
                          + "oldest first (a tie to the lower tid, the injected break thread left out) and the oldest is main.");
         }
 
+        /// <summary>
+        /// A command is never starved by a busy target (3f2d747f, 4b run 1). The debug loop used to read commands
+        /// only when WaitForDebugEvent timed out after 200 ms, so an app streaming events with no gap left `detach`
+        /// unread until the host gave up and killed it, bytes still planted. This runs the REAL loop against a
+        /// source that never times out: `detach`, and `quit` on an ATTACHED engine, must each end the loop on the
+        /// first event after they are queued. With the command read in the timeout branch only, neither ends at all.
+        /// </summary>
+        private static void CheckCommandsNeverStarved(List<string> failures, ClaimLog claims)
+        {
+            const int Cap = 500;
+            Func<uint, DebugEngine> interactive = attachPid =>
+                new DebugEngine("protocolcheck", null, null, null, null, false, 0, true, null, attachPid);
+
+            foreach (var c in new[] { new { Cmd = "detach", Pid = 0u, Mode = "launched" },
+                                      new { Cmd = "detach", Pid = 4242u, Mode = "attached" },
+                                      new { Cmd = "quit", Pid = 4242u, Mode = "attached" } })
+            {
+                var eng = interactive(c.Pid);
+                int served = -2;
+                CaptureConsole(() => { served = eng.DebugLoopStarvationForTest(c.Cmd, Cap); });
+                if (served < 0)
+                    failures.Add("starved: `" + c.Cmd + "` on a " + c.Mode + " engine was never acted on in " + Cap
+                                 + " back-to-back events - the loop reads commands only when a wait times out, and a "
+                                 + "busy app never lets one time out");
+                else if (served != 1)
+                    failures.Add("starved: `" + c.Cmd + "` on a " + c.Mode + " engine took " + served
+                                 + " events - expected the FIRST event after it was queued to carry the detach");
+            }
+
+            claims.Claim("commands are never starved: against the real debug loop fed " + Cap + " back-to-back events "
+                         + "(no wait ever times out), `detach` (launched or attached) and `quit` (attached) each detach on "
+                         + "the first event after they are queued.");
+        }
+
         private static void ExpectEqual(List<string> failures, string what, string got, string want)
         {
             if (got != want) failures.Add(what + ": " + got + " - expected " + want);
