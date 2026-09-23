@@ -67,7 +67,7 @@ namespace ClarionDbg.Cli
         /// <summary>Is <paramref name="bp"/> an arm-all copy (no image named, not single-target) whose logical
         /// breakpoint - same compiland, same REQUESTED line - is also held by an entry outside
         /// <paramref name="leaving"/>, armed or pending? Then it is redundant once that image unmaps.</summary>
-        internal bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)
+        private bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)
         {
             if (!string.IsNullOrEmpty(bp.OwnerSpec) || bp.SingleTargetRequested) return false;
             foreach (var other in _bps)

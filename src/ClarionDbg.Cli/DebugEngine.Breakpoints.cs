@@ -59,8 +59,6 @@ namespace ClarionDbg.Cli
         {
             string module = spec.Module;
             int line = spec.Line;
-            string condition = spec.Condition, hitMode = spec.HitMode, trace = spec.Trace;
-            int hitValue = spec.HitValue;
 
             var owners = OwnersOfModule(module);
             if (!string.IsNullOrEmpty(spec.Image))
@@ -90,40 +88,36 @@ namespace ClarionDbg.Cli
                     if (PendingDuplicates(b, module, line, spec.Image))
                     {
                         // re-add of a pending bp = a properties update; re-apply and re-confirm
-                        ApplyBpProps(b, condition, hitMode, hitValue, trace);
+                        ApplyBpProps(b, spec.Condition, spec.HitMode, spec.HitValue, spec.Trace);
                         EmitBpSet(b);
                         return;
                     }
                 var pend = new UserBreakpoint { Module = module, ModuleIdx = -1, RequestedLine = line, Line = line,
                                                 OwnerSpec = spec.Image, SingleTargetRequested = spec.One };
-                ApplyBpProps(pend, condition, hitMode, hitValue, trace);
+                ApplyBpProps(pend, spec.Condition, spec.HitMode, spec.HitValue, spec.Trace);
                 _bps.Add(pend);
                 Console.WriteLine($"bp: {module}:{line} pending — owning image not loaded yet");
                 EmitBpSet(pend);
                 return;
             }
 
-            foreach (var owner in owners) AddBreakpointIn(owner, spec, module, line, condition, hitMode, hitValue, trace);
+            foreach (var owner in owners) AddBreakpointIn(owner, spec);
         }
 
         /// <summary>Register (or re-confirm) one breakpoint in ONE named image. Split out of
         /// <see cref="AddBreakpoint"/> so arming in several images is a loop over the same body rather
-        /// than a second copy of the resolve-snap-plant sequence.</summary>
-        private void AddBreakpointIn(LoadedModule owner, BpSpec spec, string module, int line,
-                                     string condition, string hitMode, int hitValue, string trace)
+        /// than a second copy of the resolve-snap-plant sequence. Takes the whole spec, not a list of its
+        /// fields, so a field added to BpSpec cannot be dropped between the two.</summary>
+        private void AddBreakpointIn(LoadedModule owner, BpSpec spec)
         {
+            string module = spec.Module;
+            int line = spec.Line;
             var dbg = owner.Dbg;
             int mi = dbg.FindModuleIdx(module);
             string canon = dbg.ModuleNameForIdx(mi) ?? module;
-            int planted = line;
-            var rvas = dbg.LineToRvasInModuleIdx(mi, line);
-            if (rvas.Count == 0)
-            {
-                // Clarion's line table is sparse — snap to the nearest line that has a record
-                int snapped = NearestIn(dbg.BreakableLinesInModuleIdx(mi), line);
-                if (snapped > 0) { planted = snapped; rvas = dbg.LineToRvasInModuleIdx(mi, snapped); }
-            }
-            if (rvas.Count == 0)
+            int planted;
+            List<uint> rvas;
+            if (!TryResolveLine(dbg, mi, line, out planted, out rvas))
             {
                 Console.WriteLine($"bp: no code records in {canon} (line {line})");
                 if (EmitJson) Console.WriteLine("@JSON " + Json.BpError(canon, line, "no code records in module"));
@@ -141,7 +135,7 @@ namespace ClarionDbg.Cli
                 if (b.Owner == owner && b.ModuleIdx == mi && b.RequestedLine == line)
                 {
                     // re-add of the same line = a properties update; re-apply and re-confirm
-                    ApplyBpProps(b, condition, hitMode, hitValue, trace);
+                    ApplyBpProps(b, spec.Condition, spec.HitMode, spec.HitValue, spec.Trace);
                     EmitBpSet(b);
                     return;
                 }
@@ -149,7 +143,7 @@ namespace ClarionDbg.Cli
             var bp = new UserBreakpoint { Module = canon, ModuleIdx = mi, Owner = owner, RequestedLine = line, Line = planted,
                                           OwnerSpec = spec.Image, SingleTargetRequested = spec.One };
             bp.Rvas.AddRange(rvas);
-            ApplyBpProps(bp, condition, hitMode, hitValue, trace);
+            ApplyBpProps(bp, spec.Condition, spec.HitMode, spec.HitValue, spec.Trace);
             _bps.Add(bp);
             if (owner.LoadBase != 0) PlantBp(bp);
             if (planted != line)
@@ -352,14 +346,9 @@ namespace ClarionDbg.Cli
             int mi = m.Dbg.FindModuleIdx(bp.Module);
             if (mi < 0) return; // this image doesn't carry that compiland
 
-            int planted = bp.RequestedLine;
-            var rvas = m.Dbg.LineToRvasInModuleIdx(mi, planted);
-            if (rvas.Count == 0)
-            {
-                int snapped = NearestIn(m.Dbg.BreakableLinesInModuleIdx(mi), planted);
-                if (snapped > 0) { planted = snapped; rvas = m.Dbg.LineToRvasInModuleIdx(mi, snapped); }
-            }
-            if (rvas.Count == 0) return;
+            int planted;
+            List<uint> rvas;
+            if (!TryResolveLine(m.Dbg, mi, bp.RequestedLine, out planted, out rvas)) return;
 
             bp.Owner = m;
             bp.ModuleIdx = mi;
@@ -388,14 +377,10 @@ namespace ClarionDbg.Cli
             foreach (var other in _bps)
                 if (other.Owner == m && other.ModuleIdx == mi && other.RequestedLine == bp.RequestedLine) return;
 
-            int planted = bp.RequestedLine;
-            var rvas = m.Dbg.LineToRvasInModuleIdx(mi, planted);
-            if (rvas.Count == 0)
-            {
-                int snapped = NearestIn(m.Dbg.BreakableLinesInModuleIdx(mi), planted);
-                if (snapped > 0) { planted = snapped; rvas = m.Dbg.LineToRvasInModuleIdx(mi, snapped); }
-            }
-            if (rvas.Count == 0) return;   // this image carries the name but not the line
+            int planted;
+            List<uint> rvas;
+            if (!TryResolveLine(m.Dbg, mi, bp.RequestedLine, out planted, out rvas))
+                return;   // this image carries the name but not the line
 
             var copy = new UserBreakpoint
             {
@@ -414,6 +399,24 @@ namespace ClarionDbg.Cli
             Console.WriteLine($"bp: also armed {copy.Module}:{copy.Line} in {m.Name} "
                             + $"(same .clw name is carried by more than one image)");
             EmitBpSet(copy);
+        }
+
+        /// <summary>Resolve a REQUESTED source line to the addresses to plant at in one image's compiland
+        /// <paramref name="mi"/>. Clarion's line table is sparse, so a line with no record snaps to the
+        /// nearest one that has one (<see cref="NearestIn"/>); <paramref name="planted"/> is the line
+        /// actually used. False when neither the line nor any snap target has code, and then the out values
+        /// are not to be used. The ONE copy of this sequence: AddBreakpointIn, BindPendingTo and
+        /// CopyUnqualifiedInto each carried their own until f367a04f.</summary>
+        private static bool TryResolveLine(TswdDebugInfo dbg, int mi, int line, out int planted, out List<uint> rvas)
+        {
+            planted = line;
+            rvas = dbg.LineToRvasInModuleIdx(mi, line);
+            if (rvas.Count == 0)
+            {
+                int snapped = NearestIn(dbg.BreakableLinesInModuleIdx(mi), line);
+                if (snapped > 0) { planted = snapped; rvas = dbg.LineToRvasInModuleIdx(mi, snapped); }
+            }
+            return rvas.Count > 0;
         }
 
         /// <summary>Nearest breakable line: smallest &gt;= line (forward snap), else largest &lt; line.</summary>
@@ -477,7 +480,12 @@ namespace ClarionDbg.Cli
                     // `ret > _prevVa && ret - _prevVa <= CALL_WINDOW`; a _prevVa still holding a pre-hit EIP
                     // can make the re-arm trap below read as a call entry and plant a temp INT3 at a bogus
                     // return address. Same assignment, same reason, as the caller-resume path in OnTempBp.
-                    _prevVa = va;
+                    //
+                    // ONLY FOR THE STEPPING THREAD (f367a04f). _prevVa is the anchor of _stepTid's step and
+                    // nobody else's: OnSingleStep drives StepMachine for `tid == _stepTid` alone, so a
+                    // silent hit on any other thread has no step of its own to re-anchor. Unguarded, a
+                    // tracepoint firing on thread B moved thread A's anchor to an address A never ran.
+                    if (tid == _stepTid) _prevVa = va;
                     if (haveCtx)
                     {
                         Native.GetThreadContext(hThread, ref ctx);

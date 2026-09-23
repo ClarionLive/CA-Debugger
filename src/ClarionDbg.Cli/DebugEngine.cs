@@ -96,10 +96,12 @@ namespace ClarionDbg.Cli
                     // base64 or carries a control character rejects the whole spec. Decoding it to null made
                     // it "unqualified", so a del meant for one image removed every copy.
                     case "img":
+                    {
                         string img;
                         if (!TryDecodeImage(val, out img)) return false;
                         bp.Image = img;
                         break;
+                    }
                     case "one": bp.One = (val == "1" || val == "true"); break;
                 }
             }
@@ -393,6 +395,10 @@ namespace ClarionDbg.Cli
         // exact defect this rule holder exists to stop, and no compiler can stop you typing it — but
         // tools/test-engine-tid-members.ps1 reads THIS SOURCE and fails when one is typed outside the
         // writer, which is the part protocolcheck cannot do (it has no source tree at runtime).
+        //
+        // WHY THIS IS NOT IN Json.cs with the other emitter helpers (f367a04f item 3, 2026-09-22): that suite and
+        // tools/test-addin-json.ps1 locate the rule in THIS file by name, and the thread emitters call these
+        // as DebugEngine members. Json.cs's class comment points back here.
 
         /// <summary>THE RULE, stated once: is this a thread id worth writing to the wire?
         ///
