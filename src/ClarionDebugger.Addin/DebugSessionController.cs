@@ -18,8 +18,18 @@ namespace ClarionDebugger
     /// The live debugger pad's command surface. Implemented by <see cref="Terminal.ClarionDebuggerWebView"/>.
     /// Each method is the single execution path for one toolbar/web command; the WebView's own web-message
     /// handler routes through these too, so the pad and the IDE toolbar share one code path.
+    /// <para>
+    /// EVERY TARGET CARRIES ITS OWN MARSHAL (fc8d63f5): the interface extends
+    /// <see cref="System.ComponentModel.ISynchronizeInvoke"/>, and <see cref="DebugSessionController"/> posts
+    /// each command through it whenever the caller is on the wrong thread. The commands are UI-thread code,
+    /// and two of the forwarders are reached by REFLECTION from ClarionAssistant, on whatever thread it
+    /// calls from. The marshal used to apply only to a target that happened to be a WinForms Control; any
+    /// other implementation silently ran on the caller's thread, and it would have LOOKED as if it worked,
+    /// because the call was forwarded. Requiring the mechanism in the type is what makes that impossible to
+    /// forget: a Control gets it for free, and anything else does not compile until it says how.
+    /// </para>
     /// </summary>
-    public interface IDebugSessionTarget
+    public interface IDebugSessionTarget : System.ComponentModel.ISynchronizeInvoke
     {
         /// <summary>True once the hosted WebView has finished navigation and can accept commands.</summary>
         bool IsReady { get; }
@@ -40,6 +50,13 @@ namespace ClarionDebugger
         /// <summary>Run to cursor. <paramref name="spec"/> is "module:line", or null/empty for the active
         /// Monaco editor's live cursor.</summary>
         void CmdRunToCursor(string spec);
+
+        /// <summary>Break on the entry of the procedure that CONTAINS <paramref name="filePath"/>:<paramref
+        /// name="line"/> (1-based) - the Monaco editor's cursor, in practice. The caller's position is only a
+        /// lookup key: which procedure contains it, and where that procedure's entry is, are answered from the
+        /// Procedures list the pad itself issued (e61e4f92, on afbc68c7's host-owned contract), never taken
+        /// from the caller. Valid in any state: idle stages it, live arms it.</summary>
+        void CmdBreakOnProcEntryAt(string filePath, int line);
     }
 
     /// <summary>
@@ -201,9 +218,25 @@ namespace ClarionDebugger
         /// <summary>Run to the active Monaco editor's cursor line. Entry point for ClarionAssistant's editor
         /// context menu, reached by reflection. Frozen contract: public static void RunToCursor(), a silent
         /// no-op unless Paused with a ready pad. A null spec makes the pad resolve the live Monaco cursor.
-        /// This is the one forwarder reached from OUTSIDE this addin, so it is the one with no guarantee
-        /// about the calling thread; <see cref="Invoke"/> marshals for all of them.</summary>
+        /// It and <see cref="BreakOnProcEntry"/> are the forwarders reached from OUTSIDE this addin, so they
+        /// are the ones with no guarantee about the calling thread; <see cref="Invoke"/> marshals for all of
+        /// them.</summary>
         public static void RunToCursor() { Invoke(t => t.CmdRunToCursor(null), allowed: IsPaused); }
+
+        /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
+        /// name="line"/> (1-based). Entry point for ClarionAssistant's editor context menu, reached by
+        /// reflection (e61e4f92). Contract: a public static void method of this name taking (string, int); a
+        /// silent no-op with no ready pad; allowed in EVERY state, because break-on-entry means something
+        /// while idle too (the pad stages it for the next Start). The pad resolves the procedure from its
+        /// own list and reports a miss in its Debug Console, so an unusable position is never silent there.
+        /// <para>
+        /// ADDED, not changed: the existing members ClarionAssistant binds are untouched, and it must bind
+        /// this one OPTIONALLY (PM decision 7), since a debugger build that predates it has none.
+        /// </para></summary>
+        public static void BreakOnProcEntry(string filePath, int line)
+        {
+            Invoke(t => t.CmdBreakOnProcEntryAt(filePath, line));
+        }
 
         public static void Pause()
         {
@@ -236,10 +269,17 @@ namespace ClarionDebugger
             // Re-entering Invoke on the pad's thread re-reads the target and re-runs the guards THERE, so a
             // state change while the post was in flight is still honoured; on that pass InvokeRequired is
             // false and it falls through, so this cannot recurse.
-            var ctl = t as System.Windows.Forms.Control;
-            if (ctl != null && ctl.IsHandleCreated && ctl.InvokeRequired)
+            //
+            // Through the TARGET'S OWN marshal, which the interface requires (fc8d63f5). It used to be
+            // `t as Control`, so a target that was not a Control ran on the caller's thread. A Control whose
+            // handle is not created yet reports InvokeRequired false, so it still runs inline as it always
+            // did - there is no thread to post to.
+            bool offThread;
+            try { offThread = t.InvokeRequired; }
+            catch (Exception ex) { Debug.WriteLine("[DebugSessionController] InvokeRequired threw: " + ex.Message); return; }
+            if (offThread)
             {
-                try { ctl.BeginInvoke((Action)(() => Invoke(action, requireReady, allowed))); }
+                try { t.BeginInvoke((Action)(() => Invoke(action, requireReady, allowed)), null); }
                 catch (Exception ex) { Debug.WriteLine("[DebugSessionController] marshal failed: " + ex.Message); }
                 return;
             }

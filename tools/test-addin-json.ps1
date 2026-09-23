@@ -574,11 +574,19 @@ $ctlMethods = @(
   (Get-Method 'public static void Register(IDebugSessionTarget target)' $ctl),
   (Get-Method 'public static void Unregister(IDebugSessionTarget target)' $ctl),
   (Get-Method 'public static void NotifyStopped(IDebugSessionTarget target)' $ctl),
-  (Get-Method 'public static void SetState(IDebugSessionTarget sender, DebugControllerState state)' $ctl)
+  (Get-Method 'public static void SetState(IDebugSessionTarget sender, DebugControllerState state)' $ctl),
+  # the forwarders and the ONE marshal they share (fc8d63f5, e61e4f92)
+  (Get-Method 'public static void RunToCursor() {' $ctl),
+  (Get-Method 'public static void BreakOnProcEntry(string filePath, int line)' $ctl),
+  (Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctl),
+  (Get-Method 'private static void Invoke(Action<IDebugSessionTarget> action, bool requireReady = true, Func<DebugControllerState, bool> allowed = null)' $ctl),
+  (Get-Method 'private static bool SafeIsReady(IDebugSessionTarget t)' $ctl)
 ) -join "`n"
 
 $ctlTypes = @"
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 
 $(Get-Method 'public enum DebugControllerState' $ctl)
 
@@ -586,13 +594,31 @@ $(Get-Method 'public interface IDebugSessionTarget' $ctl)
 
 // A pad that answers IsSessionIdle however the test needs. It implements the REAL interface above, so if
 // that interface grows a member this stub stops compiling rather than drifting.
+//
+// It is deliberately NOT a WinForms Control: since fc8d63f5 the interface requires ISynchronizeInvoke, and
+// this is the implementation the old `t as Control` marshal would have run on the caller's thread.
+// OffThread makes it report "you are on the wrong thread"; its BeginInvoke runs the posted delegate as if
+// on its own thread, and every command records which of the two it ran under.
 public sealed class FakePad : IDebugSessionTarget {
     public bool Idle; public bool Throws;
+    public bool OffThread; public int Posts; public List<string> Ran = new List<string>();
+    private bool _onOwnThread;
     public bool IsReady { get { return true; } }
     public bool IsSessionIdle { get { if (Throws) throw new InvalidOperationException("disposed"); return Idle; } }
+    public bool InvokeRequired { get { return OffThread && !_onOwnThread; } }
+    public IAsyncResult BeginInvoke(Delegate method, object[] args) {
+        Posts++; _onOwnThread = true;
+        try { method.DynamicInvoke(args); } finally { _onOwnThread = false; }
+        return null;
+    }
+    public object EndInvoke(IAsyncResult result) { return null; }
+    public object Invoke(Delegate method, object[] args) { return method.DynamicInvoke(args); }
+    private string Where() { return OffThread ? (_onOwnThread ? "posted" : "CALLER") : "inline"; }
     public void CmdStart() { } public void CmdContinue() { } public void CmdPause() { }
     public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
-    public void CmdStop() { } public void CmdRunToCursor(string spec) { }
+    public void CmdStop() { }
+    public void CmdRunToCursor(string spec) { Ran.Add("rtc|" + Where()); }
+    public void CmdBreakOnProcEntryAt(string filePath, int line) { Ran.Add("boe|" + filePath + "|" + line + "|" + Where()); }
 }
 
 public static class Ctl {
@@ -662,6 +688,43 @@ $throwing = NewPad $false $true
 LiveSession $throwing
 [Ctl]::NotifyStopped($throwing)
 Check 'a throwing pad is not taken as proof its session ended' ([Ctl]::State -ne [DebugControllerState]::Idle) ([Ctl]::State)
+
+Write-Host ''
+Write-Host 'every command reaches its target on the TARGET''s thread, Control or not (fc8d63f5, e61e4f92)'
+# The REAL Invoke and forwarders, driven with FakePad - which is NOT a WinForms Control. Before fc8d63f5 the
+# marshal was `t as Control`, so this target's commands ran on whatever thread the caller was on; the
+# interface now requires ISynchronizeInvoke and Invoke posts through it. test-addin-hooks.ps1 drives the
+# same Invoke against a real Control on a real message loop; this is the non-Control half.
+function Ran { param($pad) if ($pad.Ran.Count) { $pad.Ran -join ' ; ' } else { '(nothing ran)' } }
+$np = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($np); [Ctl]::SetState($np, [DebugControllerState]::Paused)
+$np.OffThread = $true
+[Ctl]::RunToCursor()
+Check 'an off-thread call to a NON-Control target is posted through its own marshal, not run on the caller''s thread' `
+  (($np.Posts -eq 1) -and ($np.Ran.Count -eq 1) -and ($np.Ran[0] -ceq 'rtc|posted')) (Ran $np)
+[Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50)
+Check 'BreakOnProcEntry is marshalled the same way, arguments intact' `
+  (($np.Posts -eq 2) -and ($np.Ran.Count -eq 2) -and ($np.Ran[1] -ceq 'boe|C:\src\clbrws011.clw|50|posted')) (Ran $np)
+$on = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($on); [Ctl]::SetState($on, [DebugControllerState]::Paused)
+[Ctl]::RunToCursor()
+Check 'CONTROL: an on-thread caller runs inline, with no post' `
+  (($on.Posts -eq 0) -and ($on.Ran.Count -eq 1) -and ($on.Ran[0] -ceq 'rtc|inline')) (Ran $on)
+# Break on entry means something while idle (the pad stages it); run to cursor does not.
+$idl = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($idl)
+[Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50); [Ctl]::RunToCursor()
+Check 'BreakOnProcEntry is honoured while IDLE, where RunToCursor is not' `
+  (($idl.Ran.Count -eq 1) -and ($idl.Ran[0] -like 'boe|*')) (Ran $idl)
+[Ctl]::Reset()
+# The reflection contract ClarionAssistant binds, pinned by exact signature. PM decision 7: it binds this one
+# OPTIONALLY, so the pair it REQUIRES must not move either.
+Check 'the new entry point is public static void BreakOnProcEntry(string filePath, int line)' `
+  ($ctl -cmatch 'public static void BreakOnProcEntry\(string filePath, int line\)') ''
+Check 'and the two members ClarionAssistant already requires are untouched' `
+  (($ctl -cmatch 'public static DebugControllerState State\s*\r?\n\s*\{') -and ($ctl -cmatch 'public static void RunToCursor\(\) \{')) ''
+Check 'the interface itself requires the marshal' `
+  ($ctl -cmatch 'public interface IDebugSessionTarget : System\.ComponentModel\.ISynchronizeInvoke') ''
 
 Write-Host ''
 Write-Host 'Stop() answers "is it dead?" with a check (structural: it drives a real process)'
@@ -897,6 +960,7 @@ $arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleDa
 $bridgeSrc = @"
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -946,6 +1010,8 @@ public sealed class BridgePad {
   $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
   $pushProcs
   $((Get-Method 'public void CmdBreakOnProcEntry(string data)' $web) -replace '^public void', 'public void')
+  $(Get-Method 'public void CmdBreakOnProcEntryAt(string filePath, int line)' $web)
+  $(Get-Method 'private void BreakOnEntry(ProcRef proc)' $web)
   $((Get-Method 'private void OnWatch(DebugWatch w)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
   $arrowHandlers
@@ -956,8 +1022,8 @@ public sealed class BridgePad {
 Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
 function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
-function Proc { param($name, $module, $line)
-  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = 'procedure'; $p
+function Proc { param($name, $module, $line, $kind = 'procedure')
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p
 }
 
 # ---- host writers, run --------------------------------------------------------------------------------
@@ -1102,6 +1168,27 @@ Check 'and says why' (@(Errs $idle).Count -eq 1) ($idle.Lines -join ' / ')
 $idle.CmdBreakOnProcEntry('{"id":"' + $goodId + '"}')
 Check 'CONTROL: an idle request for a good module is staged once' `
   (($idle._pending.Count -eq 1) -and ($idle.BpPushes -eq 1)) "$($idle._pending.Count) staged"
+
+# ---- break on entry by POSITION: the editor's cursor (e61e4f92) ---------------------------------------
+# ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
+# list: the breakpoint goes where the list says the containing procedure starts.
+$posPad = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN::DOIT' 'clbrws011.clw' 45 'routine'))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'ELSEWHERE' 'clbrws002.clw' 10))
+$posPad.RunPushProcedures('C:\App\app.exe')
+function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
+Check 'a cursor inside MAIN, below one of its ROUTINEs, breaks on MAIN''s entry (42), not the routine''s' `
+  ((PosAdd 'C:\Src\CLBRWS011.CLW' 50) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
+Check 'a cursor further down breaks on the procedure it is actually in (OTHER, 80)' `
+  ((PosAdd 'C:\Src\clbrws011.clw' 90) -ceq 'clbrws011.clw:80') ($posPad._svc.Adds -join ',')
+Check 'a cursor ON the definition line counts as inside it' ((PosAdd 'C:\Src\clbrws011.clw' 42) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
+$none = PosAdd 'C:\Src\clbrws011.clw' 10
+Check 'a cursor above every listed procedure arms nothing, and says why' `
+  (($none -eq '') -and (@(Errs $posPad).Count -eq 1)) ($posPad.Lines -join ' / ')
+Check 'and neither does a file the list does not cover' ((PosAdd 'C:\Src\unlisted.clw' 50) -eq '') ($posPad.Lines -join ' / ')
 
 # ---- edits, through the real page ---------------------------------------------------------------------
 function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
@@ -1868,7 +1955,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 284
+$EXPECTED_CHECKS = 296
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

@@ -815,6 +815,34 @@ namespace ClarionDebugger.Terminal
                 Console("err", "break on entry: that procedure is not in the current list — refresh the Procedures pane and try again.");
                 return;
             }
+            BreakOnEntry(proc);
+        }
+
+        /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
+        /// name="line"/> - the editor cursor, reached from ClarionAssistant through
+        /// <see cref="DebugSessionController.BreakOnProcEntry"/> (e61e4f92). The position is ONLY a lookup key
+        /// into the list <see cref="PushProcedures"/> issued; which procedure it falls in, and where that one
+        /// starts, are the list's answer, exactly as with an id. The module is the file's name, the same
+        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).</summary>
+        public void CmdBreakOnProcEntryAt(string filePath, int line)
+        {
+            string module = null;
+            try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
+            catch (ArgumentException) { module = null; }
+            var proc = _procIds.Containing(module, line);
+            if (proc == null)
+            {
+                Console("err", "break on entry: no listed procedure contains " + (module ?? "(no file)") + ":" + line
+                    + " — open the app's solution so the Procedures pane is filled, or refresh it.");
+                return;
+            }
+            BreakOnEntry(proc);
+        }
+
+        /// <summary>The one body both break-on-entry paths share: validate, announce, then arm (live) or stage
+        /// (idle). Everything it knows about the procedure came from the host's own list.</summary>
+        private void BreakOnEntry(ProcRef proc)
+        {
             string module = proc.Module;
             int line = proc.Line;
             string name = proc.Name;
@@ -938,7 +966,7 @@ namespace ClarionDebugger.Terminal
                     {
                         var p = procs[i];
                         string id = ProcedureIds.IdFor(gen, i);
-                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line };
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind };
                         if (i > 0) sb.Append(',');
                         sb.Append("{\"id\":").Append(Str(id))
                           .Append(",\"name\":").Append(Str(p.Name))

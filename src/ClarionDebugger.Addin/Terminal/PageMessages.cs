@@ -251,6 +251,31 @@ namespace ClarionDebugger.Terminal
             ProcRef v;
             return id != null && _byId.TryGetValue(id, out v) ? v : null;
         }
+
+        /// <summary>The procedure or method in the current list whose definition is the last one at or above
+        /// <paramref name="line"/> in <paramref name="module"/> - the one a cursor on that line sits in - or
+        /// null when the list has none there. ROUTINEs are skipped: they are in the table so a breakpoint can
+        /// name them, but "break on procedure entry" means the enclosing procedure, and a routine is not
+        /// entered the way a procedure is. Module is compared ignoring case, as every module comparison on
+        /// the host is: it is a Windows file name.
+        /// <para>
+        /// This is how a caller that has only a POSITION (the editor's cursor, e61e4f92) reaches the same
+        /// host-owned answer an id does: the position is a lookup key into what the host listed, and the
+        /// breakpoint goes where the LIST says the procedure starts.
+        /// </para></summary>
+        public ProcRef Containing(string module, int line)
+        {
+            if (string.IsNullOrEmpty(module) || line <= 0) return null;
+            ProcRef best = null;
+            foreach (var p in _byId.Values)
+            {
+                if (p == null || p.Line <= 0 || p.Line > line) continue;
+                if (string.Equals(p.Kind, "routine", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.Equals(p.Module, module, StringComparison.OrdinalIgnoreCase)) continue;
+                if (best == null || p.Line > best.Line) best = p;
+            }
+            return best;
+        }
     }
 
     /// <summary>What one listed procedure row means: the definition its id stands for.</summary>
@@ -259,6 +284,7 @@ namespace ClarionDebugger.Terminal
         public string Name;
         public string Module;
         public int Line;
+        public string Kind;   // procedure | method | routine
     }
 
     /// <summary>The edit tuples the host has ISSUED for the rows currently on screen.
