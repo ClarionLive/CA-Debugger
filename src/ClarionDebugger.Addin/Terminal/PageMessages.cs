@@ -237,19 +237,51 @@ namespace ClarionDebugger.Terminal
             return "p" + generation.ToString(CultureInfo.InvariantCulture) + "." + index.ToString(CultureInfo.InvariantCulture);
         }
 
-        public void Replace(Dictionary<string, ProcRef> table)
+        // THE GENERATION the table belongs to (afbc68c7, codex adversary gate). A push parses off the UI
+        // thread, and the table used to be swapped only when that parse finished - so for the whole parse, the
+        // PREVIOUS exe's ids still resolved, and a right-click on the old list armed an old row in the new
+        // session. Now a push BEGINS its generation synchronously, which empties the table at once; only that
+        // generation's table can be installed; and an id resolves only if it carries the current generation.
+        private int _generation;
+
+        /// <summary>Start push <paramref name="generation"/>: every id issued before it stops resolving NOW,
+        /// not when the new list arrives.</summary>
+        public void Begin(int generation)
         {
-            _byId = table ?? NewTable();
+            _generation = generation;
+            _byId = NewTable();
         }
 
+        /// <summary>Install the table for <paramref name="generation"/>. Refused (false) unless that is still
+        /// the current generation - a slower, older parse can never overwrite a newer one.</summary>
+        public bool Replace(int generation, Dictionary<string, ProcRef> table)
+        {
+            if (generation != _generation) return false;
+            _byId = table ?? NewTable();
+            return true;
+        }
+
+        /// <summary>Empty the table without starting a push (the solution closed).</summary>
         public void Clear() { _byId = NewTable(); }
 
-        /// <summary>The procedure behind <paramref name="id"/>, or null when the host never issued it
-        /// for the list currently on screen.</summary>
+        /// <summary>The procedure behind <paramref name="id"/>, or null when it was not issued for the CURRENT
+        /// generation's list - including an id the host did issue, for a list it has since begun replacing.</summary>
         public ProcRef Resolve(string id)
         {
+            if (id == null || GenerationOf(id) != _generation) return null;
             ProcRef v;
-            return id != null && _byId.TryGetValue(id, out v) ? v : null;
+            return _byId.TryGetValue(id, out v) ? v : null;
+        }
+
+        /// <summary>The generation an id was issued for (see <see cref="IdFor"/>), or -1 when it is not one of
+        /// ours.</summary>
+        internal static int GenerationOf(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id[0] != 'p') return -1;
+            int dot = id.IndexOf('.');
+            int gen;
+            if (dot <= 1 || !int.TryParse(id.Substring(1, dot - 1), NumberStyles.None, CultureInfo.InvariantCulture, out gen)) return -1;
+            return gen;
         }
 
         /// <summary>The procedure or method in the current list whose definition is the last one at or above

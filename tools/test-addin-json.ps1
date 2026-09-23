@@ -1014,7 +1014,13 @@ public sealed class BridgePad {
   private void Post(string json) { Posts.Add(json); }
   private void SendBps() { BpPushes++; }
   private void UI(Action a) { a(); }
-  private static void RunNow(Action<object> work) { work(null); }
+  // The thread-pool work item runs inline - or is HELD, so a test can act while a refresh is mid-parse.
+  public bool HoldWork; public List<Action<object>> Held = new List<Action<object>>();
+  private void RunNow(Action<object> work) { if (HoldWork) Held.Add(work); else work(null); }
+  public void ReleaseHeld(bool newestFirst) {
+    var h = new List<Action<object>>(Held); Held.Clear(); if (newestFirst) h.Reverse();
+    foreach (var w in h) w(null);
+  }
   $(Get-Method 'private static string Str(string s)' $web)
   $(Get-Method 'private static string TidJson(uint? tid)' $web)
   $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
@@ -1048,7 +1054,8 @@ $pad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
 $pad.RunPushProcedures('C:\App\app.exe')
 $procMsg = if ($pad.Posts.Count -ge 1) { $pad.Posts[$pad.Posts.Count - 1] } else { '' }
-Check 'CONTROL: PushProcedures posted exactly one list' ($pad.Posts.Count -eq 1) "$($pad.Posts.Count) post(s)"
+Check 'CONTROL: PushProcedures posts an empty "loading" list, then the list' `
+  (($pad.Posts.Count -eq 2) -and ($pad.Posts[0] -cmatch '"procs":\[\],"loading":true') -and ($procMsg -cmatch '"name":"MAIN"')) "$($pad.Posts.Count) post(s)"
 
 $watch = New-Object ClarionDebugger.Terminal.DebugWatch
 $watch.Name = 'GLO:Count'; $watch.Found = $true; $watch.Value = '5'; $watch.TypeName = 'LONG'
@@ -1171,6 +1178,63 @@ Check 'and says why' (@(Errs $pad).Count -eq 1) ($pad.Lines -join ' / ')
 $pad._svc.Adds.Clear(); $pad.Lines.Clear()
 $pad.CmdBreakOnProcEntry('{"module":"EVIL.CLW","line":1,"name":"X"}')
 Check 'the old {module,line} payload is not honoured' ($pad._svc.Adds.Count -eq 0) ($pad._svc.Adds -join ',')
+
+# ---- an id is bound to its GENERATION (codex adversary gate) ------------------------------------------
+# The parse is asynchronous. The table used to be swapped only when it finished, so for the whole parse the
+# PREVIOUS exe's ids still resolved. Held here, so "mid-refresh" is a state the test is IN, not a race.
+function ProcIdAt { param($json, $i) if ($json -match ('"id":"(p\d+\.' + $i + ')"')) { $Matches[1] } else { '' } }
+$gp = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+$gp.RunPushProcedures('C:\App\app.exe')
+$oldId = ProcIdAt $gp.Posts[$gp.Posts.Count - 1] 0
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'NEWMAIN' 'newapp.clw' 7))
+$gp.HoldWork = $true
+$gp.RunPushProcedures('C:\Other\new.exe')      # the new target's parse starts, and is held
+Check 'a refresh tells the page to drop its ids at once' ($gp.Posts[$gp.Posts.Count - 1] -cmatch '"procs":\[\],"loading":true') $gp.Posts[$gp.Posts.Count - 1]
+$gp.CmdBreakOnProcEntry('{"id":"' + $oldId + '"}')
+Check 'an id from the previous list is refused WHILE the new one is being parsed' `
+  (($gp._svc.Adds.Count -eq 0) -and (@(Errs $gp).Count -eq 1)) "id=$oldId adds=$($gp._svc.Adds -join ',')"
+$gp.ReleaseHeld($false)
+$gp.Lines.Clear()
+$gp.CmdBreakOnProcEntry('{"id":"' + $oldId + '"}')
+Check 'and after it arrives' (($gp._svc.Adds.Count -eq 0) -and (@(Errs $gp).Count -eq 1)) ($gp._svc.Adds -join ',')
+# The synchronous clear, ISOLATED: a position lookup uses no id, so the generation check cannot be what
+# refuses it - only the table having been emptied at the start of the refresh can.
+$gh = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+$gh.RunPushProcedures('C:\App\app.exe')
+$gh.HoldWork = $true
+$gh.RunPushProcedures('C:\Other\new.exe')
+$gh.CmdBreakOnProcEntryAt('C:\Src\clbrws011.clw', 50)
+Check 'mid-refresh, a POSITION in the old list resolves to nothing either' ($gh._svc.Adds.Count -eq 0) ($gh._svc.Adds -join ',')
+# The generation check and the install gate, ISOLATED on the table itself.
+$ids = New-Object ClarionDebugger.Terminal.ProcedureIds
+$ids.Begin(2)
+$foreign = [ClarionDebugger.Terminal.ProcedureIds]::NewTable()
+$ref = New-Object ClarionDebugger.Terminal.ProcRef; $ref.Module = 'x.clw'; $ref.Line = 1
+$foreign['p1.0'] = $ref
+[void]$ids.Replace(2, $foreign)
+Check 'an id of another generation does not resolve, even if a table somehow holds it' ($null -eq $ids.Resolve('p1.0')) ''
+Check 'a table for a generation that is no longer current is not installed' (-not $ids.Replace(1, $foreign)) ''
+$newId = ProcIdAt $gp.Posts[$gp.Posts.Count - 1] 0
+$gp.CmdBreakOnProcEntry('{"id":"' + $newId + '"}')
+Check 'CONTROL: the new list''s id arms the new row' (($gp._svc.Adds.Count -eq 1) -and ($gp._svc.Adds[0] -ceq 'newapp.clw:7')) "id=$newId adds=$($gp._svc.Adds -join ',')"
+# Two refreshes in flight, the OLDER parse finishing LAST: it must not install its table over the newer one.
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'FIRST' 'first.clw' 3))
+$gp.RunPushProcedures('C:\A\a.exe')
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'SECOND' 'second.clw' 5))
+$gp.RunPushProcedures('C:\B\b.exe')
+$gp.ReleaseHeld($true)                           # newest parse first, then the stale one
+$lastList = $gp.Posts[$gp.Posts.Count - 1]
+Check 'a slower, older parse cannot replace a newer list' (($lastList -cmatch '"name":"SECOND"') -and ($lastList -cnotmatch '"name":"FIRST"')) $lastList
+$gp._svc.Adds.Clear()
+$gp.CmdBreakOnProcEntry('{"id":"' + (ProcIdAt $lastList 0) + '"}')
+Check 'and the newer list''s ids are the ones that resolve' (($gp._svc.Adds.Count -eq 1) -and ($gp._svc.Adds[0] -ceq 'second.clw:5')) ($gp._svc.Adds -join ',')
 
 # The cheap half of the ticket, which the id rework must not lose: a live add the engine never took is said.
 $freshId = if ($pad.Posts[$pad.Posts.Count - 1] -match '"id":"(p\d+\.1)"') { $Matches[1] } else { '' }
@@ -2001,7 +2065,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 306
+$EXPECTED_CHECKS = 315
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

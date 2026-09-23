@@ -967,6 +967,10 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(exe)) return;
             _svc.PrimeTarget(exe);          // anchor the .red resolver to this EXE so PRE-RUN clicks resolve (UI thread)
             int gen = ++_procGen;
+            // The old list's ids stop resolving NOW, not when the parse below finishes, and the page is told to
+            // drop them: a right-click in that window used to arm the PREVIOUS exe's row (codex adversary gate).
+            _procIds.Begin(gen);
+            Post("{\"type\":\"procedures\",\"procs\":[],\"loading\":true}");
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
@@ -994,7 +998,7 @@ namespace ClarionDebugger.Terminal
                     sb.Append("]}");
                     string json = sb.ToString();
                     // ignore an out-of-date parse — a newer push won, and its table with it
-                    UI(() => { if (gen == _procGen) { _procIds.Replace(ids); Post(json); } });
+                    UI(() => { if (gen == _procGen && _procIds.Replace(gen, ids)) Post(json); });
                 }
                 catch { }
             });
