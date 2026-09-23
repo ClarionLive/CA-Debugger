@@ -287,6 +287,7 @@ namespace ClarionDbg.Cli
         /// <summary>Plant every breakpoint whose owning image is mapped (LoadBase set).</summary>
         private void PlantAll()
         {
+            _plantAllCalls++;   // protocolcheck: an --expect-start refusal must reach no planting at all
             foreach (var bp in _bps)
                 if (bp.Owner != null && bp.Owner.LoadBase != 0) PlantBp(bp);
         }
@@ -307,6 +308,7 @@ namespace ClarionDbg.Cli
                 }
                 WriteByte(va, 0xCC);
                 _armed[va] = orig;
+                NotePlanted(va, orig);   // remembered past its removal: a queued hit on it is still ours (Attach.cs)
             }
         }
 

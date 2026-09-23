@@ -13,6 +13,7 @@
 #   A  detach while paused at a breakpoint            D  detach inside a stream of silent breakpoint hits
 #   B  detach while running                           E  `quit` while running detaches (attach mode)
 #   C  detach straight after a step-over              F  closing stdin while paused detaches (attach mode)
+#   G  --expect-start: a wrong creation time is refused with nothing planted; the listed one attaches
 # plus the refusals (no --interactive, an x64 pid, a pid that does not exist), which start no debuggee.
 #
 # THIS SUITE CANNOT SEE THE DRAIN RACE (measured 2026-09-23). The drain answers debug events other threads
@@ -46,12 +47,20 @@ if ($SelfTest) {
   # protocolcheck failure text that proves the RIGHT check caught it, and optionally the file.
   $plants = @(
     @('the drain never runs', 'internal const int DetachDrainCapEvents = 200;', 'internal const int DetachDrainCapEvents = 0;', 'detach drain: continued'),
-    @('the drain does not rewind EIP on our INT3', 'if (rewind) DetachSetEip(Tid(ev), exAddr);', 'if (rewind) { }', 'detach drain: EIP rewinds none'),
+    @('the drain does not rewind EIP on our INT3', 'if (rewind && !SetEip(Tid(ev), exAddr))', 'if (rewind && tid0 == 1 && !SetEip(Tid(ev), exAddr))', 'detach drain: EIP rewinds none'),
     @('the reseed keeps the injected break thread', 'foreach (var kv in created) if (kv.Key != breakTid) list.Add(kv);', 'foreach (var kv in created) list.Add(kv);', 'thread order: 99,'),
     @('the reseed breaks a creation-time tie the wrong way', 'a.Value.CompareTo(b.Value) : a.Key.CompareTo(b.Key)', 'a.Value.CompareTo(b.Value) : b.Key.CompareTo(a.Key)', 'thread order: 30,20,'),
     @('the reseed does not make the oldest thread main', 'if (order.Count > 0) _mainTid = order[0];', 'if (order.Count < 0) _mainTid = order[0];', 'thread order: _mainTid is'),
     # The 4b run 1 fault, restored exactly: commands read only when a wait times out (DebugEngine.cs).
-    @('commands are read only when a wait times out', "if (_interactive) { PollHover(false); DrainCommandsWhileRunning(); }`n                if (!_loopWait(buf, pollMs))`n                {`n                    if (_interactive) continue;", "if (_interactive) PollHover(false);`n                if (!_loopWait(buf, pollMs))`n                {`n                    if (_interactive) { DrainCommandsWhileRunning(); continue; }", 'starved: `detach`', 'DebugEngine.cs')
+    @('commands are read only when a wait times out', "if (_interactive) { PollHover(false); DrainCommandsWhileRunning(); }`n                if (!_loopWait(buf, pollMs))`n                {`n                    if (_interactive) continue;", "if (_interactive) PollHover(false);`n                if (!_loopWait(buf, pollMs))`n                {`n                    if (_interactive) { DrainCommandsWhileRunning(); continue; }", 'starved: `detach`', 'DebugEngine.cs'),
+    # 4b run 2 (item 3): each hardening, removed.
+    @('a TF-clear failure is not reported', 'foreach (uint t in _threads) if (!ClearTf(t)) tfFailed.Add(t);', 'foreach (uint t in _threads) ClearTf(t);', 'detach (a): two threads whose TF'),
+    @('an EIP-rewind failure is not reported', 'rewindFailed.Add("0x" + exAddr.ToString("X") + " on " + Tid(ev));', 'rewindFailed.Clear();', 'detach (a): a queued hit whose EIP'),
+    @('the drain forgets bytes removed before the detach', 'ours.UnionWith(_plantedEver);', 'ours.Clear();', 'detach (b):'),
+    @('the debug loop pauses on a stale hit of ours', 'else if (IsStaleHitOfOurs(exAddr))', 'else if (tid0 == 1 && IsStaleHitOfOurs(exAddr))', 'stale hit: the debug loop', 'DebugEngine.cs'),
+    @('an unreadable image is reported as not x86', 'if (!probeOk) return ImageArch.Unreadable;', 'if (!probeOk) return ImageArch.NotX86;', 'attach image (c): an x86 process whose image could not be read', 'ProcsCommand.cs'),
+    @('--expect-start is never compared', 'if (StartTimeMatches(ExpectStart, read, actual)) return;', 'if (tid0 == 0) return;', 'expect-start (d): a creation-time MISMATCH'),
+    @('a detach that throws sends nothing', ('catch (Exception ex)' + "`n" + '            {' + "`n" + '                aborted = '), ('catch (Exception ex) when (ex == null)' + "`n" + '            {' + "`n" + '                aborted = '), 'detach (e):')
   )
   try {
     $src = Join-Path $PSScriptRoot '..\src'
@@ -72,6 +81,9 @@ if ($SelfTest) {
         $n = ([regex]::Matches($text, [regex]::Escape($p[1]))).Count
         Check "$($p[0]): the plant applies (anchor found exactly once)" ($n -eq 1) "found $n"
         $mut = $text.Replace($p[1], $p[2])
+        # A plant that tests `tid0` gets it as a static field that is always 0 - NON-constant, so the compiler
+        # neither folds the condition away nor warns that the code after it is unreachable.
+        if ($p[2].Contains('tid0')) { $mut = [regex]::Replace($mut, '(partial class (DebugEngine|ProcsCommand)\b[^{]*\{)', ('$1' + "`n        private static uint tid0 = 0;"), 1) }
         [IO.File]::WriteAllText($f, $mut)
         $out = Join-Path $dir 'bin'
         $build = @(& dotnet build (Join-Path $dir 'src\ClarionDbg.Cli\ClarionDbg.Cli.csproj') --nologo -o $out 2>&1 | ForEach-Object { "$_" })
@@ -215,14 +227,16 @@ function Compare-BpBytesWithDisk {
 }
 
 # One leg: a fresh app, the engine attached to it, $Drive, and cleanup that runs whatever happened.
-function Invoke-Leg([string] $Id, [string] $BpArgs, [scriptblock] $Drive) {
+function Invoke-Leg([string] $Id, [string] $BpArgs, [scriptblock] $Drive, [scriptblock] $BeforeAttach = $null) {
   $script:log = New-Object System.Collections.ArrayList
   $script:logCursor = 0
   $t0 = Get-Date
   Start-Sleep -Milliseconds 50
   $script:app = Start-Process -FilePath $Target -WorkingDirectory (Split-Path $Target) -PassThru
   Start-Sleep -Seconds 2
-  $script:s = New-EngineSession -Engine $Engine -Target $Target -AttachPid $script:app.Id -StartedAt $t0 -BreakArgs $BpArgs
+  # Runs against the started app before the session attaches; whatever it returns is added to the attach args.
+  $extra = if ($BeforeAttach) { "$(& $BeforeAttach)" } else { '' }
+  $script:s = New-EngineSession -Engine $Engine -Target $Target -AttachPid $script:app.Id -StartedAt $t0 -BreakArgs "$BpArgs $extra"
   try {
     $loaded = Wait-Line $script:s '"event":"loaded"' 15
     Check "${Id}: attached (loaded carries attached:true)" ($null -ne $loaded -and $loaded -cmatch '"attached":true') "$loaded"
@@ -317,6 +331,38 @@ Invoke-CheckSection 'F: stdin closing while paused detaches, in attach mode' {
     Assert-Detached 'F' (Wait-Line $script:s '"event":"detached"' 15)
   }
 }
+
+# G: --expect-start (4b run 2). On ONE app: first the WRONG creation time, which must be refused before anything
+# is planted and leave the app exactly as it was; then the time `procs` lists, which must attach as usual.
+Invoke-CheckSection 'G: --expect-start refuses a reused pid, and accepts the listed one' {
+  Invoke-Leg 'G' $bpArgs {
+    Send 'detach'
+    Assert-Detached 'G' (Wait-Line $script:s '"event":"detached"' 15)
+  } -BeforeAttach {
+    $p = & $Engine procs --json | ConvertFrom-Json
+    $row = @($p.procs | Where-Object { $_.pid -eq $script:app.Id })
+    $started = if ($row.Count -eq 1) { [string]$row[0].started } else { '' }
+    Check 'G: procs lists the app with its creation time' ($started -match '^\d+$') "started=$started"
+    $wrong = if ($started -match '^\d+$') { ([uint64]$started + 1).ToString() } else { '1' }
+    $o = @(& $Engine attach $script:app.Id --interactive --json --expect-start $wrong --bp $BpSite 2>&1 | ForEach-Object { "$_" }); $c = $LASTEXITCODE
+    Check 'G: the wrong creation time is refused as a reused pid, exit 2' ($c -eq 2 -and ($o -join "`n") -cmatch ('"message":"attach failed: process ' + $script:app.Id + ' is not the one listed \(pid reused\)","code":0')) "exit $c; $(($o | Where-Object { $_ -match '@JSON' }) -join ' | ')"
+    Check 'G: ...with no `detached` event after the error' (-not (($o -join "`n") -cmatch '"event":"detached"')) ''
+    # Nothing was planted: the breakpoint site's bytes are the file's, and the app is not being debugged.
+    $sp = $BpSite.Split(':')
+    $site = & $Engine resolve $Target --line $sp[1] --module $sp[0] 2>&1 | Out-String
+    $rva = if ($site -match 'RVA 0x([0-9A-Fa-f]+)') { [Convert]::ToUInt32($matches[1], 16) } else { $null }
+    $same = $false
+    if ($null -ne $rva) {
+      $live = [AttachMem]::Read($script:app.Id, [int64]$script:pe.ImageBase + $rva, 16)
+      $off = $script:pe.RvaToOffset([uint32]$rva)
+      $same = $null -ne $live -and ((@($live) -join ',') -eq (@($script:pe.Bytes[$off..($off + 15)]) -join ','))
+    }
+    Check 'G: nothing was planted (the breakpoint site matches the file)' $same $(if ($null -eq $rva) { "could not resolve $BpSite" } else { ('RVA 0x{0:X}' -f $rva) })
+    $p2 = & $Engine procs --json | ConvertFrom-Json
+    Check 'G: the refused attach left no debugger on the app' (@($p2.procs | Where-Object { $_.pid -eq $script:app.Id }).Count -eq 1) ''
+    "--expect-start $started"
+  }
+}
 }
 
 # A hit count that is never reached: every row of every browse traps, single-steps to re-arm, and resumes
@@ -343,8 +389,9 @@ for ($r = 1; $r -le $StressRounds; $r++) {
 
 } finally { }
 
-# Refusals 3; A, B, C and F 7 each (attached, one setup check, five after-detach); E and each stress round 6.
-$EXPECTED_CHECKS = $(if ($OnlyStress) { 0 } else { 3 + 7 + 7 + 7 + 6 + 7 }) + 6 * $StressRounds
+# Refusals 3; A, B, C and F 7 each (attached, one setup check, five after-detach); E and each stress round 6;
+# G 11 (five on the refused attach, then attached and five after-detach).
+$EXPECTED_CHECKS = $(if ($OnlyStress) { 0 } else { 3 + 7 + 7 + 7 + 6 + 7 + 11 }) + 6 * $StressRounds
 Assert-CheckTotal $EXPECTED_CHECKS
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }

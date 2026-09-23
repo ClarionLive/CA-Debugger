@@ -472,7 +472,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>`procs --json` (ProcsCommand.cs): the attach picker's process list, one line. The host parses
-        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd}], skipped, and
+        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd,started}], skipped, and
         /// with verbose a trailing skips[{pid,name,reason}].</summary>
         public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)
         {
@@ -485,6 +485,7 @@ namespace ClarionDbg.Cli
                   .Append(",\"name\":").Append(Str(p.Name))
                   .Append(",\"path\":").Append(Str(p.Path))
                   .Append(",\"tswd\":").Append(p.Tswd ? "true" : "false")
+                  .Append(",\"started\":\"").Append(p.Started.ToString(System.Globalization.CultureInfo.InvariantCulture)).Append('"')
                   .Append('}');
             }
             sb.Append("],\"skipped\":").Append(skips.Count);

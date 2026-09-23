@@ -591,6 +591,7 @@ namespace ClarionDbg.Cli
             if (IsAttach)
             {
                 if (!StartAttach()) return 0;
+                CheckAttachedIsTheListedProcess();   // --expect-start: a reused pid detaches before anything is planted
             }
             else
             {
@@ -721,6 +722,10 @@ namespace ClarionDbg.Cli
                                 status = OnUserBp(tid, exAddr);
                             else if (_temp.ContainsKey(exAddr))
                                 status = OnTempBp(tid, exAddr);
+                            else if (IsStaleHitOfOurs(exAddr))
+                                // Ours, removed while this hit was queued (bp del while paused, a cleared temp):
+                                // rewind and run on. Ahead of OnProgrammaticBreak, which would pause at va+1.
+                                status = OnStaleHit(tid, exAddr);
                             else if (!_seenInitialBreak)
                             {
                                 _seenInitialBreak = true; // OS loader breakpoint (or the attach break) — swallow it

@@ -100,7 +100,9 @@ namespace ClarionDbg.Cli
             Console.WriteLine("      instance by emulating THR$GetInstance READ-ONLY against that thread's");
             Console.WriteLine("      TLS - no func-eval, no thread hijack - then dumps the value.");
             Console.WriteLine();
-            Console.WriteLine("  ClarionDbg attach <pid> --interactive [--json] [--bp MODULE:LINE ...] [--solution-dll PATH ...]");
+            Console.WriteLine("  ClarionDbg attach <pid> --interactive [--json] [--expect-start <started>] [--bp MODULE:LINE ...]");
+            Console.WriteLine("                   [--solution-dll PATH ...]");
+            Console.WriteLine("      --expect-start: the \"started\" value `procs` listed; a pid reused since then is refused.");
             Console.WriteLine("      Attach to a RUNNING x86 Clarion process (see `procs`) and debug it as `break --interactive`");
             Console.WriteLine("      would. `detach` (either state), `quit` and closing stdin let go of it, restoring every");
             Console.WriteLine("      breakpoint byte, and the app keeps running; `kill` ends it. Interactive only.");
@@ -740,11 +742,26 @@ namespace ClarionDbg.Cli
             if (!uint.TryParse(args[1], NumberStyles.None, CultureInfo.InvariantCulture, out pid) || pid == 0)
                 return AttachRefused("attach failed: '" + args[1] + "' is not a process id", 87);   // ERROR_INVALID_PARAMETER
 
-            string exe; bool x86; int err;
-            if (!ProcsCommand.TryDescribeProcess(pid, out exe, out x86, out err))
+            // --expect-start: the creation time `procs` listed ("started"), so a pid reused since the listing is
+            // refused rather than attached (a pid is not an identity). Checked by the engine after
+            // DebugActiveProcess, before anything is planted.
+            ulong? expectStart = null;
+            string es = GetOpt(args, "--expect-start");
+            if (es != null)
+            {
+                ulong v;
+                if (!ulong.TryParse(es, NumberStyles.None, CultureInfo.InvariantCulture, out v))
+                    return AttachRefused("attach failed: --expect-start expects the decimal creation time procs listed, got '" + es + "'", 87);
+                expectStart = v;
+            }
+
+            string exe; ProcsCommand.ImageArch arch; int err;
+            if (!ProcsCommand.TryDescribeProcess(pid, out exe, out arch, out err))
                 return AttachRefused("attach failed: " + new System.ComponentModel.Win32Exception(err).Message, err);
-            if (!x86)
-                return AttachRefused("attach failed: pid " + pid + " is not an x86 (32-bit) process", 50);   // ERROR_NOT_SUPPORTED
+            if (arch == ProcsCommand.ImageArch.NotX86)
+                return AttachRefused("attach failed: pid " + pid + " is not an x86 (32-bit) process", ProcsCommand.AttachRefusalCode(arch));
+            if (arch == ProcsCommand.ImageArch.Unreadable)
+                return AttachRefused("attach failed: the image of pid " + pid + " could not be read: " + exe, ProcsCommand.AttachRefusalCode(arch));
 
             PeImage pe; TswdDebugInfo dbg;
             try { (pe, dbg) = LoadDebug(exe); }
@@ -756,6 +773,7 @@ namespace ClarionDbg.Cli
 
             var engine = new DebugEngine(exe, pe, dbg, o.Rvas, o.Specs, false, o.WaitMs, true, o.SolutionDlls, pid);
             engine.EmitJson = o.Json;
+            engine.ExpectStart = expectStart;
             engine.Run();
             return engine.AttachFailed ? 2 : 0;
         }

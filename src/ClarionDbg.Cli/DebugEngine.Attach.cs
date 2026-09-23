@@ -50,18 +50,98 @@ namespace ClarionDbg.Cli
         internal const int DetachDrainCapMs = 2000;
         internal const int DetachDrainCapEvents = 200;
 
-        // protocolcheck's view of the teardown ORDER. Null in a real session.
+        // protocolcheck's view of the teardown ORDER, and a step to throw at (the aborted-detach case). Both null
+        // in a real session.
         private List<string> _detachTrace;
-        private void DetachStep(string name) { if (_detachTrace != null) _detachTrace.Add(name); }
+        private string _detachThrowAt;
+        private void DetachStep(string name)
+        {
+            if (_detachTrace != null) _detachTrace.Add(name);
+            if (_detachThrowAt == name) throw new InvalidOperationException("planted fault at " + name);
+        }
 
-        // The detach's three debug-API calls, as delegates so protocolcheck can feed the DRAIN a queue of events
-        // and see how each one is answered. In a real session they are exactly the Win32 functions. The live
-        // suite cannot reproduce the race the drain exists for (tools\test-attach.ps1 says why), so this is the
-        // only place the drain's answers are checked against events it actually has to answer.
+        // The detach's debug-API calls, as delegates so protocolcheck can feed the DRAIN a queue of events and
+        // see how each one is answered. In a real session they are exactly the Win32 functions. The live suite
+        // cannot reproduce the race the drain exists for (tools\test-attach.ps1 says why), so this is the only
+        // place the drain's answers are checked against events it actually has to answer.
         private Func<byte[], uint, bool> _detachWait = Native.WaitForDebugEvent;
         private Func<uint, uint, uint, bool> _detachContinue = Native.ContinueDebugEvent;
-        private Action<uint, uint> _detachSetEip;
-        private void DetachSetEip(uint tid, uint eip) { if (_detachSetEip != null) _detachSetEip(tid, eip); else SetThreadEip(tid, eip); }
+
+        // The two thread-context operations the detach and a stale hit depend on, each answering whether it
+        // WORKED (4b run 2, Codex HIGH: they used to fail silently, and a thread left with TF set, or a queued
+        // INT3 whose EIP was not rewound, was continued while `detached` reported no error). Null = the real call.
+        private Func<uint, uint, bool> _setEipHook;
+        private Func<uint, bool> _clearTfHook;
+        private bool SetEip(uint tid, uint eip) { return _setEipHook != null ? _setEipHook(tid, eip) : SetThreadEip(tid, eip); }
+        private bool ClearTf(uint tid) { return _clearTfHook != null ? _clearTfHook(tid) : ClearThreadTrapFlag(tid); }
+
+        // EVERY address this session ever planted an INT3 at, for as long as the image that holds it is mapped
+        // (4b run 2, MEDIUM). _armed and _temp say what is planted NOW; a byte removed while the target was frozen
+        // (bp del while paused, run-to-cursor cleanup, a temp CancelStep restored) can still have another thread's
+        // hit on it QUEUED, and that hit is ours: rewind EIP and continue, never hand it back at va+1. A VA whose
+        // original byte was itself 0xCC is left out - a hit there is the app's own.
+        private readonly HashSet<uint> _plantedEver = new HashSet<uint>();
+        private void NotePlanted(uint va, byte original) { if (original != 0xCC) _plantedEver.Add(va); }
+        private void ForgetPlantedIn(uint lo, uint size) { _plantedEver.RemoveWhere(va => va >= lo && va - lo < size); }
+
+        /// <summary>A breakpoint at <paramref name="va"/> that we planted once and no longer have planted, whose
+        /// byte is not an INT3 now: a hit that was queued before we removed the byte. Unreadable counts as ours,
+        /// since we did plant there.</summary>
+        private bool IsStaleHitOfOurs(uint va)
+        {
+            if (!_plantedEver.Contains(va) || _armed.ContainsKey(va) || _temp.ContainsKey(va)) return false;
+            byte now;
+            return !(ReadByte(va, out now) && now == 0xCC);
+        }
+
+        /// <summary>The debug loop met a stale hit of ours (<see cref="IsStaleHitOfOurs"/>): put the thread back on
+        /// the instruction the INT3 replaced and let it run. Before this, the loop took it for a programmatic
+        /// break and paused at va+1, mid-instruction - in LAUNCH mode as much as attach.</summary>
+        private uint OnStaleHit(uint tid, uint va)
+        {
+            if (SetEip(tid, va))
+                Console.WriteLine($"  (a hit on 0x{va:X} was queued before its breakpoint was removed; resumed at the instruction)");
+            else
+                EmitError($"a hit on 0x{va:X} was queued before its breakpoint was removed, and EIP could not be put back on thread {TidText(tid)}; the thread may fault");
+            return Native.DBG_CONTINUE;
+        }
+
+        // `attach --expect-start <decimal>`: the creation FILETIME `procs` listed for the pid. Null = not checked.
+        public ulong? ExpectStart;
+        private bool _detachQuiet;       // a refused attach detaches without a `detached` event: `error` says it all
+        private int _plantAllCalls;      // protocolcheck: did anything plant (see PlantAll)
+
+        /// <summary>Pure: does the attached process's creation time answer the one the host listed?
+        /// No expectation passes; an expectation with an unreadable time FAILS - it cannot be proven the same.</summary>
+        internal static bool StartTimeMatches(ulong? expected, bool read, ulong actual)
+        {
+            return expected == null || (read && actual == expected.Value);
+        }
+
+        /// <summary>After DebugActiveProcess, before anything is planted: the pid may have been reused since the
+        /// host listed it (a pid is not an identity). On a mismatch, report it and detach on the first event -
+        /// the attach burst's CREATE_PROCESS, which then never reaches PlantAll.</summary>
+        private void CheckAttachedIsTheListedProcess()
+        {
+            if (ExpectStart == null) return;
+            ulong actual;
+            bool read = ProcsCommand.TryGetProcessStart(_attachPid, out actual);
+            ApplyListedProcessCheck(read, actual);
+        }
+
+        private void ApplyListedProcessCheck(bool read, ulong actual)
+        {
+            if (StartTimeMatches(ExpectStart, read, actual)) return;
+            RefuseListedProcessMismatch();
+        }
+
+        private void RefuseListedProcessMismatch()
+        {
+            Console.WriteLine("@JSON " + Json.AttachError($"attach failed: process {_attachPid} is not the one listed (pid reused)", 0));
+            AttachFailed = true;
+            _detachQuiet = true;
+            _detachPending = true;
+        }
 
         /// <summary>Start the attach. False (with the error event already written) when Windows refuses.</summary>
         private bool StartAttach()
@@ -156,84 +236,127 @@ namespace ClarionDbg.Cli
         /// <summary>
         /// Detach on the event in <paramref name="held"/>. <paramref name="heldStatus"/> is the continue status
         /// the loop's handler already decided, or null when the event arrived with the detach already pending and
-        /// no handler ran, in which case the drain rules decide it too. Returns the `detached` event (also
-        /// emitted), or null when the target exited during the drain.
+        /// no handler ran, in which case the drain rules decide it too. Returns the `detached` event (emitted
+        /// unless the detach is the quiet one of a refused attach), or null when the target exited during the drain.
+        ///
+        /// EVERYTHING that can leave the app worse off is counted and reported in "error", because the host warns
+        /// only when error is present (4b run 2): a byte not restored, a thread whose TF could not be cleared, a
+        /// queued INT3 whose EIP could not be rewound, a failed stop - and a detach that threw part-way, which
+        /// still attempts the stop and still sends `detached` (restored = what was done before it threw).
         /// </summary>
         private string DetachAt(byte[] held, uint? heldStatus)
         {
             _detachPending = false;
             uint pid = _pid != 0 ? _pid : Pid(held);
-
-            // The addresses that are OURS, snapshotted before anything is cleared: the drain needs them to tell
-            // our INT3 (rewind and continue) from the app's own (hand it to the app).
-            var ours = new HashSet<uint>(_armed.Keys);
-            ours.UnionWith(_temp.Keys);
-
-            int restored = 0, failed = 0;
-            DetachStep("restore");
-            foreach (var kv in _temp) { if (TryWriteByte(kv.Key, kv.Value)) restored++; else failed++; }
-            foreach (var kv in _armed) { if (TryWriteByte(kv.Key, kv.Value)) restored++; else failed++; }
-            DetachStep("cancelstep");
-            CancelStep();          // step state; clears _temp (its bytes are already back)
-            _armed.Clear();
-
-            DetachStep("clear-rearm");
-            _rearm.Clear();
-
-            DetachStep("clear-tf");
-            ClearTrapFlagOnAllThreads();
-
-            DetachStep("forget-setip");
-            foreach (uint t in _threads) ForgetSetIpThread(t);
-            _setIpStepping = false;
-
-            DetachStep("hover-off");
-            _hover.Set(false);
-            _hoverTrees.Clear();
-
-            bool exited = false;
+            int restored = 0, failed = 0, drained = 0, oursDrained = 0;
+            var tfFailed = new List<uint>();
+            var rewindFailed = new List<string>();
+            string stopError = null, aborted = null;
+            bool heldContinued = false, stopTried = false, exited = false;
             uint exitCode = 0;
-            DetachStep("continue-held");
-            uint status = heldStatus ?? DetachClassify(held, ours, ref exited, ref exitCode);
-            _detachContinue(Pid(held), Tid(held), status);
-
-            DetachStep("drain");
-            int drained = 0, oursDrained = 0;
-            var buf = new byte[1024];
-            var sw = Stopwatch.StartNew();
-            while (!exited && drained < DetachDrainCapEvents && sw.ElapsedMilliseconds < DetachDrainCapMs
-                   && _detachWait(buf, DetachDrainWaitMs))
+            try
             {
-                drained++;
-                if (IsOursOrTrap(buf, ours)) oursDrained++;
-                uint st = DetachClassify(buf, ours, ref exited, ref exitCode);
-                _detachContinue(Pid(buf), Tid(buf), st);
+                // The addresses that are OURS, snapshotted before anything is cleared: the drain needs them to tell
+                // our INT3 (rewind and continue) from the app's own (hand it to the app). Planted NOW, plus every
+                // byte planted earlier in the session, whose queued hits are just as much ours.
+                var ours = new HashSet<uint>(_armed.Keys);
+                ours.UnionWith(_temp.Keys);
+                ours.UnionWith(_plantedEver);
+
+                DetachStep("restore");
+                foreach (var kv in _temp) { if (TryWriteByte(kv.Key, kv.Value)) restored++; else failed++; }
+                foreach (var kv in _armed) { if (TryWriteByte(kv.Key, kv.Value)) restored++; else failed++; }
+                DetachStep("cancelstep");
+                CancelStep();          // step state; clears _temp (its bytes are already back)
+                _armed.Clear();
+
+                DetachStep("clear-rearm");
+                _rearm.Clear();
+
+                DetachStep("clear-tf");
+                foreach (uint t in _threads) if (!ClearTf(t)) tfFailed.Add(t);
+
+                DetachStep("forget-setip");
+                foreach (uint t in _threads) ForgetSetIpThread(t);
+                _setIpStepping = false;
+
+                DetachStep("hover-off");
+                _hover.Set(false);
+                _hoverTrees.Clear();
+
+                DetachStep("continue-held");
+                uint status = heldStatus ?? DetachClassify(held, ours, rewindFailed, ref exited, ref exitCode);
+                _detachContinue(Pid(held), Tid(held), status);
+                heldContinued = true;
+
+                DetachStep("drain");
+                var buf = new byte[1024];
+                var sw = Stopwatch.StartNew();
+                while (!exited && drained < DetachDrainCapEvents && sw.ElapsedMilliseconds < DetachDrainCapMs
+                       && _detachWait(buf, DetachDrainWaitMs))
+                {
+                    drained++;
+                    if (IsOursOrTrap(buf, ours)) oursDrained++;
+                    uint st = DetachClassify(buf, ours, rewindFailed, ref exited, ref exitCode);
+                    _detachContinue(Pid(buf), Tid(buf), st);
+                }
+
+                _hProcess = IntPtr.Zero;   // kernel32 owns the event's handles and closes them at the stop
+
+                if (exited)
+                {
+                    Console.WriteLine($"process exited (code {exitCode}) while detaching");
+                    if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));
+                    return null;
+                }
+
+                DetachStep("stop");
+                stopTried = true;
+                if (!Native.DebugActiveProcessStop(pid))
+                    stopError = "DebugActiveProcessStop failed (" + System.Runtime.InteropServices.Marshal.GetLastWin32Error() + ")";
+
+                DetachStep("emit");
+            }
+            catch (Exception ex)
+            {
+                aborted = "detach aborted: " + ex.Message;
+                // Best effort, in the order the normal path would have: the held event must not be left to the
+                // stop (which would hand it to the app as unhandled), and the debugger must still let go.
+                if (!heldContinued) { try { _detachContinue(Pid(held), Tid(held), heldStatus ?? Native.DBG_CONTINUE); } catch { } }
+                _hProcess = IntPtr.Zero;
+                if (!stopTried && !exited)
+                {
+                    try
+                    {
+                        if (!Native.DebugActiveProcessStop(pid))
+                            stopError = "DebugActiveProcessStop failed (" + System.Runtime.InteropServices.Marshal.GetLastWin32Error() + ")";
+                    }
+                    catch (Exception stopEx) { stopError = "DebugActiveProcessStop threw: " + stopEx.Message; }
+                }
             }
 
-            _hProcess = IntPtr.Zero;   // kernel32 owns the event's handles and closes them at the stop
-
-            if (exited)
-            {
-                Console.WriteLine($"process exited (code {exitCode}) while detaching");
-                if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));
-                return null;
-            }
-
-            DetachStep("stop");
-            string error = failed > 0 ? failed + " breakpoint byte(s) could not be restored" : null;
-            if (!Native.DebugActiveProcessStop(pid))
-            {
-                string why = "DebugActiveProcessStop failed (" + System.Runtime.InteropServices.Marshal.GetLastWin32Error() + ")";
-                error = error == null ? why : error + "; " + why;
-            }
-
-            DetachStep("emit");
+            string error = DetachError(aborted, failed, tfFailed, rewindFailed, stopError);
             string json = Json.Detached(pid, drained, restored, error);
             // "ours" is console-only evidence for tools\test-attach.ps1: how many drained events were the ones the
             // drain exists for (our INT3, a trap flag we set). The wire event stays the frozen contract.
             Console.WriteLine($"detached from pid {pid}: {restored} byte(s) restored, {drained} queued event(s) drained (ours={oursDrained}){(error != null ? "; ERROR: " + error : "")}");
-            if (EmitJson) Console.WriteLine("@JSON " + json);
+            if (EmitJson && !_detachQuiet) Console.WriteLine("@JSON " + json);
             return json;
+        }
+
+        /// <summary>The `detached` error text, or null when nothing went wrong. Pure. Each failure names what it
+        /// can (the tids, the addresses), so a user reading the host's warning knows what may fault.</summary>
+        internal static string DetachError(string aborted, int bytesNotRestored, List<uint> tfNotCleared,
+                                           List<string> eipNotRewound, string stopError)
+        {
+            var parts = new List<string>();
+            if (aborted != null) parts.Add(aborted);
+            if (bytesNotRestored > 0) parts.Add(bytesNotRestored + " breakpoint byte(s) could not be restored");
+            if (tfNotCleared.Count > 0)
+                parts.Add("TF not cleared on " + tfNotCleared.Count + " thread(s) (" + string.Join(",", tfNotCleared) + ")");
+            foreach (var r in eipNotRewound) parts.Add("EIP not rewound at " + r);
+            if (stopError != null) parts.Add(stopError);
+            return parts.Count == 0 ? null : string.Join("; ", parts);
         }
 
         /// <summary>Is this queued event one the drain exists for: an INT3 at one of our addresses, or a trap?</summary>
@@ -245,8 +368,9 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>The continue status for one event met while detaching, applying the side effects the drain
-        /// needs (EIP rewind, file-handle close) and recognising the target's exit.</summary>
-        private uint DetachClassify(byte[] ev, HashSet<uint> ours, ref bool exited, ref uint exitCode)
+        /// needs (EIP rewind, file-handle close) and recognising the target's exit. A rewind that FAILS is
+        /// recorded as "0xVA on TID" for the error.</summary>
+        private uint DetachClassify(byte[] ev, HashSet<uint> ours, List<string> rewindFailed, ref bool exited, ref uint exitCode)
         {
             uint code = Code(ev);
             uint exCode = code == Native.EXCEPTION_DEBUG_EVENT ? U32(ev, 12) : 0;
@@ -254,7 +378,7 @@ namespace ClarionDbg.Cli
             bool rewind;
             uint status = DecideDetachEvent(code, exCode, exAddr, ours, ref _seenInitialBreak, ref _pauseRequested, out rewind);
 
-            if (rewind) DetachSetEip(Tid(ev), exAddr);
+            if (rewind && !SetEip(Tid(ev), exAddr)) rewindFailed.Add("0x" + exAddr.ToString("X") + " on " + Tid(ev));
             if (code == Native.LOAD_DLL_DEBUG_EVENT || code == Native.CREATE_PROCESS_DEBUG_EVENT) CloseHandleValue(U32(ev, 12));
             if (code == Native.EXIT_PROCESS_DEBUG_EVENT) { exited = true; exitCode = U32(ev, 12); }
             return status;
@@ -272,6 +396,8 @@ namespace ClarionDbg.Cli
         ///                                itself does not exist. Deliberate deviation, recorded here.
         ///   any other exception       -> NOT_HANDLED
         ///   anything else             -> DBG_CONTINUE
+        /// "Our INT3" means any address in <paramref name="ours"/>, which the caller builds from what is planted
+        /// now AND everything planted earlier in the session.
         /// </summary>
         internal static uint DecideDetachEvent(uint code, uint exCode, uint exAddr, HashSet<uint> ours,
                                                ref bool seenInitialBreak, ref bool pauseRequested, out bool rewind)
@@ -289,33 +415,35 @@ namespace ClarionDbg.Cli
             return Native.DBG_EXCEPTION_NOT_HANDLED;
         }
 
-        private void ClearTrapFlagOnAllThreads()
-        {
-            foreach (uint t in _threads)
-            {
-                IntPtr h = OpenThreadForContext(t);
-                if (h == IntPtr.Zero) continue;
-                try
-                {
-                    var c = NewContext();
-                    if (Native.GetThreadContext(h, ref c) && (c.EFlags & TRAP_FLAG) != 0)
-                    {
-                        c.EFlags &= ~TRAP_FLAG;
-                        Native.SetThreadContext(h, ref c);
-                    }
-                }
-                finally { Native.CloseHandle(h); }
-            }
-        }
-
-        private void SetThreadEip(uint tid, uint eip)
+        /// <summary>Clear TF on one thread. True when it is clear afterwards (it was not set, or it was cleared);
+        /// false when the thread could not be opened, read or written - its TF is then UNKNOWN, and a set one kills
+        /// the app on its next instruction once the debugger has gone.</summary>
+        private static bool ClearThreadTrapFlag(uint tid)
         {
             IntPtr h = OpenThreadForContext(tid);
-            if (h == IntPtr.Zero) return;
+            if (h == IntPtr.Zero) return false;
             try
             {
                 var c = NewContext();
-                if (Native.GetThreadContext(h, ref c)) { c.Eip = eip; Native.SetThreadContext(h, ref c); }
+                if (!Native.GetThreadContext(h, ref c)) return false;
+                if ((c.EFlags & TRAP_FLAG) == 0) return true;
+                c.EFlags &= ~TRAP_FLAG;
+                return Native.SetThreadContext(h, ref c);
+            }
+            finally { Native.CloseHandle(h); }
+        }
+
+        /// <summary>Put a thread's EIP at <paramref name="eip"/>. True only when the context was written.</summary>
+        private static bool SetThreadEip(uint tid, uint eip)
+        {
+            IntPtr h = OpenThreadForContext(tid);
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                var c = NewContext();
+                if (!Native.GetThreadContext(h, ref c)) return false;
+                c.Eip = eip;
+                return Native.SetThreadContext(h, ref c);
             }
             finally { Native.CloseHandle(h); }
         }
@@ -363,54 +491,81 @@ namespace ClarionDbg.Cli
 
         // ------------------------------------------------------------------ test seams (protocolcheck)
 
-        /// <summary>Run the REAL detach teardown on an engine with NO target and hand back the step order and the
-        /// `detached` event. Every Win32 call in it lands on a null handle, a pid of 0 or a thread with no debug
-        /// object, and fails harmlessly - which is also what makes the restore count come back 0 with an error.
-        /// Refuses an attached engine like every other mutating seam.</summary>
-        internal string DetachTeardownForTest(uint[] armedVas, uint[] tempVas, uint[] rearmTids, out List<string> order)
+        /// <summary>One detach, set up and observed by protocolcheck. Inputs first, results after the run.</summary>
+        internal sealed class DetachScenario
         {
-            List<string> continues; List<string> rewinds;
-            return DetachDrainForTest(armedVas, tempVas, rearmTids, new List<byte[]>(), out order, out continues, out rewinds);
+            public uint[] Armed = new uint[0], Temp = new uint[0], RearmTids = new uint[0], Threads = new uint[0], PlantedEver = new uint[0];
+            public List<byte[]> Queue = new List<byte[]>();
+            public HashSet<uint> TfFailTids = new HashSet<uint>(), EipFailTids = new HashSet<uint>();
+            public string ThrowAt;
+            // results
+            public List<string> Order, Continues = new List<string>(), Rewinds = new List<string>();
+            public string Json, Escaped;
         }
 
-        /// <summary>The same teardown, with the drain fed <paramref name="queue"/> in place of WaitForDebugEvent.
-        /// <paramref name="continues"/> gets "tid:status" for every ContinueDebugEvent, the held event (tid 0)
-        /// first; <paramref name="rewinds"/> gets "tid:0xEIP" for every EIP the drain moved back.</summary>
-        internal string DetachDrainForTest(uint[] armedVas, uint[] tempVas, uint[] rearmTids, List<byte[]> queue,
-                                           out List<string> order, out List<string> continues, out List<string> rewinds)
+        /// <summary>Run the REAL DetachAt on an engine with NO target. The drain is fed <see cref="DetachScenario.Queue"/>
+        /// in place of WaitForDebugEvent, and the context operations answer through hooks that record what was asked
+        /// and fail for the tids named. Every remaining Win32 call lands on a null handle or pid 0 and fails
+        /// harmlessly, which is also why a restore comes back failed. An exception that escapes DetachAt is caught
+        /// here and put in <see cref="DetachScenario.Escaped"/>.</summary>
+        internal void RunDetachScenarioForTest(DetachScenario s)
         {
-            RefuseSeamIfAttached("DetachDrainForTest");
-            foreach (var va in armedVas) _armed[va] = 0x55;
-            foreach (var va in tempVas) _temp[va] = 0x8B;
-            foreach (var t in rearmTids) _rearm[t] = new Rearm { Va = armedVas.Length > 0 ? armedVas[0] : 0, IsTemp = false };
+            RefuseSeamIfAttached("RunDetachScenarioForTest");
+            foreach (var va in s.Armed) _armed[va] = 0x55;
+            foreach (var va in s.Temp) _temp[va] = 0x8B;
+            foreach (var t in s.RearmTids) _rearm[t] = new Rearm { Va = s.Armed.Length > 0 ? s.Armed[0] : 0, IsTemp = false };
+            foreach (var t in s.Threads) _threads.Add(t);
+            foreach (var va in s.PlantedEver) NotePlanted(va, 0x55);
             _hover.Set(true);
             _seenInitialBreak = true;
 
-            var cont = new List<string>(); var rew = new List<string>();
             int next = 0;
             _detachWait = (buf, ms) =>
             {
-                if (next >= queue.Count) return false;
+                if (next >= s.Queue.Count) return false;
                 Array.Clear(buf, 0, buf.Length);
-                Array.Copy(queue[next], buf, Math.Min(queue[next].Length, buf.Length));
+                Array.Copy(s.Queue[next], buf, Math.Min(s.Queue[next].Length, buf.Length));
                 next++;
                 return true;
             };
-            _detachContinue = (p, t, st) => { cont.Add(t + ":0x" + st.ToString("X8")); return true; };
-            _detachSetEip = (t, eip) => rew.Add(t + ":0x" + eip.ToString("X"));
+            _detachContinue = (p, t, st) => { s.Continues.Add(t + ":0x" + st.ToString("X8")); return true; };
+            _setEipHook = (t, eip) => { s.Rewinds.Add(t + ":0x" + eip.ToString("X")); return !s.EipFailTids.Contains(t); };
+            _clearTfHook = t => !s.TfFailTids.Contains(t);
             _detachTrace = new List<string>();
+            _detachThrowAt = s.ThrowAt;
 
             var held = new byte[1024];
             BitConverter.GetBytes(Native.OUTPUT_DEBUG_STRING_EVENT).CopyTo(held, 0);   // pid 0, tid 0
-            string json;
-            try { json = DetachAt(held, null); }
+            try { s.Json = DetachAt(held, null); }
+            catch (Exception ex) { s.Escaped = ex.GetType().Name + ": " + ex.Message; }
             finally
             {
-                order = _detachTrace; _detachTrace = null;
-                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent; _detachSetEip = null;
+                s.Order = _detachTrace; _detachTrace = null; _detachThrowAt = null;
+                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
+                _setEipHook = null; _clearTfHook = null;
+                foreach (var t in s.Threads) _threads.Remove(t);
             }
-            continues = cont; rewinds = rew;
-            return json;
+        }
+
+        /// <summary>The teardown alone (an empty queue): its step order and the `detached` event.</summary>
+        internal string DetachTeardownForTest(uint[] armedVas, uint[] tempVas, uint[] rearmTids, out List<string> order)
+        {
+            var s = new DetachScenario { Armed = armedVas, Temp = tempVas, RearmTids = rearmTids };
+            RunDetachScenarioForTest(s);
+            order = s.Order;
+            return s.Json;
+        }
+
+        /// <summary>The teardown with the drain fed <paramref name="queue"/>. <paramref name="continues"/> gets
+        /// "tid:status" for every ContinueDebugEvent, the held event (tid 0) first; <paramref name="rewinds"/> gets
+        /// "tid:0xEIP" for every EIP the drain moved back.</summary>
+        internal string DetachDrainForTest(uint[] armedVas, uint[] tempVas, uint[] rearmTids, List<byte[]> queue,
+                                           out List<string> order, out List<string> continues, out List<string> rewinds)
+        {
+            var s = new DetachScenario { Armed = armedVas, Temp = tempVas, RearmTids = rearmTids, Queue = queue };
+            RunDetachScenarioForTest(s);
+            order = s.Order; continues = s.Continues; rewinds = s.Rewinds;
+            return s.Json;
         }
 
         private sealed class EventSourceExhausted : Exception { }
@@ -444,6 +599,68 @@ namespace ClarionDbg.Cli
                 _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent;
                 _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
             }
+        }
+
+        /// <summary>Run the REAL debug loop on ONE event - <paramref name="ev"/> - and hand back how it was continued
+        /// and every EIP it rewound. Needs a NON-interactive engine, so a wrong turn into a pause cannot block on
+        /// stdin (a non-interactive programmatic break just continues, which is what makes a missing rewind show).</summary>
+        internal void OneLoopEventForTest(byte[] ev, uint[] plantedEver, out List<string> continues, out List<string> rewinds)
+        {
+            RefuseSeamIfAttached("OneLoopEventForTest");
+            if (_interactive) throw new InvalidOperationException("OneLoopEventForTest: needs a NON-interactive engine");
+            foreach (var va in plantedEver) NotePlanted(va, 0x55);
+            _seenInitialBreak = true;
+            var cont = new List<string>(); var rew = new List<string>();
+            bool given = false;
+            _loopWait = (buf, ms) =>
+            {
+                if (given) throw new EventSourceExhausted();
+                Array.Clear(buf, 0, buf.Length);
+                Array.Copy(ev, buf, Math.Min(ev.Length, buf.Length));
+                given = true;
+                return true;
+            };
+            _loopContinue = (p, t, st) => { cont.Add(t + ":0x" + st.ToString("X8")); return true; };
+            _setEipHook = (t, eip) => { rew.Add(t + ":0x" + eip.ToString("X")); return true; };
+            try { DebugLoop(); }
+            catch (EventSourceExhausted) { }
+            finally
+            {
+                _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent; _setEipHook = null;
+            }
+            continues = cont; rewinds = rew;
+        }
+
+        /// <summary>The `--expect-start` flow on an ATTACH engine with no target: the listed-process check with a
+        /// given creation time, then the REAL loop fed the attach burst's CREATE_PROCESS (pid 0). Reports whether
+        /// anything was planted and whether the attach was refused.</summary>
+        internal void ExpectStartFlowForTest(ulong expected, bool read, ulong actual, out bool planted, out bool refused)
+        {
+            RefuseSeamIfAttached("ExpectStartFlowForTest");
+            if (!IsAttach) throw new InvalidOperationException("ExpectStartFlowForTest: needs an attach engine");
+            ExpectStart = expected;
+            ApplyListedProcessCheck(read, actual);
+            bool given = false;
+            _loopWait = (buf, ms) =>
+            {
+                if (given) throw new EventSourceExhausted();
+                Array.Clear(buf, 0, buf.Length);
+                BitConverter.GetBytes(Native.CREATE_PROCESS_DEBUG_EVENT).CopyTo(buf, 0);
+                given = true;
+                return true;
+            };
+            _loopContinue = (p, t, st) => true;
+            _detachWait = (buf, ms) => false;
+            _detachContinue = (p, t, st) => true;
+            try { DebugLoop(); }
+            catch (EventSourceExhausted) { }
+            finally
+            {
+                _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent;
+                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
+            }
+            planted = _plantAllCalls > 0;
+            refused = AttachFailed;
         }
 
         /// <summary>A DEBUG_EVENT buffer for the drain seam: an exception (code, address) on <paramref name="tid"/>,

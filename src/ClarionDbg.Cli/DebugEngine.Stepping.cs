@@ -88,6 +88,7 @@ namespace ClarionDbg.Cli
                             {
                                 WriteByte(ret, 0xCC);
                                 _temp[ret] = orig;
+                                NotePlanted(ret, orig);   // a queued hit on it outlives CancelStep (Attach.cs)
                                 covered = true;
                             }
                             else if (_temp.ContainsKey(ret))
