@@ -18,8 +18,13 @@ namespace ClarionDbg.Cli
     /// or -1 would read as a real thread id, match nothing, and make the pad drop replies it should have
     /// shown — a silently blank panel rather than an error. So "unknown" has exactly one representation,
     /// and this asserts it directly instead of trusting that no future caller introduces a sentinel.
+    /// <para>
+    /// PARTIAL (wave 3, 2026-09-22): a stream that adds checks writes them in its OWN file,
+    /// ProtocolCheck.&lt;Area&gt;.cs, as methods of this class. The only shared edit is one line per check in
+    /// the <c>checks</c> array in <c>Run</c>, so parallel streams stop colliding in this file.
+    /// </para>
     /// </summary>
-    internal static class ProtocolCheck
+    internal static partial class ProtocolCheck
     {
         /// <summary>
         /// What the run is allowed to SAY it verified. One claim per check, registered by the check itself.
