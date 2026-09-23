@@ -76,12 +76,17 @@ $readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
 Set-ExtractSource $src
 
 
+$tidNameDecls = @('private const string TidMemberTid', 'private const string TidMemberStopped', 'private const string TidMemberSelected',
+  'private static readonly string[] TidValuedMemberNames') | ForEach-Object { Get-Statement $_ $web }
+$tidNameDecls = $tidNameDecls -join "`n"
 $methods = @(
   (Get-Method 'private static string ScanNumberToken(string json, string key)'),
   (Get-Method 'private static int? GetIntOrNull(string json, string key)'),
   (Get-Method 'private static uint? GetUIntOrNull(string json, string key)'),
   (Get-Method 'private static string TidJson(uint? tid)' $web),
-  (Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+  (Get-Method 'private static string TidMember(string name, uint? tid)' $web),
+  # the declared names the writer checks against (c299aced), lifted rather than retyped
+  $tidNameDecls
 ) -join "`n"
 
 # same bodies, reachable from PowerShell
@@ -937,6 +942,7 @@ public sealed class BridgePad {
   $(Get-Method 'private static string Str(string s)' $web)
   $(Get-Method 'private static string TidJson(uint? tid)' $web)
   $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+  $tidNameDecls
   $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
   $pushProcs
   $((Get-Method 'public void CmdBreakOnProcEntry(string data)' $web) -replace '^public void', 'public void')
@@ -1426,13 +1432,14 @@ Check 'a 0 is a sentinel for selected as much as for tid - written as absent too
 Check 'a known stopped is written under its own name' `
   ([PadJsonProbe]::TidMember('stopped', 116932) -ceq ',"stopped":116932') ([PadJsonProbe]::TidMember('stopped', 116932))
 Check 'and TidJson is that same writer, not a second copy of the rule' `
-  ((Get-Method 'private static string TidJson(uint? tid)' $web) -match 'TidMember\("tid", tid\)') ''
+  ((Get-Method 'private static string TidJson(uint? tid)' $web) -match 'TidMember\(TidMemberTid, tid\)') ''
 # ALL THREE, counted rather than asserted as "every": a fourth member added without the writer is what the
 # count catches. The per-row tid is written inline in OnThreads and is the third.
 $onThreads = Get-Method 'private void OnThreads(DebugThreadList list)' $web
-Check 'both top-level thread-id members in OnThreads go through it' `
-  ((([regex]::Matches($onThreads, 'TidMember\(')).Count) -eq 2) `
-  ((([regex]::Matches($onThreads, 'TidMember\(')).Count).ToString() + ' of 2')
+# THREE since c299aced: the per-row tid used to be typed inline and now goes through the writer as well.
+Check 'all three thread-id members in OnThreads go through it (stopped, selected, and each row''s tid)' `
+  ((([regex]::Matches($onThreads, 'TidMember\(')).Count) -eq 3) `
+  ((([regex]::Matches($onThreads, 'TidMember\(')).Count).ToString() + ' of 3')
 Check 'and neither is appended as a bare number any more' `
   (($onThreads -notmatch '\\"stopped\\":\\"\).Append\(list') -and ($onThreads -notmatch 'Append\(list\.StoppedTid\)')) ''
 # The reader half: absent must survive arrival. Substituting 0u on the way in undoes the wire rule in the

@@ -1326,8 +1326,18 @@ namespace ClarionDebugger.Terminal
         /// dropped. Emitting 0 for "unknown" would make every such reply look like a different thread's.</summary>
         private static string TidJson(uint? tid)
         {
-            return TidMember("tid", tid);
+            return TidMember(TidMemberTid, tid);
         }
+
+        // The host's thread-id-valued member names, declared once (c299aced). tools/test-host-tid-members.ps1
+        // READS this array, so a name added here comes under its scan automatically, and it fails any host
+        // source that writes one of these as JSON text instead of passing it to TidMember - the same
+        // structure the engine side has had since 3b043dfc. `stopped` and `selected` are also the names of
+        // two per-row BOOLEANS in OnThreads; the scanner tells them apart by the value, not the name.
+        private const string TidMemberTid = "tid";
+        private const string TidMemberStopped = "stopped";
+        private const string TidMemberSelected = "selected";
+        private static readonly string[] TidValuedMemberNames = { TidMemberTid, TidMemberStopped, TidMemberSelected };
 
         /// <summary>THE host's one writer of a thread-id-valued member, whatever the member is called.
         /// Writes <paramref name="name"/> only when the id is KNOWN, and nothing at all when it is not.
@@ -1347,6 +1357,8 @@ namespace ClarionDebugger.Terminal
         /// </para></summary>
         private static string TidMember(string name, uint? tid)
         {
+            System.Diagnostics.Debug.Assert(Array.IndexOf(TidValuedMemberNames, name) >= 0,
+                "TidMember was handed an undeclared name; add it to TidValuedMemberNames");
             if (!tid.HasValue || tid.Value == 0) return string.Empty;
             return ",\"" + name + "\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
@@ -1359,16 +1371,20 @@ namespace ClarionDebugger.Terminal
             // Both go through the one writer, so an unknown stopped/selected is ABSENT rather than the
             // thread-0 it used to claim to be — the same rule the per-row tid has always had here.
             var sb = new StringBuilder("{\"type\":\"threads\"")
-                .Append(TidMember("stopped", list.StoppedTid))
-                .Append(TidMember("selected", list.SelectedTid))
+                .Append(TidMember(TidMemberStopped, list.StoppedTid))
+                .Append(TidMember(TidMemberSelected, list.SelectedTid))
                 .Append(",\"threads\":[");
             for (int i = 0; i < list.Threads.Count; i++)
             {
                 var t = list.Threads[i];
                 if (i > 0) sb.Append(',');
-                sb.Append("{\"tid\":").Append(t.Tid)
-                  .Append(",\"clarionThread\":").Append(t.ClarionThread.HasValue
+                // The row's own tid goes through the one writer too (c299aced). It used to be typed inline as
+                // `{"tid":` + t.Tid, which is correct only while every row has a real id; the writer makes
+                // that a rule rather than a fact about today's parser. clarionThread opens the row because
+                // TidMember writes a leading comma - the page reads members by key, so order is free.
+                sb.Append("{\"clarionThread\":").Append(t.ClarionThread.HasValue
                         ? t.ClarionThread.Value.ToString(CultureInfo.InvariantCulture) : "null")
+                  .Append(TidMember(TidMemberTid, t.Tid))
                   .Append(",\"proc\":").Append(Str(t.Proc))
                   .Append(",\"module\":").Append(Str(t.Module))
                   .Append(",\"line\":").Append(t.Line)

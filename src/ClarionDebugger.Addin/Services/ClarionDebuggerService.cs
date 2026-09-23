@@ -1158,10 +1158,14 @@ namespace ClarionDebugger.Services
                 foreach (Match m in Regex.Matches(ExtractArrayBalanced(json, "threads"), "\\{[^{}]*\\}"))
                 {
                     string t = m.Value;
-                    if (!t.Contains("\"tid\":")) continue;
+                    // A row is a thread only if it names one. This used to test for the TEXT "tid": and then
+                    // read the number with `?? 0u`, so a row whose tid did not parse became thread 0 - the
+                    // sentinel the absent-tid rule exists to keep off the wire (c299aced).
+                    uint? rowTid = GetUIntOrNull(t, "tid");
+                    if (!rowTid.HasValue || rowTid.Value == 0) continue;
                     list.Threads.Add(new DebugThread
                     {
-                        Tid = GetUIntOrNull(t, "tid") ?? 0u,
+                        Tid = rowTid.Value,
                         ClarionThread = GetIntOrNull(t, "clarionThread"),
                         Proc = GetStr(t, "proc"),
                         Module = GetStr(t, "module"),
