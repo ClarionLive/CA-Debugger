@@ -72,6 +72,7 @@ $Suites = @(
   @{ File = 'test-pad-editmeta.js' }
   @{ File = 'test-pad-parse.js'; Success = '^all \d+ inline script block\(s\) parse OK$' }
   @{ File = 'test-pad-source.js' }
+  @{ File = 'test-pad-setip.js' }
   @{ File = 'test-pad-threads.js' }
   @{ File = 'test-pad-watch-persist.js' }
   @{ File = 'test-bp-threaded.ps1'; Live = $true }
