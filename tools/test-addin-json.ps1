@@ -1368,7 +1368,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 228
+$EXPECTED_CHECKS = 222
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

@@ -75,13 +75,10 @@ namespace ClarionDbg.Cli
                 CheckWinCapKeyIsIdentityNotPosition,
                 CheckRefusalsNeverShowARawTid,
                 CheckFieldNameResolvesToFileRecord,
-<<<<<<< HEAD
                 CheckStepAnchorBelongsToSteppingThread,
-=======
                 CheckTemplateSpanDiscriminator,
                 CheckFileRecordShape,
                 CheckDataNameIndexFromParsedBlob,
->>>>>>> 977160d
             };
 
             foreach (var check in checks)
