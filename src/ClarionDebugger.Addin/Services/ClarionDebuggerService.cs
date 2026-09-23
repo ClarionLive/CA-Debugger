@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using ClarionDebugger.Terminal;
 
 namespace ClarionDebugger.Services
 {
@@ -124,10 +125,10 @@ namespace ClarionDebugger.Services
         /// breakpoint, which reads back the same way and means the same thing.
         /// </para>
         /// <para>
-        /// This is an IDENTITY TOKEN, NOT A PATH TO OPEN. It names the image, not the .clw, and it arrives
-        /// in the wire's escaped form (a Windows separator reads back as <c>\</c>, because GetStr does not
-        /// unescape). Both sides of every comparison come from that same wire, so equality is exact; anything
-        /// that wanted a real disk path would have to unescape it first.
+        /// This is an IDENTITY TOKEN, NOT A PATH TO OPEN. It names the image, not the .clw. Since 079ff431
+        /// GetStr unescapes, so it reads back as the image's real path - but that does not make it a file
+        /// the host should open, and nothing does: it is only ever compared with another owner read the
+        /// same way, which is why unescaping both sides at once left every comparison unchanged.
         /// </para></summary>
         public string OwnerPath;
 
@@ -1126,11 +1127,15 @@ namespace ClarionDebugger.Services
         /// — flat unique keys, extracted directly. Null when the event carries no register block.</summary>
         private static Dictionary<string, string> ParseRegs(string json)
         {
-            if (string.IsNullOrEmpty(json) || json.IndexOf("\"regs\":{", StringComparison.Ordinal) < 0) return null;
+            int at = string.IsNullOrEmpty(json) ? -1 : json.IndexOf("\"regs\":{", StringComparison.Ordinal);
+            if (at < 0) return null;
+            // GetStr reads members of the object it is handed, so it is handed the register block itself -
+            // from its opening brace; the reader stops at the matching close.
+            string block = json.Substring(at + "\"regs\":".Length);
             var regs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var reg in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" })
             {
-                string v = GetStr(json, reg);
+                string v = GetStr(block, reg);
                 if (v != null) regs[reg] = v;
             }
             return regs;
@@ -1620,10 +1625,28 @@ namespace ClarionDebugger.Services
             return uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v) ? v : 0;
         }
 
+        /// <summary>A string member of THIS object, UNESCAPED, or null when it is absent, not a string, or
+        /// the text is not a well-formed object.
+        /// <para>
+        /// This was a regex returning the raw text between the quotes, so a path arrived with its separators
+        /// still doubled and was escaped a second time on its way to the page (079ff431); it also stopped
+        /// at the first quote, cutting short any value with an escaped one in it, and matched the key
+        /// ANYWHERE in the text. It now goes through the bridge's real reader.
+        /// </para>
+        /// <para>
+        /// THE CALLER AUDIT (2026-09-22), because both changes - unescaping, and top-level only - can move a
+        /// caller that leaned on the old behaviour:
+        /// every event handler in <see cref="OnLine"/> and the flat objects cut out by ParseStack /
+        /// ParseThreads / ParseDisasm / GetProcedures read members of the object they were handed; the
+        /// ParseBpList chunks each start at their own object's brace, and the reader stops at its end. The
+        /// one caller that read a NESTED member was ParseRegs (the registers sit inside <c>"regs":{...}</c>),
+        /// and it now hands over that object instead of the event. The one caller that compared RAW text
+        /// was the breakpoint owner (OwnerPath): it is only ever compared with another value read here,
+        /// so both sides moved together and the comparison is unchanged.
+        /// </para></summary>
         private static string GetStr(string json, string key)
         {
-            var m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-            return m.Success ? m.Groups[1].Value : null;
+            return JsonMessageReader.ReadStringField(json, key);
         }
         private static int GetInt(string json, string key)
         {

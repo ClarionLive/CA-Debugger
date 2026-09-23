@@ -62,6 +62,9 @@ $engineThreadsSrc = Get-Content -Raw -LiteralPath $EngineThreadsPath
 $engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
+# GetStr reads through the bridge's JsonMessageReader since 079ff431, so every probe that compiles it needs the
+# real reader beside it.
+$readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
 
 # Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
 # lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
@@ -193,6 +196,11 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using BpReader;
+
+namespace BpReader {
+$((Get-Method 'internal static class JsonMessageReader' $readerEarly) -replace 'internal static class', 'public static class')
+}
 
 $bpRecord
 
@@ -1191,6 +1199,73 @@ Check 'OnWebMessage parses no payload inline - no Split, no bare TryParse' `
   (($onMsg -notmatch '\.Split\(') -and ($onMsg -notmatch '\b(u?int)\.TryParse\(')) ''
 
 Write-Host ''
+Write-Host 'a module path reaches the page as the path, not escaped twice (079ff431)'
+# GetStr returned the raw text between the quotes, so a path read off the engine's module-loaded event kept
+# its separators doubled, and OnModuleLoaded escaped it AGAIN on the way to the page: C:\\App\\... on screen.
+# Every hop below is the shipped code: the engine's real writer, the host's real reader, the WebView's real
+# writer. What the page is handed is decoded the way the page decodes it (JSON.parse <-> ConvertFrom-Json).
+$modSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+namespace ModPath {
+$((Get-Method 'internal static class JsonMessageReader' $readerEarly) -replace 'internal static class', 'public static class')
+// The engine's image, cut down to the fields its real ModuleLoaded writer reads. Pinned against
+// LoadedModule.cs below.
+public sealed class LoadedModule { public string Path; public string Name; public uint LoadBase; public uint Size; public bool HasDebug; }
+public static class Json {
+  $(Get-Method 'public static string Str(string s)' $engine)
+  $(Get-Method 'public static string ModuleLoaded(LoadedModule m)' $engine)
+}
+$(Get-Method 'public sealed class DebugModule')
+public static class Host {
+  $((Get-Method 'private static string GetStr(string json, string key)') -replace 'private static', 'public static')
+  $((Get-Method 'private static Dictionary<string, string> ParseRegs(string json)') -replace 'private static', 'public static')
+}
+public sealed class Pad {
+  public List<string> Posts = new List<string>();
+  private void Post(string json) { Posts.Add(json); }
+  private void Console(string level, string text) { }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $((Get-Method 'private void OnModuleLoaded(DebugModule m)' $web) -replace '^private void', 'public void')
+}
+}
+"@
+Add-Type -TypeDefinition $modSrc -Language CSharp | Out-Null
+$lmSrc = Get-Content -Raw -LiteralPath $LoadedModulePath
+Check 'the cut-down image stub matches the real LoadedModule field names' `
+  (($lmSrc -cmatch 'public string Name;') -and ($lmSrc -cmatch 'public uint LoadBase;') -and ($lmSrc -cmatch 'public uint Size;') -and ($lmSrc -cmatch 'public bool HasDebug')) ''
+
+$img = New-Object ModPath.LoadedModule
+$img.Path = 'C:\App\Dll1\dll1.dll'; $img.Name = 'dll1.dll'; $img.LoadBase = 0x10000000; $img.Size = 0x1000; $img.HasDebug = $true
+$evt = [ModPath.Json]::ModuleLoaded($img)
+Check 'CONTROL: the engine escapes the path once, as JSON requires' ($evt.Contains('"path":"C:\\App\\Dll1\\dll1.dll"')) $evt
+# The host's module-loaded arm, which sits in a switch too long to brace-match out: it is mirrored here with
+# the same reader, and pinned to the shipped arm just below.
+$dm = New-Object ModPath.DebugModule
+$dm.Name = [ModPath.Host]::GetStr($evt, 'name'); $dm.Path = [ModPath.Host]::GetStr($evt, 'path')
+$dm.Base = [ModPath.Host]::GetStr($evt, 'base'); $dm.HasDebug = $true
+Check 'the module-loaded arm reads the path through GetStr' ($src -cmatch 'Path = GetStr\(json, "path"\)') ''
+Check 'the host reads back the real path, unescaped' ($dm.Path -ceq $img.Path) (ShowVal $dm.Path)
+$mp = New-Object ModPath.Pad
+$mp.OnModuleLoaded($dm)
+$pageSees = if ($mp.Posts.Count -ge 1) { ($mp.Posts[0] | ConvertFrom-Json).path } else { $null }
+Check 'and the page receives C:\App\..., not C:\\App\\...' ($pageSees -ceq $img.Path) (ShowVal $pageSees)
+
+# The reader swap fixed the regex's other two faults as well, and changed where it looks. Each is pinned.
+Check 'a value holding an escaped quote is read whole, not cut at the quote' `
+  ([ModPath.Host]::GetStr('{"message":"say \"hi\" now"}', 'message') -ceq 'say "hi" now') ([ModPath.Host]::GetStr('{"message":"say \"hi\" now"}', 'message'))
+Check 'a number is still not a string, as the regex never matched one' ($null -eq [ModPath.Host]::GetStr('{"line":42}', 'line')) ''
+Check 'a member inside a nested object is not the event''s own' `
+  ($null -eq [ModPath.Host]::GetStr('{"event":"x","inner":{"module":"a.clw"}}', 'module')) ''
+# ...which is why ParseRegs, the one caller that read NESTED members, now hands over the register block.
+$regs = [ModPath.Host]::ParseRegs('{"event":"paused","module":"m.clw","regs":{"eax":"0x1","eip":"0x4754EB"},"tid":7}')
+Check 'the registers inside "regs":{...} still read' (($null -ne $regs) -and ($regs['eip'] -ceq '0x4754EB') -and ($regs['eax'] -ceq '0x1')) ''
+Check 'CONTROL: an event with no register block still has none' ($null -eq [ModPath.Host]::ParseRegs('{"event":"paused","regs":null}')) ''
+
+Write-Host ''
 Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-named .clw'
 # A Check's DETAIL argument is evaluated BEFORE Check runs, so an index into a list that a broken build
 # left EMPTY throws and kills the suite mid-run - hiding every failure after it, in the one situation
@@ -1214,7 +1289,10 @@ $ulOwn = New-Object 'System.Collections.Generic.List[UserBreakpoint]'
 $ulOwn.Add($bpD1)
 $listD1 = [BpWire]::BpList($ulOwn)
 $emitters = @($setD1, $delD1, $listD1)
-$carrying = @($emitters | Where-Object { [BpHost]::GetStr($_, 'ownerPath') }).Count
+# bp-list carries its owners INSIDE the bps array, so it is read per row through ParseBpList - the way the
+# host reads it. GetStr reads only the object it is handed (079ff431), and the event itself has no owner.
+$listOwner = @([BpHost]::ParseBpList($listD1)) | ForEach-Object { $_.OwnerPath } | Select-Object -First 1
+$carrying = @(@([BpHost]::GetStr($setD1, 'ownerPath'), [BpHost]::GetStr($delD1, 'ownerPath'), $listOwner) | Where-Object { $_ }).Count
 Check 'all 3 breakpoint echoes carry ownerPath (bp-set, bp-del, bp-list)' ($carrying -eq 3) "$carrying of 3"
 
 $dllRows = New-Object System.Collections.ArrayList
@@ -1235,11 +1313,11 @@ Check 'removing the Dll1 breakpoint leaves exactly 1 row' ($dllSurv.Count -eq 1)
 Check 'and the row left behind is the Dll2 one' `
   ($dllSurv.Count -eq 1 -and $dllSurv[0].OwnerPath -match 'dll2') (OwnerOf $dllSurv)
 
-# What the owner IS, stated so nobody later treats it as a file to open: the IMAGE path, in the wire's
-# escaped form, because GetStr returns the raw JSON text and does not unescape. Both sides of every
-# comparison come off that same wire, so equality is exact - but File.Exists on it would not be.
-Check 'the owner reads back as the escaped wire form, an identity token rather than a usable path' `
-  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -eq 'C:\\App\\Dll1\\dll1.dll') (OwnerOf $dllRows)
+# What the owner IS: the IMAGE path, an identity token compared only with another owner read the same way.
+# Until 079ff431 it read back in the wire's ESCAPED form (GetStr did not unescape); it now reads back as the
+# real path. Both sides of every comparison moved together, which is what the two-DLL checks above prove.
+Check 'the owner reads back unescaped, as the image''s real path' `
+  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -ceq 'C:\App\Dll1\dll1.dll') (OwnerOf $dllRows)
 
 Write-Host ''
 Write-Host 'an engine that predates ownerPath behaves EXACTLY as it did before, on every path that reads it'
@@ -1783,7 +1861,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 274
+$EXPECTED_CHECKS = 284
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

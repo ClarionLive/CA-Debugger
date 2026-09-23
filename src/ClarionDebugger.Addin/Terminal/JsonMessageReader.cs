@@ -46,6 +46,26 @@ namespace ClarionDebugger.Terminal
         /// </para></summary>
         public static string ReadField(string json, string key)
         {
+            return Find(json, key, false);
+        }
+
+        /// <summary>As <see cref="ReadField"/>, but only a JSON STRING value counts: a number, boolean,
+        /// <c>null</c>, object or array reads as null. The value comes back unescaped.
+        /// <para>
+        /// This is the engine-event reader's contract (079ff431). ClarionDebuggerService.GetStr used to match
+        /// <c>"key":"..."</c> with a regex, which also only ever answered for a string - so this keeps that -
+        /// but it returned the text between the quotes RAW. A Windows path therefore arrived with its
+        /// separators still doubled, and the host re-escaped it on the way to the page, which then showed
+        /// <c>C:\\App\\...</c>. The same regex stopped at the first quote, so a value holding an escaped
+        /// quote came back cut short.
+        /// </para></summary>
+        public static string ReadStringField(string json, string key)
+        {
+            return Find(json, key, true);
+        }
+
+        private static string Find(string json, string key, bool stringsOnly)
+        {
             if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(key)) return null;
 
             int i = 0;
@@ -74,6 +94,7 @@ namespace ClarionDebugger.Terminal
                 // The value is walked either way. Skipping it properly is what stops the NEXT member's name
                 // being read out of the middle of this one's text.
                 bool wanted = string.Equals(name, key, StringComparison.Ordinal);
+                if (wanted && stringsOnly && (i >= json.Length || json[i] != '"')) return null;
                 string value = ReadValue(json, ref i, wanted);
                 // A "did the scan advance?" guard used to sit here — `if (i <= before && i >= json.Length)
                 // return null;` — and it could not fire. ReadValue's first statement sets i = -1 whenever i
