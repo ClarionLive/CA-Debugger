@@ -205,6 +205,11 @@ namespace ClarionDbg.Cli
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "K32GetMappedFileNameW")]
         public static extern uint GetMappedFileName(IntPtr hProcess, IntPtr lpv, System.Text.StringBuilder lpFilename, uint nSize);
 
+        // A process's creation time (FILETIME, UTC, 100 ns ticks): the identity check behind `procs` "started"
+        // and `attach --expect-start`, since a pid alone can be reused.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetProcessTimes(IntPtr hProcess, out long creation, out long exit, out long kernel, out long user);
+
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern uint QueryDosDeviceW(string lpDeviceName, System.Text.StringBuilder lpTargetPath, uint ucchMax);
     }

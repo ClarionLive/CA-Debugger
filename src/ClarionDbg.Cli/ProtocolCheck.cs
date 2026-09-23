@@ -95,6 +95,7 @@ namespace ClarionDbg.Cli
                 CheckSetIpObserved,
                 CheckDetach,
                 CheckCommandsNeverStarved,
+                CheckDetachHardening,
             };
 
             foreach (var check in checks)

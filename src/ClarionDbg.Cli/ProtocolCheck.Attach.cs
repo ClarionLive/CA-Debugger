@@ -169,6 +169,134 @@ namespace ClarionDbg.Cli
                          + "the first event after they are queued.");
         }
 
+        /// <summary>
+        /// Five ways a detach we called clean could leave the app to crash (3f2d747f, 4b pipeline run 2), each driven
+        /// through the REAL code with the one input moved:
+        ///   (a) a context operation that FAILS - clearing TF, rewinding EIP - reaches `detached` as an error naming
+        ///       the tids and addresses;
+        ///   (b) a queued hit on a byte REMOVED before the detach is still ours: the drain rewinds it, and so does the
+        ///       debug loop itself (launch mode too) instead of pausing at va+1;
+        ///   (c) an unreadable image is not reported as "not x86";
+        ///   (d) `--expect-start` with the wrong creation time refuses the attach before anything is planted;
+        ///   (e) a detach that throws part-way still sends `detached`, with the error.
+        /// </summary>
+        private static void CheckDetachHardening(List<string> failures, ClaimLog claims)
+        {
+            const uint Ex = Native.EXCEPTION_DEBUG_EVENT, Bp = Native.EXCEPTION_BREAKPOINT;
+
+            // ---- (a) context operations that fail ----
+            var sA = new DebugEngine.DetachScenario
+            {
+                Armed = new uint[] { 0x401000 }, Threads = new uint[] { 7, 8, 9 },
+                TfFailTids = new HashSet<uint> { 7, 9 }, EipFailTids = new HashSet<uint> { 101 },
+                Queue = new List<byte[]> { DebugEngine.DebugEventForTest(Ex, 101, Bp, 0x401000) },
+            };
+            CaptureConsole(() => NewEngine().RunDetachScenarioForTest(sA));
+            string errA = ErrorMember(sA.Json);
+            if (errA == null || errA.IndexOf("TF not cleared on 2 thread(s) (7,9)", StringComparison.Ordinal) < 0)
+                failures.Add("detach (a): two threads whose TF could not be cleared are not in detached.error: " + (sA.Json ?? sA.Escaped ?? "(null)"));
+            if (errA == null || errA.IndexOf("EIP not rewound at 0x401000 on 101", StringComparison.Ordinal) < 0)
+                failures.Add("detach (a): a queued hit whose EIP could not be rewound is not in detached.error: " + (sA.Json ?? sA.Escaped ?? "(null)"));
+            // CONTROL: the same scenario with every operation succeeding reports neither (only the no-process restore).
+            var sA0 = new DebugEngine.DetachScenario
+            {
+                Armed = new uint[] { 0x401000 }, Threads = new uint[] { 7, 8, 9 },
+                Queue = new List<byte[]> { DebugEngine.DebugEventForTest(Ex, 101, Bp, 0x401000) },
+            };
+            CaptureConsole(() => NewEngine().RunDetachScenarioForTest(sA0));
+            string errA0 = ErrorMember(sA0.Json) ?? "";
+            if (errA0.IndexOf("TF not cleared", StringComparison.Ordinal) >= 0 || errA0.IndexOf("EIP not rewound", StringComparison.Ordinal) >= 0)
+                failures.Add("detach (a) control: with every context operation succeeding the error still names one: " + errA0);
+
+            // ---- (b) a byte removed before the detach, with a hit on it queued ----
+            var sB = new DebugEngine.DetachScenario
+            {
+                PlantedEver = new uint[] { 0x401300 },     // planted earlier, NOT in _armed now
+                Queue = new List<byte[]> { DebugEngine.DebugEventForTest(Ex, 111, Bp, 0x401300) },
+            };
+            CaptureConsole(() => NewEngine().RunDetachScenarioForTest(sB));
+            if (!sB.Continues.Contains("111:0x00010002") || !sB.Rewinds.Contains("111:0x401300"))
+                failures.Add("detach (b): a queued hit on a byte planted earlier and already removed was continued "
+                             + string.Join(",", sB.Continues) + " with rewinds " + (sB.Rewinds.Count == 0 ? "none" : string.Join(",", sB.Rewinds))
+                             + " - expected 111:0x00010002 with a rewind to 0x401300; handed back, the app takes an INT3 at va+1");
+
+            // ...and in the debug loop itself: a stale hit is rewound and continued, not paused on.
+            var loopEng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            List<string> lc = null, lr = null;
+            CaptureConsole(() => loopEng.OneLoopEventForTest(DebugEngine.DebugEventForTest(Ex, 112, Bp, 0x401300),
+                                                             new uint[] { 0x401300 }, out lc, out lr));
+            if (lc == null || !lc.Contains("112:0x00010002") || lr == null || !lr.Contains("112:0x401300"))
+                failures.Add("stale hit: the debug loop answered a queued hit on a removed breakpoint with continues "
+                             + (lc == null ? "(null)" : string.Join(",", lc)) + " and rewinds "
+                             + (lr == null || lr.Count == 0 ? "none" : string.Join(",", lr))
+                             + " - expected a rewind to 0x401300 and DBG_CONTINUE (a programmatic-break pause would sit at va+1)");
+            // CONTROL: an address we never planted is NOT rewound (it is the app's own INT3).
+            var loopEng2 = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
+            List<string> lc2 = null, lr2 = null;
+            CaptureConsole(() => loopEng2.OneLoopEventForTest(DebugEngine.DebugEventForTest(Ex, 113, Bp, 0x409999),
+                                                              new uint[] { 0x401300 }, out lc2, out lr2));
+            if (lr2 == null || lr2.Count != 0)
+                failures.Add("stale hit control: an INT3 at an address never planted was rewound: " + (lr2 == null ? "(null)" : string.Join(",", lr2)));
+
+            // ---- (c) the image classification ----
+            Action<string, bool, bool, ushort, ProcsCommand.ImageArch, int> arch = (what, wow, ok, mach, want, wantCode) =>
+            {
+                var got = ProcsCommand.ClassifyProcessImage(wow, ok, mach);
+                if (got != want || ProcsCommand.AttachRefusalCode(got) != wantCode)
+                    failures.Add("attach image (c): " + what + " -> " + got + " (code " + ProcsCommand.AttachRefusalCode(got)
+                                 + "), expected " + want + " (code " + wantCode + ")");
+            };
+            arch("a process WOW64 does not run", false, false, 0, ProcsCommand.ImageArch.NotX86, 50);
+            arch("an x86 process whose image could not be read", true, false, 0, ProcsCommand.ImageArch.Unreadable, 0);
+            arch("a WOW64 process whose image is not i386", true, true, ClarionDbg.Core.PeProbe.MachineAmd64, ProcsCommand.ImageArch.NotX86, 50);
+            arch("an x86 process with an i386 image", true, true, ClarionDbg.Core.PeProbe.MachineI386, ProcsCommand.ImageArch.X86, 0);
+
+            // ---- (d) --expect-start ----
+            Func<DebugEngine> attachEng = () => new DebugEngine("protocolcheck", null, null, null, null, false, 0, true, null, 4242);
+            bool planted = true, refused = false;
+            string outD = CaptureConsole(() => attachEng().ExpectStartFlowForTest(1000, true, 2000, out planted, out refused));
+            if (!refused || planted || outD.IndexOf("\"message\":\"attach failed: process 4242 is not the one listed (pid reused)\",\"code\":0", StringComparison.Ordinal) < 0)
+                failures.Add("expect-start (d): a creation-time MISMATCH gave refused=" + refused + " planted=" + planted
+                             + " - expected the pid-reused error, exit 2 and nothing planted; output: " + outD.Replace("\r\n", " | "));
+            if (outD.IndexOf("\"event\":\"detached\"", StringComparison.Ordinal) >= 0)
+                failures.Add("expect-start (d): the refused attach also sent `detached` - the error is the whole answer");
+            bool plantedOk = false, refusedOk = true;
+            CaptureConsole(() => attachEng().ExpectStartFlowForTest(1000, true, 1000, out plantedOk, out refusedOk));
+            if (refusedOk || !plantedOk)
+                failures.Add("expect-start (d) control: a MATCHING creation time gave refused=" + refusedOk + " planted=" + plantedOk
+                             + " - expected the attach to proceed to planting");
+            bool plantedUnread = true, refusedUnread = false;
+            CaptureConsole(() => attachEng().ExpectStartFlowForTest(1000, false, 0, out plantedUnread, out refusedUnread));
+            if (!refusedUnread || plantedUnread)
+                failures.Add("expect-start (d): an UNREADABLE creation time was accepted - it cannot be proven the listed process");
+
+            // ---- (e) a detach that throws part-way ----
+            var sE = new DebugEngine.DetachScenario { Armed = new uint[] { 0x401000 }, ThrowAt = "drain" };
+            CaptureConsole(() => NewEngine().RunDetachScenarioForTest(sE));
+            string errE = ErrorMember(sE.Json);
+            if (sE.Escaped != null || errE == null || !errE.StartsWith("detach aborted: planted fault at drain", StringComparison.Ordinal))
+                failures.Add("detach (e): a detach that threw at the drain " + (sE.Escaped != null ? "let the exception escape (" + sE.Escaped + ")" : "sent " + (sE.Json ?? "(null)"))
+                             + " - expected `detached` with error 'detach aborted: ...'");
+            if (!sE.Continues.Contains("0:0x00010002"))
+                failures.Add("detach (e): the held event was not continued before the aborted detach let go: " + string.Join(",", sE.Continues));
+
+            claims.Claim("detach hardening (4b run 2): a failed TF clear or EIP rewind is named in detached.error; a queued hit "
+                         + "on a byte planted earlier and removed is rewound by the drain AND by the debug loop (never paused at "
+                         + "va+1), while an address never planted is not; an unreadable image is code 0, only a confirmed "
+                         + "non-i386 is 50; --expect-start refuses a mismatched or unreadable creation time before anything is "
+                         + "planted and a matching one proceeds; a detach that throws still sends `detached` with the error.");
+        }
+
+        /// <summary>The "error" member of a `detached` event, or null when absent (or no event).</summary>
+        private static string ErrorMember(string json)
+        {
+            if (json == null) return null;
+            int at = json.IndexOf("\"error\":\"", StringComparison.Ordinal);
+            if (at < 0) return null;
+            int s = at + 9, e = json.IndexOf('"', s);
+            return e > s ? json.Substring(s, e - s) : null;
+        }
+
         private static void ExpectEqual(List<string> failures, string what, string got, string want)
         {
             if (got != want) failures.Add(what + ": " + got + " - expected " + want);
