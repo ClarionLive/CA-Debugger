@@ -33,6 +33,10 @@ param(
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
+  # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
+  [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
+  # the engine's Variables-row writer, whose edit members the host grants on the way out
+  [string] $EngineLocalsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Locals.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
   # the disassembly view: its request tags carry the epoch that decides whether a reply is still wanted
   [string] $DisasmViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
@@ -58,6 +62,9 @@ $engineThreadsSrc = Get-Content -Raw -LiteralPath $EngineThreadsPath
 $engineVarEditSrc = Get-Content -Raw -LiteralPath $EngineVarEditPath
 $ctl = Get-Content -Raw -LiteralPath $ControllerPath
 $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
+# GetStr reads through the bridge's JsonMessageReader since 079ff431, so every probe that compiles it needs the
+# real reader beside it.
+$readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
 
 # Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
 # lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
@@ -69,12 +76,17 @@ $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 Set-ExtractSource $src
 
 
+$tidNameDecls = @('private const string TidMemberTid', 'private const string TidMemberStopped', 'private const string TidMemberSelected',
+  'private static readonly string[] TidValuedMemberNames') | ForEach-Object { Get-Statement $_ $web }
+$tidNameDecls = $tidNameDecls -join "`n"
 $methods = @(
   (Get-Method 'private static string ScanNumberToken(string json, string key)'),
   (Get-Method 'private static int? GetIntOrNull(string json, string key)'),
   (Get-Method 'private static uint? GetUIntOrNull(string json, string key)'),
   (Get-Method 'private static string TidJson(uint? tid)' $web),
-  (Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+  (Get-Method 'private static string TidMember(string name, uint? tid)' $web),
+  # the declared names the writer checks against (c299aced), lifted rather than retyped
+  $tidNameDecls
 ) -join "`n"
 
 # same bodies, reachable from PowerShell
@@ -127,8 +139,8 @@ Write-Host ''
 Write-Host 'and the WRITER says "unknown" the same way the reader hears it: by leaving the member out'
 Check 'an absent tid writes no member at all' ([PadJsonProbe]::TidJson($null) -eq '') "'$([PadJsonProbe]::TidJson($null))'"
 Check 'a 0 is a sentinel, not a thread - written as absent too' ([PadJsonProbe]::TidJson(0) -eq '') "'$([PadJsonProbe]::TidJson(0))'"
-Check 'a real tid is written' ([PadJsonProbe]::TidJson(116932) -eq ',"tid":116932') ([PadJsonProbe]::TidJson(116932))
-Check 'a high DWORD is written whole' ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') ([PadJsonProbe]::TidJson(4294967295))
+Check 'a real tid is written' ([PadJsonProbe]::TidJson(116932) -ceq ',"tid":116932') ([PadJsonProbe]::TidJson(116932))
+Check 'a high DWORD is written whole' ([PadJsonProbe]::TidJson(4294967295) -ceq ',"tid":4294967295') ([PadJsonProbe]::TidJson(4294967295))
 
 Write-Host ''
 Write-Host 'every watch request goes through the path that ANSWERS a refusal'
@@ -189,6 +201,11 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using BpReader;
+
+namespace BpReader {
+$((Get-Method 'internal static class JsonMessageReader' $readerEarly) -replace 'internal static class', 'public static class')
+}
 
 $bpRecord
 
@@ -236,7 +253,7 @@ function HostBpDel { param($list, $json)
   foreach ($b in $list) { if (-not [BpHost]::BpDelMatches($b, $mod, $req, $planted, $owner)) { [void]$keep.Add($b) } }
   , $keep
 }
-function Lines { param($list) (($list | ForEach-Object { "$($_.RequestedLine)->$($_.Line)" }) -join ' ') }
+function Lines { param($list) (($list | ForEach-Object { "$($_.DisplayLine)->$($_.Line)" }) -join ' ') }
 
 # requested 10 and requested 12 both snapped to record line 11
 $bp10 = EngineBp 'clbrws011.clw' 10 11
@@ -250,7 +267,7 @@ Check 'two gutter lines sharing one planted line are 2 host rows, not 1' ($rows.
 # the user removes the one at source line 10; the engine echoes the breakpoint it actually dropped
 $surv = HostBpDel $rows ([BpWire]::BpDel($bp10))
 Check 'removing one of them leaves exactly 1 row' ($surv.Count -eq 1) (Lines $surv)
-Check 'and the row left behind is the SURVIVOR, requested line 12' ($surv.Count -eq 1 -and $surv[0].RequestedLine -eq 12) (Lines $surv)
+Check 'and the row left behind is the SURVIVOR, requested line 12' ($surv.Count -eq 1 -and $surv[0].DisplayLine -eq 12) (Lines $surv)
 Check 'the survivor keeps the planted line it shares, 11' ($surv.Count -eq 1 -and $surv[0].Line -eq 11) (Lines $surv)
 
 # ...and the same the other way round, so the result is not an artefact of list order
@@ -258,7 +275,7 @@ $rowsB = New-Object System.Collections.ArrayList
 HostBpSet $rowsB ([BpWire]::BpSet($bp10))
 HostBpSet $rowsB ([BpWire]::BpSet($bp12))
 $survB = HostBpDel $rowsB ([BpWire]::BpDel($bp12))
-Check 'removing the SECOND one instead leaves requested line 10' ($survB.Count -eq 1 -and $survB[0].RequestedLine -eq 10) (Lines $survB)
+Check 'removing the SECOND one instead leaves requested line 10' ($survB.Count -eq 1 -and $survB[0].DisplayLine -eq 10) (Lines $survB)
 
 Write-Host ''
 Write-Host 'the writer carries both lines, so a caller cannot send half an identity'
@@ -368,7 +385,7 @@ HostBpSet $bothPresent ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 10 11)))
 HostBpSet $bothPresent ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 12 11)))
 $bpSurv = HostBpDel $bothPresent ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 10 11)))
 Check 'with requested lines on BOTH sides it still removes only the one named' `
-  ($bpSurv.Count -eq 1 -and $bpSurv[0].RequestedLine -eq 12) (Lines $bpSurv)
+  ($bpSurv.Count -eq 1 -and $bpSurv[0].DisplayLine -eq 12) (Lines $bpSurv)
 
 Write-Host ''
 Write-Host 'bp-list decodes through the same reader, so it inherits the same promise'
@@ -383,7 +400,7 @@ Check 'the two entries are not the same breakpoint under the identity key' `
   ($parsedList.Count -eq 2 -and -not [BpHost]::SameBpIdentity($parsedList[0], $parsedList[1])) (Lines $parsedList)
 # What the pane is handed for the gutter marker. 0 would put the marker on line 0 of the file.
 Check 'each entry reports the line it was planted on, never 0' `
-  ($parsedList.Count -eq 2 -and $parsedList[0].RequestedLine -eq 11 -and $parsedList[1].RequestedLine -eq 22) (Lines $parsedList)
+  ($parsedList.Count -eq 2 -and $parsedList[0].DisplayLine -eq 11 -and $parsedList[1].DisplayLine -eq 22) (Lines $parsedList)
 
 Write-Host ''
 Write-Host 'and the promise is kept in the reader and the identity key themselves'
@@ -409,6 +426,15 @@ Check 'BpDelMatches decides the line through the same one, and holds no copy eit
 Check 'and both take the owner half from BpOwnerMatches' `
   (($identBody -match 'BpOwnerMatches\(') -and ($delBody -match 'BpOwnerMatches\(')) ''
 
+Write-Host ''
+Write-Host 'the read side is DisplayLine, get-only, and RequestedLineOrNull is the only writer (f367a04f)'
+$bpClass = Get-CSharpCodeOnly $bpRecord
+$displayProp = Get-CSharpBlock 'public int DisplayLine' $bpClass
+Check 'DisplayLine exists and has no setter, and no RequestedLine member is left to write through' `
+  (($null -ne $displayProp) -and ($displayProp -notmatch '\bset\b') -and ($bpClass -notmatch '\bpublic int RequestedLine\b')) ''
+Check 'BuildBpSpec writes DisplayLine, with no second spelling of its fallback' `
+  (((Get-Method 'public static string BuildBpSpec(DebugBreakpoint bp)') -match 'Append\(bp\.DisplayLine\)') -and `
+   ((Get-CSharpCodeOnly (Get-Method 'public static string BuildBpSpec(DebugBreakpoint bp)')) -notmatch '> 0 \?')) ''
 Write-Host ''
 Write-Host 'the real handler arms use these same keys, so the mirror above cannot drift'
 Check 'the bp-set arm dedupes through SameBpIdentity' ($src -match 'if \(SameBpIdentity\(b, bp\)\)') ''
@@ -479,11 +505,11 @@ $noSource = if ($noSourceCount -ge 1) { [HostSourceProbe]::Posts[0] } else { '' 
 # THE RULE, from the writer's own output: no source means NO lines. A placeholder line here is what the page
 # would render under the new stop's header, which is the whole failure 4891ed2 set out to close.
 Check 'and its lines array is EMPTY, so buildSource is the only thing that can write a listing' `
-  ($noSource -match '"lines":\[\]') $noSource
+  ($noSource -cmatch '"lines":\[\]') $noSource
 Check 'and `file` carries the MODULE name, the only name the stop has left' `
-  ($noSource -match ('"file":"' + [regex]::Escape($noSourceModule) + '"')) $noSource
+  ($noSource -cmatch ('"file":"' + [regex]::Escape($noSourceModule) + '"')) $noSource
 Check 'and startLine is 0 with current on the stop line' `
-  ($noSource -match '"startLine":0' -and $noSource -match ('"current":' + $noSourceLine + '[,}]')) $noSource
+  ($noSource -cmatch '"startLine":0' -and $noSource -cmatch ('"current":' + $noSourceLine + '[,}]')) $noSource
 
 # The with-source case, for the other half of the fixture: a real file on disk, deterministic contents so
 # the captured message is reproducible.
@@ -557,11 +583,19 @@ $ctlMethods = @(
   (Get-Method 'public static void Register(IDebugSessionTarget target)' $ctl),
   (Get-Method 'public static void Unregister(IDebugSessionTarget target)' $ctl),
   (Get-Method 'public static void NotifyStopped(IDebugSessionTarget target)' $ctl),
-  (Get-Method 'public static void SetState(IDebugSessionTarget sender, DebugControllerState state)' $ctl)
+  (Get-Method 'public static void SetState(IDebugSessionTarget sender, DebugControllerState state)' $ctl),
+  # the forwarders and the ONE marshal they share (fc8d63f5, e61e4f92)
+  (Get-Method 'public static void RunToCursor() {' $ctl),
+  (Get-Method 'public static void BreakOnProcEntry(string filePath, int line)' $ctl),
+  (Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctl),
+  (Get-Method 'private static void Invoke(Action<IDebugSessionTarget> action, bool requireReady = true, Func<DebugControllerState, bool> allowed = null)' $ctl),
+  (Get-Method 'private static bool SafeIsReady(IDebugSessionTarget t)' $ctl)
 ) -join "`n"
 
 $ctlTypes = @"
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 
 $(Get-Method 'public enum DebugControllerState' $ctl)
 
@@ -569,13 +603,31 @@ $(Get-Method 'public interface IDebugSessionTarget' $ctl)
 
 // A pad that answers IsSessionIdle however the test needs. It implements the REAL interface above, so if
 // that interface grows a member this stub stops compiling rather than drifting.
+//
+// It is deliberately NOT a WinForms Control: since fc8d63f5 the interface requires ISynchronizeInvoke, and
+// this is the implementation the old `t as Control` marshal would have run on the caller's thread.
+// OffThread makes it report "you are on the wrong thread"; its BeginInvoke runs the posted delegate as if
+// on its own thread, and every command records which of the two it ran under.
 public sealed class FakePad : IDebugSessionTarget {
     public bool Idle; public bool Throws;
+    public bool OffThread; public int Posts; public List<string> Ran = new List<string>();
+    private bool _onOwnThread;
     public bool IsReady { get { return true; } }
     public bool IsSessionIdle { get { if (Throws) throw new InvalidOperationException("disposed"); return Idle; } }
+    public bool InvokeRequired { get { return OffThread && !_onOwnThread; } }
+    public IAsyncResult BeginInvoke(Delegate method, object[] args) {
+        Posts++; _onOwnThread = true;
+        try { method.DynamicInvoke(args); } finally { _onOwnThread = false; }
+        return null;
+    }
+    public object EndInvoke(IAsyncResult result) { return null; }
+    public object Invoke(Delegate method, object[] args) { return method.DynamicInvoke(args); }
+    private string Where() { return OffThread ? (_onOwnThread ? "posted" : "CALLER") : "inline"; }
     public void CmdStart() { } public void CmdContinue() { } public void CmdPause() { }
     public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
-    public void CmdStop() { } public void CmdRunToCursor(string spec) { }
+    public void CmdStop() { }
+    public void CmdRunToCursor(string spec) { Ran.Add("rtc|" + Where()); }
+    public void CmdBreakOnProcEntryAt(string filePath, int line) { Ran.Add("boe|" + filePath + "|" + line + "|" + Where()); }
 }
 
 public static class Ctl {
@@ -647,6 +699,43 @@ LiveSession $throwing
 Check 'a throwing pad is not taken as proof its session ended' ([Ctl]::State -ne [DebugControllerState]::Idle) ([Ctl]::State)
 
 Write-Host ''
+Write-Host 'every command reaches its target on the TARGET''s thread, Control or not (fc8d63f5, e61e4f92)'
+# The REAL Invoke and forwarders, driven with FakePad - which is NOT a WinForms Control. Before fc8d63f5 the
+# marshal was `t as Control`, so this target's commands ran on whatever thread the caller was on; the
+# interface now requires ISynchronizeInvoke and Invoke posts through it. test-addin-hooks.ps1 drives the
+# same Invoke against a real Control on a real message loop; this is the non-Control half.
+function Ran { param($pad) if ($pad.Ran.Count) { $pad.Ran -join ' ; ' } else { '(nothing ran)' } }
+$np = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($np); [Ctl]::SetState($np, [DebugControllerState]::Paused)
+$np.OffThread = $true
+[Ctl]::RunToCursor()
+Check 'an off-thread call to a NON-Control target is posted through its own marshal, not run on the caller''s thread' `
+  (($np.Posts -eq 1) -and ($np.Ran.Count -eq 1) -and ($np.Ran[0] -ceq 'rtc|posted')) (Ran $np)
+[Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50)
+Check 'BreakOnProcEntry is marshalled the same way, arguments intact' `
+  (($np.Posts -eq 2) -and ($np.Ran.Count -eq 2) -and ($np.Ran[1] -ceq 'boe|C:\src\clbrws011.clw|50|posted')) (Ran $np)
+$on = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($on); [Ctl]::SetState($on, [DebugControllerState]::Paused)
+[Ctl]::RunToCursor()
+Check 'CONTROL: an on-thread caller runs inline, with no post' `
+  (($on.Posts -eq 0) -and ($on.Ran.Count -eq 1) -and ($on.Ran[0] -ceq 'rtc|inline')) (Ran $on)
+# Break on entry means something while idle (the pad stages it); run to cursor does not.
+$idl = NewPad $true
+[Ctl]::Reset(); [Ctl]::Register($idl)
+[Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50); [Ctl]::RunToCursor()
+Check 'BreakOnProcEntry is honoured while IDLE, where RunToCursor is not' `
+  (($idl.Ran.Count -eq 1) -and ($idl.Ran[0] -like 'boe|*')) (Ran $idl)
+[Ctl]::Reset()
+# The reflection contract ClarionAssistant binds, pinned by exact signature. PM decision 7: it binds this one
+# OPTIONALLY, so the pair it REQUIRES must not move either.
+Check 'the new entry point is public static void BreakOnProcEntry(string filePath, int line)' `
+  ($ctl -cmatch 'public static void BreakOnProcEntry\(string filePath, int line\)') ''
+Check 'and the two members ClarionAssistant already requires are untouched' `
+  (($ctl -cmatch 'public static DebugControllerState State\s*\r?\n\s*\{') -and ($ctl -cmatch 'public static void RunToCursor\(\) \{')) ''
+Check 'the interface itself requires the marshal' `
+  ($ctl -cmatch 'public interface IDebugSessionTarget : System\.ComponentModel\.ISynchronizeInvoke') ''
+
+Write-Host ''
 Write-Host 'Stop() answers "is it dead?" with a check (structural: it drives a real process)'
 $stop = Get-Method 'public bool Stop()'
 Check 'Stop reports an outcome instead of returning void' ($src -match 'public bool Stop\(\)' -and $src -notmatch 'public void Stop\(\)') ''
@@ -672,14 +761,12 @@ Write-Host 'the INBOUND reader, on payloads built by the page''s own sender'
 # hand-builds JSON, they all either stringify or send a delimiter-separated string. Quote injection through
 # today's senders was NOT reachable. The cases the old extractor genuinely got wrong are in the next block.
 #
-# So this block is regression coverage, not an exploit: whatever a hostile debuggee puts in a procedure
-# name, the page encodes it and the host must read back exactly what was sent. The debuggee is untrusted -
-# those names come out of the target's TSWD debug info and return here when the user right-clicks a
-# Procedures row - and stage 2 adds more senders to this path, which is why the order dependence goes now,
-# while there are still few enough senders to check.
+# So this block is regression coverage, not an exploit: whatever a hostile debuggee gets into text the page
+# sends, the page encodes it and the host must read back exactly what was sent. The debuggee is untrusted -
+# its names come out of the target's TSWD debug info, and a user pastes them into breakpoint conditions.
 #
 # The fixtures are not written here. They are produced by running debugger.html's REAL send() and its REAL
-# breakonprocentry handler - both lifted out of the page - under node, with the page objects they touch
+# breakpoint-properties editor - both lifted out of the page - under node, with the page objects they touch
 # stubbed. Two suites built on each side's imagination of the other cannot contradict each other, and this
 # project has already shipped exactly that failure.
 
@@ -693,43 +780,57 @@ Add-Type -Language CSharp -TypeDefinition (
 ) | Out-Null
 
 $sendFn  = Get-Method 'function send(action,data)' $page
-$handler = Get-Method "`$('miBpEntry').onclick=" $page
+$bpEditor = Get-Method 'function buildBpEditor(b, locked){' $page
 
+# afbc68c7 moved these fixtures. They used to run through the Procedures pane's break-on-entry sender, which
+# carried the procedure NAME - but that request now carries only a host-issued id (see the break-on-entry
+# section below), so a hostile name no longer reaches the host by that route at all. The real sender that
+# still carries free text the host reads back is the Breakpoints pane's properties editor: its condition and
+# trace are typed by the user, and a condition is exactly where someone pastes a name out of the debuggee.
 $js = @'
-// Just enough of the page for the real handler to run.
-const els = {};
-function $(id){ if(!els[id]) els[id] = { classList:{remove(){},add(){}}, style:{}, dataset:{}, addEventListener(){} }; return els[id]; }
-let procCtx = null, wire = null;
+// Just enough of the page for the real editor to run. Every element answers querySelector with a stable
+// child per selector, which is all buildBpEditor asks of the DOM.
+function mkEl(tag){ return { tag, _q:{}, children:[], dataset:{}, style:{}, value:'', disabled:false, title:'', innerHTML:'',
+  classList:{add(){},remove(){},toggle(){},contains(){return false;}}, addEventListener(){},
+  appendChild(c){ this.children.push(c); return c; },
+  querySelector(sel){ return this._q[sel] || (this._q[sel]=mkEl(sel)); } }; }
+const document = { createElement: mkEl };
+let wire = null;
 const wv = { postMessage(s){ wire = s; } };
 
-'@ + $sendFn + "`n" + $handler + ";`n" + @'
+'@ + $sendFn + "`n" + $bpEditor + "`n" + @'
 
-// Every name here is what a HOSTILE debuggee could put in its own debug info. The page escapes them
-// correctly - JSON.stringify does - so these are well-formed messages whose VALUES look like structure.
+// Every value here is what a HOSTILE debuggee could get into a condition - a name out of its own symbols,
+// pasted in. The page escapes it correctly (JSON.stringify does), so these are well-formed messages whose
+// VALUES look like structure.
 const names = [
-  ['a closing brace inside the name',        'Proc}'],
-  ['a quote inside the name',                'say "hi" now'],
-  ['an escaped quote inside the name',       'esc \\" here'],
-  ['a backslash inside the name',            'back\\slash'],
-  ['a whole fake field inside the name',     'X","line":9999,"module":"EVIL.CLW'],
+  ['a closing brace inside the value',        'Proc}'],
+  ['a quote inside the value',                'say "hi" now'],
+  ['an escaped quote inside the value',       'esc \\" here'],
+  ['a backslash inside the value',            'back\\slash'],
+  ['a whole fake field inside the value',     'X","line":9999,"module":"EVIL.CLW'],
   ['a fake field that also closes the object', 'X"},{"line":9999'],
-  ['a newline inside the name',              'two\nlines'],
-  ['a brace and a quote together',           '{"line":1}'],
+  ['a newline inside the value',              'two\nlines'],
+  ['a brace and a quote together',            '{"line":1}'],
 ];
 
 const out = [];
 for (const [label, name] of names) {
-  procCtx = { module: 'MAIN.CLW', line: 42, name: name };
+  const ed = buildBpEditor({ module: 'MAIN.CLW', line: 42, requested: 42 }, false);
+  ed.querySelector('.bp-cond').value = name;
+  ed.querySelector('.bp-trace').value = name;
+  ed.querySelector('.bp-hm').value = '';
   wire = null;
-  els['miBpEntry'].onclick();
-  out.push({ label, wire, name });
+  ed.querySelector('.bp-save').onclick({ stopPropagation(){} });
+  // the editor trims what the user typed, so that is what the host must read back
+  out.push({ label, wire, name: name.trim() });
 }
 
 // The same real send(), with the members in an order the page does not use today. The retired rule forbade
 // exactly this - untrusted content anywhere but last - so it is the case that proves the rule is gone.
 wire = null;
-send('breakonprocentry', JSON.stringify({ name: 'X","line":9999', module: 'MAIN.CLW', line: 42 }));
-out.push({ label: 'untrusted name FIRST, which the retired field-order rule forbade', wire, name: 'X","line":9999' });
+send('bpprops', JSON.stringify({ condition: 'X","line":9999', trace: 'X","line":9999', module: 'MAIN.CLW', line: 42, hitMode: '', hitValue: 0 }));
+out.push({ label: 'untrusted text FIRST, which the retired field-order rule forbade', wire, name: 'X","line":9999' });
 
 console.log(JSON.stringify(out));
 '@
@@ -752,9 +853,12 @@ foreach ($f in $fixtures) {
   $data   = Read1 $f.wire 'data'
   $module = Read1 $data 'module'
   $line   = Read1 $data 'line'
-  $name   = Read1 $data 'name'
-  $ok = ($action -eq 'breakonprocentry') -and ($module -eq 'MAIN.CLW') -and ($line -eq '42') -and ($name -eq $f.name)
-  Check $f.label $ok "module=$module line=$line name=$name"
+  $cond   = Read1 $data 'condition'
+  $trace  = Read1 $data 'trace'
+  # Case-sensitive for the wire's own tokens and the user's text; case-BLIND for the module, a Windows file
+  # name the host itself compares OrdinalIgnoreCase (09207c17: converting it would contradict shipped behaviour).
+  $ok = ($action -ceq 'bpprops') -and ($module -eq 'MAIN.CLW') -and ($line -ceq '42') -and ($cond -ceq $f.name) -and ($trace -ceq $f.name)
+  Check $f.label $ok "module=$module line=$line condition=$cond"
 }
 
 Write-Host ''
@@ -776,7 +880,7 @@ Check 'a key that exists ONLY nested reads as absent, not as the nested value' `
 Check 'a brace inside a string value does not end the object' `
   ((Read1 '{"name":"a}b","line":42}' 'line') -eq '42') (Read1 '{"name":"a}b","line":42}' 'line')
 Check 'an escaped quote does not end the string' `
-  ((Read1 '{"name":"a\"b","line":42}' 'name') -eq 'a"b') (Read1 '{"name":"a\"b","line":42}' 'name')
+  ((Read1 '{"name":"a\"b","line":42}' 'name') -ceq 'a"b') (Read1 '{"name":"a\"b","line":42}' 'name')
 Check 'a key name that is a prefix of another is not confused with it' `
   ((Read1 '{"lineNumber":9,"line":42}' 'line') -eq '42') (Read1 '{"lineNumber":9,"line":42}' 'line')
 Check 'whitespace and newlines around members' `
@@ -809,21 +913,459 @@ Check 'a truncated \u escape' ($null -eq (Read1 '{"a":"x\u00"}' 'a')) ''
 # old JsonVal returned '{"b":1' - a truncated blob a caller would have used as a string
 Check 'an object VALUE is not returned as text' ($null -eq (Read1 '{"a":{"b":1}}' 'a')) (Read1 '{"a":{"b":1}}' 'a')
 Check 'a number still reads as its literal text' ((Read1 '{"a":-3}' 'a') -eq '-3') (Read1 '{"a":-3}' 'a')
-Check 'a bool still reads as its literal text' ((Read1 '{"a":true}' 'a') -eq 'true') (Read1 '{"a":true}' 'a')
+Check 'a bool still reads as its literal text' ((Read1 '{"a":true}' 'a') -ceq 'true') (Read1 '{"a":true}' 'a')
 
 Write-Host ''
 Write-Host 'the retired rule is not lying around waiting to be followed again'
 # The doc comment used to codify the field-ORDER workaround AS THE CONTRACT - "any new payload must do the
 # same". That instruction is the defect propagating itself into code not yet written, so retiring it is part
 # of the fix. This is the guard that keeps it retired.
-$jsonVal = Get-Method 'private static string JsonVal(string json, string key)' $web
-Check 'JsonVal delegates to the real reader instead of scanning' ($jsonVal -match 'JsonMessageReader\.ReadField') ''
-Check 'no IndexOf scan left in JsonVal' ($jsonVal -notmatch 'IndexOf') ''
-$doc = $web.Substring(0, $web.IndexOf('private static string JsonVal(string json, string key)', [StringComparison]::Ordinal))
-$doc = $doc.Substring([Math]::Max(0, $doc.Length - 1600))
-Check 'its doc comment no longer instructs new payloads to order their fields' `
-  ($doc -notmatch 'must do the same' -and $doc -notmatch 'goes LAST') ''
-Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
+# afbc68c7 retired JsonVal itself. Every inbound field is now read by the typed request DTOs in
+# PageMessages.cs, one Parse per request, and the retirement notice moved there with the readers.
+$pageMsgs = Get-Content -Raw -LiteralPath $PageMessagesPath
+$jsonValCalls = [regex]::Matches((Get-CSharpCodeOnly $web), '\bJsonVal\(')
+Check 'no JsonVal( is left in the bridge; the DTOs read every field' ($jsonValCalls.Count -eq 0) "$($jsonValCalls.Count) call(s)"
+# CONTROL: the scan sees a call when there is one, so the zero above is a zero somebody looked for.
+Check 'CONTROL: that scan finds a JsonVal( call in code' `
+  ([regex]::Matches((Get-CSharpCodeOnly 'string m = JsonVal(data, "module");'), '\bJsonVal\(').Count -eq 1) ''
+Check 'the bridge reads its envelope through the DTO' ($web -match 'PageEnvelope\.Parse\(e\.TryGetWebMessageAsString\(\)\)') ''
+Check 'the DTOs read JSON through the real reader, with no quote-search of their own' `
+  (($pageMsgs -match 'JsonMessageReader\.ReadField') -and ((Get-CSharpCodeOnly $pageMsgs) -notmatch 'IndexOf\("\\"')) ''
+Check 'the DTO header does not instruct payloads to order their fields' `
+  ($pageMsgs -notmatch 'must do the same' -and $pageMsgs -notmatch 'goes LAST') ''
+Check 'and says plainly that there is no rule about field order' ($pageMsgs -match 'NO RULE ABOUT FIELD ORDER') ''
+
+Write-Host ''
+Write-Host 'the page hands back only what the host ISSUED: procedure ids and edit tuples (afbc68c7)'
+# Bridge hardening stage 2. Two requests used to carry the host's own decisions back as page data:
+#   breakonprocentry  {module, line, name}  -> any module:line the page named became a persistent breakpoint
+#   editvar           {va, typeCode, size, places, tid, value} -> forwarded to SetVariable as sent, so any
+#                     address in the debuggee could be written under any type the message named
+# Now a Procedures row goes out with an opaque id and the host resolves it; an edit is honoured only when its
+# tuple is one the host itself sent for a row that is still current.
+#
+# END TO END, EVERY HOP REAL. The host writers (PushProcedures, OnWatch, OnSvcModuleData) are compiled out of
+# the WebView and RUN; what they post is fed to the page's own functions (buildProcs, the Procedures
+# right-click, the break-on-entry handler, setEditMeta, editAttrs, beginEdit) under node; what THOSE send is
+# fed to the host's real checkers (CmdBreakOnProcEntry, EditVar). No hop is a hand-written string, so a host
+# and a page that disagree about a member name or a number's type fail here.
+#
+# THE ONE HAND-WRITTEN HOP is the engine's Variables row, because its writer is a large instance method over
+# live process memory. It is written in the writer's shape, and the writer's four edit members are pinned by
+# name below so a rename on the engine side fails here rather than passing against a stale imitation.
+#
+# ONE SUBSTITUTION in the code under test, stated: PushProcedures queues its parse on the thread pool, and
+# the probe runs that work item inline (ThreadPool.QueueUserWorkItem -> RunNow). Nothing else is edited.
+
+$pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
+$readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
+# Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
+# `);` that closes UI( is put back here.
+function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
+$pushProcs = (Get-Method 'private void PushProcedures(string exe)' $web) -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
+$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(' |
+  ForEach-Object { (Get-ArrowHandler $_) -replace '^private void', 'public void' }) -join "`n"
+
+$bridgeSrc = @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+$readerBody
+$pageMsgsBody
+namespace ClarionDebugger.Terminal {
+$(Get-Method 'public enum DebugSessionState')
+$bpRecord
+$(Get-Method 'public sealed class DebugWatch')
+$(Get-Method 'public sealed class DebugProcedure')
+public sealed class ClarionDebuggerService {
+  public static List<DebugProcedure> Listed = new List<DebugProcedure>();
+  public static List<DebugProcedure> GetProcedures(string exe) { return new List<DebugProcedure>(Listed); }
+  $(Get-Method 'public static bool IsValidModuleName(string module)')
+  $((Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)') -replace 'internal static', 'public static')
+}
+public sealed class FakeSvc {
+  public DebugSessionState State = DebugSessionState.Paused;
+  public bool IsRunning = true; public bool Accept = true; public bool AcceptSet = true;
+  public List<string> Adds = new List<string>();
+  public List<string> Sets = new List<string>();
+  public void PrimeTarget(string exe) { }
+  public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
+  public bool SetVariable(string va, string typeCode, int size, int places, string value, uint? tid) {
+    Sets.Add(va + "|" + typeCode + "|" + size + "|" + places + "|" + (tid.HasValue ? tid.Value.ToString() : "-") + "|" + value);
+    return AcceptSet;
+  }
+}
+public sealed class BridgePad {
+  public FakeSvc _svc = new FakeSvc();
+  public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public ProcedureIds _procIds = new ProcedureIds();
+  public EditGrants _editGrants = new EditGrants();
+  public List<string> Lines = new List<string>();
+  public List<string> Posts = new List<string>();
+  public int BpPushes;
+  private int _procGen;
+  private void Console(string level, string text) { Lines.Add(level + "|" + text); }
+  private void Post(string json) { Posts.Add(json); }
+  private void SendBps() { BpPushes++; }
+  private void UI(Action a) { a(); }
+  private static void RunNow(Action<object> work) { work(null); }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $(Get-Method 'private static string TidJson(uint? tid)' $web)
+  $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+  $tidNameDecls
+  $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
+  $pushProcs
+  $((Get-Method 'public void CmdBreakOnProcEntry(string data)' $web) -replace '^public void', 'public void')
+  $(Get-Method 'public void CmdBreakOnProcEntryAt(string filePath, int line)' $web)
+  $(Get-Method 'private void BreakOnEntry(ProcRef proc)' $web)
+  $((Get-Method 'private void OnWatch(DebugWatch w)' $web) -replace '^private void', 'public void')
+  $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
+  $arrowHandlers
+  public void RunPushProcedures(string exe) { PushProcedures(exe); }
+}
+}
+"@
+Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
+
+function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
+function Proc { param($name, $module, $line, $kind = 'procedure')
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p
+}
+
+# ---- host writers, run --------------------------------------------------------------------------------
+$pad = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'SPLASH' 'clbrws001.clw' 17))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+$pad.RunPushProcedures('C:\App\app.exe')
+$procMsg = if ($pad.Posts.Count -ge 1) { $pad.Posts[$pad.Posts.Count - 1] } else { '' }
+Check 'CONTROL: PushProcedures posted exactly one list' ($pad.Posts.Count -eq 1) "$($pad.Posts.Count) post(s)"
+
+$watch = New-Object ClarionDebugger.Terminal.DebugWatch
+$watch.Name = 'GLO:Count'; $watch.Found = $true; $watch.Value = '5'; $watch.TypeName = 'LONG'
+$watch.Va = '0x4A10F0'; $watch.TypeCode = '0x03'; $watch.Size = 4; $watch.Places = 0; $watch.Tid = 4812
+$pad.OnWatch($watch)
+$watchMsg = $pad.Posts[$pad.Posts.Count - 1]
+
+# The engine's Variables row: a GROUP whose one editable member sits in `children`, so the grant has to be
+# found below the top level. Shape pinned against the writer just below.
+$engineRows = '{"name":"G:REC","type":"GROUP","value":"","children":[{"name":"G:X","type":"DECIMAL(7,2)","value":"1.50","va":"0x4A2200","typeCode":"0x0A","size":4,"places":2}]}'
+$engineLocals = Get-Content -Raw -LiteralPath $EngineLocalsPath
+Check 'the engine row writer still emits va, typeCode, size and places under those names' `
+  (($engineLocals -match '\\"va\\":\\"0x') -and ($engineLocals -match '\\"typeCode\\":\\"0x') -and `
+   ($engineLocals -match '\\"size\\":') -and ($engineLocals -match '\\"places\\":')) ''
+$pad.OnSvcModuleData('clbrws011.clw', $engineRows, 4812)
+$moduleMsg = $pad.Posts[$pad.Posts.Count - 1]
+Check 'CONTROL: the nested row was granted and the group itself was not' ($pad._editGrants.Count -eq 2) "$($pad._editGrants.Count) grant(s) incl. the watch"
+
+# ---- the page, run ------------------------------------------------------------------------------------
+$pageJs = @(
+  (Get-Method 'function send(action,data)' $page),
+  (Get-CSharpStatement 'const isProcKind' $page),
+  (Get-Method 'function buildProcs(procs){' $page),
+  ((Get-Method "`$('procList').addEventListener('contextmenu'," $page) + ');'),
+  ((Get-Method "`$('miBpEntry').onclick=" $page) + ';'),
+  (Get-Method 'function editAttrs(v){' $page),
+  (Get-Method 'function setEditMeta(cell, meta){' $page),
+  (Get-Method 'function stripEditQuotes(s){' $page),
+  (Get-Method 'function beginEdit(cell){' $page)
+) -join "`n"
+$inputFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-in-' + [Guid]::NewGuid().ToString('N') + '.json')
+@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
+$bridgeJs = @'
+const fs = require('fs');
+const INPUT = JSON.parse(fs.readFileSync(process.argv[2], 'utf8').replace(/^\uFEFF/, ''));
+function mkEl(tag){ return { tag, _q:{}, children:[], dataset:{}, style:{}, value:'', title:'', textContent:'', innerHTML:'',
+  classList:{add(){},remove(){},toggle(){},contains(){return false;}}, listeners:{},
+  addEventListener(t,f){ this.listeners[t]=f; }, appendChild(c){ this.children.push(c); return c; },
+  focus(){}, select(){}, querySelector(sel){ return this._q[sel] || (this._q[sel]=mkEl(sel)); } }; }
+const els = {};
+function $(id){ return els[id] || (els[id]=mkEl(id)); }
+const document = { createElement: mkEl, createDocumentFragment(){ return mkEl('#frag'); } };
+const window = { innerWidth: 1000 };
+let wire = null; const wv = { postMessage(s){ wire = s; } };
+let allProcs = [], procIndex = null, bps = [], procCtx = null;
+function buildBps(){} function filterProcs(){}
+let isPaused = true, activeEdit = null, selTid = null;
+function editThreadSuffix(){ return ''; } function viewingOtherThread(){ return false; } function toast(){}
+'@ + "`n" + $pageJs + "`n" + @'
+
+const out = {};
+// Procedures: the list the host posted, rendered by the real buildProcs, right-clicked on MAIN, broken on.
+buildProcs(JSON.parse(INPUT.procs).procs);
+const rows = $('procList').children[0].children;
+const main = rows.find(r => r.dataset.name === 'MAIN');
+$('procList').listeners.contextmenu({ target:{ closest(){ return main; } }, preventDefault(){}, clientX:0, clientY:0 });
+wire = null; $('miBpEntry').onclick(); out.bpe = wire;
+
+// An edit on the Watch row the host posted: the page's own case 'watch' hands setEditMeta these four.
+function commit(cell, value){ beginEdit(cell); const inp = cell.children[cell.children.length - 1];
+  inp.value = value; wire = null; inp.onkeydown({ key:'Enter', preventDefault(){} }); return wire; }
+const wm = JSON.parse(INPUT.watch);
+const wcell = mkEl('span'); setEditMeta(wcell, { va:wm.va, typeCode:wm.typeCode, size:wm.size, places:wm.places });
+selTid = wm.tid;
+out.watchEdit = commit(wcell, 'X","va":"0x1","value":"7');
+
+// An edit on the NESTED Variables row: editAttrs writes the attributes the tree row is built with.
+const child = JSON.parse(INPUT.moduledata).items[0].children[0];
+const tcell = mkEl('span'); const attrs = editAttrs(child); let m; const re = / data-(\w+)="([^"]*)"/g;
+while ((m = re.exec(attrs))) tcell.dataset[m[1]] = m[2];
+out.treeEdit = commit(tcell, '2.25');
+console.log(JSON.stringify(out));
+'@
+$bridgeFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-' + [Guid]::NewGuid().ToString('N') + '.js')
+Set-Content -LiteralPath $bridgeFile -Value $bridgeJs -Encoding UTF8
+$pageOut = $null
+try {
+  $raw = & node $bridgeFile $inputFile 2>&1
+  if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL  could not run the page half of the bridge under node"; $raw | ForEach-Object { Write-Host "        $_" }; $script:failures++ }
+  else { $pageOut = ($raw -join "`n") | ConvertFrom-Json }
+} finally {
+  Remove-Item -LiteralPath $bridgeFile, $inputFile -ErrorAction SilentlyContinue
+}
+function DataOf { param($wire) Read1 $wire 'data' }
+
+# ---- break on entry, through the real page ------------------------------------------------------------
+$bpeData = if ($pageOut) { DataOf $pageOut.bpe } else { '' }
+Check 'the page sends the row''s host-issued id' ((Read1 $bpeData 'id') -cmatch '^p\d+\.\d+$') $bpeData
+Check 'and neither a module nor a line: the host looks those up' `
+  (($null -eq (Read1 $bpeData 'module')) -and ($null -eq (Read1 $bpeData 'line'))) $bpeData
+$pad.CmdBreakOnProcEntry($bpeData)
+Check 'the host arms the breakpoint the id stands for - MAIN at clbrws011.clw:42' `
+  (($pad._svc.Adds.Count -eq 1) -and ($pad._svc.Adds[0] -ceq 'clbrws011.clw:42')) ($pad._svc.Adds -join ',')
+
+# A list replaced since the page was sent it: the old id resolves to nothing, not to whatever row now has
+# that index.
+$pad.RunPushProcedures('C:\App\app.exe')
+$pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry($bpeData)
+Check 'an id from a list the host has since replaced arms nothing' ($pad._svc.Adds.Count -eq 0) ($pad._svc.Adds -join ',')
+Check 'and says why' (@(Errs $pad).Count -eq 1) ($pad.Lines -join ' / ')
+# The payload the page USED to send names a module and line, and no id. It must arm nothing at all.
+$pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry('{"module":"EVIL.CLW","line":1,"name":"X"}')
+Check 'the old {module,line} payload is not honoured' ($pad._svc.Adds.Count -eq 0) ($pad._svc.Adds -join ',')
+
+# The cheap half of the ticket, which the id rework must not lose: a live add the engine never took is said.
+$freshId = if ($pad.Posts[$pad.Posts.Count - 1] -match '"id":"(p\d+\.1)"') { $Matches[1] } else { '' }
+$pad._svc.Accept = $false; $pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry('{"id":"' + $freshId + '"}')
+Check 'CONTROL: a current id reaches the engine' ($pad._svc.Adds.Count -eq 1) "id=$freshId adds=$($pad._svc.Adds -join ',')"
+Check 'a refused live add writes an error line naming the breakpoint' `
+  ((@(Errs $pad).Count -eq 1) -and (@(Errs $pad)[0] -match 'clbrws011\.clw:42')) ($pad.Lines -join ' / ')
+$pad._svc.Accept = $true; $pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry('{"id":"' + $freshId + '"}')
+Check 'CONTROL: an accepted live add writes no error' (@(Errs $pad).Count -eq 0) ($pad.Lines -join ' / ')
+
+# The idle branch validates the module before staging it. With ids, the only modules that can arrive are the
+# ones the host listed, so an unusable one is planted in the LIST here to prove the check is still live.
+$idle = New-Object ClarionDebugger.Terminal.BridgePad
+$idle._svc.IsRunning = $false
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'BAD' '..\evil clw' 5))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'GOOD' 'clbrws011.clw' 42))
+$idle.RunPushProcedures('C:\App\app.exe')
+$idleList = $idle.Posts[$idle.Posts.Count - 1]
+$badId = if ($idleList -match '"id":"(p\d+\.0)"') { $Matches[1] } else { '' }
+$goodId = if ($idleList -match '"id":"(p\d+\.1)"') { $Matches[1] } else { '' }
+$idle.CmdBreakOnProcEntry('{"id":"' + $badId + '"}')
+Check 'an idle request for an unusable module stages nothing' ($idle._pending.Count -eq 0) "$($idle._pending.Count) staged"
+Check 'and says why' (@(Errs $idle).Count -eq 1) ($idle.Lines -join ' / ')
+$idle.CmdBreakOnProcEntry('{"id":"' + $goodId + '"}')
+Check 'CONTROL: an idle request for a good module is staged once' `
+  (($idle._pending.Count -eq 1) -and ($idle.BpPushes -eq 1)) "$($idle._pending.Count) staged"
+
+# ---- break on entry by POSITION: the editor's cursor (e61e4f92) ---------------------------------------
+# ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
+# list: the breakpoint goes where the list says the containing procedure starts.
+$posPad = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN::DOIT' 'clbrws011.clw' 45 'routine'))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'ELSEWHERE' 'clbrws002.clw' 10))
+$posPad.RunPushProcedures('C:\App\app.exe')
+function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
+Check 'a cursor inside MAIN, below one of its ROUTINEs, breaks on MAIN''s entry (42), not the routine''s' `
+  ((PosAdd 'C:\Src\CLBRWS011.CLW' 50) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
+Check 'a cursor further down breaks on the procedure it is actually in (OTHER, 80)' `
+  ((PosAdd 'C:\Src\clbrws011.clw' 90) -ceq 'clbrws011.clw:80') ($posPad._svc.Adds -join ',')
+Check 'a cursor ON the definition line counts as inside it' ((PosAdd 'C:\Src\clbrws011.clw' 42) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
+$none = PosAdd 'C:\Src\clbrws011.clw' 10
+Check 'a cursor above every listed procedure arms nothing, and says why' `
+  (($none -eq '') -and (@(Errs $posPad).Count -eq 1)) ($posPad.Lines -join ' / ')
+Check 'and neither does a file the list does not cover' ((PosAdd 'C:\Src\unlisted.clw' 50) -eq '') ($posPad.Lines -join ' / ')
+
+# ---- edits, through the real page ---------------------------------------------------------------------
+function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
+$watchData = if ($pageOut) { DataOf $pageOut.watchEdit } else { '' }
+$treeData  = if ($pageOut) { DataOf $pageOut.treeEdit } else { '' }
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'an edit on the Watch row the host sent is written' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
+Check 'with the tuple the host issued and the user''s value, untouched by the text inside it' `
+  (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A10F0|0x03|4|0|4812|X","va":"0x1","value":"7')) (Sets $pad)
+$pad._svc.Sets.Clear()
+$pad.EditVar($treeData)
+Check 'an edit on the NESTED Variables row is written - the grant reached inside children' `
+  (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A2200|0x0A|4|2|4812|2.25')) (Sets $pad)
+
+# Each part of the tuple is checked, one at a time, against the same real payload.
+$tamper = @(
+  @('an address the host never issued',         'va',       '"0x4A10F4"'),
+  @('a type code the host never issued',        'typeCode', '"0x12"'),
+  @('a size the host never issued',             'size',     '400'),
+  @('a scale the host never issued',            'places',   '3'),
+  @('a thread the row was not read on',         'tid',      '999')
+)
+foreach ($c in $tamper) {
+  $d = $watchData -replace ('"' + $c[1] + '":("[^"]*"|\d+)'), ('"' + $c[1] + '":' + $c[2])
+  $pad._svc.Sets.Clear(); $pad.Posts.Clear()
+  $pad.EditVar($d)
+  Check "refused: $($c[0])" (($d -cne $watchData) -and ($pad._svc.Sets.Count -eq 0)) (Sets $pad)
+}
+# A refusal is answered in the shape the engine's own refusal takes, so the page treats it as one.
+Check 'and a refusal is answered with a failed varset naming the address' `
+  (($pad.Posts.Count -ge 1) -and ($pad.Posts[0] -cmatch '"type":"varset","va":"0x4A10F0","ok":false')) ($pad.Posts -join ' / ')
+
+# CURRENT: a thread switch retires every grant, and a failed switch retires none.
+$pad.OnSvcThreadSelected(9001, $false, 'no such thread')
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'CONTROL: a switch the engine REFUSED leaves the grants alone' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
+$pad.OnSvcThreadSelected(9001, $true, $null)
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'after a thread switch the same edit is refused until the row is re-read' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+
+# A request the service would not send is said, not dropped: no varset would ever have come.
+$pad.OnWatch($watch)
+$pad._svc.AcceptSet = $false; $pad.Posts.Clear()
+$pad.EditVar($watchData)
+Check 'a write SetVariable refused is answered with a failed varset too' `
+  (($pad.Posts.Count -ge 1) -and ($pad.Posts[0] -cmatch '"ok":false') -and ($pad.Posts[0] -cmatch 'did not take')) ($pad.Posts -join ' / ')
+
+# The three other places a stop, resume or exit makes rows stale. Not reachable from this probe (they sit in
+# UI lambdas with live-editor side effects), so they are pinned by POSITION: the clear must come before the
+# re-reads that re-grant, or the fresh grants are wiped along with the stale ones.
+$onPaused = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $web)
+$iClearP = $onPaused.IndexOf('_editGrants.Clear()'); $iReq = $onPaused.IndexOf('_svc.RequestStack()')
+Check 'a new stop clears the grants BEFORE requesting the replies that re-grant' `
+  (($iClearP -ge 0) -and ($iReq -gt $iClearP)) "clear=$iClearP request=$iReq"
+Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
+Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
+Check 'the frame-locals and expand replies grant their rows as module data does' `
+  (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
+   ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
+
+# ---- the grant walker on its own ----------------------------------------------------------------------
+$g = New-Object ClarionDebugger.Terminal.EditGrants
+$g.GrantRows('{"va":"0x10","typeCode":"0x03","size":4,"places":0},{"name":"x","children":[{"va":"0x20","typeCode":"0x03","size":4}]}', $null)
+Check 'unscoped rows (an expanded reference) grant for any thread' `
+  ($g.IsGranted('0x10', '0x03', 4, 0, 77) -and $g.IsGranted('0x20', '0x03', 4, 0, $null)) "$($g.Count) grant(s)"
+$g2 = New-Object ClarionDebugger.Terminal.EditGrants
+$g2.GrantRows('{"va":"0x10","typeCode":"0x03","size":4,"places":0},{"va":"0x20",', 5)
+Check 'a malformed reply grants NOTHING, not the rows before the fault' ($g2.Count -eq 0) "$($g2.Count) grant(s)"
+$g3 = New-Object ClarionDebugger.Terminal.EditGrants
+$g3.Grant('0x10', '0x03', 4, 0, 5)
+Check 'a thread-scoped grant does not answer a page with no thread selection' (-not $g3.IsGranted('0x10', '0x03', 4, 0, $null)) ''
+Check 'CONTROL: ...and does answer its own thread' ($g3.IsGranted('0x10', '0x03', 4, 0, 5)) ''
+
+# ---- the other request DTOs ---------------------------------------------------------------------------
+# These payloads are delimiter strings, parsed exactly as before and now in one place each. Checked on the
+# shapes the page builds and on the malformed shapes each one must drop.
+$x = [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|clbrws011.clw|123|0x4A0000')
+Check 'expand: reqId|module|typeRef|addr reads as four typed fields' `
+  (($null -ne $x) -and $x.ReqId -eq 7 -and $x.Module -ceq 'clbrws011.clw' -and $x.TypeRef -eq 123 -and $x.Addr -ceq '0x4A0000') ''
+Check 'expand: a wrong field count, or a typeRef that is not a number, is dropped' `
+  (($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123')) -and ($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|-1|0x1'))) ''
+$fl = [ClarionDebugger.Terminal.FrameLocalsRequest]::Parse('3|0x401000|0x19FF00')
+Check 'framelocals: reqId|va|ebp reads as three typed fields' (($null -ne $fl) -and $fl.ReqId -eq 3 -and $fl.Ebp -ceq '0x19FF00') ''
+$ml = [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('a:b.clw:12')
+Check 'module:line splits on the LAST colon' (($null -ne $ml) -and $ml.Module -ceq 'a:b.clw' -and $ml.Line -eq 12) ''
+Check 'module:line with no module, or no number, is dropped' `
+  (($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse(':12')) -and ($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('m.clw:x'))) ''
+$ob = [ClarionDebugger.Terminal.OpenBpRequest]::Parse("42`tC:\src\m.clw")
+Check 'openbp: line<TAB>path' (($null -ne $ob) -and $ob.Line -eq 42 -and $ob.Path -ceq 'C:\src\m.clw') ''
+$u = [uint32] 0
+Check 'a thread id is a DWORD: a sign is not accepted' `
+  (-not [ClarionDebugger.Terminal.PageNumbers]::TryUInt('-5', [ref] $u) -and [ClarionDebugger.Terminal.PageNumbers]::TryUInt('4294967295', [ref] $u)) ''
+Check 'no envelope without an action' `
+  (($null -eq [ClarionDebugger.Terminal.PageEnvelope]::Parse('{"data":"x"}')) -and ($null -eq [ClarionDebugger.Terminal.PageEnvelope]::Parse('not json'))) ''
+# The switch itself: no case may go back to picking its own fields out of raw text.
+$onMsg = Get-CSharpCodeOnly (Get-Method 'private void OnWebMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)' $web)
+Check 'OnWebMessage parses no payload inline - no Split, no bare TryParse' `
+  (($onMsg -notmatch '\.Split\(') -and ($onMsg -notmatch '\b(u?int)\.TryParse\(')) ''
+
+Write-Host ''
+Write-Host 'a module path reaches the page as the path, not escaped twice (079ff431)'
+# GetStr returned the raw text between the quotes, so a path read off the engine's module-loaded event kept
+# its separators doubled, and OnModuleLoaded escaped it AGAIN on the way to the page: C:\\App\\... on screen.
+# Every hop below is the shipped code: the engine's real writer, the host's real reader, the WebView's real
+# writer. What the page is handed is decoded the way the page decodes it (JSON.parse <-> ConvertFrom-Json).
+$modSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+namespace ModPath {
+$((Get-Method 'internal static class JsonMessageReader' $readerEarly) -replace 'internal static class', 'public static class')
+// The engine's image, cut down to the fields its real ModuleLoaded writer reads. Pinned against
+// LoadedModule.cs below.
+public sealed class LoadedModule { public string Path; public string Name; public uint LoadBase; public uint Size; public bool HasDebug; }
+public static class Json {
+  $(Get-Method 'public static string Str(string s)' $engine)
+  $(Get-Method 'public static string ModuleLoaded(LoadedModule m)' $engine)
+}
+$(Get-Method 'public sealed class DebugModule')
+public static class Host {
+  $((Get-Method 'private static string GetStr(string json, string key)') -replace 'private static', 'public static')
+  $((Get-Method 'private static Dictionary<string, string> ParseRegs(string json)') -replace 'private static', 'public static')
+}
+public sealed class Pad {
+  public List<string> Posts = new List<string>();
+  private void Post(string json) { Posts.Add(json); }
+  private void Console(string level, string text) { }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $((Get-Method 'private void OnModuleLoaded(DebugModule m)' $web) -replace '^private void', 'public void')
+}
+}
+"@
+Add-Type -TypeDefinition $modSrc -Language CSharp | Out-Null
+$lmSrc = Get-Content -Raw -LiteralPath $LoadedModulePath
+Check 'the cut-down image stub matches the real LoadedModule field names' `
+  (($lmSrc -cmatch 'public string Name;') -and ($lmSrc -cmatch 'public uint LoadBase;') -and ($lmSrc -cmatch 'public uint Size;') -and ($lmSrc -cmatch 'public bool HasDebug')) ''
+
+$img = New-Object ModPath.LoadedModule
+$img.Path = 'C:\App\Dll1\dll1.dll'; $img.Name = 'dll1.dll'; $img.LoadBase = 0x10000000; $img.Size = 0x1000; $img.HasDebug = $true
+$evt = [ModPath.Json]::ModuleLoaded($img)
+Check 'CONTROL: the engine escapes the path once, as JSON requires' ($evt.Contains('"path":"C:\\App\\Dll1\\dll1.dll"')) $evt
+# The host's module-loaded arm, which sits in a switch too long to brace-match out: it is mirrored here with
+# the same reader, and pinned to the shipped arm just below.
+$dm = New-Object ModPath.DebugModule
+$dm.Name = [ModPath.Host]::GetStr($evt, 'name'); $dm.Path = [ModPath.Host]::GetStr($evt, 'path')
+$dm.Base = [ModPath.Host]::GetStr($evt, 'base'); $dm.HasDebug = $true
+Check 'the module-loaded arm reads the path through GetStr' ($src -cmatch 'Path = GetStr\(json, "path"\)') ''
+Check 'the host reads back the real path, unescaped' ($dm.Path -ceq $img.Path) (ShowVal $dm.Path)
+$mp = New-Object ModPath.Pad
+$mp.OnModuleLoaded($dm)
+$pageSees = if ($mp.Posts.Count -ge 1) { ($mp.Posts[0] | ConvertFrom-Json).path } else { $null }
+Check 'and the page receives C:\App\..., not C:\\App\\...' ($pageSees -ceq $img.Path) (ShowVal $pageSees)
+
+# The reader swap fixed the regex's other two faults as well, and changed where it looks. Each is pinned.
+Check 'a value holding an escaped quote is read whole, not cut at the quote' `
+  ([ModPath.Host]::GetStr('{"message":"say \"hi\" now"}', 'message') -ceq 'say "hi" now') ([ModPath.Host]::GetStr('{"message":"say \"hi\" now"}', 'message'))
+Check 'a number is still not a string, as the regex never matched one' ($null -eq [ModPath.Host]::GetStr('{"line":42}', 'line')) ''
+Check 'a member inside a nested object is not the event''s own' `
+  ($null -eq [ModPath.Host]::GetStr('{"event":"x","inner":{"module":"a.clw"}}', 'module')) ''
+# ...which is why ParseRegs, the one caller that read NESTED members, now hands over the register block.
+$regs = [ModPath.Host]::ParseRegs('{"event":"paused","module":"m.clw","regs":{"eax":"0x1","eip":"0x4754EB"},"tid":7}')
+Check 'the registers inside "regs":{...} still read' (($null -ne $regs) -and ($regs['eip'] -ceq '0x4754EB') -and ($regs['eax'] -ceq '0x1')) ''
+Check 'CONTROL: an event with no register block still has none' ($null -eq [ModPath.Host]::ParseRegs('{"event":"paused","regs":null}')) ''
 
 Write-Host ''
 Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-named .clw'
@@ -849,7 +1391,10 @@ $ulOwn = New-Object 'System.Collections.Generic.List[UserBreakpoint]'
 $ulOwn.Add($bpD1)
 $listD1 = [BpWire]::BpList($ulOwn)
 $emitters = @($setD1, $delD1, $listD1)
-$carrying = @($emitters | Where-Object { [BpHost]::GetStr($_, 'ownerPath') }).Count
+# bp-list carries its owners INSIDE the bps array, so it is read per row through ParseBpList - the way the
+# host reads it. GetStr reads only the object it is handed (079ff431), and the event itself has no owner.
+$listOwner = @([BpHost]::ParseBpList($listD1)) | ForEach-Object { $_.OwnerPath } | Select-Object -First 1
+$carrying = @(@([BpHost]::GetStr($setD1, 'ownerPath'), [BpHost]::GetStr($delD1, 'ownerPath'), $listOwner) | Where-Object { $_ }).Count
 Check 'all 3 breakpoint echoes carry ownerPath (bp-set, bp-del, bp-list)' ($carrying -eq 3) "$carrying of 3"
 
 $dllRows = New-Object System.Collections.ArrayList
@@ -870,11 +1415,11 @@ Check 'removing the Dll1 breakpoint leaves exactly 1 row' ($dllSurv.Count -eq 1)
 Check 'and the row left behind is the Dll2 one' `
   ($dllSurv.Count -eq 1 -and $dllSurv[0].OwnerPath -match 'dll2') (OwnerOf $dllSurv)
 
-# What the owner IS, stated so nobody later treats it as a file to open: the IMAGE path, in the wire's
-# escaped form, because GetStr returns the raw JSON text and does not unescape. Both sides of every
-# comparison come off that same wire, so equality is exact - but File.Exists on it would not be.
-Check 'the owner reads back as the escaped wire form, an identity token rather than a usable path' `
-  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -eq 'C:\\App\\Dll1\\dll1.dll') (OwnerOf $dllRows)
+# What the owner IS: the IMAGE path, an identity token compared only with another owner read the same way.
+# Until 079ff431 it read back in the wire's ESCAPED form (GetStr did not unescape); it now reads back as the
+# real path. Both sides of every comparison moved together, which is what the two-DLL checks above prove.
+Check 'the owner reads back unescaped, as the image''s real path' `
+  ($dllRows.Count -ge 1 -and $dllRows[0].OwnerPath -ceq 'C:\App\Dll1\dll1.dll') (OwnerOf $dllRows)
 
 Write-Host ''
 Write-Host 'an engine that predates ownerPath behaves EXACTLY as it did before, on every path that reads it'
@@ -916,7 +1461,7 @@ Check 'an owner-bearing bp-del still removes a row whose owner is unknown' `
 # for it, because no image carries its compiland yet.
 $pendingSet = [BpWire]::BpSet((EngineBp 'clbrws011.clw' 50 50))
 Check 'a pending breakpoint writes ownerPath as JSON null, which reads as unknown too' `
-  (($pendingSet -match '"ownerPath":null') -and ($null -eq [BpHost]::GetStr($pendingSet, 'ownerPath'))) $pendingSet
+  (($pendingSet -cmatch '"ownerPath":null') -and ($null -eq [BpHost]::GetStr($pendingSet, 'ownerPath'))) $pendingSet
 
 Write-Host ''
 Write-Host 'the two identity predicates AGREE - enumerated, not asserted'
@@ -981,15 +1526,16 @@ Check 'an unknown stopped writes no member at all' ([PadJsonProbe]::TidMember('s
 Check 'a 0 is a sentinel for selected as much as for tid - written as absent too' `
   ([PadJsonProbe]::TidMember('selected', 0) -eq '') "'$([PadJsonProbe]::TidMember('selected', 0))'"
 Check 'a known stopped is written under its own name' `
-  ([PadJsonProbe]::TidMember('stopped', 116932) -eq ',"stopped":116932') ([PadJsonProbe]::TidMember('stopped', 116932))
+  ([PadJsonProbe]::TidMember('stopped', 116932) -ceq ',"stopped":116932') ([PadJsonProbe]::TidMember('stopped', 116932))
 Check 'and TidJson is that same writer, not a second copy of the rule' `
-  ((Get-Method 'private static string TidJson(uint? tid)' $web) -match 'TidMember\("tid", tid\)') ''
+  ((Get-Method 'private static string TidJson(uint? tid)' $web) -match 'TidMember\(TidMemberTid, tid\)') ''
 # ALL THREE, counted rather than asserted as "every": a fourth member added without the writer is what the
 # count catches. The per-row tid is written inline in OnThreads and is the third.
 $onThreads = Get-Method 'private void OnThreads(DebugThreadList list)' $web
-Check 'both top-level thread-id members in OnThreads go through it' `
-  ((([regex]::Matches($onThreads, 'TidMember\(')).Count) -eq 2) `
-  ((([regex]::Matches($onThreads, 'TidMember\(')).Count).ToString() + ' of 2')
+# THREE since c299aced: the per-row tid used to be typed inline and now goes through the writer as well.
+Check 'all three thread-id members in OnThreads go through it (stopped, selected, and each row''s tid)' `
+  ((([regex]::Matches($onThreads, 'TidMember\(')).Count) -eq 3) `
+  ((([regex]::Matches($onThreads, 'TidMember\(')).Count).ToString() + ' of 3')
 Check 'and neither is appended as a bare number any more' `
   (($onThreads -notmatch '\\"stopped\\":\\"\).Append\(list') -and ($onThreads -notmatch 'Append\(list\.StoppedTid\)')) ''
 # The reader half: absent must survive arrival. Substituting 0u on the way in undoes the wire rule in the
@@ -1063,7 +1609,7 @@ CheckWhy 'and it still rejects 0, which is the half both writers already agree o
 # The divergence itself, pinned. This asserts CURRENT behaviour on purpose: it is the "documented" half of
 # the decision above, and it names its own successor so nobody reads it as approval.
 CheckWhy 'the divergence, stated: TidJson writes uint.MaxValue whole where the engine would omit it' `
-  ([PadJsonProbe]::TidJson(4294967295) -eq ',"tid":4294967295') `
+  ([PadJsonProbe]::TidJson(4294967295) -ceq ',"tid":4294967295') `
   'TidJson has adopted the engine rule - good; delete this check and update the note above, on 3b043dfc'
 CheckWhy 'the two writers DO agree on 0, so this is a one-value divergence and not two rules' `
   ([PadJsonProbe]::TidJson(0) -eq '') `
@@ -1368,7 +1914,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 222
+$EXPECTED_CHECKS = 292
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

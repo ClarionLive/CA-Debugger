@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using ClarionDebugger.Terminal;
 
 namespace ClarionDebugger.Services
 {
@@ -97,12 +98,17 @@ namespace ClarionDebugger.Services
         /// breakpoint can be shown or re-specified by. Every display, gutter and spec-building reader wants
         /// this; nothing may use it for IDENTITY, which goes through
         /// <see cref="ClarionDebuggerService.SameBpIdentity"/> so an absent requested line falls back
-        /// explicitly instead of comparing as 0. Assigning it records the line AS PRESENT, which is what a
-        /// host-built entry means.</summary>
-        public int RequestedLine
+        /// explicitly instead of comparing as 0.
+        /// <para>
+        /// GET-ONLY, and named for what it is (f367a04f). This was <c>RequestedLine</c>, with a setter, so the
+        /// one name meant "the line the user asked for" when written and "that, or the planted line" when
+        /// read - and a reader could not tell from the name that it might be getting the planted line. The
+        /// setter is gone: <see cref="RequestedLineOrNull"/> is the sole writer, and a host-built entry sets
+        /// it to record the line AS PRESENT.
+        /// </para></summary>
+        public int DisplayLine
         {
             get { return _requestedLine ?? Line; }
-            set { _requestedLine = value; }
         }
 
         public int Line;            // line actually planted (snapped to nearest code record)
@@ -124,10 +130,10 @@ namespace ClarionDebugger.Services
         /// breakpoint, which reads back the same way and means the same thing.
         /// </para>
         /// <para>
-        /// This is an IDENTITY TOKEN, NOT A PATH TO OPEN. It names the image, not the .clw, and it arrives
-        /// in the wire's escaped form (a Windows separator reads back as <c>\</c>, because GetStr does not
-        /// unescape). Both sides of every comparison come from that same wire, so equality is exact; anything
-        /// that wanted a real disk path would have to unescape it first.
+        /// This is an IDENTITY TOKEN, NOT A PATH TO OPEN. It names the image, not the .clw. Since 079ff431
+        /// GetStr unescapes, so it reads back as the image's real path - but that does not make it a file
+        /// the host should open, and nothing does: it is only ever compared with another owner read the
+        /// same way, which is why unescaping both sides at once left every comparison unchanged.
         /// </para></summary>
         public string OwnerPath;
 
@@ -404,9 +410,60 @@ namespace ClarionDebugger.Services
             Launch(targetExe, args, false);
         }
 
+        /// <summary>What Launch may do, given whether an engine process is still alive and the session state.
+        /// <para>
+        /// The case this exists for (0449e5c9): the DEBUGGEE finished, the engine said "exited", and the state
+        /// went Idle at once - by the Owner's decision, so a run-to-completion reads as over immediately. The
+        /// engine PROCESS can outlive that by a moment, and a Start pressed inside that window used to hit
+        /// "A debug session is already running." for a session the user had just been told was over. It is
+        /// now refused with the truth instead (<see cref="EngineClosingMessage"/>), and
+        /// <see cref="ReapLingeringEngine"/> closes the window from the other side.
+        /// </para></summary>
+        internal enum LaunchGate { Proceed, RefuseClosing, AlreadyRunning }
+
+        internal static LaunchGate DecideLaunch(bool engineAlive, DebugSessionState state)
+        {
+            if (!engineAlive) return LaunchGate.Proceed;
+            return state == DebugSessionState.Idle ? LaunchGate.RefuseClosing : LaunchGate.AlreadyRunning;
+        }
+
+        /// <summary>The one wording of the refusal, shared by the pad's pre-check and Launch's own.</summary>
+        public const string EngineClosingMessage =
+            "the previous session's engine is still closing — press Start again in a moment";
+
+        /// <summary>True in the short window after a session reported itself over (Idle) while its engine
+        /// process has not exited yet. A Start in that window is refused with <see cref="EngineClosingMessage"/>.</summary>
+        public bool IsEngineStillClosing { get { return DecideLaunch(IsRunning, State) == LaunchGate.RefuseClosing; } }
+
+        /// <summary>How long an engine may outlive its own "exited" event before it is stopped for it.</summary>
+        internal const int ReapGraceMs = 1500;
+
+        /// <summary>Give <paramref name="engine"/> <paramref name="graceMs"/> to exit on its own, and if it has
+        /// not, call <paramref name="stop"/>. Blocking: the caller runs it off the UI thread. Returns true when
+        /// it had to stop the engine. A process whose state cannot be read counts as still running, so it is
+        /// stopped rather than trusted (the same "cannot tell is not dead" rule as ProcessConfirmedDead).</summary>
+        internal static bool ReapLingeringEngine(Process engine, int graceMs, Func<bool> stop)
+        {
+            if (engine == null) return false;
+            bool exited;
+            try { exited = engine.WaitForExit(graceMs); }
+            catch { exited = false; }
+            if (exited) return false;
+            stop();
+            return true;
+        }
+
         private void Launch(string targetExe, string args, bool interactive)
         {
-            if (IsRunning) throw new InvalidOperationException("A debug session is already running.");
+            switch (DecideLaunch(IsRunning, State))
+            {
+                case LaunchGate.RefuseClosing:
+                    // Refused, not thrown: this is a moment to wait, not a failure (0449e5c9).
+                    LogReceived?.Invoke(EngineClosingMessage);
+                    return;
+                case LaunchGate.AlreadyRunning:
+                    throw new InvalidOperationException("A debug session is already running.");
+            }
 
             string engine = FindEngine();
             if (engine == null) throw new FileNotFoundException("ClarionDbg.exe not found next to the addin or in the dev build output.");
@@ -474,9 +531,10 @@ namespace ClarionDebugger.Services
         /// Callers that need the guarantee must check the result; callers that ignore it are no worse off than
         /// before, because the state they would have seen as Idle now simply stays where it was.
         ///
-        /// Known remaining path that reports Idle without a process check: the engine's "exited" event (the
-        /// DEBUGGEE finished), handled in OnJson, sets Idle while the engine process itself may still be alive
-        /// for a short window. That is a separate lifecycle from this one and is not addressed here.
+        /// The one path that reports Idle WITHOUT this check is the engine's "exited" event (the DEBUGGEE
+        /// finished): it sets Idle at once by decision (0449e5c9 option C), and covers the engine process's
+        /// remaining lifetime by reaping it (<see cref="ReapLingeringEngine"/>, which calls this) and by
+        /// refusing a Start until it is gone (<see cref="DecideLaunch"/>).
         ///
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
         /// (CmdStop and Dispose's live path both dispatch via Task.Run; Dispose's already-idle path runs it
@@ -876,7 +934,7 @@ namespace ClarionDebugger.Services
                     int delLine = GetInt(json, "line");
                     // The engine removed exactly ONE logical breakpoint and names it by its requested line.
                     // GetIntOrNull, not GetInt: absent must stay distinguishable from 0, because 0 is a real
-                    // RequestedLine for an unresolved raw breakpoint.
+                    // requested line for an unresolved raw breakpoint.
                     int? delRequested = GetIntOrNull(json, "requestedLine");
                     // ...and by its owning image, for the same reason: `module` is a basename, so a bp-del
                     // that named only (module, requestedLine) would remove the same-named breakpoint in
@@ -984,7 +1042,20 @@ namespace ClarionDebugger.Services
 
                 case "exited":
                     CurrentVa = null;
+                    // Idle at once, by the Owner's decision (0449e5c9 option C): the run is over as far as the
+                    // user is concerned. The engine PROCESS may still be closing, so it is given ReapGraceMs to
+                    // exit and then stopped, off this reader thread; a Start meanwhile is refused honestly.
                     SetState(DebugSessionState.Idle);
+                    var exitedEngine = _proc;
+                    System.Threading.Tasks.Task.Run(() =>
+                    {
+                        try
+                        {
+                            ReapLingeringEngine(exitedEngine, ReapGraceMs,
+                                () => ReferenceEquals(_proc, exitedEngine) && Stop());
+                        }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] reap after exit failed: " + ex.Message); }
+                    });
                     break;
 
                 default:
@@ -1126,11 +1197,15 @@ namespace ClarionDebugger.Services
         /// — flat unique keys, extracted directly. Null when the event carries no register block.</summary>
         private static Dictionary<string, string> ParseRegs(string json)
         {
-            if (string.IsNullOrEmpty(json) || json.IndexOf("\"regs\":{", StringComparison.Ordinal) < 0) return null;
+            int at = string.IsNullOrEmpty(json) ? -1 : json.IndexOf("\"regs\":{", StringComparison.Ordinal);
+            if (at < 0) return null;
+            // GetStr reads members of the object it is handed, so it is handed the register block itself -
+            // from its opening brace; the reader stops at the matching close.
+            string block = json.Substring(at + "\"regs\":".Length);
             var regs = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var reg in new[] { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags" })
             {
-                string v = GetStr(json, reg);
+                string v = GetStr(block, reg);
                 if (v != null) regs[reg] = v;
             }
             return regs;
@@ -1153,10 +1228,14 @@ namespace ClarionDebugger.Services
                 foreach (Match m in Regex.Matches(ExtractArrayBalanced(json, "threads"), "\\{[^{}]*\\}"))
                 {
                     string t = m.Value;
-                    if (!t.Contains("\"tid\":")) continue;
+                    // A row is a thread only if it names one. This used to test for the TEXT "tid": and then
+                    // read the number with `?? 0u`, so a row whose tid did not parse became thread 0 - the
+                    // sentinel the absent-tid rule exists to keep off the wire (c299aced).
+                    uint? rowTid = GetUIntOrNull(t, "tid");
+                    if (!rowTid.HasValue || rowTid.Value == 0) continue;
                     list.Threads.Add(new DebugThread
                     {
-                        Tid = GetUIntOrNull(t, "tid") ?? 0u,
+                        Tid = rowTid.Value,
                         ClarionThread = GetIntOrNull(t, "clarionThread"),
                         Proc = GetStr(t, "proc"),
                         Module = GetStr(t, "module"),
@@ -1525,8 +1604,8 @@ namespace ClarionDebugger.Services
         /// <para>
         /// Requested lines are comparable only when BOTH sides have one, exactly as in
         /// <see cref="SameBpIdentity"/>, which was written to mirror this function. Reading the entry's line
-        /// through the substituting <c>RequestedLine</c> getter instead compared the entry's PLANTED line
-        /// against the echo's REQUESTED one whenever the entry came from an engine build that reports no
+        /// through the substituting getter (then <c>RequestedLine</c>, now <c>DisplayLine</c>) instead
+        /// compared the entry's PLANTED line against the echo's REQUESTED one whenever the entry came from an engine build that reports no
         /// <c>requestedLine</c> — which both removes a row the engine did not delete (the two lines happen to
         /// be equal) and leaves the named one behind (they happen not to be). A stale entry from an earlier
         /// session is enough to reach that mix. So the absent case falls back to the planted line here too:
@@ -1602,7 +1681,12 @@ namespace ClarionDebugger.Services
         public static string BuildBpSpec(DebugBreakpoint bp)
         {
             var sb = new System.Text.StringBuilder();
-            sb.Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
+            // DisplayLine already falls back to the planted line when no requested line exists, which is what
+            // the `RequestedLine > 0 ? RequestedLine : Line` here used to spell out a second time (f367a04f).
+            // The two differ only for a PRESENT requested line of 0 - an unresolved raw breakpoint's echo -
+            // and none reaches this method: as of 2026-09-22 its callers pass the pad's staged entries, which
+            // are host-built with Line equal to the requested line.
+            sb.Append(bp.Module).Append(':').Append(bp.DisplayLine);
             if (!string.IsNullOrEmpty(bp.Condition)) sb.Append("|c=").Append(B64(bp.Condition));
             if (bp.HitMode == "eq" || bp.HitMode == "gte" || bp.HitMode == "mod")
                 sb.Append("|hm=").Append(bp.HitMode).Append("|hv=").Append(bp.HitValue);
@@ -1620,10 +1704,28 @@ namespace ClarionDebugger.Services
             return uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v) ? v : 0;
         }
 
+        /// <summary>A string member of THIS object, UNESCAPED, or null when it is absent, not a string, or
+        /// the text is not a well-formed object.
+        /// <para>
+        /// This was a regex returning the raw text between the quotes, so a path arrived with its separators
+        /// still doubled and was escaped a second time on its way to the page (079ff431); it also stopped
+        /// at the first quote, cutting short any value with an escaped one in it, and matched the key
+        /// ANYWHERE in the text. It now goes through the bridge's real reader.
+        /// </para>
+        /// <para>
+        /// THE CALLER AUDIT (2026-09-22), because both changes - unescaping, and top-level only - can move a
+        /// caller that leaned on the old behaviour:
+        /// every event handler in <see cref="OnLine"/> and the flat objects cut out by ParseStack /
+        /// ParseThreads / ParseDisasm / GetProcedures read members of the object they were handed; the
+        /// ParseBpList chunks each start at their own object's brace, and the reader stops at its end. The
+        /// one caller that read a NESTED member was ParseRegs (the registers sit inside <c>"regs":{...}</c>),
+        /// and it now hands over that object instead of the event. The one caller that compared RAW text
+        /// was the breakpoint owner (OwnerPath): it is only ever compared with another value read here,
+        /// so both sides moved together and the comparison is unchanged.
+        /// </para></summary>
         private static string GetStr(string json, string key)
         {
-            var m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-            return m.Success ? m.Groups[1].Value : null;
+            return JsonMessageReader.ReadStringField(json, key);
         }
         private static int GetInt(string json, string key)
         {

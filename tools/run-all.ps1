@@ -56,6 +56,11 @@ $Suites = @(
   @{ File = 'test-addin-bpremove.ps1' }
   @{ File = 'test-addin-hooks.ps1' }
   @{ File = 'test-addin-json.ps1' }
+  @{ File = 'test-addin-lifecycle.ps1' }
+  @{ File = 'test-host-tid-members.ps1'
+     NoTotal = 'wave 3 integration: Eli opts it in to Assert-CheckTotal as a pipeline follow-up (c299aced)' }
+  @{ File = 'test-host-tid-members.ps1'; Args = @('-SelfTest')
+     NoTotal = 'wave 3 integration: Eli opts it in to Assert-CheckTotal as a pipeline follow-up (c299aced)' }
   @{ File = 'test-disasm-seat.ps1' }
   @{ File = 'test-file-record-predicate.ps1'
      NoTotal = 'wave 3 integration: Bea opts it in to Assert-CheckTotal with her phase-2 merge (04d7b4c8)' }
