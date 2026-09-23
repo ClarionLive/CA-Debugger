@@ -638,7 +638,9 @@ namespace ClarionDbg.Cli
         /// handle and fails harmlessly; with one attached the same call patches, retargets or terminates a
         /// real process. The engine already spells "there is no target" as <c>_hProcess == IntPtr.Zero</c>
         /// (DebugEngine.LibState.cs, DebugEngine.cs RequestPause) — this is that test inverted, so the seam
-        /// cannot be misused instead of merely being documented as not-to-be-misused.</summary>
+        /// cannot be misused instead of merely being documented as not-to-be-misused.
+        /// "Attached" here means HOLDING ANY DEBUGGEE, launched or attached with `attach &lt;pid&gt;` alike: the
+        /// name predates the attach verb (3f2d747f), and the test is the handle, not how it was obtained.</summary>
         private void RefuseSeamIfAttached(string seam)
         {
             if (_hProcess != IntPtr.Zero)

@@ -65,6 +65,8 @@ $Suites = @(
   @{ File = 'test-procs.ps1' }
   @{ File = 'test-procs.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-procs.ps1'; Args = @('-WithClarion'); Live = $true }
+  @{ File = 'test-attach.ps1'; Args = @('-SelfTest') }
+  @{ File = 'test-attach.ps1'; Live = $true }
   @{ File = 'test-engine-bpowner.ps1'; Success = '^ALL CHECKS PASSED$'
      NoTotal = 'not yet opted in to Assert-CheckTotal and prints no count - ticket 6493d226' }
   @{ File = 'test-engine-session.ps1' }

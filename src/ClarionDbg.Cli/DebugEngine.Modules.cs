@@ -170,7 +170,9 @@ namespace ClarionDbg.Cli
         {
             try
             {
-                string path = GetPathFromHandle(hFile);
+                // An attach's synthetic LOAD_DLL events may carry no file handle (and never an image name), so
+                // fall back to asking the target's memory (DebugEngine.Attach.cs).
+                string path = GetPathFromHandle(hFile) ?? PathFromMappedImage(baseVa);
                 string name = !string.IsNullOrEmpty(path)
                     ? System.IO.Path.GetFileName(path).ToLowerInvariant()
                     : $"(0x{baseVa:x})";
