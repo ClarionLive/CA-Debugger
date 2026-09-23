@@ -396,18 +396,19 @@ Write-Host ''
 Write-Host '4. stepping while viewing another thread says what it will do (375d463b)'
 # The step buttons stay ENABLED - stepping is defined on the stopped thread and is a legitimate thing to want
 # from anywhere - but the tooltip and the banner name the thread that will run and say the view returns to it.
-# The two pure helpers are compiled out of the shipped view; the wiring is pinned as statements.
-$isOther = Get-Method 'private static bool IsOtherThread(uint selTid, uint stoppedTid)' $viewSrc
+# The "another thread" rule is SeatState.IsOtherThread (compiled above) - ONE statement of it, read by the
+# banner, the stop symbol and these tooltips. StepTip is compiled out of the shipped view; the wiring is
+# pinned as statements.
 $stepTip = Get-Method 'private static string StepTip(string tip, string stoppedName)' $viewSrc
 Add-Type -TypeDefinition @"
 public static class DisasmStepProbe {
-$(($isOther, $stepTip -join "`n") -replace 'private static', 'public static')
+$($stepTip -replace 'private static', 'public static')
 }
 "@ -Language CSharp | Out-Null
-Check 'another selected thread, both known: viewing another thread' ([DisasmStepProbe]::IsOtherThread($B, $A)) ''
-Check 'the stopped thread itself: not another thread' (-not [DisasmStepProbe]::IsOtherThread($A, $A)) ''
-Check 'selection unknown: says nothing' (-not [DisasmStepProbe]::IsOtherThread($Z, $A)) ''
-Check 'stopped thread unknown: says nothing' (-not [DisasmStepProbe]::IsOtherThread($B, $Z)) ''
+Check 'another selected thread, both known: viewing another thread' ([ClarionDebugger.Disassembly.SeatState]::IsOtherThread($B, $A)) ''
+Check 'the stopped thread itself: not another thread' (-not [ClarionDebugger.Disassembly.SeatState]::IsOtherThread($A, $A)) ''
+Check 'selection unknown: says nothing' (-not [ClarionDebugger.Disassembly.SeatState]::IsOtherThread($Z, $A)) ''
+Check 'stopped thread unknown: says nothing' (-not [ClarionDebugger.Disassembly.SeatState]::IsOtherThread($B, $Z)) ''
 $plain = 'Step over one instruction'
 # [NullString]::Value, not $null: PowerShell hands a .NET string parameter "" for $null.
 Check 'on the stopped thread the tooltip is the plain one' ([DisasmStepProbe]::StepTip($plain, [NullString]::Value) -eq $plain) ''
@@ -419,7 +420,7 @@ Check '...and says the view returns to it' ($tip -match 'returns to it') $tip
 $updTips = Get-CSharpCodeOnly (Get-Method 'private void UpdateStepTips()' $viewSrc)
 Check 'the tooltips name the STOPPED thread, never the viewed one' `
   (($updTips -match 'ThreadName\(_stoppedTid\)') -and ($updTips -notmatch 'ThreadName\(_selTid\)')) ''
-Check 'the tooltips speak only when IsOtherThread says so' ($updTips -match 'IsOtherThread\(_selTid,\s*_stoppedTid\)') ''
+Check 'the tooltips speak only when SeatState.IsOtherThread says so' ($updTips -match 'SeatState\.IsOtherThread\(_selTid,\s*_stoppedTid\)') ''
 foreach ($pair in @(@('_bOver', 'TipOver'), @('_bInto', 'TipInto'), @('_bOut', 'TipOut'))) {
   Check "$($pair[0]) gets its own tip through StepTip" `
     ($updTips -match ([regex]::Escape($pair[0]) + '\.ToolTipText\s*=\s*StepTip\(' + $pair[1] + ',\s*stopped\)')) ''
