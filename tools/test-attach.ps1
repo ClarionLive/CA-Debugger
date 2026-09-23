@@ -42,14 +42,16 @@ if ($SelfTest) {
   Write-Host 'test-attach -SelfTest: each planted detach fault must turn protocolcheck red, on the check aimed at it'
   Write-Host ''
   $work = Join-Path ([IO.Path]::GetTempPath()) ('test-attach-mutant-' + [guid]::NewGuid().ToString('N'))
-  # Each plant: name, anchor (must occur exactly once in DebugEngine.Attach.cs), replacement, and the
-  # protocolcheck failure text that proves the RIGHT check caught it.
+  # Each plant: name, anchor (must occur exactly once in its file), replacement, the
+  # protocolcheck failure text that proves the RIGHT check caught it, and optionally the file.
   $plants = @(
     @('the drain never runs', 'internal const int DetachDrainCapEvents = 200;', 'internal const int DetachDrainCapEvents = 0;', 'detach drain: continued'),
     @('the drain does not rewind EIP on our INT3', 'if (rewind) DetachSetEip(Tid(ev), exAddr);', 'if (rewind) { }', 'detach drain: EIP rewinds none'),
     @('the reseed keeps the injected break thread', 'foreach (var kv in created) if (kv.Key != breakTid) list.Add(kv);', 'foreach (var kv in created) list.Add(kv);', 'thread order: 99,'),
     @('the reseed breaks a creation-time tie the wrong way', 'a.Value.CompareTo(b.Value) : a.Key.CompareTo(b.Key)', 'a.Value.CompareTo(b.Value) : b.Key.CompareTo(a.Key)', 'thread order: 30,20,'),
-    @('the reseed does not make the oldest thread main', 'if (order.Count > 0) _mainTid = order[0];', 'if (order.Count < 0) _mainTid = order[0];', 'thread order: _mainTid is')
+    @('the reseed does not make the oldest thread main', 'if (order.Count > 0) _mainTid = order[0];', 'if (order.Count < 0) _mainTid = order[0];', 'thread order: _mainTid is'),
+    # The 4b run 1 fault, restored exactly: commands read only when a wait times out (DebugEngine.cs).
+    @('commands are read only when a wait times out', "if (_interactive) { PollHover(false); DrainCommandsWhileRunning(); }`n                if (!_loopWait(buf, pollMs))`n                {`n                    if (_interactive) continue;", "if (_interactive) PollHover(false);`n                if (!_loopWait(buf, pollMs))`n                {`n                    if (_interactive) { DrainCommandsWhileRunning(); continue; }", 'starved: `detach`', 'DebugEngine.cs')
   )
   try {
     $src = Join-Path $PSScriptRoot '..\src'
@@ -62,8 +64,11 @@ if ($SelfTest) {
           Get-ChildItem -LiteralPath (Join-Path $src $d) -File | Where-Object { $_.Extension -in '.cs', '.csproj' } |
             ForEach-Object { [IO.File]::WriteAllBytes((Join-Path $to $_.Name), [IO.File]::ReadAllBytes($_.FullName)) }
         }
-        $f = Join-Path $dir 'src\ClarionDbg.Cli\DebugEngine.Attach.cs'
-        $text = [IO.File]::ReadAllText($f)
+        # A plant names its file in a 5th element (default DebugEngine.Attach.cs). Line endings are normalized
+        # to LF first, so a multi-line anchor matches whether the working copy is CRLF or LF.
+        $file = if ($p.Count -ge 5) { $p[4] } else { 'DebugEngine.Attach.cs' }
+        $f = Join-Path $dir "src\ClarionDbg.Cli\$file"
+        $text = [IO.File]::ReadAllText($f).Replace("`r`n", "`n")
         $n = ([regex]::Matches($text, [regex]::Escape($p[1]))).Count
         Check "$($p[0]): the plant applies (anchor found exactly once)" ($n -eq 1) "found $n"
         $mut = $text.Replace($p[1], $p[2])
