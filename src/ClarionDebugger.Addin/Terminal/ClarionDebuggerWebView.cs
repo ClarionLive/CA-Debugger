@@ -846,7 +846,12 @@ namespace ClarionDebugger.Terminal
             string module = proc.Module;
             int line = proc.Line;
             string name = proc.Name;
-            if (line <= 0) return;
+            if (line <= 0)
+            {
+                Console("err", "break on entry: " + (string.IsNullOrEmpty(name) ? "that procedure" : name)
+                    + " has no definition line to break on.");
+                return;
+            }
 
             // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
             // the idle branch staged whatever module it was handed, so a name the engine would refuse sat
@@ -1412,8 +1417,9 @@ namespace ClarionDebugger.Terminal
                 if (i > 0) sb.Append(',');
                 // The row's own tid goes through the one writer too (c299aced). It used to be typed inline as
                 // `{"tid":` + t.Tid, which is correct only while every row has a real id; the writer makes
-                // that a rule rather than a fact about today's parser. clarionThread opens the row because
-                // TidMember writes a leading comma - the page reads members by key, so order is free.
+                // that a rule rather than a fact about the parser (which, as of 2026-09-22, drops a row with no
+                // tid). clarionThread opens the row because TidMember writes a leading comma - the page reads
+                // members by key, so order is free.
                 sb.Append("{\"clarionThread\":").Append(t.ClarionThread.HasValue
                         ? t.ClarionThread.Value.ToString(CultureInfo.InvariantCulture) : "null")
                   .Append(TidMember(TidMemberTid, t.Tid))
