@@ -37,6 +37,8 @@ param(
   [string] $VersionPath = '',
   [string] $EngineJsonPath = '',
   [string] $ProcsCommandPath = '',
+  # protocolcheck's pins of the engine's attach wire shapes, which the writer compiled here must match
+  [string] $ProtocolCheckPath = '',
   [string] $PagePath = '',
   [switch] $SelfTest
 )
@@ -52,6 +54,7 @@ if (-not $RedPath) { $RedPath = Join-Path $root 'src\ClarionDebugger.Addin\Servi
 if (-not $VersionPath) { $VersionPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionVersionService.cs' }
 if (-not $EngineJsonPath) { $EngineJsonPath = Join-Path $root 'src\ClarionDbg.Cli\Json.cs' }
 if (-not $ProcsCommandPath) { $ProcsCommandPath = Join-Path $root 'src\ClarionDbg.Cli\ProcsCommand.cs' }
+if (-not $ProtocolCheckPath) { $ProtocolCheckPath = Join-Path $root 'src\ClarionDbg.Cli\ProtocolCheck.Attach.cs' }
 if (-not $PagePath) { $PagePath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\debugger.html' }
 
 # ================================================================================================ -SelfTest
@@ -63,7 +66,7 @@ if (-not $PagePath) { $PagePath = Join-Path $root 'src\ClarionDebugger.Addin\Ter
 if ($SelfTest) {
   $sources = [ordered]@{
     service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; reader = $ReaderPath; red = $RedPath
-    version = $VersionPath; json = $EngineJsonPath; procs = $ProcsCommandPath; page = $PagePath
+    version = $VersionPath; json = $EngineJsonPath; procs = $ProcsCommandPath; pcheck = $ProtocolCheckPath; page = $PagePath
   }
   $M = @(
     @{ Id = 'M1';  Suite = 'ps';   File = 'msgs';    Why = 'an unlisted pid resolves';
@@ -91,7 +94,11 @@ if ($SelfTest) {
     @{ Id = 'M12'; Suite = 'ps';   File = 'web';     Why = 'the exit after a detach wipes the Detached line';
        Find = 'if (attach.Detached) return;'; Repl = 'if (attach.Detached && attach == null) return;' }
     @{ Id = 'M13'; Suite = 'ps';   File = 'web';     Why = 'a failed breakpoint restore is not warned about';
-       Find = '(!d.Restored || !string.IsNullOrEmpty(d.Error))'; Repl = '(d == null)' }
+       Find = 'if (d != null && !string.IsNullOrEmpty(d.Error))'; Repl = 'if (d == null)' }
+    @{ Id = 'M24'; Suite = 'ps';   File = 'service'; Why = 'restored read as a bool again (the seam bug: every clean detach warned or lost its count)';
+       Find = 'Restored = GetIntOrNull(json, "restored") ?? -1,'; Repl = 'Restored = GetBool(json, "restored") ? 1 : -1,' }
+    @{ Id = 'M25'; Suite = 'ps';   File = 'web';     Why = 'a detach with restored 0 and no error warns of a crash';
+       Find = 'if (d != null && !string.IsNullOrEmpty(d.Error))'; Repl = 'if (d != null && (d.Restored == 0 || !string.IsNullOrEmpty(d.Error)))' }
     @{ Id = 'M14'; Suite = 'ps';   File = 'web';     Why = 'an attach failure''s reason is lost in the clear';
        Find = '_attach.LastError = msg;'; Repl = '_attach.Name = _attach.Name;' }
     @{ Id = 'M15'; Suite = 'ps';   File = 'web';     Why = 'process paths are written into the procs JSON unescaped';
@@ -145,7 +152,7 @@ if ($SelfTest) {
         if ($r.Suite -eq 'ps') {
           $out = & pwsh -NoProfile -File $using:self -ServicePath (& $f 'service') -WebViewPath (& $f 'web') `
             -PageMessagesPath (& $f 'msgs') -ReaderPath (& $f 'reader') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
-            -EngineJsonPath (& $f 'json') -ProcsCommandPath (& $f 'procs') -PagePath (& $f 'page') 2>&1
+            -EngineJsonPath (& $f 'json') -ProcsCommandPath (& $f 'procs') -ProtocolCheckPath (& $f 'pcheck') -PagePath (& $f 'page') 2>&1
           $ok = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
         } else {
           $out = & node $using:nodeSuite (& $f 'page') 2>&1
@@ -165,8 +172,8 @@ if ($SelfTest) {
   } finally {
     Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
   }
-  # 23 finds + 23 mutations + 2 controls
-  $EXPECTED_CHECKS = 48
+  # 25 finds + 25 mutations + 2 controls
+  $EXPECTED_CHECKS = 52
   Assert-CheckTotal $EXPECTED_CHECKS
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
@@ -285,9 +292,15 @@ try {
     'System.Threading', 'System.Threading.Thread', 'System.Runtime.InteropServices') | Out-Null
 } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
 
-# The engine's REAL procs writer, so the host's reader is tested against what the engine writes.
+# The engine's REAL writers - procs, loaded (with attached), detached, and the attach error - so every engine
+# payload these checks feed the host is one the engine's own code produced. None is hand-written (3f2d747f seam:
+# a hand-written "restored":true passed here while the engine sends a COUNT, and every clean detach warned).
 $engineJson = Get-Content -Raw -LiteralPath $EngineJsonPath
 $procsCmd = Get-Content -Raw -LiteralPath $ProcsCommandPath
+$xLoaded = Get-Method 'public static string Loaded(uint pid, uint loadBase)' $engineJson
+$xLoadedAttached = Get-Method 'public static string Loaded(uint pid, uint loadBase, bool attached)' $engineJson
+$xDetachedW = Get-Method 'public static string Detached(uint pid, int drained, int restored, string error)' $engineJson
+$xAttachError = Get-Method 'public static string AttachError(string message, int code)' $engineJson
 $engineProbe = @"
 using System;
 using System.Collections.Generic;
@@ -298,6 +311,10 @@ namespace AttachEngineSide {
   public static class EngineJson {
     $(Get-Method 'public static string Str(string s)' $engineJson)
     $(Get-Method 'public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)' $engineJson)
+    $xLoaded
+    $xLoadedAttached
+    $xDetachedW
+    $xAttachError
   }
 }
 "@
@@ -386,8 +403,17 @@ function New-AttachedPad {
   $p.Posts.Clear(); $p.ClearedLine = 0
   $p
 }
-function New-Detach { param([bool] $Restored = $true, [string] $Err = $null, [string] $Name = 'app.exe')
-  $d = New-Object ClarionDebugger.Services.DebugDetach; $d.Pid = 4242; $d.Name = $Name; $d.Restored = $Restored; $d.Error = $Err; $d }
+# Engine payloads, from the engine's own writers (Json.cs), framed the way the engine prints events.
+# [NullString]::Value, because PowerShell hands a .NET string parameter "" for $null - and the writer would then
+# emit "error":"", which is not what the engine sends for a clean detach.
+function Engine-Detached { param([int] $Restored = 3, $Err = $null, [int] $Drained = 0)
+  if ($null -eq $Err) { $Err = [NullString]::Value }
+  [AttachEngineSide.EngineJson]::Detached([uint32] 4242, $Drained, $Restored, $Err) }
+# A DebugDetach as the host really gets one: the ENGINE's detached line through the host's real ParseDetached.
+# $Err is untyped on purpose: a [string] parameter turns $null into "", which the writer would emit as "error":"".
+function New-Detach { param([int] $Restored = 3, $Err = $null, [bool] $Named = $true)
+  $target = if ($Named) { Proc 4242 'app.exe' 'C:\app.exe' } else { $null }
+  Invoke-Static 'ParseDetached' @((Engine-Detached $Restored $Err), $target) }
 
 # ================================================================================================ 3. detached + Stop
 # A stand-in engine: reads one command line, records it, then exits or hangs as told.
@@ -417,20 +443,32 @@ function Invoke-OnLine { param($Svc, $Source, [string] $Line) $SvcT.GetMethod('O
 
 try {
 Invoke-CheckSection '3. the engine''s detached event (the service''s real OnLine)' {
-  $d = Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":3,"restored":true}', (Proc 4242 'app.exe' 'C:\app.exe'))
-  Check 'a clean detach: pid, drained, restored, no error, and the listed name' `
-    (($d.Pid -eq 4242) -and ($d.Drained -eq 3) -and $d.Restored -and ($null -eq $d.Error) -and ($d.Name -eq 'app.exe')) "$($d.Pid) $($d.Drained) $($d.Restored) $(ShowVal $d.Error) $($d.Name)"
-  $d2 = Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":0,"restored":false,"error":"bp 0x401000: \"denied\""}', $null)
-  Check 'a failed restore: restored false and the error text, unescaped' ((-not $d2.Restored) -and ($d2.Error -ceq 'bp 0x401000: "denied"')) (ShowVal $d2.Error)
+  # The writer compiled here IS the shape the engine sends: protocolcheck pins its output to this literal.
+  $pc = Get-Content -Raw -LiteralPath $ProtocolCheckPath
+  $pin = [regex]::Match($pc, '"attach wire: detached", Json\.Detached\(1234, 2, 3, null\),\s*"((?:[^"\\]|\\.)*)"\)')
+  Check 'the compiled writer produces exactly the detached line protocolcheck pins (restored is a COUNT)' `
+    ($pin.Success -and ([AttachEngineSide.EngineJson]::Detached([uint32] 1234, 2, 3, [NullString]::Value) -ceq ($pin.Groups[1].Value -replace '\\"', '"'))) `
+    "$([AttachEngineSide.EngineJson]::Detached([uint32] 1234, 2, 3, [NullString]::Value)) vs $($pin.Groups[1].Value)"
+  $d = Invoke-Static 'ParseDetached' @((Engine-Detached 3 $null 2), (Proc 4242 'app.exe' 'C:\app.exe'))
+  Check 'a clean detach: pid, drained, the restored COUNT, no error, and the listed name' `
+    (($d.Pid -eq 4242) -and ($d.Drained -eq 2) -and ($d.Restored -eq 3) -and ($null -eq $d.Error) -and ($d.Name -eq 'app.exe')) "$($d.Pid) $($d.Drained) $($d.Restored) $(ShowVal $d.Error) $($d.Name)"
+  $d0 = Invoke-Static 'ParseDetached' @((Engine-Detached 0 $null), $null)
+  Check 'restored 0 with no error reads as 0 and no error (nothing was planted: a clean detach)' (($d0.Restored -eq 0) -and ($null -eq $d0.Error)) "$($d0.Restored) $(ShowVal $d0.Error)"
+  $d2 = Invoke-Static 'ParseDetached' @((Engine-Detached 1 'bp 0x401000: "denied"'), $null)
+  Check 'a failed restore: the count and the error text, unescaped' (($d2.Restored -eq 1) -and ($d2.Error -ceq 'bp 0x401000: "denied"')) (ShowVal $d2.Error)
+  # Not an engine shape (the writer always sends the count): a missing or non-numeric count is UNKNOWN (-1).
+  $dm = Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":0}', $null)
+  $db = Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":0,"restored":true}', $null)
+  Check 'a missing or non-numeric restored reads as -1 (unknown), never as a failure' (($dm.Restored -eq -1) -and ($db.Restored -eq -1) -and ($null -eq $dm.Error)) "$($dm.Restored) $($db.Restored)"
 
   $engine = Start-FakeEngine 'never'
   $svc = New-Service $engine.Process (Proc 4242 'app.exe' 'C:\app.exe')
   $script:dets = [System.Collections.Generic.List[object]]::new()
   $svc.add_Detached([Action[ClarionDebugger.Services.DebugDetach]] { param($x) $script:dets.Add($x) })
   Check 'an attached engine counts as an attach session' ($svc.IsAttachSession) ''
-  Invoke-OnLine $svc $engine.Process '@JSON {"event":"loaded","pid":4242,"attached":true}'
+  Invoke-OnLine $svc $engine.Process ('@JSON ' + [AttachEngineSide.EngineJson]::Loaded([uint32] 4242, [uint32] 0x400000, $true))
   Check 'loaded (with the additive attached:true) runs the session' ($svc.State -eq 'Running') "$($svc.State)"
-  Invoke-OnLine $svc $engine.Process '@JSON {"event":"detached","pid":4242,"drained":2,"restored":true}'
+  Invoke-OnLine $svc $engine.Process ('@JSON ' + (Engine-Detached 3 $null 2))
   Check 'detached ends the session at once' ($svc.State -eq 'Idle') "$($svc.State)"
   Check 'and raises Detached once, naming the app' (($script:dets.Count -eq 1) -and ($script:dets[0].Name -eq 'app.exe') -and ($script:dets[0].Pid -eq 4242)) "$($script:dets.Count)"
 
@@ -443,7 +481,7 @@ Invoke-CheckSection '3. the engine''s detached event (the service''s real OnLine
   $script:logs2 = [System.Collections.Generic.List[string]]::new()
   $svc2.add_Detached([Action[ClarionDebugger.Services.DebugDetach]] { param($x) $script:dets2.Add($x) })
   $svc2.add_LogReceived([Action[string]] { param($x) $script:logs2.Add($x) })
-  Invoke-OnLine $svc2 $old '@JSON {"event":"detached","pid":4242,"drained":0,"restored":true}'
+  Invoke-OnLine $svc2 $old ('@JSON ' + (Engine-Detached 3))
   Check 'an older engine''s detached leaves the new session running' ($svc2.State -eq 'Running') "$($svc2.State)"
   Check 'raises no Detached for it' ($script:dets2.Count -eq 0) ''
   Check 'and says so in the log instead' (($script:logs2 -join '|') -match 'previous session''s engine detached from pid 4242') ($script:logs2 -join '|')
@@ -462,7 +500,7 @@ Invoke-CheckSection '3b. a refused attach: an error, even with code 0, is a fail
   $script:errs = [System.Collections.Generic.List[string]]::new(); $script:exits = [System.Collections.Generic.List[int]]::new()
   $svc.add_EngineError([Action[string]] { param($x) $script:errs.Add($x) })
   $svc.add_Exited([Action[int]] { param($x) $script:exits.Add($x) })
-  Invoke-OnLine $svc $dead '@JSON {"event":"error","message":"attach failed: no TSWD debug info in C:\\app.exe <b>x</b>","code":0}'
+  Invoke-OnLine $svc $dead ('@JSON ' + [AttachEngineSide.EngineJson]::AttachError('attach failed: no TSWD debug info in C:\app.exe <b>x</b>', 0))
   Check 'the error reaches the host as its message text, unchanged' `
     (($script:errs.Count -eq 1) -and ($script:errs[0] -ceq 'attach failed: no TSWD debug info in C:\app.exe <b>x</b>')) ($script:errs -join '|')
   Check 'code 0 is NOT success: the session does not become Running' ($svc.State -eq 'Launching') "$($svc.State)"
@@ -473,7 +511,7 @@ Invoke-CheckSection '3b. a refused attach: an error, even with code 0, is a fail
   # After a detach, too, nothing attached remains.
   $e = Start-FakeEngine 'never'
   $svc = New-Service $e.Process (Proc 4242 'app.exe' 'C:\app.exe')
-  Invoke-OnLine $svc $e.Process '@JSON {"event":"detached","pid":4242,"drained":0,"restored":true}'
+  Invoke-OnLine $svc $e.Process ('@JSON ' + (Engine-Detached 0))
   Check 'after detached, no attached state remains either' (-not $svc.IsAttachSession) ''
   try { if (-not $e.Process.HasExited) { $e.Process.Kill() } } catch { }
 
@@ -598,9 +636,23 @@ Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits'
   Check 'detached clears the edit grants, the transient breakpoints and the run-to-cursor key' `
     (($pad.GrantCount -eq 0) -and ($pad._transientBps.Count -eq 0) -and ($null -eq $pad._pendingRtcKey)) ''
   Check 'and the execution line' ($pad.ClearedLine -eq 1) ''
-  Check 'it clears the page FIRST, then says the app is still running' `
-    (($pad.Posts.Count -ge 2) -and ($pad.Posts[0] -ceq $ClearJson) -and ($pad.Posts[1] -ceq 'console|info|Detached; app.exe is still running.')) ($pad.Posts -join ' / ')
-  Check 'a clean detach warns about nothing' (-not (($pad.Posts -join "`n") -match 'console\|err\|')) ($pad.Posts -join ' / ')
+  Check 'it clears the page FIRST, then says the app is still running, with the engine''s restored count' `
+    (($pad.Posts.Count -eq 2) -and ($pad.Posts[0] -ceq $ClearJson) -and ($pad.Posts[1] -ceq 'console|info|Detached; app.exe is still running (3 breakpoints restored).')) ($pad.Posts -join ' / ')
+  Check 'a clean detach (the ENGINE''s payload: a count, no error) warns about nothing' (-not (($pad.Posts -join "`n") -match 'console\|err\|')) ($pad.Posts -join ' / ')
+  $pad = New-AttachedPad
+  $pad.OnSvcDetached((New-Detach 0))
+  Check 'restored 0 with no error is a clean detach too: no warning, and the count is shown' `
+    ((-not (($pad.Posts -join "`n") -match 'console\|err\|')) -and ($pad.Posts -contains 'console|info|Detached; app.exe is still running (0 breakpoints restored).')) ($pad.Posts -join ' / ')
+  $pad = New-AttachedPad
+  $pad.OnSvcDetached((New-Detach 1))
+  Check 'one breakpoint is "1 breakpoint", singular' ($pad.Posts -contains 'console|info|Detached; app.exe is still running (1 breakpoint restored).') ($pad.Posts -join ' / ')
+  $pad = New-AttachedPad
+  $pad.OnSvcDetached((Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":0}', (Proc 4242 'app.exe' 'C:\app.exe'))))
+  Check 'an unknown count (-1) is left out of the line, and is not a failure' `
+    (($pad.Posts -contains 'console|info|Detached; app.exe is still running.') -and -not (($pad.Posts -join "`n") -match 'console\|err\|')) ($pad.Posts -join ' / ')
+  $pad = New-AttachedPad
+  $pad.OnSvcDetached((New-Detach))
+  $pad.Posts.Clear()
   $pad.Posts.Clear()
   $pad.OnSvcExited(0)
   Check 'the engine''s exit after a detach posts nothing, so the Detached line survives' ($pad.Posts.Count -eq 0) ($pad.Posts -join ' / ')
@@ -611,19 +663,18 @@ Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits'
   # exit); the pad still names the app it attached to.
   $pad = New-AttachedPad
   $pad.OnSvcExited(0)
-  $pad.OnSvcDetached((New-Detach -Name $null))
+  $pad.OnSvcDetached((New-Detach -Named $false))
   $last = $pad.Posts[$pad.Posts.Count - 1]
-  Check 'exit first, detached second (no name on the event): the Detached line still names the app, and is last' ($last -ceq 'console|info|Detached; app.exe is still running.') ($pad.Posts -join ' / ')
+  Check 'exit first, detached second (no name on the event): the Detached line still names the app, and is last' ($last -ceq 'console|info|Detached; app.exe is still running (3 breakpoints restored).') ($pad.Posts -join ' / ')
   Check 'and it follows a clear' ($pad.Posts[$pad.Posts.Count - 2] -ceq $ClearJson) ($pad.Posts -join ' / ')
 
+  # The warning is driven by the engine's `error` alone.
   $pad = New-AttachedPad
-  $pad.OnSvcDetached((New-Detach $false 'bp at 0x401000 not restored'))
+  $pad.OnSvcDetached((New-Detach 2 '1 breakpoint byte(s) could not be restored'))
   $txt = $pad.Posts -join "`n"
-  Check 'detached with an error: an ERR line warns the app may crash, with the reason' `
-    ($txt -match 'console\|err\|detach could not restore every breakpoint \(bp at 0x401000 not restored\): app\.exe will probably crash') ($pad.Posts -join ' / ')
-  $pad = New-AttachedPad
-  $pad.OnSvcDetached((New-Detach $false $null))
-  Check 'restored:false with no error text still warns' (($pad.Posts -join "`n") -match 'console\|err\|detach could not restore every breakpoint: app\.exe') ($pad.Posts -join ' / ')
+  Check 'detached with an error (the ENGINE''s payload): an ERR line warns the app may crash, with the reason' `
+    ($txt -match 'console\|err\|detach could not restore every breakpoint \(1 breakpoint byte\(s\) could not be restored\): app\.exe will probably crash') ($pad.Posts -join ' / ')
+  Check 'and the info line still reports what WAS restored' ($pad.Posts -contains 'console|info|Detached; app.exe is still running (2 breakpoints restored).') ($pad.Posts -join ' / ')
 }
 
 Invoke-CheckSection '7. the pad: an attach that fails, and a launch''s exit (unchanged)' {
@@ -666,8 +717,8 @@ Invoke-CheckSection '8. where the pieces are wired (position and text pins)' {
   Check 'the only literal "quit" in the service is TeardownCommand''s' (([regex]::Matches((Get-CSharpCodeOnly $svcSrc), '"quit"')).Count -eq 1) ''
 }
 
-# Runtime counts on a clean run, per section: 25, 8, 9, 6 (3b), 10, 23, 11, 3, 10.
-$EXPECTED_CHECKS = 105
+# Runtime counts on a clean run, per section: 25, 8, 12, 6 (3b), 10, 23, 14, 3, 10.
+$EXPECTED_CHECKS = 111
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

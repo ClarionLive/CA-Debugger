@@ -462,11 +462,15 @@ namespace ClarionDebugger.Terminal
             Post("{\"type\":\"clear\"}");   // first: `clear` empties the console, and the lines below must survive it
             string name = d != null && !string.IsNullOrEmpty(d.Name) ? d.Name
                         : !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";
-            Console("info", "Detached; " + name + " is still running.");
-            if (d != null && (!d.Restored || !string.IsNullOrEmpty(d.Error)))
-                Console("err", "detach could not restore every breakpoint"
-                    + (string.IsNullOrEmpty(d.Error) ? "" : " (" + d.Error + ")")
-                    + ": " + name + " will probably crash when it reaches one. Save your work in it and restart it.");
+            // `restored` is a COUNT and informational; -1 = the engine did not say. The crash warning is driven
+            // ONLY by `error`, which the engine sets whenever any restore failed.
+            string count = d != null && d.Restored >= 0
+                ? " (" + d.Restored.ToString(CultureInfo.InvariantCulture) + " breakpoint" + (d.Restored == 1 ? "" : "s") + " restored)"
+                : "";
+            Console("info", "Detached; " + name + " is still running" + count + ".");
+            if (d != null && !string.IsNullOrEmpty(d.Error))
+                Console("err", "detach could not restore every breakpoint (" + d.Error + "): "
+                    + name + " will probably crash when it reaches one. Save your work in it and restart it.");
         });
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
