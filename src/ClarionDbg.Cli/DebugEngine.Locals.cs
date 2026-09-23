@@ -546,7 +546,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
-        /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
+        /// in this module's DATA section), read live. Excludes file record buffers (FILE$PRE:RECORD) which already
         /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
         private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
                                              IntPtr hThread)
@@ -566,8 +566,11 @@ namespace ClarionDbg.Cli
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
                         if (ds.ModuleIdx != mi) continue;
-                        if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
-                            continue;   // file record buffer — belongs to the file-buffer tree, not module data
+                        // File record buffer: belongs to the file-buffer tree, not module data. The SHAPE test,
+                        // shared with the name index. A bare ":RECORD" suffix also hid a form's
+                        // HISTORY::COU:RECORD, which is a module GROUP the Tables tree does not show (04d7b4c8).
+                        if (TswdDebugInfo.IsFileRecordName(ds.Name))
+                            continue;
                         // A ,THREAD module symbol lives in .cwtls and has one instance PER THREAD, exactly
                         // like the record buffers `watch` resolves. Reading the link-time template here would
                         // show every thread the same shared value — and, now that this panel is re-read on a

@@ -76,6 +76,8 @@ namespace ClarionDbg.Cli
                 CheckRefusalsNeverShowARawTid,
                 CheckFieldNameResolvesToFileRecord,
                 CheckTemplateSpanDiscriminator,
+                CheckFileRecordShape,
+                CheckDataNameIndexFromParsedBlob,
             };
 
             foreach (var check in checks)
