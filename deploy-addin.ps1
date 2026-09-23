@@ -1,4 +1,4 @@
-# Clarion Debugger (standalone addin) — build & deploy.
+﻿# Clarion Debugger (standalone addin) — build & deploy.
 # Builds the ClarionDbg engine + the IDE addin, then deploys both into
 # <ClarionRoot>\accessory\addins\ClarionDebugger\ for each requested version.
 #
