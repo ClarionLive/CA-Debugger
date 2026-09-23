@@ -80,7 +80,8 @@ function Read-EngineLines {
         $line = $Session.Sink[$Session.Cursor]
         $Session.Cursor++
         if ($null -eq $Session.TargetPid -and $null -ne $line) {
-            if ($line -match '"event":"loaded"[^}]*"pid":\s*(\d+)') { $Session.TargetPid = [int]$matches[1] }
+            # -cmatch: a WIRE spelling, case-sensitive JSON (09207c17). Same rule as Wait-EnginePaused below.
+            if ($line -cmatch '"event":"loaded"[^}]*"pid":\s*(\d+)') { $Session.TargetPid = [int]$matches[1] }
             elseif ($line -match '^launched\s+\S+\s+\(pid\s+(\d+)\)') { $Session.TargetPid = [int]$matches[1] }
         }
         $out += $line
@@ -96,8 +97,10 @@ function Wait-EnginePaused {
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
         foreach ($line in (Read-EngineLines $Session)) {
             if ($OnLine) { & $OnLine $line }
-            if ($line -match '"event":"paused"') { return $true }
-            if ($line -match '"event":"exited"') { return $false }
+            # -cmatch, not -match (09207c17): these are WIRE event names, which the pad switches on exactly.
+            # -match is case-insensitive, so it would report a stop for "event":"Paused" that the pad ignores.
+            if ($line -cmatch '"event":"paused"') { return $true }
+            if ($line -cmatch '"event":"exited"') { return $false }
         }
         if ($Session.Proc -and $Session.Proc.HasExited -and $Session.Cursor -ge $Session.Sink.Count) { return $false }
         if ($EachTick) { & $EachTick }

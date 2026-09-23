@@ -64,6 +64,13 @@ Invoke-CheckSection '3) Wait-EnginePaused reports the stop, the exit, and the ti
     Emit $s2 '@JSON {"event":"exited","code":0}'
     Check 'an exited event is not a stop' (-not (Wait-EnginePaused $s2 5))
 
+    # CASE IS PART OF THE TOKEN (09207c17). The pad switches on "paused" exactly, so a line the pad would
+    # not treat as a stop must not be one here either. Pins the -cmatch in Wait-EnginePaused: with -match
+    # this line is a stop, and every check above still passes.
+    $sCase = New-FakeSession
+    Emit $sCase '@JSON {"event":"Paused","ebp":"0x18FF00","va":"0x847A76"}'
+    Check 'a case-drifted "Paused" is not a stop' (-not (Wait-EnginePaused $sCase 1))
+
     $s3 = New-FakeSession
     $script:tickCount = 0
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -406,6 +413,20 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
     } finally { Remove-Item -LiteralPath $banned -Force -ErrorAction SilentlyContinue }
 }
 
+# THE SECTION RUNNER MUST NOT SHADOW ITS CALLER. PowerShell scoping is dynamic, so a section body sees
+# Invoke-CheckSection's own locals ahead of the script's variables of the same name - found 2026-09-22 when
+# test-bp-threaded.ps1's -Name read as the section's heading. Every name the runner uses internally is set
+# here at SCRIPT scope, and the section must read the script's values back.
+$script:Name = 'caller Name'; $script:Body = 'caller Body'; $script:before = 'caller before'
+$script:returned = 'caller returned'; $script:err = 'caller err'
+$script:sectionName = 'caller sectionName'; $script:sectionBody = 'caller sectionBody'
+Invoke-CheckSection '7) a section reads its CALLER''s variables, never the section runner''s own' {
+    $seen = "$Name|$Body|$before|$returned|$err|$sectionName|$sectionBody"
+    Check 'every runner-internal name reads the script''s value inside a section' `
+        ($seen -ceq 'caller Name|caller Body|caller before|caller returned|caller err|caller sectionName|caller sectionBody') $seen
+}
+Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionName, sectionBody
+
 # (b) THE BACKSTOP, in lib-check.ps1's terms. (a) - Invoke-CheckSection turning a thrown section into a
 # failed check - is what actually closes ticket cb9324f2 and needs nothing maintained. This catches the
 # remaining case (a) cannot: a section that returns EARLY without throwing raises nothing to catch, and
@@ -414,7 +435,7 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 56
+$EXPECTED_CHECKS = 58
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

@@ -52,6 +52,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\engine-session.ps1"
+# Check / Invoke-CheckSection / Assert-CheckTotal (60344b78). engine-session.ps1 does not load them.
+. "$PSScriptRoot\lib-check.ps1"
 
 Add-Type @"
 using System; using System.Runtime.InteropServices; using System.Text;
@@ -107,19 +109,22 @@ $script:watchLine = $null
 # this one is for the console line and the log, where a bare pid does no harm.
 function TargetPid { if ($null -eq $session.TargetPid) { 0 } else { [int]$session.TargetPid } }
 
+# -cmatch on every WIRE spelling (09207c17): event names and member keys are case-sensitive JSON that the pad
+# switches on exactly, and PowerShell's -match is not - it would count an "event":"Trace" line as a hit. The
+# one case-blind match left is the Clarion NAME, which Clarion itself treats case-insensitively.
 function Note([string]$l) {
     if (-not $script:announcedPid -and $null -ne $session.TargetPid) {
         $script:announcedPid = $true
         Write-Host "## target pid = $($session.TargetPid) (from the engine, not by name)"
     }
-    if ($l -match '"event":"trace"') {
-        $v = if ($l -match 'value=\[([^\]]*)\]') { $matches[1] } else { '<unparsed>' }
-        $hc = if ($l -match '"hitCount":(\d+)') { [int]$matches[1] } else { -1 }
+    if ($l -cmatch '"event":"trace"') {
+        $v = if ($l -cmatch 'value=\[([^\]]*)\]') { $matches[1] } else { '<unparsed>' }
+        $hc = if ($l -cmatch '"hitCount":(\d+)') { [int]$matches[1] } else { -1 }
         [void]$script:events.Add(@{ Kind='trace'; Value=$v; HitCount=$hc; Raw=$l })
     }
-    elseif ($l -match '"event":"paused"')  { [void]$script:events.Add(@{ Kind='paused';  Raw=$l }) }
-    elseif ($l -match '"event":"exited"')  { [void]$script:events.Add(@{ Kind='exited';  Raw=$l }) }
-    elseif ($l -match '"event":"watch"' -and $l -match [regex]::Escape($Name)) { $script:watchLine = $l; [void]$script:events.Add(@{ Kind='watch'; Raw=$l }) }
+    elseif ($l -cmatch '"event":"paused"')  { [void]$script:events.Add(@{ Kind='paused';  Raw=$l }) }
+    elseif ($l -cmatch '"event":"exited"')  { [void]$script:events.Add(@{ Kind='exited';  Raw=$l }) }
+    elseif ($l -cmatch '"event":"watch"' -and $l -match [regex]::Escape($Name)) { $script:watchLine = $l; [void]$script:events.Add(@{ Kind='watch'; Raw=$l }) }
 }
 
 function Show([string]$l) {
@@ -169,87 +174,95 @@ function Run-Leg([string]$label) {
     }
 }
 
-try {
-    # let the app come up and report its pid
-    Run-For 4 "startup"
+Invoke-CheckSection 'drive the target through both legs, then judge what the engine read' {
+  try {
+      # let the app come up and report its pid
+      Run-For 4 "startup"
 
-    # LEG 1 -- hits with no pause anywhere.
-    $leg1Start = $script:events.Count
-    Run-Leg "LEG 1: tracepoint hits, target never paused"
-    $leg1End = $script:events.Count
+      # LEG 1 -- hits with no pause anywhere.
+      $leg1Start = $script:events.Count
+      Run-Leg "LEG 1: tracepoint hits, target never paused"
+      $leg1End = $script:events.Count
 
-    # explicit stop, cross-check the same name through the Watch path, then resume
-    Write-Host ">>> pause"
-    $proc.StandardInput.WriteLine("pause")
-    $paused = Wait-Paused $PauseTimeoutSec
-    if ($paused) {
-        Write-Host ">>> watch $Name"
-        $proc.StandardInput.WriteLine("watch $Name")
-        Run-For 3 "watch reply"
-        Write-Host ">>> continue"
-        $proc.StandardInput.WriteLine("continue")
-        Start-Sleep -Milliseconds 800; Drain
-    } else { Write-Host "!! never paused" }
+      # explicit stop, cross-check the same name through the Watch path, then resume
+      Write-Host ">>> pause"
+      $proc.StandardInput.WriteLine("pause")
+      $paused = Wait-Paused $PauseTimeoutSec
+      if ($paused) {
+          Write-Host ">>> watch $Name"
+          $proc.StandardInput.WriteLine("watch $Name")
+          Run-For 3 "watch reply"
+          Write-Host ">>> continue"
+          $proc.StandardInput.WriteLine("continue")
+          Start-Sleep -Milliseconds 800; Drain
+      } else { Write-Host "!! never paused" }
 
-    # LEG 2 -- hits AFTER a stop and a resume. Anything cached at hit time in leg 1 is now a resume old.
-    $leg2Start = $script:events.Count
-    # Same rule as the menu poke: verify first, and say so when there is nothing to wake.
-    $wakePid = Get-EngineTargetPid $session
-    if ($null -ne $wakePid) { [void][Poke]::Wake($wakePid) }
-    else { Write-Host '## wake skipped -- no verifiable debuggee process' }
-    Run-For 2 "LEG 2: settling after the resume"
-    Run-Leg "LEG 2: more tracepoint hits, after a pause and a resume"
-    $leg2End = $script:events.Count
+      # LEG 2 -- hits AFTER a stop and a resume. Anything cached at hit time in leg 1 is now a resume old.
+      $leg2Start = $script:events.Count
+      # Same rule as the menu poke: verify first, and say so when there is nothing to wake.
+      $wakePid = Get-EngineTargetPid $session
+      if ($null -ne $wakePid) { [void][Poke]::Wake($wakePid) }
+      else { Write-Host '## wake skipped -- no verifiable debuggee process' }
+      Run-For 2 "LEG 2: settling after the resume"
+      Run-Leg "LEG 2: more tracepoint hits, after a pause and a resume"
+      $leg2End = $script:events.Count
+  }
+  finally {
+      Stop-EngineSession $session
+      Start-Sleep -Milliseconds 400; Drain
+      # The ONLY thing here that signals the debuggee: pid AND name AND started-after-this-session, checked
+      # in one shared place. A recycled pid is not this run's target and is left alone.
+      Stop-EngineTarget $session
+      Remove-EngineSession $session
+      if ($LogFile) { [IO.File]::WriteAllLines($LogFile, [string[]]$session.Sink.ToArray()) }
+  }
+
+  # --- verdict ------------------------------------------------------------------------------------
+  function Slice([int]$a, [int]$b) { if ($b -le $a) { return @() } ; return @($script:events[$a..($b-1)]) }
+  $leg1 = @(Slice $leg1Start $leg1End)
+  $leg2 = @(Slice $leg2Start $leg2End)
+  $t1 = @($leg1 | Where-Object { $_.Kind -eq 'trace' })
+  $t2 = @($leg2 | Where-Object { $_.Kind -eq 'trace' })
+  $v1 = @($t1 | ForEach-Object { $_.Value } | Sort-Object -Unique)
+  $v2 = @($t2 | ForEach-Object { $_.Value } | Sort-Object -Unique)
+  $unrendered = @(@($t1) + @($t2) | Where-Object { $_.Value -like '{?*' })
+
+  Write-Host ""
+  Write-Host "================ RESULT ================"
+  Write-Host ("leg 1 hits (no pause) : {0}   distinct values: {1}" -f $t1.Count, $v1.Count)
+  Write-Host ("leg 2 hits (post-resume): {0} distinct values: {1}" -f $t2.Count, $v2.Count)
+  Write-Host ("leg 1 values : " + (($v1 | Select-Object -First 8) -join ' | '))
+  Write-Host ("leg 2 values : " + (($v2 | Select-Object -First 8) -join ' | '))
+  Write-Host ("watch reply  : " + $(if ($script:watchLine) { $script:watchLine } else { '<none>' }))
+
+  # E and G assert MORE than one value, which is true of an unconditional tracepoint and false of a
+  # conditional one, so a condition leg replaces them with H and I rather than adding to them. Either way the
+  # verdict is 7 checks, which Assert-CheckTotal below holds.
+  # The name under test must really BE threaded, or every other check below is vacuous. -cmatch: `true` is
+  # lowercase by RFC 8259, and a drifted `True` must not satisfy it (09207c17).
+  Check 'A the name is THREADed (watch says threaded:true)' ($null -ne $script:watchLine -and $script:watchLine -cmatch '"threaded":true') (ShowVal $script:watchLine)
+  Check 'B leg 1 hit the tracepoint many times, no pause (>= 8)' ($t1.Count -ge 8) "$($t1.Count) hit(s)"
+  Check 'C leg 1 took the NON-pausing path (no paused event among the hits)' (@($leg1 | Where-Object { $_.Kind -eq 'paused' }).Count -eq 0) ''
+  Check 'D no hit rendered the name as {?...}' ($unrendered.Count -eq 0) "$($unrendered.Count) unrendered"
+  if (-not $Condition) { Check 'E leg 1 read LIVE data (>= 2 distinct values)' ($v1.Count -ge 2) "$($v1.Count) distinct" }
+  Check 'F the tracepoint still fired after pause+resume (>= 8)' ($t2.Count -ge 8) "$($t2.Count) hit(s)"
+  if (-not $Condition) { Check 'G leg 2 read LIVE data too (>= 2 distinct values)' ($v2.Count -ge 2) "$($v2.Count) distinct" }
+  if ($Condition) {
+      $allT  = @(@($t1) + @($t2))
+      $wrong = @($allT | Where-Object { $_.Value -ne $Expect })
+      Check 'H the condition was satisfied at least once (a trace fired)' ($allT.Count -ge 1) "$($allT.Count) trace(s)"
+      Check "I every fired trace shows the value the condition selected ('$Expect')" ($allT.Count -ge 1 -and $wrong.Count -eq 0) `
+        $(if ($wrong.Count) { "$($wrong.Count) fired with a value the condition should have rejected: " + (($wrong | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ' | ') } else { '' })
+  }
 }
-finally {
-    Stop-EngineSession $session
-    Start-Sleep -Milliseconds 400; Drain
-    # The ONLY thing here that signals the debuggee: pid AND name AND started-after-this-session, checked
-    # in one shared place. A recycled pid is not this run's target and is left alone.
-    Stop-EngineTarget $session
-    Remove-EngineSession $session
-    if ($LogFile) { [IO.File]::WriteAllLines($LogFile, [string[]]$session.Sink.ToArray()) }
-}
+# THE COUNT, ASSERTED AND PRINTED (60344b78). The run above sits inside Invoke-CheckSection, so a throw or a
+# top-level `break` anywhere in it is a non-zero exit rather than a silent success with no verdict. This
+# catches a verdict check that was skipped. COUNTING RULE: the RUNTIME count of Check calls - 7 with or
+# without -Condition, since H and I replace E and G. Update it deliberately with the checks.
+$EXPECTED_CHECKS = 7
+Assert-CheckTotal $EXPECTED_CHECKS
 
-# --- verdict ------------------------------------------------------------------------------------
-function Slice([int]$a, [int]$b) { if ($b -le $a) { return @() } ; return @($script:events[$a..($b-1)]) }
-$leg1 = @(Slice $leg1Start $leg1End)
-$leg2 = @(Slice $leg2Start $leg2End)
-$t1 = @($leg1 | Where-Object { $_.Kind -eq 'trace' })
-$t2 = @($leg2 | Where-Object { $_.Kind -eq 'trace' })
-$v1 = @($t1 | ForEach-Object { $_.Value } | Sort-Object -Unique)
-$v2 = @($t2 | ForEach-Object { $_.Value } | Sort-Object -Unique)
-$unrendered = @(@($t1) + @($t2) | Where-Object { $_.Value -like '{?*' })
-
-Write-Host ""
-Write-Host "================ RESULT ================"
-Write-Host ("leg 1 hits (no pause) : {0}   distinct values: {1}" -f $t1.Count, $v1.Count)
-Write-Host ("leg 2 hits (post-resume): {0} distinct values: {1}" -f $t2.Count, $v2.Count)
-Write-Host ("leg 1 values : " + (($v1 | Select-Object -First 8) -join ' | '))
-Write-Host ("leg 2 values : " + (($v2 | Select-Object -First 8) -join ' | '))
-Write-Host ("watch reply  : " + $(if ($script:watchLine) { $script:watchLine } else { '<none>' }))
-
-$checks = @()
-# The name under test must really BE threaded, or every other check below is vacuous.
-$checks += @{ N="A the name is THREADed (watch says threaded:true)"; Ok = ($script:watchLine -ne $null -and $script:watchLine -match '"threaded":true') }
-$checks += @{ N="B leg 1 hit the tracepoint many times, no pause (>= 8)"; Ok = ($t1.Count -ge 8) }
-$checks += @{ N="C leg 1 took the NON-pausing path (no paused event among the hits)"; Ok = (@($leg1 | Where-Object { $_.Kind -eq 'paused' }).Count -eq 0) }
-$checks += @{ N="D no hit rendered the name as {?...}";              Ok = ($unrendered.Count -eq 0) }
-$checks += @{ N="E leg 1 read LIVE data (>= 2 distinct values)";     Ok = ($v1.Count -ge 2) }
-$checks += @{ N="F the tracepoint still fired after pause+resume (>= 8)"; Ok = ($t2.Count -ge 8) }
-$checks += @{ N="G leg 2 read LIVE data too (>= 2 distinct values)"; Ok = ($v2.Count -ge 2) }
-if ($Condition) {
-    $allT  = @(@($t1) + @($t2))
-    $wrong = @($allT | Where-Object { $_.Value -ne $Expect })
-    # E and G assert MORE than one value, which is true of an unconditional tracepoint and false of a
-    # conditional one, so a condition leg replaces them rather than adding to them.
-    $checks = @($checks | Where-Object { $_.N -notmatch '^(E|G) ' })
-    $checks += @{ N="H the condition was satisfied at least once (a trace fired)"; Ok = ($allT.Count -ge 1) }
-    $checks += @{ N="I every fired trace shows the value the condition selected ('$Expect')"; Ok = ($allT.Count -ge 1 -and $wrong.Count -eq 0) }
-    if ($wrong.Count -gt 0) { Write-Host ("!! {0} trace(s) fired with a value the condition should have rejected: {1}" -f $wrong.Count, (($wrong | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ' | ')) }
-}
-
-$fail = 0
-foreach ($c in $checks) { $tag = if ($c.Ok) { "PASS" } else { "FAIL"; }; if (-not $c.Ok) { $fail++ }; Write-Host ("  [{0}] {1}" -f $(if($c.Ok){"PASS"}else{"FAIL"}), $c.N) }
 Write-Host "========================================"
-if ($fail -eq 0) { Write-Host "ALL CHECKS PASSED"; exit 0 } else { Write-Host "$fail CHECK(S) FAILED"; exit 1 }
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+Write-Host "ALL $($script:checks) CHECKS PASSED"
+exit 0

@@ -86,18 +86,27 @@ function ShowVal { param($v) if ($null -eq $v) { '(null)' } else { [string] $v }
 # report which section, and how it went wrong.
 function Invoke-CheckSection {
   param([string] $Name, [scriptblock] $Body)
+  # EVERY LOCAL HERE IS PRIVATE, and the two parameters are removed once copied. PowerShell scoping is
+  # DYNAMIC: $Body runs in a child of THIS function's scope, so a plain local here SHADOWS the caller's
+  # script variable of the same name for the whole section. Found 2026-09-22: test-bp-threaded.ps1's
+  # -Name parameter (the Clarion name under test) read as this function's $Name - the section heading -
+  # and the harness sent `watch drive the target through both legs, ...` to the engine. Nothing threw;
+  # check A simply failed on a clean run. A section must see its caller's variables and nothing of ours.
+  $private:sectionName = $Name
+  $private:sectionBody = $Body
+  Remove-Variable -Name Name, Body -Scope Local
   # The runner prints the heading, so the name in the heading and the name in a failure are the SAME string
   # and cannot drift apart.
-  Write-Host $Name
-  $before = $script:checks
-  $returned = $false
-  try { $Body.Invoke(); $returned = $true }
+  Write-Host $sectionName
+  $private:before = $script:checks
+  $private:returned = $false
+  try { $sectionBody.Invoke(); $returned = $true }
   catch {
     # The InnerException is the one the section actually threw; .Invoke() wraps it in a
     # MethodInvocationException whose own message is about Invoke, not about the bug.
-    $err = $_.Exception
+    $private:err = $_.Exception
     if ($err.InnerException) { $err = $err.InnerException }
-    Check "section '$Name' ran to completion" $false "$($err.GetType().Name): $($err.Message)"
+    Check "section '$sectionName' ran to completion" $false "$($err.GetType().Name): $($err.Message)"
     $returned = $true
   }
   finally {
@@ -110,7 +119,7 @@ function Invoke-CheckSection {
       # This `finally` is the only thing that still executes during that unwind (verified likewise), which
       # is why the report and the exit code are issued from HERE rather than reported as a failed check -
       # a Check would be counted by a total nothing will ever reach.
-      Write-Host "  FAIL  section '$Name' terminated the script without throwing"
+      Write-Host "  FAIL  section '$sectionName' terminated the script without throwing"
       Write-Host '        (a `break` or `continue` with no enclosing loop is flow control, not an error:'
       Write-Host '         it is uncatchable, and everything after it - including the summary - is skipped)'
       exit 1
@@ -120,7 +129,7 @@ function Invoke-CheckSection {
   # member is a section whose setup silently produced no cases. Positive, per-section, and it sees things
   # a global total cannot attribute.
   if ($script:checks -eq $before) {
-    Check "section '$Name' reported at least one check" $false 'it ran and asserted nothing'
+    Check "section '$sectionName' reported at least one check" $false 'it ran and asserted nothing'
   }
 }
 
