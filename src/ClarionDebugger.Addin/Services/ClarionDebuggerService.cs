@@ -340,6 +340,9 @@ namespace ClarionDebugger.Services
         public event Action<string> LogReceived;
         public event Action<int> Exited;
         public event Action<DebugDetach> Detached;                 // an attached session let its process go (it keeps running)
+        // Stop had to KILL an attached engine that did not detach in time (the listed target, or null). The app may
+        // still hold planted breakpoints and will probably crash (3f2d747f). Raised on Stop's thread, before it returns.
+        public event Action<AttachableProcess> DetachAbandoned;
 
         public bool IsRunning { get { return _proc != null && !_proc.HasExited; } }
 
@@ -428,13 +431,30 @@ namespace ClarionDebugger.Services
         /// </summary>
         public void AttachSession(AttachableProcess target, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
         {
-            if (target == null || target.Pid == 0) throw new ArgumentException("No process to attach to.");
+            string args = BuildAttachArgs(target, breakpoints, solutionDlls);   // throws before anything starts
             if (!ReferenceEquals(Active, this)) { Active = this; ActiveChanged?.Invoke(); }
             MemLo = MemHi = 0;
+            Launch(target.Path, args, true, target);
+        }
+
+        /// <summary>The engine command line for an attach: <c>attach &lt;pid&gt; --interactive --json --expect-start
+        /// &lt;started&gt;</c> plus the shared session options. Throws, starting nothing, for no target or no start time.
+        /// <para>
+        /// A PID IS NOT AN IDENTITY: between the listing and the attach the listed process can exit and another take
+        /// its pid. The engine checks the process's creation time against --expect-start and refuses a mismatch
+        /// ("pid reused"), so an attach never goes out without the start time the listing reported.
+        /// </para></summary>
+        internal static string BuildAttachArgs(AttachableProcess target, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)
+        {
+            if (target == null || target.Pid == 0) throw new ArgumentException("No process to attach to.");
+            if (!AttachableProcess.IsStartTime(target.Started))
+                throw new ArgumentException("The process list gave no start time for pid " + target.Pid.ToString(CultureInfo.InvariantCulture)
+                    + ", so the debugger cannot prove it is still the process that was listed.");
             var args = new System.Text.StringBuilder();
-            args.Append("attach ").Append(target.Pid.ToString(CultureInfo.InvariantCulture)).Append(" --interactive --json");
+            args.Append("attach ").Append(target.Pid.ToString(CultureInfo.InvariantCulture)).Append(" --interactive --json")
+                .Append(" --expect-start ").Append(target.Started);
             AppendSessionOptions(args, breakpoints, solutionDlls);
-            Launch(target.Path, args.ToString(), true, target);
+            return args.ToString();
         }
 
         /// <summary>The <c>--bp</c> and <c>--solution-dll</c> options, shared by a launch and an attach so the two
@@ -685,8 +705,20 @@ namespace ClarionDebugger.Services
                     // fall back to Kill. After Kill, WaitForExit confirms the OS has actually reaped the process
                     // (Kill only requests termination).
                     bool attached = IsAttachSession;
+                    var target = _attachTarget;   // captured: the exit handler clears the field
+                    var engine = _proc;
                     bool exited = SendCommand(TeardownCommand(attached))
                                && _proc.WaitForExit(attached ? DetachWaitMs : QuitWaitMs);
+                    // An attached engine's LAST words are its `detached` event, and it may carry an error (bytes left
+                    // planted: the app may crash). The timed wait returns at process exit, possibly before the
+                    // buffered line is read; the untimed wait returns only once redirected output has been drained,
+                    // so Detached is raised BEFORE Stop returns - and so before a caller that observes teardown
+                    // (the pad's Dispose, 3f2d747f) stops listening. The process has already exited, so this is bounded.
+                    if (exited && attached)
+                    {
+                        try { engine.WaitForExit(); }
+                        catch (Exception ex) { LogReceived?.Invoke("[stop] reading the engine's last output failed: " + ex.Message); }
+                    }
                     if (!exited && IsRunning)
                     {
                         // ATTACH MODE: KILL IS THE LAST RESORT, AND IT WILL PROBABLY CRASH THE USER'S APP. A killed
@@ -706,6 +738,9 @@ namespace ClarionDebugger.Services
                         catch (Exception ex) { LogReceived?.Invoke("[stop] kill failed: " + ex.Message); }
                         try { _proc.WaitForExit(3000); }   // bounded — don't hang forever on a wedged process
                         catch (Exception ex) { LogReceived?.Invoke("[stop] wait after kill failed: " + ex.Message); }
+                        // A typed signal as well as the log line: the log line is for the console, and a pad that is
+                        // closing has none. Its teardown observer turns this into a warning that does not need the page.
+                        if (attached) DetachAbandoned?.Invoke(target);
                     }
                 }
             }
@@ -1659,7 +1694,11 @@ namespace ClarionDebugger.Services
                         Pid = pid,
                         Name = JsonMessageReader.ReadStringField(o, "name"),
                         Path = JsonMessageReader.ReadStringField(o, "path"),
-                        Tswd = tswd == "true"
+                        Tswd = tswd == "true",
+                        // Creation FILETIME as a decimal string (additive; an older engine omits it). Anything that is
+                        // not plain digits is dropped, and the attach is then refused rather than made blind.
+                        Started = AttachableProcess.IsStartTime(JsonMessageReader.ReadStringField(o, "started"))
+                            ? JsonMessageReader.ReadStringField(o, "started") : null
                     });
                 });
                 return ok ? list : null;
