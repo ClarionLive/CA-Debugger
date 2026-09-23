@@ -73,6 +73,10 @@ namespace ClarionDebugger.Terminal
         private int _procsGen;   // generation of the newest process listing; an older one arriving late is dropped
         // The ATTACH session in progress, or null for a launch / no session. UI-thread only.
         private AttachContext _attach;
+        // The app last attached to, for the "Detached; <name>" line only. The engine's `detached` event names just the
+        // pid, and when the engine's exit is handled before that buffered line, both the service's target and _attach
+        // are already gone. Display only: nothing decides anything on it.
+        private string _lastAttachName;
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
         private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
@@ -456,7 +460,8 @@ namespace ClarionDebugger.Terminal
             if (_attach != null) _attach.Detached = true;
             _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine();
             Post("{\"type\":\"clear\"}");   // first: `clear` empties the console, and the lines below must survive it
-            string name = d != null && !string.IsNullOrEmpty(d.Name) ? d.Name : "the app";
+            string name = d != null && !string.IsNullOrEmpty(d.Name) ? d.Name
+                        : !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";
             Console("info", "Detached; " + name + " is still running.");
             if (d != null && (!d.Restored || !string.IsNullOrEmpty(d.Error)))
                 Console("err", "detach could not restore every breakpoint"
@@ -824,6 +829,7 @@ namespace ClarionDebugger.Terminal
                 Console("info", "attaching to " + label + "  (" + _pending.Count + " breakpoint(s)"
                     + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
                 _attach = new AttachContext { Name = target.Name };
+                _lastAttachName = target.Name;
                 try { _svc.AttachSession(target, _pending.ToArray(), solutionDlls); }
                 catch { _attach = null; throw; }
                 // Stop now DETACHES; the page says so on its Stop control.

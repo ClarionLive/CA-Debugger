@@ -568,6 +568,10 @@ namespace ClarionDebugger.Services
             if (!ReferenceEquals(source, _proc)) return;
             int code = 0;
             try { code = source.ExitCode; } catch { }
+            // No attached state outlives its engine. A FAILED attach ends here: the engine reports
+            // {"event":"error","message":"attach failed: ...","code":N} (N may be 0, which is NOT success) and
+            // exits 2. Only `loaded` moves a session out of Launching; an error never does.
+            _attachTarget = null;
             SetState(DebugSessionState.Idle);
             Exited?.Invoke(code);
         }
@@ -586,6 +590,7 @@ namespace ClarionDebugger.Services
             if (ReferenceEquals(source, _proc))
             {
                 CurrentVa = null;
+                _attachTarget = null;   // the session is over, so nothing is attached any more
                 SetState(DebugSessionState.Idle);
             }
             System.Threading.Tasks.Task.Run(() =>

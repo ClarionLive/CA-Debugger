@@ -96,6 +96,10 @@ if ($SelfTest) {
        Find = '_attach.LastError = msg;'; Repl = '_attach.Name = _attach.Name;' }
     @{ Id = 'M15'; Suite = 'ps';   File = 'web';     Why = 'process paths are written into the procs JSON unescaped';
        Find = '.Append(",\"path\":").Append(Str(p.Path)).Append(''}'');'; Repl = '.Append(",\"path\":\"").Append(p.Path).Append("\"}");' }
+    @{ Id = 'M22'; Suite = 'ps';   File = 'service'; Why = 'attached state outlives a failed attach''s engine';
+       Find = "_attachTarget = null;`n            SetState(DebugSessionState.Idle);`n            Exited?.Invoke(code);"; Repl = "SetState(DebugSessionState.Idle);`n            Exited?.Invoke(code);" }
+    @{ Id = 'M23'; Suite = 'ps';   File = 'web';     Why = 'the Detached line loses the app name when the exit came first';
+       Find = ': !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";'; Repl = ': "the app";' }
     @{ Id = 'M16'; Suite = 'node'; File = 'page';    Why = 'a process name is written as markup';
        Find = "name.textContent=p.name==null?'':String(p.name);"; Repl = "name.innerHTML=p.name==null?'':String(p.name);" }
     @{ Id = 'M17'; Suite = 'node'; File = 'page';    Why = 'a row with a non-integer pid is shown';
@@ -161,8 +165,8 @@ if ($SelfTest) {
   } finally {
     Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
   }
-  # 21 finds + 21 mutations + 2 controls
-  $EXPECTED_CHECKS = 44
+  # 23 finds + 23 mutations + 2 controls
+  $EXPECTED_CHECKS = 48
   Assert-CheckTotal $EXPECTED_CHECKS
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
@@ -231,6 +235,7 @@ namespace ClarionDebugger.Terminal
     private readonly ListedProcesses _listedProcs = new ListedProcesses();
     private int _procsGen;
     private AttachContext _attach;
+    private string _lastAttachName;
     private readonly EditGrants _editGrants = new EditGrants();
     public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public string _pendingRtcKey;
@@ -372,6 +377,18 @@ Invoke-CheckSection '2. the engine''s procs line, read by the host (ParseProcsJs
   # above is the engine's own code, which is what makes this a check of both sides.
 }
 
+# A pad attached to pid 4242 ('app.exe'), holding the state a session end must clear.
+function New-AttachedPad {
+  $p = New-Object ClarionDebugger.Terminal.AttachPad
+  $l = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $l.Add((Proc 4242 'app.exe' 'C:\app.exe'))
+  [ClarionDebugger.Terminal.FakeLists]::Next = $l; $p.CmdListProcs(); $p.CmdAttach('4242')
+  $p.GrantOne(); $p._transientBps.Add('x.clw:1') | Out-Null; $p._pendingRtcKey = 'x.clw:1'
+  $p.Posts.Clear(); $p.ClearedLine = 0
+  $p
+}
+function New-Detach { param([bool] $Restored = $true, [string] $Err = $null, [string] $Name = 'app.exe')
+  $d = New-Object ClarionDebugger.Services.DebugDetach; $d.Pid = 4242; $d.Name = $Name; $d.Restored = $Restored; $d.Error = $Err; $d }
+
 # ================================================================================================ 3. detached + Stop
 # A stand-in engine: reads one command line, records it, then exits or hangs as told.
 $fakeEngine = Join-Path ([IO.Path]::GetTempPath()) ('attach-fake-engine-' + [guid]::NewGuid().ToString('N') + '.ps1')
@@ -431,6 +448,41 @@ Invoke-CheckSection '3. the engine''s detached event (the service''s real OnLine
   Check 'raises no Detached for it' ($script:dets2.Count -eq 0) ''
   Check 'and says so in the log instead' (($script:logs2 -join '|') -match 'previous session''s engine detached from pid 4242') ($script:logs2 -join '|')
   foreach ($p in $engine.Process, $newer.Process) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+}
+
+Invoke-CheckSection '3b. a refused attach: an error, even with code 0, is a failure (engine contract from Kit, 7e9f67e)' {
+  # The engine's refusal codes are not all Win32 errors: no TSWD / an unreadable image is code 0. Success is
+  # decided by `loaded` arriving, never by an error's code. Driven through the real OnLine and the real
+  # process-exit handler, with a real process that has exited with the engine's refusal code 2.
+  $psi = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', '/c exit 2'
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $dead = [System.Diagnostics.Process]::Start($psi); $dead.WaitForExit()
+  $svc = New-Service $dead (Proc 4242 'app.exe' 'C:\app.exe')
+  $SvcT.GetMethod('SetState', $IF).Invoke($svc, @([ClarionDebugger.Services.DebugSessionState]::Launching)) | Out-Null
+  $script:errs = [System.Collections.Generic.List[string]]::new(); $script:exits = [System.Collections.Generic.List[int]]::new()
+  $svc.add_EngineError([Action[string]] { param($x) $script:errs.Add($x) })
+  $svc.add_Exited([Action[int]] { param($x) $script:exits.Add($x) })
+  Invoke-OnLine $svc $dead '@JSON {"event":"error","message":"attach failed: no TSWD debug info in C:\\app.exe <b>x</b>","code":0}'
+  Check 'the error reaches the host as its message text, unchanged' `
+    (($script:errs.Count -eq 1) -and ($script:errs[0] -ceq 'attach failed: no TSWD debug info in C:\app.exe <b>x</b>')) ($script:errs -join '|')
+  Check 'code 0 is NOT success: the session does not become Running' ($svc.State -eq 'Launching') "$($svc.State)"
+  $SvcT.GetMethod('OnEngineProcessExited', $IF).Invoke($svc, @($dead)) | Out-Null
+  Check 'the engine''s exit (code 2) returns the session to Idle and reports the code' (($svc.State -eq 'Idle') -and ($script:exits.Count -eq 1) -and ($script:exits[0] -eq 2)) "$($svc.State) $($script:exits -join ',')"
+  Check 'and no attached state remains' (-not $svc.IsAttachSession) ''
+
+  # After a detach, too, nothing attached remains.
+  $e = Start-FakeEngine 'never'
+  $svc = New-Service $e.Process (Proc 4242 'app.exe' 'C:\app.exe')
+  Invoke-OnLine $svc $e.Process '@JSON {"event":"detached","pid":4242,"drained":0,"restored":true}'
+  Check 'after detached, no attached state remains either' (-not $svc.IsAttachSession) ''
+  try { if (-not $e.Process.HasExited) { $e.Process.Kill() } } catch { }
+
+  # The pad: a code-0 refusal is said again, as text, after the exit's clear, and nothing attached is left.
+  $pad = New-AttachedPad
+  $pad.OnSvcEngineError('attach failed: no TSWD debug info in C:\app.exe')
+  $pad.Posts.Clear(); $pad.OnSvcExited(2)
+  Check 'the pad repeats the refusal after the clear, and holds no attach session' `
+    (($pad.Posts[0] -ceq $ClearJson) -and ($pad.Posts[1] -ceq 'console|err|engine: attach failed: no TSWD debug info in C:\app.exe') -and -not $pad.HasAttach) ($pad.Posts -join ' / ')
 }
 
 Invoke-CheckSection '4. Stop: detach in attach mode, quit otherwise, kill only as the last resort' {
@@ -539,17 +591,6 @@ Invoke-CheckSection '5. the pad lists, and attaches only to what it listed' {
   [ClarionDebugger.Terminal.FakeLists]::NextError = $null
 }
 
-function New-AttachedPad {
-  $p = New-Object ClarionDebugger.Terminal.AttachPad
-  $l = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $l.Add((Proc 4242 'app.exe' 'C:\app.exe'))
-  [ClarionDebugger.Terminal.FakeLists]::Next = $l; $p.CmdListProcs(); $p.CmdAttach('4242')
-  $p.GrantOne(); $p._transientBps.Add('x.clw:1') | Out-Null; $p._pendingRtcKey = 'x.clw:1'
-  $p.Posts.Clear(); $p.ClearedLine = 0
-  $p
-}
-function New-Detach { param([bool] $Restored = $true, [string] $Error = $null)
-  $d = New-Object ClarionDebugger.Services.DebugDetach; $d.Pid = 4242; $d.Name = 'app.exe'; $d.Restored = $Restored; $d.Error = $Error; $d }
-
 Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits' {
   $pad = New-AttachedPad
   Check 'CONTROL: the attached pad holds state a session end must clear' (($pad.GrantCount -eq 1) -and ($pad._transientBps.Count -eq 1) -and ($null -ne $pad._pendingRtcKey)) ''
@@ -566,11 +607,13 @@ Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits'
   Check 'and the attach session is over' (-not $pad.HasAttach) ''
 
   # The other order: the process exit is handled before the buffered detached line.
+  # By then the service has dropped its attach target, so the event carries no name (the service clears it on
+  # exit); the pad still names the app it attached to.
   $pad = New-AttachedPad
   $pad.OnSvcExited(0)
-  $pad.OnSvcDetached((New-Detach))
+  $pad.OnSvcDetached((New-Detach -Name $null))
   $last = $pad.Posts[$pad.Posts.Count - 1]
-  Check 'exit first, detached second: the Detached line is still the last thing on the page' ($last -ceq 'console|info|Detached; app.exe is still running.') ($pad.Posts -join ' / ')
+  Check 'exit first, detached second (no name on the event): the Detached line still names the app, and is last' ($last -ceq 'console|info|Detached; app.exe is still running.') ($pad.Posts -join ' / ')
   Check 'and it follows a clear' ($pad.Posts[$pad.Posts.Count - 2] -ceq $ClearJson) ($pad.Posts -join ' / ')
 
   $pad = New-AttachedPad
@@ -623,8 +666,8 @@ Invoke-CheckSection '8. where the pieces are wired (position and text pins)' {
   Check 'the only literal "quit" in the service is TeardownCommand''s' (([regex]::Matches((Get-CSharpCodeOnly $svcSrc), '"quit"')).Count -eq 1) ''
 }
 
-# Runtime counts on a clean run, per section: 25, 8, 9, 10, 23, 11, 3, 10.
-$EXPECTED_CHECKS = 99
+# Runtime counts on a clean run, per section: 25, 8, 9, 6 (3b), 10, 23, 11, 3, 10.
+$EXPECTED_CHECKS = 105
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

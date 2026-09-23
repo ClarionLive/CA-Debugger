@@ -120,6 +120,7 @@ public sealed class RaceProbe {
   public DebugSessionState State = DebugSessionState.Launching;
   public int ExitedRaised = -999;
   public string CurrentVa = "0x1";
+  public object _attachTarget;   // the attach target (3f2d747f) both handlers clear; not what this race is about
   public event Action<string> LogReceived;
   public event Action<int> Exited;
   public RaceProbe() { Exited += c => ExitedRaised = c; LogReceived += s => { }; }
