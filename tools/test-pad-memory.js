@@ -131,6 +131,13 @@ check('memClampStart does not go below 0', memClampStart(-16, 256) === 0);
   check('a full read carries no short-read note', !/memnote/.test(body));
   check('the reply clears the in-flight mark, so the next stop re-reads', memInFlight === null);
 
+  // The SAME address asked twice (a stop, then the refresh button): the address match cannot tell the two
+  // replies apart, so only the reqId stands between the older bytes and the screen.
+  reset(); memGo(0x401000); memReread();
+  onMem({ type: 'mem', reqId: '1', addr: '0x401000', len: 256, read: 1, bytes: '41' });
+  check('an older reply for the SAME address does not paint either', !/mrow/.test($('memBody').innerHTML), $('memBody').innerHTML.slice(0, 60));
+  check('...and the newer request is still in flight', memInFlight !== null);
+
   reset(); memGo(0x401000);
   onMem({ type: 'mem', reqId: '1', addr: '0x401000', len: 256, read: 32, bytes: '00'.repeat(32) });
   check('a short read says how much was readable', /32 of 256 bytes readable/.test($('memBody').innerHTML), $('memBody').innerHTML.slice(-90));
