@@ -310,27 +310,75 @@ namespace ClarionDebugger.Terminal
     {
         public const int MaxGrants = 50000;
         private readonly HashSet<string> _keys = new HashSet<string>(StringComparer.Ordinal);
+        // EXPAND is issued the same way as EDIT (afbc68c7, codex security gate). An expand names a module, a
+        // type and an ADDRESS, and the engine renders that type's members at that address - edit metadata
+        // included. Forwarded unchecked, a forged expand at any address minted grants for every member it
+        // rendered: an arbitrary-address write by two requests instead of one. So the expandable tuples
+        // the host issued are recorded like edit tuples, an expand is forwarded only for one of them, and
+        // an expand reply grants its rows only when the host forwarded that request (_expandsInFlight).
+        private readonly HashSet<string> _expandable = new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _expandsInFlight = new HashSet<string>(StringComparer.Ordinal);
 
+        /// <summary>The number of EDIT tuples granted.</summary>
         public int Count { get { return _keys.Count; } }
 
-        public void Clear() { _keys.Clear(); }
+        /// <summary>The number of EXPANDABLE tuples issued.</summary>
+        public int ExpandableCount { get { return _expandable.Count; } }
+
+        /// <summary>Retire everything: edit grants, expandable rows and forwarded expands. One clear, so no
+        /// clear site can retire one family and leave the other live.</summary>
+        public void Clear() { _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); }
+
+        /// <summary>Record an expandable row (a lazy reference / array-element group node) the host issued.</summary>
+        public void GrantExpandable(string module, uint typeRef, string addr)
+        {
+            if (string.IsNullOrEmpty(module) || string.IsNullOrEmpty(addr)) return;
+            if (_keys.Count + _expandable.Count >= MaxGrants) return;
+            _expandable.Add(ExpandKey(module, typeRef, addr));
+        }
+
+        /// <summary>True when this exact (module, typeRef, addr) is a row the host issued for the rows now
+        /// current. Anything else is a forged or stale expand and is not forwarded.</summary>
+        public bool IsExpandIssued(string module, uint typeRef, string addr)
+        {
+            if (string.IsNullOrEmpty(module) || string.IsNullOrEmpty(addr)) return false;
+            return _expandable.Contains(ExpandKey(module, typeRef, addr));
+        }
+
+        /// <summary>The host forwarded expand <paramref name="reqId"/> to the engine after verifying it.</summary>
+        public void ExpandForwarded(int reqId) { _expandsInFlight.Add(reqId.ToString(CultureInfo.InvariantCulture)); }
+
+        /// <summary>Consume the record that <paramref name="reqId"/> was a verified, forwarded expand. False
+        /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
+        public bool ExpandVerified(string reqId) { return reqId != null && _expandsInFlight.Remove(reqId); }
+
+        private static string ExpandKey(string module, uint typeRef, string addr)
+        {
+            return module.ToUpperInvariant() + "|" + typeRef.ToString(CultureInfo.InvariantCulture) + "|" + addr.ToUpperInvariant();
+        }
 
         /// <summary>Record one editable tuple. Rows with no address or type code are not editable and are
         /// ignored.</summary>
         public void Grant(string va, string typeCode, int size, int places, uint? tid)
         {
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return;
-            if (_keys.Count >= MaxGrants) return;
+            if (_keys.Count + _expandable.Count >= MaxGrants) return;
             _keys.Add(Key(va, typeCode, size, places, TidKey(tid)));
         }
 
-        /// <summary>Record every editable row inside an engine row array body (the text between the
-        /// brackets, exactly as it is forwarded to the page), children included.</summary>
+        /// <summary>Record every editable row, and every EXPANDABLE row, inside an engine row array body (the
+        /// text between the brackets, exactly as it is forwarded to the page), children included.</summary>
         public void GrantRows(string itemsJson, uint? tid)
         {
             if (string.IsNullOrEmpty(itemsJson)) return;
             JsonMessageReader.ForEachObject("[" + itemsJson + "]", o =>
             {
+                if (JsonMessageReader.ReadField(o, "ref") == "true")
+                {
+                    uint typeRef;
+                    if (PageNumbers.TryUInt(JsonMessageReader.ReadField(o, "typeRef"), out typeRef))
+                        GrantExpandable(JsonMessageReader.ReadField(o, "module"), typeRef, JsonMessageReader.ReadField(o, "addr"));
+                }
                 string va = JsonMessageReader.ReadField(o, "va");
                 string tc = JsonMessageReader.ReadField(o, "typeCode");
                 if (va == null || tc == null) return;

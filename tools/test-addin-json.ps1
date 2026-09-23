@@ -963,7 +963,7 @@ $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal
 # `);` that closes UI( is put back here.
 function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
 $pushProcs = (Get-Method 'private void PushProcedures(string exe)' $web) -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
-$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(' |
+$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(', 'private void OnSvcExpanded(' |
   ForEach-Object { (Get-ArrowHandler $_) -replace '^private void', 'public void' }) -join "`n"
 
 $bridgeSrc = @"
@@ -991,6 +991,9 @@ public sealed class FakeSvc {
   public bool IsRunning = true; public bool Accept = true; public bool AcceptSet = true;
   public List<string> Adds = new List<string>();
   public List<string> Sets = new List<string>();
+  public List<string> Expands = new List<string>();
+  public bool AcceptExpand = true;
+  public bool RequestExpand(int reqId, string module, uint typeRef, string addr) { Expands.Add(reqId + "|" + module + "|" + typeRef + "|" + addr); return AcceptExpand; }
   public void PrimeTarget(string exe) { }
   public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
   public bool SetVariable(string va, string typeCode, int size, int places, string value, uint? tid) {
@@ -1023,6 +1026,8 @@ public sealed class BridgePad {
   $(Get-Method 'private void BreakOnEntry(ProcRef proc)' $web)
   $((Get-Method 'private void OnWatch(DebugWatch w)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
+  $((Get-Method 'private void Expand(string data)' $web) -replace '^private void', 'public void')
+  $(Get-Method 'private void RefuseExpand(int reqId, string why)' $web)
   $arrowHandlers
   public void RunPushProcedures(string exe) { PushProcedures(exe); }
 }
@@ -1052,7 +1057,7 @@ $watchMsg = $pad.Posts[$pad.Posts.Count - 1]
 
 # The engine's Variables row: a GROUP whose one editable member sits in `children`, so the grant has to be
 # found below the top level. Shape pinned against the writer just below.
-$engineRows = '{"name":"G:REC","type":"GROUP","value":"","children":[{"name":"G:X","type":"DECIMAL(7,2)","value":"1.50","va":"0x4A2200","typeCode":"0x0A","size":4,"places":2}]}'
+$engineRows = '{"name":"G:REC","type":"GROUP","value":"","children":[{"name":"G:X","type":"DECIMAL(7,2)","value":"1.50","va":"0x4A2200","typeCode":"0x0A","size":4,"places":2},{"name":"G:PTR","type":"","value":"0x4B0000","ref":true,"addr":"0x4B0000","module":"clbrws011.clw","typeRef":77}]}'
 $engineLocals = Get-Content -Raw -LiteralPath $EngineLocalsPath
 Check 'the engine row writer still emits va, typeCode, size and places under those names' `
   (($engineLocals -match '\\"va\\":\\"0x') -and ($engineLocals -match '\\"typeCode\\":\\"0x') -and `
@@ -1071,7 +1076,8 @@ $pageJs = @(
   (Get-Method 'function editAttrs(v){' $page),
   (Get-Method 'function setEditMeta(cell, meta){' $page),
   (Get-Method 'function stripEditQuotes(s){' $page),
-  (Get-Method 'function beginEdit(cell){' $page)
+  (Get-Method 'function beginEdit(cell){' $page),
+  (Get-Method 'function requestExpand(v, cb){' $page)
 ) -join "`n"
 $inputFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-in-' + [Guid]::NewGuid().ToString('N') + '.json')
 @{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
@@ -1090,6 +1096,7 @@ let wire = null; const wv = { postMessage(s){ wire = s; } };
 let allProcs = [], procIndex = null, bps = [], procCtx = null;
 function buildBps(){} function filterProcs(){}
 let isPaused = true, activeEdit = null, selTid = null;
+let _expandSeq = 0; const _expandCbs = {};
 function editThreadSuffix(){ return ''; } function viewingOtherThread(){ return false; } function toast(){}
 '@ + "`n" + $pageJs + "`n" + @'
 
@@ -1114,6 +1121,10 @@ const child = JSON.parse(INPUT.moduledata).items[0].children[0];
 const tcell = mkEl('span'); const attrs = editAttrs(child); let m; const re = / data-(\w+)="([^"]*)"/g;
 while ((m = re.exec(attrs))) tcell.dataset[m[1]] = m[2];
 out.treeEdit = commit(tcell, '2.25');
+
+// Opening the reference row the host posted: the page's own expand request for it.
+const refRow = JSON.parse(INPUT.moduledata).items[0].children[1];
+wire = null; requestExpand(refRow, function(){}); out.expand = wire;
 console.log(JSON.stringify(out));
 '@
 $bridgeFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-' + [Guid]::NewGuid().ToString('N') + '.js')
@@ -1260,6 +1271,42 @@ Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'p
 Check 'the frame-locals and expand replies grant their rows as module data does' `
   (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
    ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
+
+# ---- expand is issued like edit (afbc68c7, codex security gate) --------------------------------------
+# A forged expand needs no host-issued row: name a known group type at ANY address and the engine renders its
+# members WITH edit metadata. Forwarded unchecked, those replies minted grants, and EditVar trusts grants.
+# So the host records the expandable rows it issues, forwards only those, and grants an expand reply's rows
+# only when it forwarded that very request.
+$expandData = if ($pageOut) { DataOf $pageOut.expand } else { '' }
+Check 'the page asks to expand the reference row exactly as the host sent it' ($expandData -ceq '1|clbrws011.clw|77|0x4B0000') $expandData
+$xp = New-Object ClarionDebugger.Terminal.BridgePad
+$xp.OnSvcModuleData('clbrws011.clw', $engineRows, 4812)
+Check 'CONTROL: the host recorded the reference row as expandable' ($xp._editGrants.ExpandableCount -eq 1) "$($xp._editGrants.ExpandableCount)"
+$xp.Expand($expandData)
+Check 'an issued reference row is expanded' (($xp._svc.Expands.Count -eq 1) -and ($xp._svc.Expands[0] -ceq '1|clbrws011.clw|77|0x4B0000')) ($xp._svc.Expands -join ',')
+$children = '{"name":"P:N","type":"LONG","value":"3","va":"0x4B0004","typeCode":"0x03","size":4,"places":0},{"name":"P:SUB","type":"","value":"0x4C0000","ref":true,"addr":"0x4C0000","module":"clbrws011.clw","typeRef":78}'
+$xp.OnSvcExpanded('1', $children)
+$xp.EditVar('{"va":"0x4B0004","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"9"}')
+Check 'and the verified reply''s members are editable' ($xp._svc.Sets.Count -eq 1) ($xp._svc.Sets -join ' ; ')
+$xp.Expand('2|clbrws011.clw|78|0x4C0000')
+Check 'and its nested reference can be opened in turn (expand is recursive)' ($xp._svc.Expands.Count -eq 2) ($xp._svc.Expands -join ',')
+
+# THE FORGERY: the same real type, at an address the host never offered.
+$xp._svc.Expands.Clear(); $xp.Posts.Clear(); $xp.Lines.Clear()
+$xp.Expand('3|clbrws011.clw|77|0x500000')
+Check 'a forged expand (an issued type at a non-issued address) is not forwarded' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
+Check 'and is answered: an empty, refused reply for that reqId, and a console line' `
+  (($xp.Posts.Count -eq 1) -and ($xp.Posts[0] -cmatch '"type":"expanded","reqId":"3","items":\[\],"refused":true') -and (@(Errs $xp).Count -eq 1)) ($xp.Posts -join ' / ')
+# Even if an engine reply for it arrived anyway, the host never forwarded it, so its rows grant nothing.
+$xp.OnSvcExpanded('3', '{"name":"F:N","type":"LONG","value":"0","va":"0x500004","typeCode":"0x03","size":4,"places":0}')
+$xp._svc.Sets.Clear()
+$xp.EditVar('{"va":"0x500004","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"9"}')
+Check 'a reply to an expand the host did not forward creates no edit grant' ($xp._svc.Sets.Count -eq 0) ($xp._svc.Sets -join ' ; ')
+# CURRENT, as for edits: a thread switch retires the issued expandable rows.
+$xp.OnSvcThreadSelected(9001, $true, $null)
+$xp._svc.Expands.Clear()
+$xp.Expand($expandData)
+Check 'after a thread switch the old reference row cannot be expanded until re-read' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
 
 # ---- the grant walker on its own ----------------------------------------------------------------------
 $g = New-Object ClarionDebugger.Terminal.EditGrants
@@ -1914,7 +1961,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 292
+$EXPECTED_CHECKS = 301
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

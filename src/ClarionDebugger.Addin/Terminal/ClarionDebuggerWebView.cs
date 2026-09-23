@@ -307,7 +307,10 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
         {
-            _editGrants.GrantRows(itemsJson, null);
+            // Only a reply to an expand the host VERIFIED and forwarded may grant (afbc68c7): its rows are
+            // members of a group the host itself offered. Any other reply is posted for display, and grants
+            // nothing - its rows cannot be edited or expanded further.
+            if (_editGrants.ExpandVerified(reqId)) _editGrants.GrantRows(itemsJson, null);
             Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}");
         });
 
@@ -575,13 +578,7 @@ namespace ClarionDebugger.Terminal
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
-                    case "expand":   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
-                        if (_svc.State == DebugSessionState.Paused)
-                        {
-                            var x = ExpandRequest.Parse(data);
-                            if (x != null) _svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr);
-                        }
-                        break;
+                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
                     case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
                         if (_svc.State == DebugSessionState.Paused)
                         {
@@ -1534,6 +1531,37 @@ namespace ClarionDebugger.Terminal
             else if (!_svc.SetVariable(req.Va, req.TypeCode, req.Size, req.Places, req.Value, req.Tid))
                 why = "the engine did not take the request";
             if (why != null) OnSvcVariableSet(req.Va, false, null, why);
+        }
+
+        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
+        /// is forwarded ONLY when that exact tuple is an expandable row the host issued for the rows now current
+        /// (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
+        /// address the page named - edit metadata included - and a forged expand would mint the edit grants
+        /// that EditVar checks. A refusal, or a request the service would not send, is ANSWERED with an empty
+        /// expanded reply for that reqId, so the node the page is opening does not wait forever.</summary>
+        private void Expand(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var x = ExpandRequest.Parse(data);
+            if (x == null) return;
+            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "that node is no longer current (or was never offered) — let the view refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.ExpandForwarded(x.ReqId);
+        }
+
+        private void RefuseExpand(int reqId, string why)
+        {
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "expand refused: " + why);
         }
 
         private void SendBps()
