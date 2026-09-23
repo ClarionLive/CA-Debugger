@@ -350,11 +350,11 @@ namespace ClarionDebugger.Terminal
             // later RemoveBreakpoint (OnPaused) matches engine truth even if the engine canonicalizes the module
             // name differently from the UI's curFile — no stranded, untracked one-shot.
             if (_pendingRtcKey != null && bp != null && bp.Module != null
-                && (bp.RequestedLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
+                && (bp.DisplayLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
             {
                 _transientBps.Remove(_pendingRtcKey);
                 _pendingRtcKey = null;
-                _transientBps.Add(TransientKey(bp.Module, bp.RequestedLine));   // engine-confirmed identity
+                _transientBps.Add(TransientKey(bp.Module, bp.DisplayLine));   // engine-confirmed identity
                 SendBps();
                 if (CurrentState == DebugSessionState.Paused) _svc.Continue();
                 return;
@@ -711,7 +711,7 @@ namespace ClarionDebugger.Terminal
             //   • nothing on this requested line → plant the transient one-shot and continue.
             DebugBreakpoint exact = null;
             foreach (var b in _svc.Breakpoints)
-                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.RequestedLine == line) { exact = b; break; }
+                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.DisplayLine == line) { exact = b; break; }
 
             if (exact != null)
             {
@@ -873,7 +873,7 @@ namespace ClarionDebugger.Terminal
             else
             {
                 foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
                 SendBps();
             }
         }
@@ -918,7 +918,7 @@ namespace ClarionDebugger.Terminal
                 foreach (var gb in _gutter.Snapshot())
                 {
                     bool known = false;
-                    foreach (var b in _pending) if (SameBp(b, gb.Module, gb.RequestedLine)) { known = true; break; }
+                    foreach (var b in _pending) if (SameBp(b, gb.Module, gb.DisplayLine)) { known = true; break; }
                     if (!known) _pending.Add(gb);
                 }
                 Post("{\"type\":\"clear\"}");
@@ -1234,7 +1234,7 @@ namespace ClarionDebugger.Terminal
             foreach (var b in _pending) if (SameBp(b, module, line)) { target = b; break; }
             if (target == null)
             {
-                target = new DebugBreakpoint { Module = module, RequestedLine = line, Line = line };
+                target = new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line };
                 _pending.Add(target);
             }
             target.Condition = condition;
@@ -1535,7 +1535,7 @@ namespace ClarionDebugger.Terminal
             foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
             {
                 if (b.Module != null && (_transientBps.Contains(TransientKey(b.Module, b.Line))
-                                      || _transientBps.Contains(TransientKey(b.Module, b.RequestedLine)))) continue;
+                                      || _transientBps.Contains(TransientKey(b.Module, b.DisplayLine)))) continue;
                 list.Add(b);
             }
 
@@ -1555,7 +1555,7 @@ namespace ClarionDebugger.Terminal
                 string path = GutterPathFor(paths, b, out pathState);
                 sb.Append("{\"module\":").Append(Str(b.Module))
                   .Append(",\"line\":").Append(b.Line)
-                  .Append(",\"requested\":").Append(b.RequestedLine)
+                  .Append(",\"requested\":").Append(b.DisplayLine)
                   .Append(",\"path\":").Append(Str(path))
                   .Append(",\"pathState\":").Append(Str(PathStateName(pathState)))
                   .Append(",\"condition\":").Append(Str(b.Condition))
@@ -1592,7 +1592,7 @@ namespace ClarionDebugger.Terminal
                 {
                     if (string.IsNullOrEmpty(g.Path) || string.IsNullOrEmpty(g.Module)) continue;
                     ClaimGutterPath(paths, g.Module + "|" + g.Line, g.Path);
-                    ClaimGutterPath(paths, g.Module + "|" + g.RequestedLine, g.Path);
+                    ClaimGutterPath(paths, g.Module + "|" + g.DisplayLine, g.Path);
                 }
             }
             catch { }
@@ -1677,7 +1677,7 @@ namespace ClarionDebugger.Terminal
                 if (p != null) { state = BpPathState.Ok; return p; }
                 contested = true;                      // the key exists but two files claim it
             }
-            if (paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p))
+            if (paths.TryGetValue(b.Module + "|" + b.DisplayLine, out p))
             {
                 if (p != null) { state = BpPathState.Ok; return p; }
                 contested = true;
@@ -1750,7 +1750,7 @@ namespace ClarionDebugger.Terminal
             else
             {
                 foreach (var b in _pending) if (SameBp(b, module, line)) return;
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
                 SendBps();
             }
         }
@@ -1787,7 +1787,7 @@ namespace ClarionDebugger.Terminal
         /// It used to also match <c>b.Line == line</c>, a two-way OR that let ONE removal trim a
         /// DIFFERENT staged entry whose planted line happened to equal the removed one's requested line -
         /// silently losing it from the next session's launch spec (b1db9a76 item 2). That OR was
-        /// unreachable in-tree, because every _pending entry is created with Line == RequestedLine and
+        /// unreachable in-tree, because every _pending entry is created with Line equal to its requested line and
         /// nothing writes the engine's snapped line back into _pending. It was held back from wave 1
         /// until 05959085 settled which line is the key; it has, so the OR is gone rather than left as a
         /// promise the rest of the identity code no longer makes.

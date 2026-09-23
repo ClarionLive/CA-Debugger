@@ -98,12 +98,17 @@ namespace ClarionDebugger.Services
         /// breakpoint can be shown or re-specified by. Every display, gutter and spec-building reader wants
         /// this; nothing may use it for IDENTITY, which goes through
         /// <see cref="ClarionDebuggerService.SameBpIdentity"/> so an absent requested line falls back
-        /// explicitly instead of comparing as 0. Assigning it records the line AS PRESENT, which is what a
-        /// host-built entry means.</summary>
-        public int RequestedLine
+        /// explicitly instead of comparing as 0.
+        /// <para>
+        /// GET-ONLY, and named for what it is (f367a04f). This was <c>RequestedLine</c>, with a setter, so the
+        /// one name meant "the line the user asked for" when written and "that, or the planted line" when
+        /// read - and a reader could not tell from the name that it might be getting the planted line. The
+        /// setter is gone: <see cref="RequestedLineOrNull"/> is the sole writer, and a host-built entry sets
+        /// it to record the line AS PRESENT.
+        /// </para></summary>
+        public int DisplayLine
         {
             get { return _requestedLine ?? Line; }
-            set { _requestedLine = value; }
         }
 
         public int Line;            // line actually planted (snapped to nearest code record)
@@ -877,7 +882,7 @@ namespace ClarionDebugger.Services
                     int delLine = GetInt(json, "line");
                     // The engine removed exactly ONE logical breakpoint and names it by its requested line.
                     // GetIntOrNull, not GetInt: absent must stay distinguishable from 0, because 0 is a real
-                    // RequestedLine for an unresolved raw breakpoint.
+                    // requested line for an unresolved raw breakpoint.
                     int? delRequested = GetIntOrNull(json, "requestedLine");
                     // ...and by its owning image, for the same reason: `module` is a basename, so a bp-del
                     // that named only (module, requestedLine) would remove the same-named breakpoint in
@@ -1534,8 +1539,8 @@ namespace ClarionDebugger.Services
         /// <para>
         /// Requested lines are comparable only when BOTH sides have one, exactly as in
         /// <see cref="SameBpIdentity"/>, which was written to mirror this function. Reading the entry's line
-        /// through the substituting <c>RequestedLine</c> getter instead compared the entry's PLANTED line
-        /// against the echo's REQUESTED one whenever the entry came from an engine build that reports no
+        /// through the substituting getter (then <c>RequestedLine</c>, now <c>DisplayLine</c>) instead
+        /// compared the entry's PLANTED line against the echo's REQUESTED one whenever the entry came from an engine build that reports no
         /// <c>requestedLine</c> — which both removes a row the engine did not delete (the two lines happen to
         /// be equal) and leaves the named one behind (they happen not to be). A stale entry from an earlier
         /// session is enough to reach that mix. So the absent case falls back to the planted line here too:
@@ -1611,7 +1616,12 @@ namespace ClarionDebugger.Services
         public static string BuildBpSpec(DebugBreakpoint bp)
         {
             var sb = new System.Text.StringBuilder();
-            sb.Append(bp.Module).Append(':').Append(bp.RequestedLine > 0 ? bp.RequestedLine : bp.Line);
+            // DisplayLine already falls back to the planted line when no requested line exists, which is what
+            // the `RequestedLine > 0 ? RequestedLine : Line` here used to spell out a second time (f367a04f).
+            // The two differ only for a PRESENT requested line of 0 - an unresolved raw breakpoint's echo -
+            // and none reaches this method: as of 2026-09-22 its callers pass the pad's staged entries, which
+            // are host-built with Line equal to the requested line.
+            sb.Append(bp.Module).Append(':').Append(bp.DisplayLine);
             if (!string.IsNullOrEmpty(bp.Condition)) sb.Append("|c=").Append(B64(bp.Condition));
             if (bp.HitMode == "eq" || bp.HitMode == "gte" || bp.HitMode == "mod")
                 sb.Append("|hm=").Append(bp.HitMode).Append("|hv=").Append(bp.HitValue);

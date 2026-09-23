@@ -253,7 +253,7 @@ function HostBpDel { param($list, $json)
   foreach ($b in $list) { if (-not [BpHost]::BpDelMatches($b, $mod, $req, $planted, $owner)) { [void]$keep.Add($b) } }
   , $keep
 }
-function Lines { param($list) (($list | ForEach-Object { "$($_.RequestedLine)->$($_.Line)" }) -join ' ') }
+function Lines { param($list) (($list | ForEach-Object { "$($_.DisplayLine)->$($_.Line)" }) -join ' ') }
 
 # requested 10 and requested 12 both snapped to record line 11
 $bp10 = EngineBp 'clbrws011.clw' 10 11
@@ -267,7 +267,7 @@ Check 'two gutter lines sharing one planted line are 2 host rows, not 1' ($rows.
 # the user removes the one at source line 10; the engine echoes the breakpoint it actually dropped
 $surv = HostBpDel $rows ([BpWire]::BpDel($bp10))
 Check 'removing one of them leaves exactly 1 row' ($surv.Count -eq 1) (Lines $surv)
-Check 'and the row left behind is the SURVIVOR, requested line 12' ($surv.Count -eq 1 -and $surv[0].RequestedLine -eq 12) (Lines $surv)
+Check 'and the row left behind is the SURVIVOR, requested line 12' ($surv.Count -eq 1 -and $surv[0].DisplayLine -eq 12) (Lines $surv)
 Check 'the survivor keeps the planted line it shares, 11' ($surv.Count -eq 1 -and $surv[0].Line -eq 11) (Lines $surv)
 
 # ...and the same the other way round, so the result is not an artefact of list order
@@ -275,7 +275,7 @@ $rowsB = New-Object System.Collections.ArrayList
 HostBpSet $rowsB ([BpWire]::BpSet($bp10))
 HostBpSet $rowsB ([BpWire]::BpSet($bp12))
 $survB = HostBpDel $rowsB ([BpWire]::BpDel($bp12))
-Check 'removing the SECOND one instead leaves requested line 10' ($survB.Count -eq 1 -and $survB[0].RequestedLine -eq 10) (Lines $survB)
+Check 'removing the SECOND one instead leaves requested line 10' ($survB.Count -eq 1 -and $survB[0].DisplayLine -eq 10) (Lines $survB)
 
 Write-Host ''
 Write-Host 'the writer carries both lines, so a caller cannot send half an identity'
@@ -385,7 +385,7 @@ HostBpSet $bothPresent ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 10 11)))
 HostBpSet $bothPresent ([BpWire]::BpSet((EngineBp 'clbrws011.clw' 12 11)))
 $bpSurv = HostBpDel $bothPresent ([BpWire]::BpDel((EngineBp 'clbrws011.clw' 10 11)))
 Check 'with requested lines on BOTH sides it still removes only the one named' `
-  ($bpSurv.Count -eq 1 -and $bpSurv[0].RequestedLine -eq 12) (Lines $bpSurv)
+  ($bpSurv.Count -eq 1 -and $bpSurv[0].DisplayLine -eq 12) (Lines $bpSurv)
 
 Write-Host ''
 Write-Host 'bp-list decodes through the same reader, so it inherits the same promise'
@@ -400,7 +400,7 @@ Check 'the two entries are not the same breakpoint under the identity key' `
   ($parsedList.Count -eq 2 -and -not [BpHost]::SameBpIdentity($parsedList[0], $parsedList[1])) (Lines $parsedList)
 # What the pane is handed for the gutter marker. 0 would put the marker on line 0 of the file.
 Check 'each entry reports the line it was planted on, never 0' `
-  ($parsedList.Count -eq 2 -and $parsedList[0].RequestedLine -eq 11 -and $parsedList[1].RequestedLine -eq 22) (Lines $parsedList)
+  ($parsedList.Count -eq 2 -and $parsedList[0].DisplayLine -eq 11 -and $parsedList[1].DisplayLine -eq 22) (Lines $parsedList)
 
 Write-Host ''
 Write-Host 'and the promise is kept in the reader and the identity key themselves'
@@ -426,6 +426,15 @@ Check 'BpDelMatches decides the line through the same one, and holds no copy eit
 Check 'and both take the owner half from BpOwnerMatches' `
   (($identBody -match 'BpOwnerMatches\(') -and ($delBody -match 'BpOwnerMatches\(')) ''
 
+Write-Host ''
+Write-Host 'the read side is DisplayLine, get-only, and RequestedLineOrNull is the only writer (f367a04f)'
+$bpClass = Get-CSharpCodeOnly $bpRecord
+$displayProp = Get-CSharpBlock 'public int DisplayLine' $bpClass
+Check 'DisplayLine exists and has no setter, and no RequestedLine member is left to write through' `
+  (($null -ne $displayProp) -and ($displayProp -notmatch '\bset\b') -and ($bpClass -notmatch '\bpublic int RequestedLine\b')) ''
+Check 'BuildBpSpec writes DisplayLine, with no second spelling of its fallback' `
+  (((Get-Method 'public static string BuildBpSpec(DebugBreakpoint bp)') -match 'Append\(bp\.DisplayLine\)') -and `
+   ((Get-CSharpCodeOnly (Get-Method 'public static string BuildBpSpec(DebugBreakpoint bp)')) -notmatch '> 0 \?')) ''
 Write-Host ''
 Write-Host 'the real handler arms use these same keys, so the mirror above cannot drift'
 Check 'the bp-set arm dedupes through SameBpIdentity' ($src -match 'if \(SameBpIdentity\(b, bp\)\)') ''
@@ -1955,7 +1964,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 296
+$EXPECTED_CHECKS = 298
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

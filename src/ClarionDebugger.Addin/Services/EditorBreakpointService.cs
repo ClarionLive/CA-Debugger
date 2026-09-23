@@ -86,7 +86,7 @@ namespace ClarionDebugger.Services
                 {
                     string module; int line;
                     if (TryMap(bb, out module, out line))
-                        list.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line, Path = bb.FileName });
+                        list.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line, Path = bb.FileName });
                 }
             }
             catch { }
