@@ -213,6 +213,16 @@
   .thsel .thsel-ar { color:var(--fg-dim); font-size:9px; }
   /* viewing a thread other than the one the engine stopped on — amber everywhere it shows */
   .thsel.other { border-color:var(--warn); color:var(--warn); background:var(--warn-bg); }
+  /* identify-thread-by-window toggle (f6e547ce): off is a bare glyph; on shows which thread owns the window
+     under the mouse, and while PAUSED hovering selects that thread */
+  .thhover { margin-left:4px; display:inline-flex; align-items:center; gap:4px; flex:0 1 auto; min-width:0; max-width:170px;
+             padding:1px 6px; border:1px solid var(--popup-border); border-radius:10px; background:var(--input); color:var(--fg-dim);
+             font-size:10px; font-weight:600; letter-spacing:0; text-transform:none; cursor:pointer; }
+  .thhover:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thhover.on { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thhover .thhover-ic { flex:none; }
+  .thhover .thhover-t { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thhover .thhover-t:empty { display:none; }
   .thpick { display:none; margin:2px 8px 4px; border:1px solid var(--popup-border); border-radius:4px; background:var(--popup); overflow:hidden; }
   .thpick.show { display:block; }
   .thpick .thhdr { padding:4px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
@@ -431,7 +441,7 @@
         </div>
       </details>
       <details class="section" open data-sec="stack">
-        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="sec-x" title="Hide section">✕</span></summary>
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="thhover" id="thHover" title="Identify thread by window: off. Click, then point at one of your program's windows."><span class="thhover-ic">⌖</span><span class="thhover-t" id="thHoverText"></span></span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="thwarn" id="thWarn"><span id="thWarnText"></span><span class="thback" id="thBack" title="Show the thread the engine stopped on">Back to stopped thread</span></div>
           <div class="thpick" id="thPick"><div class="thhdr">Read panels against</div><div id="thList"></div></div>
@@ -1743,6 +1753,7 @@
     const badge=$('thBadgeTop');
     if(badge) badge.textContent = other ? ('viewing '+threadName(t,selTid)+' — not the stopped thread') : '';
     renderThreadPicker();
+    renderHoverUi();             // the hover label names threads from the same rows
   }
 
   function selectThread(tid){
@@ -1931,6 +1942,90 @@
     switchGen++;                 // invalidates any armed sweep
     if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
     closeThreadPicker(); renderThreadUi();
+    cancelHoverSelect();         // a hover that settled on LAST stop's world must not switch this one
+  }
+
+  // ---- identify thread by window (f6e547ce) ----
+  // The ENGINE polls the window under the mouse (about every 150 ms, message-free) and sends a `hover`
+  // event only when the answer changes: {on, paused, tid}, where an absent tid means "not over one of the
+  // debuggee's windows". It is NOT a thread-scoped reply, so it never goes through tidAccepted.
+  //
+  // While RUNNING it only reports, because there is no stop to read. While PAUSED a hover selects that
+  // thread, through the same selectThread the picker uses, which already refuses when the page is not
+  // paused and when the thread is the one already shown. A switch re-reads every panel, so a hover selects
+  // only once the pointer has SETTLED on one thread for HOVER_SETTLE_MS: every new answer cancels the
+  // pending settle. It also never starts a switch while another is in flight. selectThread has no such
+  // guard of its own, and a second switch sent over the first would leave the rows' TOCTOU state belonging
+  // to neither.
+  //
+  // ONE GUARD PER RULE. The first cut also re-checked isPaused, the selected thread, a generation counter
+  // and the toggle inside the settle, and a mutation run showed every one of them dead: selectThread and
+  // clearTimeout already held each rule. A guard no test can fail reads as protection it does not give.
+  const HOVER_SETTLE_MS=300;
+  let hoverOn=false;          // the user's toggle; it outlives stops and sessions
+  let hoverTid=null;          // the engine's last answer (null = none)
+  let hoverPaused=false;      // ...and whether the ENGINE was paused when it gave it
+  let hoverTimer=null;        // the pending settle
+  let hoverRunState='idle';   // last runstate seen, to re-arm the engine when a session starts
+
+  function setHoverMode(on){
+    hoverOn=!!on;
+    cancelHoverSelect();
+    hoverTid=null; hoverPaused=false;
+    send('hover', hoverOn ? 'on' : 'off');
+    renderHoverUi();
+  }
+  function cancelHoverSelect(){
+    if(hoverTimer!==null){ clearTimeout(hoverTimer); hoverTimer=null; }
+  }
+  // A new engine starts with hover off. Re-arm it when a session begins, not on every resume (the engine
+  // re-announces on `hover on`, so a resend per resume would be chatter for nothing).
+  function hoverOnRunState(state){
+    const prev=hoverRunState; hoverRunState=state||'idle';
+    if(hoverOn && prev==='idle' && hoverRunState!=='idle') send('hover','on');
+    if(hoverRunState==='idle'){ cancelHoverSelect(); hoverTid=null; renderHoverUi(); }
+  }
+  // `on:false` needs no branch of its own: it carries no tid, so it reads as "none", and the toggle is
+  // the page's state, not the engine's.
+  function onHover(m){
+    if(!m) return;
+    cancelHoverSelect();
+    hoverTid=(typeof m.tid==='number' && m.tid>0) ? m.tid : null;
+    hoverPaused=m.paused===true;
+    renderHoverUi();
+    // hoverPaused, not isPaused: an answer the engine gave while RUNNING can land just after the page has
+    // seen the stop, and it describes a window from before the stop. (A null tid needs no check here:
+    // selectThread refuses one.)
+    if(!hoverOn || !hoverPaused) return;
+    const tid=hoverTid;
+    hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);
+  }
+  function hoverSettle(tid){
+    hoverTimer=null;
+    if(threadSwitching){                                                 // one switch at a time: try again
+      hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);      // once the one in flight lands
+      return;
+    }
+    // A window whose thread is not in this stop's list (the list is complete for a stop: threads cannot
+    // start while the process is frozen) would only earn a refusal toast. An EMPTY list means the
+    // inventory has not arrived yet, so the engine is left to judge.
+    if(threadRows.length && !threadRowFor(tid)) return;
+    selectThread(tid);
+  }
+  function renderHoverUi(){
+    const el=$('thHover'), txt=$('thHoverText');
+    if(el) el.classList.toggle('on', hoverOn);
+    let label='', title;
+    if(!hoverOn) title="Identify thread by window: off. Click, then point at one of your program's windows.";
+    else if(hoverTid===null){ label='—'; title='Identify thread by window: on. The mouse is not over one of your program\'s windows.'; }
+    else {
+      const nm=threadName(threadRowFor(hoverTid), hoverTid);
+      label=nm;
+      title = hoverPaused ? ('The window under the mouse belongs to '+nm+'. Rest on it to show that thread.')
+                          : ('The window under the mouse belongs to '+nm+'. Pause to read that thread.');
+    }
+    if(txt) txt.textContent=label;   // textContent: nothing here is markup
+    if(el) el.title=title;
   }
 
   (function wireThreadUi(){
@@ -1939,6 +2034,9 @@
     if(chip) chip.onclick=e=>{ e.preventDefault(); e.stopPropagation(); toggleThreadPicker(); };
     const back=$('thBack');
     if(back) back.onclick=e=>{ e.stopPropagation(); if(stopTid!=null) selectThread(stopTid); };
+    const hv=$('thHover');
+    // Same as the chip: it lives in the <summary>, where a click would collapse the section.
+    if(hv) hv.onclick=e=>{ e.preventDefault(); e.stopPropagation(); setHoverMode(!hoverOn); };
   })();
 
   // ---- call stack ----
@@ -2442,7 +2540,7 @@
     switch(m.type){
       case 'about': setAbout(m); break;
       case 'target': setTarget(m); break;
-      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
+      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); hoverOnRunState(m.state); break;
       case 'paused':
         // Where the stop is, in the source header — the band this used to write is gone (87c66af6).
         // Written HERE and not only by the 'source' reply because a `source` message does not always
@@ -2463,6 +2561,7 @@
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'threads': onThreads(m); break;
       case 'threadselected': onThreadSelected(m); break;
+      case 'hover': onHover(m); break;   // NOT tidAccepted: its tid names the window's thread, not a reply's
       case 'engineerror': onEngineError(m); break;
       // Thread-scoped replies: a reply for a thread we are no longer showing is dropped before it can
       // repaint anything (tidAccepted also lets through an engine that doesn't stamp its replies).
