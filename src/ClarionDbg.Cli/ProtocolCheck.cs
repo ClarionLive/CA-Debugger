@@ -1090,13 +1090,43 @@ namespace ClarionDbg.Cli
                          + "(uint)-1 an int cast produces) collapse to ONE rendering, that rendering is "
                          + "TidText's \"(unknown)\" and not a number, and a KNOWN id still reads as its "
                          + "own number - so a refusal can no longer tell the user about a thread 0 or a "
-                         + "thread 4294967295 that does not exist.");
+                         + "thread 4294967295 that does not exist. Driven for the threaded-write refusal "
+                         + "through ThreadedWriteAllowed (shared template, no own copy), and for its other "
+                         + "three thread-naming wordings (own copy; another thread's instance, by owner and "
+                         + "by selected id) through WriteRefusal directly, since reaching those needs a "
+                         + "live thread; the decision that PICKS a wording is not covered by those three.");
 
             var eng = new DebugEngine("protocolcheck", null, null, null, null, false, 0, false);
             eng.RegisterThreadedModuleForTest("app.exe", 0x400000, 0xC8000, 0xCC000, iatRva: 0);
             const uint known = 4812;
+            const uint otherKnown = 5190;    // the tid NOT under test in a two-thread wording
             const uint minusOne = unchecked((uint)-1);
             const uint templateVa = 0x4C8000;
+
+            // WriteRefusal's other wordings, rendered by the SHIPPED method on the SHIPPED struct. Both are
+            // private to DebugEngine, and reaching them through ThreadedWriteAllowed needs a live thread
+            // (TryInstanceBase opens one), so they are set up by reflection (ticket 6874c2d1: the
+            // other-instance wording at DebugEngine.VarEdit.cs:242-243 had no runtime driver at all).
+            // A renamed type, field or method is a FAILURE here, never a skipped entry.
+            var bf = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
+            var accessType = typeof(DebugEngine).GetNestedType("ThreadedAccess", bf);
+            var kindType = typeof(DebugEngine).GetNestedType("ThreadedRefusal", bf);
+            var writeRefusal = accessType == null ? null : accessType.GetMethod("WriteRefusal");
+            if (accessType == null || kindType == null || writeRefusal == null)
+                failures.Add("refusal wording: DebugEngine.ThreadedAccess / ThreadedRefusal / WriteRefusal not found "
+                             + "by reflection - three refusal wordings below are no longer driven");
+            Func<string, uint, uint, bool, string> render = (kind, ownerTid, selectedTid, haveOwnCopy) =>
+            {
+                if (writeRefusal == null || kindType == null) return null;
+                object a = Activator.CreateInstance(accessType);
+                accessType.GetField("Kind").SetValue(a, Enum.Parse(kindType, kind));
+                accessType.GetField("Owner").SetValue(a, new LoadedModule { Name = "app.exe" });
+                accessType.GetField("OwnerTid").SetValue(a, ownerTid);
+                accessType.GetField("SelectedTid").SetValue(a, selectedTid);
+                accessType.GetField("HaveOwnCopy").SetValue(a, haveOwnCopy);
+                accessType.GetField("OwnCopyVa").SetValue(a, 0x5000u);
+                return (string)writeRefusal.Invoke(a, new object[] { templateVa, 1 });
+            };
 
             // The refusal producers reachable with no target. A table rather than three copies, so adding
             // the next drivable one is a line — and so the assertions below are applied to every entry
@@ -1109,6 +1139,12 @@ namespace ClarionDbg.Cli
                     eng.ThreadedWriteAllowedForTest(templateVa, 1, t, out why);
                     return why;
                 }) },
+                new { Name = "threaded-write refusal, selected thread has its own copy",
+                      Make = (Func<uint, string>)(t => render("SharedTemplate", 0, t, true)) },
+                new { Name = "threaded-write refusal, another thread's instance (owner id)",
+                      Make = (Func<uint, string>)(t => render("OtherThreadInstance", t, otherKnown, false)) },
+                new { Name = "threaded-write refusal, another thread's instance (selected id)",
+                      Make = (Func<uint, string>)(t => render("OtherThreadInstance", otherKnown, t, false)) },
             };
 
             foreach (var p in producers)
