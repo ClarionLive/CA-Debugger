@@ -100,6 +100,7 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
+            _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -247,6 +248,7 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
+            _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -336,6 +338,13 @@ namespace ClarionDebugger.Terminal
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
                                   + ": " + (error ?? "could not select"));
+        });
+        // Hover mode (f6e547ce). Not thread-SCOPED: the tid names the thread under the cursor, so the page
+        // must not run it through tidAccepted. None is an absent tid, through TidJson like every tid.
+        private void OnSvcHover(uint? tid, bool on, bool paused) => UI(() =>
+        {
+            Post("{\"type\":\"hover\",\"on\":" + (on ? "true" : "false") + ",\"paused\":" + (paused ? "true" : "false")
+                + TidJson(tid) + "}");
         });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         // The ENGINE's answer to a write the host sent: it re-issues the grant that write spent, so the row can
@@ -609,6 +618,8 @@ namespace ClarionDebugger.Terminal
                         if (_svc.State == DebugSessionState.Paused && PageNumbers.TryUInt(data, out uint seltid))
                             _svc.SelectThread(seltid);
                         break;
+                    // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
+                    case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
                     case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
                     case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;

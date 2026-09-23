@@ -57,6 +57,8 @@ let activeEdit = null;                 // the page's in-place editor handle (rea
 // The real page waits PENDING_SWEEP_MS before giving up on a row still showing "…". Shortened here so the
 // test doesn't sleep for four seconds; the assertion below keeps the page's own constant honest.
 const PENDING_SWEEP_MS = 30;
+// Same for the hover settle (the page's is 300 ms; section H asserts it is still defined and sane).
+const HOVER_SETTLE_MS = 20;
 
 // ---- collaborators that are NOT under test ---------------------------------------------------------
 const CALLS = [];
@@ -88,7 +90,8 @@ const FNS = ['esc', 'send', 'resetThreadState', 'setSrcLocation', 'clearSrc',
   'onThreads', 'onThreadSelected', 'onEngineError', 'rearmCurrentThread', 'beginThreadSwitch', 'invalidateThreadScopedState',
   'viewingOtherThread', 'editThreadSuffix', 'watchedKey', 'addWatchSilent', 'addWatch', 'removeWatch', 'syncRowWatch',
   'cancelPendingCallbacks', 'armPendingSweep', 'requestFrameLocals', 'requestExpand',
-  'buildStack', 'renderStack', 'onMessage'];
+  'buildStack', 'renderStack', 'onMessage',
+  'setHoverMode', 'cancelHoverSelect', 'hoverOnRunState', 'onHover', 'hoverSettle', 'renderHoverUi'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
@@ -123,6 +126,7 @@ function commitActiveEdit(text) {
 
 // the page's own thread state (declared with `let` in the page, so the tests own the bindings here)
 let threadRows = [], stopTid = null, selTid = null, threadSwitching = false, switchGen = 0, stackPendingTid = null;
+let hoverOn = false, hoverTid = null, hoverPaused = false, hoverTimer = null, hoverRunState = 'idle';
 
 let failures = 0;
 function check(label, cond, detail) {
@@ -172,6 +176,8 @@ function resetAll() {
   values.clear(); clearSent(); CALLS.length = 0; TOASTS.length = 0; LOGGED.length = 0;
   threadRows = []; stopTid = null; selTid = null; threadSwitching = false; stackPendingTid = null;
   lastFrames = null; isPaused = true;
+  if (hoverTimer !== null) clearTimeout(hoverTimer);
+  hoverOn = false; hoverTid = null; hoverPaused = false; hoverTimer = null; hoverRunState = 'idle';
 }
 
 (async function run() {
@@ -959,6 +965,155 @@ console.log('\nX) a resume and a new stop clear the values cache, for every read
   check('CONTROL: this stop\'s own answer is shown normally', $('dtVal').textContent.includes('NV'),
         $('dtVal').textContent);
   check('   and the row still carries it', state(row).text === "'NV'", state(row).text);
+}
+
+console.log('\nH) identify thread by window (f6e547ce): report while running, settle-then-select while paused');
+{
+  const OTHER_TID = 6012;   // a third thread, so a hover can target something other than the switch in flight
+  function threeThreads(sel) {
+    const e = freshThreadsEvent(sel);
+    e.threads.push({ tid: OTHER_TID, clarionThread: 3, proc: 'BrowseAuthors', module: 'clbrws012.clw', line: 88,
+                     state: 'syscall', clarionFrames: 7, stopped: false, selected: false });
+    return e;
+  }
+  const selects = () => SENT.filter(m => m.action === 'selectthread').map(m => m.data);
+  const hov = (tid, paused) => onMessage(JSON.stringify(tid == null ? { type: 'hover', on: true, paused }
+                                                                    : { type: 'hover', on: true, paused, tid }));
+  const settle = () => sleep(HOVER_SETTLE_MS + 30);
+
+  const m = html.match(/const\s+HOVER_SETTLE_MS\s*=\s*(\d+)/);
+  check('HOVER_SETTLE_MS is defined in the page, long enough to be a debounce (>= 150 ms, the poll)',
+        !!m && +m[1] >= 150, m ? m[1] : 'missing');
+
+  // H1. the toggle is what reaches the host
+  resetAll();
+  setHoverMode(true);
+  check('H1 turning it on sends hover/on', SENT.length === 1 && SENT[0].action === 'hover' && SENT[0].data === 'on',
+        JSON.stringify(SENT));
+  check('   and the toggle shows it is on', $('thHover').classList.contains('on'));
+  clearSent(); setHoverMode(false);
+  check('   turning it off sends hover/off', SENT.length === 1 && SENT[0].data === 'off', JSON.stringify(SENT));
+  check('   and the label empties', $('thHoverText').textContent === '', $('thHoverText').textContent);
+
+  // H2. running: REPORT only
+  resetAll(); hoverOn = true; isPaused = false;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, false);
+  check('H2 running: the label names the window\'s thread', $('thHoverText').textContent === 'Thread 2',
+        $('thHoverText').textContent);
+  check('   and says it cannot switch until paused', /Pause to read/.test($('thHover').title), $('thHover').title);
+  await settle();
+  check('   and never selects, however long the pointer rests', selects().length === 0, JSON.stringify(SENT));
+  // CONTROL: the same answer, paused, DOES select - so H2 is not passing because selection is broken.
+  isPaused = true; hov(BROWSE_TID, true); await settle();
+  check('   CONTROL: the same thread while paused is selected', selects().join() === String(BROWSE_TID), selects().join());
+
+  // H2b. the other race: the engine answered while RUNNING, and the answer lands after the page saw the
+  // stop. It describes a window from before the stop, so it reports and does not select.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, false); await settle();
+  check('H2b a running-time answer landing on a paused page selects nothing', selects().length === 0, selects().join());
+
+  // H3. paused: debounce. A pass over several threads selects only the one the pointer settles on.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, true);
+  check('H3 no switch the moment a hover arrives', selects().length === 0, JSON.stringify(SENT));
+  hov(OTHER_TID, true); hov(null, true); hov(BROWSE_TID, true);
+  await settle();
+  check('   one switch, to the thread it settled on, after a pass over three answers',
+        selects().join() === String(BROWSE_TID), selects().join() || 'none');
+
+  // H4. none (the IDE on top, or empty desktop) selects nothing and says so
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(BROWSE_TID, true); hov(null, true);
+  await settle();
+  check('H4 moving off the program cancels the pending switch', selects().length === 0, selects().join());
+  check('   and the label shows none', $('thHoverText').textContent === '—', $('thHoverText').textContent);
+
+  // H5. the thread already shown is not re-selected (a re-read would only flicker)
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(STOP_TID, true); await settle();
+  check('H5 hovering the thread already selected sends nothing', SENT.length === 0, JSON.stringify(SENT));
+
+  // H6. the in-flight guard: no second switch over one that has not answered
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID));
+  selectThread(BROWSE_TID); clearSent();
+  check('H6 precondition: a switch is in flight', threadSwitching === true);
+  hov(OTHER_TID, true); await settle(); await settle();
+  check('   a settled hover does not start a second switch while it is', selects().length === 0, selects().join());
+  onThreadSelected({ type: 'threadselected', tid: BROWSE_TID, ok: true });
+  check('   precondition: the first switch has landed', threadSwitching === false && selTid === BROWSE_TID);
+  clearSent(); await settle();
+  check('   and once it lands, the hover still under the pointer is honoured',
+        selects().join() === String(OTHER_TID), selects().join() || 'none');
+
+  // H7. a resume, a new stop, or turning the mode off each cancels a pending switch
+  for (const [what, act] of [
+    ['a resume', () => onMessage(JSON.stringify({ type: 'resumed' }))],
+    ['a new stop', () => onMessage(JSON.stringify({ type: 'paused', module: 'CUST.CLW', proc: 'Main', line: 1, tid: STOP_TID, regs: null }))],
+    ['turning it off', () => setHoverMode(false)],
+  ]) {
+    resetAll(); hoverOn = true;
+    onThreads(threeThreads(STOP_TID));
+    hov(BROWSE_TID, true); act(); clearSent();
+    await settle();
+    check('H7 ' + what + ' before the pointer settles cancels the switch', selects().length === 0, selects().join());
+  }
+
+  // H7b. a paused:true answer that lands after the page has seen the resume (the engine polled just before
+  // it resumed) must not switch a page that is no longer paused.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); isPaused = false; clearSent();
+  hov(BROWSE_TID, true); await settle();
+  check('H7b a stale paused answer after the resume selects nothing', selects().length === 0, selects().join());
+
+  // H7c. an answer still in flight when the toggle went off is shown nowhere and selects nothing
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID));
+  setHoverMode(false); clearSent();
+  hov(BROWSE_TID, true); await settle();
+  check('H7c a late answer after turning it off selects nothing', selects().length === 0, selects().join());
+
+  // H8. a window whose thread is not in this stop's list earns no request (and so no refusal toast)
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID)); clearSent();
+  hov(99991, true); await settle();
+  check('H8 a thread missing from the list is not requested', selects().length === 0, selects().join());
+
+  // H9. the event is NOT gated by tidAccepted: its tid is rarely the selected thread, and that is the point.
+  resetAll(); hoverOn = true;
+  onThreads(threeThreads(STOP_TID));
+  check('H9 precondition: tidAccepted WOULD drop this tid', !tidAccepted({ tid: BROWSE_TID }));
+  hov(BROWSE_TID, true);
+  check('   but the hover event still lands', hoverTid === BROWSE_TID && $('thHoverText').textContent === 'Thread 2',
+        $('thHoverText').textContent);
+
+  // H10. the engine's on:false clears the report
+  hov(BROWSE_TID, false);
+  onMessage(JSON.stringify({ type: 'hover', on: false, paused: false }));
+  check('H10 on:false from the engine clears the thread', hoverTid === null && $('thHoverText').textContent === '—',
+        $('thHoverText').textContent);
+
+  // H11. a new engine starts with hover off: re-arm it at session start, and only then
+  resetAll(); hoverOn = true; clearSent();
+  const hoverSends = () => SENT.filter(x => x.action === 'hover').length;
+  onMessage(JSON.stringify({ type: 'runstate', state: 'launching' }));
+  check('H11 a session start re-arms the engine', hoverSends() === 1, JSON.stringify(SENT));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'running' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'paused' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'running' }));
+  check('   but a resume inside the session does not resend it', hoverSends() === 1, JSON.stringify(SENT));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'idle' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'launching' }));
+  check('   and the next session re-arms it again', hoverSends() === 2, JSON.stringify(SENT));
+  hoverOn = false; onMessage(JSON.stringify({ type: 'runstate', state: 'idle' }));
+  onMessage(JSON.stringify({ type: 'runstate', state: 'launching' }));
+  check('   CONTROL: with the toggle off nothing is sent', hoverSends() === 2, JSON.stringify(SENT));
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
