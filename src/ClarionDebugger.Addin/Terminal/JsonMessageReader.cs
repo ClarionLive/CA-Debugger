@@ -22,6 +22,12 @@ namespace ClarionDebugger.Terminal
     /// <c>{action,data}</c> envelope, and the flat object inside <c>data</c>), so nothing needs to reach into
     /// a nested one, and "the key I found was actually inside something else" stops being expressible.
     /// </para>
+    /// <para>
+    /// The one reader that DOES go inside is <see cref="ForEachObject"/>, and it does so on purpose: it hands
+    /// back each nested object whole, to be read with <see cref="ReadField"/> in turn, so the top-level rule
+    /// still holds for every object it is applied to. It exists for rows the host forwards but did not build
+    /// (afbc68c7).
+    /// </para>
     /// </summary>
     internal static class JsonMessageReader
     {
@@ -81,6 +87,85 @@ namespace ClarionDebugger.Terminal
                 if (i < 0) return null;             // malformed value; nothing after it can be trusted
                 if (wanted) return value;
             }
+        }
+
+        /// <summary>Call <paramref name="visit"/> with the text of every OBJECT anywhere inside
+        /// <paramref name="json"/>, innermost first, so each one can be read with <see cref="ReadField"/>.
+        /// Returns false, having visited nothing, when the text is not one well-formed value.
+        /// <para>
+        /// This is how the host reads rows it did not build. The engine's Variables rows reach the page
+        /// verbatim - nested <c>children</c> and all - and the ones that can be edited carry the address and
+        /// type the page will later send back. The host records those tuples on the way OUT (afbc68c7), and
+        /// a flat reader cannot see a member inside a group's children. Malformed input visits NOTHING
+        /// rather than the objects before the fault: a partial walk would grant some rows of a reply the
+        /// host could not read, which is a harder state to reason about than granting none.
+        /// </para></summary>
+        public static bool ForEachObject(string json, Action<string> visit)
+        {
+            if (string.IsNullOrEmpty(json) || visit == null) return false;
+            var found = new System.Collections.Generic.List<string>();
+            int i = 0;
+            SkipWhitespace(json, ref i);
+            if (!WalkValue(json, ref i, found)) return false;
+            SkipWhitespace(json, ref i);
+            if (i != json.Length) return false;     // trailing text after the value
+            foreach (var o in found) visit(o);
+            return true;
+        }
+
+        /// <summary>Walk one value at <paramref name="i"/>, collecting every object's text into
+        /// <paramref name="found"/>. False on malformed input.</summary>
+        private static bool WalkValue(string json, ref int i, System.Collections.Generic.List<string> found)
+        {
+            if (i >= json.Length) return false;
+            char c = json[i];
+            if (c == '"') return ReadString(json, ref i) != null;
+            if (c == '{')
+            {
+                int start = i;
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == '}') { i++; found.Add(json.Substring(start, i - start)); return true; }
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length || json[i] != '"' || ReadString(json, ref i) == null) return false;
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length || json[i] != ':') return false;
+                    i++;
+                    SkipWhitespace(json, ref i);
+                    if (!WalkValue(json, ref i, found)) return false;
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != '}') return false;
+                    i++;
+                    found.Add(json.Substring(start, i - start));
+                    return true;
+                }
+            }
+            if (c == '[')
+            {
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == ']') { i++; return true; }
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    if (!WalkValue(json, ref i, found)) return false;
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != ']') return false;
+                    i++;
+                    return true;
+                }
+            }
+            // number, true, false, null: at least one character, up to the next structural one.
+            int s = i;
+            while (i < json.Length && json[i] != ',' && json[i] != '}' && json[i] != ']'
+                   && json[i] != ' ' && json[i] != '\t' && json[i] != '\r' && json[i] != '\n') i++;
+            return i > s;
         }
 
         /// <summary>Consume one value. Returns its text only when <paramref name="capture"/>, so skipping a

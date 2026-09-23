@@ -33,6 +33,10 @@ param(
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
+  # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
+  [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
+  # the engine's Variables-row writer, whose edit members the host grants on the way out
+  [string] $EngineLocalsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Locals.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
   # the disassembly view: its request tags carry the epoch that decides whether a reply is still wanted
   [string] $DisasmViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
@@ -672,14 +676,12 @@ Write-Host 'the INBOUND reader, on payloads built by the page''s own sender'
 # hand-builds JSON, they all either stringify or send a delimiter-separated string. Quote injection through
 # today's senders was NOT reachable. The cases the old extractor genuinely got wrong are in the next block.
 #
-# So this block is regression coverage, not an exploit: whatever a hostile debuggee puts in a procedure
-# name, the page encodes it and the host must read back exactly what was sent. The debuggee is untrusted -
-# those names come out of the target's TSWD debug info and return here when the user right-clicks a
-# Procedures row - and stage 2 adds more senders to this path, which is why the order dependence goes now,
-# while there are still few enough senders to check.
+# So this block is regression coverage, not an exploit: whatever a hostile debuggee gets into text the page
+# sends, the page encodes it and the host must read back exactly what was sent. The debuggee is untrusted -
+# its names come out of the target's TSWD debug info, and a user pastes them into breakpoint conditions.
 #
 # The fixtures are not written here. They are produced by running debugger.html's REAL send() and its REAL
-# breakonprocentry handler - both lifted out of the page - under node, with the page objects they touch
+# breakpoint-properties editor - both lifted out of the page - under node, with the page objects they touch
 # stubbed. Two suites built on each side's imagination of the other cannot contradict each other, and this
 # project has already shipped exactly that failure.
 
@@ -693,43 +695,57 @@ Add-Type -Language CSharp -TypeDefinition (
 ) | Out-Null
 
 $sendFn  = Get-Method 'function send(action,data)' $page
-$handler = Get-Method "`$('miBpEntry').onclick=" $page
+$bpEditor = Get-Method 'function buildBpEditor(b, locked){' $page
 
+# afbc68c7 moved these fixtures. They used to run through the Procedures pane's break-on-entry sender, which
+# carried the procedure NAME - but that request now carries only a host-issued id (see the break-on-entry
+# section below), so a hostile name no longer reaches the host by that route at all. The real sender that
+# still carries free text the host reads back is the Breakpoints pane's properties editor: its condition and
+# trace are typed by the user, and a condition is exactly where someone pastes a name out of the debuggee.
 $js = @'
-// Just enough of the page for the real handler to run.
-const els = {};
-function $(id){ if(!els[id]) els[id] = { classList:{remove(){},add(){}}, style:{}, dataset:{}, addEventListener(){} }; return els[id]; }
-let procCtx = null, wire = null;
+// Just enough of the page for the real editor to run. Every element answers querySelector with a stable
+// child per selector, which is all buildBpEditor asks of the DOM.
+function mkEl(tag){ return { tag, _q:{}, children:[], dataset:{}, style:{}, value:'', disabled:false, title:'', innerHTML:'',
+  classList:{add(){},remove(){},toggle(){},contains(){return false;}}, addEventListener(){},
+  appendChild(c){ this.children.push(c); return c; },
+  querySelector(sel){ return this._q[sel] || (this._q[sel]=mkEl(sel)); } }; }
+const document = { createElement: mkEl };
+let wire = null;
 const wv = { postMessage(s){ wire = s; } };
 
-'@ + $sendFn + "`n" + $handler + ";`n" + @'
+'@ + $sendFn + "`n" + $bpEditor + "`n" + @'
 
-// Every name here is what a HOSTILE debuggee could put in its own debug info. The page escapes them
-// correctly - JSON.stringify does - so these are well-formed messages whose VALUES look like structure.
+// Every value here is what a HOSTILE debuggee could get into a condition - a name out of its own symbols,
+// pasted in. The page escapes it correctly (JSON.stringify does), so these are well-formed messages whose
+// VALUES look like structure.
 const names = [
-  ['a closing brace inside the name',        'Proc}'],
-  ['a quote inside the name',                'say "hi" now'],
-  ['an escaped quote inside the name',       'esc \\" here'],
-  ['a backslash inside the name',            'back\\slash'],
-  ['a whole fake field inside the name',     'X","line":9999,"module":"EVIL.CLW'],
+  ['a closing brace inside the value',        'Proc}'],
+  ['a quote inside the value',                'say "hi" now'],
+  ['an escaped quote inside the value',       'esc \\" here'],
+  ['a backslash inside the value',            'back\\slash'],
+  ['a whole fake field inside the value',     'X","line":9999,"module":"EVIL.CLW'],
   ['a fake field that also closes the object', 'X"},{"line":9999'],
-  ['a newline inside the name',              'two\nlines'],
-  ['a brace and a quote together',           '{"line":1}'],
+  ['a newline inside the value',              'two\nlines'],
+  ['a brace and a quote together',            '{"line":1}'],
 ];
 
 const out = [];
 for (const [label, name] of names) {
-  procCtx = { module: 'MAIN.CLW', line: 42, name: name };
+  const ed = buildBpEditor({ module: 'MAIN.CLW', line: 42, requested: 42 }, false);
+  ed.querySelector('.bp-cond').value = name;
+  ed.querySelector('.bp-trace').value = name;
+  ed.querySelector('.bp-hm').value = '';
   wire = null;
-  els['miBpEntry'].onclick();
-  out.push({ label, wire, name });
+  ed.querySelector('.bp-save').onclick({ stopPropagation(){} });
+  // the editor trims what the user typed, so that is what the host must read back
+  out.push({ label, wire, name: name.trim() });
 }
 
 // The same real send(), with the members in an order the page does not use today. The retired rule forbade
 // exactly this - untrusted content anywhere but last - so it is the case that proves the rule is gone.
 wire = null;
-send('breakonprocentry', JSON.stringify({ name: 'X","line":9999', module: 'MAIN.CLW', line: 42 }));
-out.push({ label: 'untrusted name FIRST, which the retired field-order rule forbade', wire, name: 'X","line":9999' });
+send('bpprops', JSON.stringify({ condition: 'X","line":9999', trace: 'X","line":9999', module: 'MAIN.CLW', line: 42, hitMode: '', hitValue: 0 }));
+out.push({ label: 'untrusted text FIRST, which the retired field-order rule forbade', wire, name: 'X","line":9999' });
 
 console.log(JSON.stringify(out));
 '@
@@ -752,9 +768,10 @@ foreach ($f in $fixtures) {
   $data   = Read1 $f.wire 'data'
   $module = Read1 $data 'module'
   $line   = Read1 $data 'line'
-  $name   = Read1 $data 'name'
-  $ok = ($action -eq 'breakonprocentry') -and ($module -eq 'MAIN.CLW') -and ($line -eq '42') -and ($name -eq $f.name)
-  Check $f.label $ok "module=$module line=$line name=$name"
+  $cond   = Read1 $data 'condition'
+  $trace  = Read1 $data 'trace'
+  $ok = ($action -ceq 'bpprops') -and ($module -ceq 'MAIN.CLW') -and ($line -ceq '42') -and ($cond -ceq $f.name) -and ($trace -ceq $f.name)
+  Check $f.label $ok "module=$module line=$line condition=$cond"
 }
 
 Write-Host ''
@@ -816,75 +833,360 @@ Write-Host 'the retired rule is not lying around waiting to be followed again'
 # The doc comment used to codify the field-ORDER workaround AS THE CONTRACT - "any new payload must do the
 # same". That instruction is the defect propagating itself into code not yet written, so retiring it is part
 # of the fix. This is the guard that keeps it retired.
-$jsonVal = Get-Method 'private static string JsonVal(string json, string key)' $web
-Check 'JsonVal delegates to the real reader instead of scanning' ($jsonVal -match 'JsonMessageReader\.ReadField') ''
-Check 'no IndexOf scan left in JsonVal' ($jsonVal -notmatch 'IndexOf') ''
-$doc = $web.Substring(0, $web.IndexOf('private static string JsonVal(string json, string key)', [StringComparison]::Ordinal))
-$doc = $doc.Substring([Math]::Max(0, $doc.Length - 1600))
-Check 'its doc comment no longer instructs new payloads to order their fields' `
-  ($doc -notmatch 'must do the same' -and $doc -notmatch 'goes LAST') ''
-Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
+# afbc68c7 retired JsonVal itself. Every inbound field is now read by the typed request DTOs in
+# PageMessages.cs, one Parse per request, and the retirement notice moved there with the readers.
+$pageMsgs = Get-Content -Raw -LiteralPath $PageMessagesPath
+$jsonValCalls = [regex]::Matches((Get-CSharpCodeOnly $web), '\bJsonVal\(')
+Check 'no JsonVal( is left in the bridge; the DTOs read every field' ($jsonValCalls.Count -eq 0) "$($jsonValCalls.Count) call(s)"
+# CONTROL: the scan sees a call when there is one, so the zero above is a zero somebody looked for.
+Check 'CONTROL: that scan finds a JsonVal( call in code' `
+  ([regex]::Matches((Get-CSharpCodeOnly 'string m = JsonVal(data, "module");'), '\bJsonVal\(').Count -eq 1) ''
+Check 'the bridge reads its envelope through the DTO' ($web -match 'PageEnvelope\.Parse\(e\.TryGetWebMessageAsString\(\)\)') ''
+Check 'the DTOs read JSON through the real reader, with no quote-search of their own' `
+  (($pageMsgs -match 'JsonMessageReader\.ReadField') -and ((Get-CSharpCodeOnly $pageMsgs) -notmatch 'IndexOf\("\\"')) ''
+Check 'the DTO header does not instruct payloads to order their fields' `
+  ($pageMsgs -notmatch 'must do the same' -and $pageMsgs -notmatch 'goes LAST') ''
+Check 'and says plainly that there is no rule about field order' ($pageMsgs -match 'NO RULE ABOUT FIELD ORDER') ''
 
 Write-Host ''
-Write-Host 'break on entry: a breakpoint the engine never took is SAID, not implied'
-# afbc68c7 item 1. CmdBreakOnProcEntry printed "break on entry: X" and then called AddBreakpoint and threw its
-# answer away, so a request that never reached the engine looked exactly like one that did. The idle branch
-# staged whatever module it was handed. The REAL method is compiled below against a fake service, so what is
-# asserted is what it does - which console lines it writes and what it stages - not what its text resembles.
-$boeProbeSrc = @"
+Write-Host 'the page hands back only what the host ISSUED: procedure ids and edit tuples (afbc68c7)'
+# Bridge hardening stage 2. Two requests used to carry the host's own decisions back as page data:
+#   breakonprocentry  {module, line, name}  -> any module:line the page named became a persistent breakpoint
+#   editvar           {va, typeCode, size, places, tid, value} -> forwarded to SetVariable as sent, so any
+#                     address in the debuggee could be written under any type the message named
+# Now a Procedures row goes out with an opaque id and the host resolves it; an edit is honoured only when its
+# tuple is one the host itself sent for a row that is still current.
+#
+# END TO END, EVERY HOP REAL. The host writers (PushProcedures, OnWatch, OnSvcModuleData) are compiled out of
+# the WebView and RUN; what they post is fed to the page's own functions (buildProcs, the Procedures
+# right-click, the break-on-entry handler, setEditMeta, editAttrs, beginEdit) under node; what THOSE send is
+# fed to the host's real checkers (CmdBreakOnProcEntry, EditVar). No hop is a hand-written string, so a host
+# and a page that disagree about a member name or a number's type fail here.
+#
+# THE ONE HAND-WRITTEN HOP is the engine's Variables row, because its writer is a large instance method over
+# live process memory. It is written in the writer's shape, and the writer's four edit members are pinned by
+# name below so a rename on the engine side fails here rather than passing against a stale imitation.
+#
+# ONE SUBSTITUTION in the code under test, stated: PushProcedures queues its parse on the thread pool, and
+# the probe runs that work item inline (ThreadPool.QueueUserWorkItem -> RunNow). Nothing else is edited.
+
+$pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
+$readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
+# Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
+# `);` that closes UI( is put back here.
+function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
+$pushProcs = (Get-Method 'private void PushProcedures(string exe)' $web) -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
+$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(' |
+  ForEach-Object { (Get-ArrowHandler $_) -replace '^private void', 'public void' }) -join "`n"
+
+$bridgeSrc = @"
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
-namespace BoeProbe {
+$readerBody
+$pageMsgsBody
+namespace ClarionDebugger.Terminal {
+$(Get-Method 'public enum DebugSessionState')
 $bpRecord
+$(Get-Method 'public sealed class DebugWatch')
+$(Get-Method 'public sealed class DebugProcedure')
 public sealed class ClarionDebuggerService {
+  public static List<DebugProcedure> Listed = new List<DebugProcedure>();
+  public static List<DebugProcedure> GetProcedures(string exe) { return new List<DebugProcedure>(Listed); }
   $(Get-Method 'public static bool IsValidModuleName(string module)')
   $((Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)') -replace 'internal static', 'public static')
 }
 public sealed class FakeSvc {
-  public bool IsRunning; public bool Accept = true;
+  public DebugSessionState State = DebugSessionState.Paused;
+  public bool IsRunning = true; public bool Accept = true; public bool AcceptSet = true;
   public List<string> Adds = new List<string>();
+  public List<string> Sets = new List<string>();
+  public void PrimeTarget(string exe) { }
   public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
+  public bool SetVariable(string va, string typeCode, int size, int places, string value, uint? tid) {
+    Sets.Add(va + "|" + typeCode + "|" + size + "|" + places + "|" + (tid.HasValue ? tid.Value.ToString() : "-") + "|" + value);
+    return AcceptSet;
+  }
 }
-$((Get-Method 'internal static class JsonMessageReader' $reader) -replace 'internal static class', 'public static class')
-public sealed class Pad {
+public sealed class BridgePad {
   public FakeSvc _svc = new FakeSvc();
   public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public ProcedureIds _procIds = new ProcedureIds();
+  public EditGrants _editGrants = new EditGrants();
   public List<string> Lines = new List<string>();
+  public List<string> Posts = new List<string>();
   public int BpPushes;
+  private int _procGen;
   private void Console(string level, string text) { Lines.Add(level + "|" + text); }
+  private void Post(string json) { Posts.Add(json); }
   private void SendBps() { BpPushes++; }
+  private void UI(Action a) { a(); }
+  private static void RunNow(Action<object> work) { work(null); }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $(Get-Method 'private static string TidJson(uint? tid)' $web)
+  $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
   $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
-  $(Get-Method 'private static string JsonVal(string json, string key)' $web)
-  $(Get-Method 'public void CmdBreakOnProcEntry(string data)' $web)
+  $pushProcs
+  $((Get-Method 'public void CmdBreakOnProcEntry(string data)' $web) -replace '^public void', 'public void')
+  $((Get-Method 'private void OnWatch(DebugWatch w)' $web) -replace '^private void', 'public void')
+  $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
+  $arrowHandlers
+  public void RunPushProcedures(string exe) { PushProcedures(exe); }
 }
 }
 "@
-Add-Type -TypeDefinition $boeProbeSrc -Language CSharp | Out-Null
-function BoeErrs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
+Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
-$boe = New-Object BoeProbe.Pad
-$boe._svc.IsRunning = $true; $boe._svc.Accept = $false
-$boe.CmdBreakOnProcEntry('{"module":"MAIN.CLW","line":42,"name":"MAIN"}')
-Check 'CONTROL: the live branch really asked the engine' ($boe._svc.Adds.Count -eq 1) ($boe._svc.Adds -join ',')
+function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
+function Proc { param($name, $module, $line)
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = 'procedure'; $p
+}
+
+# ---- host writers, run --------------------------------------------------------------------------------
+$pad = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'SPLASH' 'clbrws001.clw' 17))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+$pad.RunPushProcedures('C:\App\app.exe')
+$procMsg = if ($pad.Posts.Count -ge 1) { $pad.Posts[$pad.Posts.Count - 1] } else { '' }
+Check 'CONTROL: PushProcedures posted exactly one list' ($pad.Posts.Count -eq 1) "$($pad.Posts.Count) post(s)"
+
+$watch = New-Object ClarionDebugger.Terminal.DebugWatch
+$watch.Name = 'GLO:Count'; $watch.Found = $true; $watch.Value = '5'; $watch.TypeName = 'LONG'
+$watch.Va = '0x4A10F0'; $watch.TypeCode = '0x03'; $watch.Size = 4; $watch.Places = 0; $watch.Tid = 4812
+$pad.OnWatch($watch)
+$watchMsg = $pad.Posts[$pad.Posts.Count - 1]
+
+# The engine's Variables row: a GROUP whose one editable member sits in `children`, so the grant has to be
+# found below the top level. Shape pinned against the writer just below.
+$engineRows = '{"name":"G:REC","type":"GROUP","value":"","children":[{"name":"G:X","type":"DECIMAL(7,2)","value":"1.50","va":"0x4A2200","typeCode":"0x0A","size":4,"places":2}]}'
+$engineLocals = Get-Content -Raw -LiteralPath $EngineLocalsPath
+Check 'the engine row writer still emits va, typeCode, size and places under those names' `
+  (($engineLocals -match '\\"va\\":\\"0x') -and ($engineLocals -match '\\"typeCode\\":\\"0x') -and `
+   ($engineLocals -match '\\"size\\":') -and ($engineLocals -match '\\"places\\":')) ''
+$pad.OnSvcModuleData('clbrws011.clw', $engineRows, 4812)
+$moduleMsg = $pad.Posts[$pad.Posts.Count - 1]
+Check 'CONTROL: the nested row was granted and the group itself was not' ($pad._editGrants.Count -eq 2) "$($pad._editGrants.Count) grant(s) incl. the watch"
+
+# ---- the page, run ------------------------------------------------------------------------------------
+$pageJs = @(
+  (Get-Method 'function send(action,data)' $page),
+  (Get-CSharpStatement 'const isProcKind' $page),
+  (Get-Method 'function buildProcs(procs){' $page),
+  ((Get-Method "`$('procList').addEventListener('contextmenu'," $page) + ');'),
+  ((Get-Method "`$('miBpEntry').onclick=" $page) + ';'),
+  (Get-Method 'function editAttrs(v){' $page),
+  (Get-Method 'function setEditMeta(cell, meta){' $page),
+  (Get-Method 'function stripEditQuotes(s){' $page),
+  (Get-Method 'function beginEdit(cell){' $page)
+) -join "`n"
+$inputFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-in-' + [Guid]::NewGuid().ToString('N') + '.json')
+@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
+$bridgeJs = @'
+const fs = require('fs');
+const INPUT = JSON.parse(fs.readFileSync(process.argv[2], 'utf8').replace(/^\uFEFF/, ''));
+function mkEl(tag){ return { tag, _q:{}, children:[], dataset:{}, style:{}, value:'', title:'', textContent:'', innerHTML:'',
+  classList:{add(){},remove(){},toggle(){},contains(){return false;}}, listeners:{},
+  addEventListener(t,f){ this.listeners[t]=f; }, appendChild(c){ this.children.push(c); return c; },
+  focus(){}, select(){}, querySelector(sel){ return this._q[sel] || (this._q[sel]=mkEl(sel)); } }; }
+const els = {};
+function $(id){ return els[id] || (els[id]=mkEl(id)); }
+const document = { createElement: mkEl, createDocumentFragment(){ return mkEl('#frag'); } };
+const window = { innerWidth: 1000 };
+let wire = null; const wv = { postMessage(s){ wire = s; } };
+let allProcs = [], procIndex = null, bps = [], procCtx = null;
+function buildBps(){} function filterProcs(){}
+let isPaused = true, activeEdit = null, selTid = null;
+function editThreadSuffix(){ return ''; } function viewingOtherThread(){ return false; } function toast(){}
+'@ + "`n" + $pageJs + "`n" + @'
+
+const out = {};
+// Procedures: the list the host posted, rendered by the real buildProcs, right-clicked on MAIN, broken on.
+buildProcs(JSON.parse(INPUT.procs).procs);
+const rows = $('procList').children[0].children;
+const main = rows.find(r => r.dataset.name === 'MAIN');
+$('procList').listeners.contextmenu({ target:{ closest(){ return main; } }, preventDefault(){}, clientX:0, clientY:0 });
+wire = null; $('miBpEntry').onclick(); out.bpe = wire;
+
+// An edit on the Watch row the host posted: the page's own case 'watch' hands setEditMeta these four.
+function commit(cell, value){ beginEdit(cell); const inp = cell.children[cell.children.length - 1];
+  inp.value = value; wire = null; inp.onkeydown({ key:'Enter', preventDefault(){} }); return wire; }
+const wm = JSON.parse(INPUT.watch);
+const wcell = mkEl('span'); setEditMeta(wcell, { va:wm.va, typeCode:wm.typeCode, size:wm.size, places:wm.places });
+selTid = wm.tid;
+out.watchEdit = commit(wcell, 'X","va":"0x1","value":"7');
+
+// An edit on the NESTED Variables row: editAttrs writes the attributes the tree row is built with.
+const child = JSON.parse(INPUT.moduledata).items[0].children[0];
+const tcell = mkEl('span'); const attrs = editAttrs(child); let m; const re = / data-(\w+)="([^"]*)"/g;
+while ((m = re.exec(attrs))) tcell.dataset[m[1]] = m[2];
+out.treeEdit = commit(tcell, '2.25');
+console.log(JSON.stringify(out));
+'@
+$bridgeFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-' + [Guid]::NewGuid().ToString('N') + '.js')
+Set-Content -LiteralPath $bridgeFile -Value $bridgeJs -Encoding UTF8
+$pageOut = $null
+try {
+  $raw = & node $bridgeFile $inputFile 2>&1
+  if ($LASTEXITCODE -ne 0) { Write-Host "  FAIL  could not run the page half of the bridge under node"; $raw | ForEach-Object { Write-Host "        $_" }; $script:failures++ }
+  else { $pageOut = ($raw -join "`n") | ConvertFrom-Json }
+} finally {
+  Remove-Item -LiteralPath $bridgeFile, $inputFile -ErrorAction SilentlyContinue
+}
+function DataOf { param($wire) Read1 $wire 'data' }
+
+# ---- break on entry, through the real page ------------------------------------------------------------
+$bpeData = if ($pageOut) { DataOf $pageOut.bpe } else { '' }
+Check 'the page sends the row''s host-issued id' ((Read1 $bpeData 'id') -cmatch '^p\d+\.\d+$') $bpeData
+Check 'and neither a module nor a line: the host looks those up' `
+  (($null -eq (Read1 $bpeData 'module')) -and ($null -eq (Read1 $bpeData 'line'))) $bpeData
+$pad.CmdBreakOnProcEntry($bpeData)
+Check 'the host arms the breakpoint the id stands for - MAIN at clbrws011.clw:42' `
+  (($pad._svc.Adds.Count -eq 1) -and ($pad._svc.Adds[0] -ceq 'clbrws011.clw:42')) ($pad._svc.Adds -join ',')
+
+# A list replaced since the page was sent it: the old id resolves to nothing, not to whatever row now has
+# that index.
+$pad.RunPushProcedures('C:\App\app.exe')
+$pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry($bpeData)
+Check 'an id from a list the host has since replaced arms nothing' ($pad._svc.Adds.Count -eq 0) ($pad._svc.Adds -join ',')
+Check 'and says why' (@(Errs $pad).Count -eq 1) ($pad.Lines -join ' / ')
+# The payload the page USED to send names a module and line, and no id. It must arm nothing at all.
+$pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry('{"module":"EVIL.CLW","line":1,"name":"X"}')
+Check 'the old {module,line} payload is not honoured' ($pad._svc.Adds.Count -eq 0) ($pad._svc.Adds -join ',')
+
+# The cheap half of the ticket, which the id rework must not lose: a live add the engine never took is said.
+$freshId = if ($pad.Posts[$pad.Posts.Count - 1] -match '"id":"(p\d+\.1)"') { $Matches[1] } else { '' }
+$pad._svc.Accept = $false; $pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry('{"id":"' + $freshId + '"}')
+Check 'CONTROL: a current id reaches the engine' ($pad._svc.Adds.Count -eq 1) "id=$freshId adds=$($pad._svc.Adds -join ',')"
 Check 'a refused live add writes an error line naming the breakpoint' `
-  (@(BoeErrs $boe).Count -eq 1 -and @(BoeErrs $boe)[0] -match 'MAIN\.CLW:42') ($boe.Lines -join ' / ')
-$boeOk = New-Object BoeProbe.Pad
-$boeOk._svc.IsRunning = $true; $boeOk._svc.Accept = $true
-$boeOk.CmdBreakOnProcEntry('{"module":"MAIN.CLW","line":42,"name":"MAIN"}')
-Check 'CONTROL: an accepted live add writes no error' (@(BoeErrs $boeOk).Count -eq 0) ($boeOk.Lines -join ' / ')
+  ((@(Errs $pad).Count -eq 1) -and (@(Errs $pad)[0] -match 'clbrws011\.clw:42')) ($pad.Lines -join ' / ')
+$pad._svc.Accept = $true; $pad._svc.Adds.Clear(); $pad.Lines.Clear()
+$pad.CmdBreakOnProcEntry('{"id":"' + $freshId + '"}')
+Check 'CONTROL: an accepted live add writes no error' (@(Errs $pad).Count -eq 0) ($pad.Lines -join ' / ')
 
-# The idle branch: a module the engine would refuse is not staged into the pane as if it were a breakpoint.
-$boeIdle = New-Object BoeProbe.Pad
-$boeIdle.CmdBreakOnProcEntry('{"module":"..\\evil clw","line":42,"name":"X"}')
-Check 'an idle request with an unusable module stages nothing' ($boeIdle._pending.Count -eq 0) "$($boeIdle._pending.Count) staged"
-Check 'and says why' (@(BoeErrs $boeIdle).Count -eq 1) ($boeIdle.Lines -join ' / ')
-$boeIdleOk = New-Object BoeProbe.Pad
-$boeIdleOk.CmdBreakOnProcEntry('{"module":"MAIN.CLW","line":42,"name":"X"}')
-Check 'CONTROL: an idle request with a good module is staged once' `
-  ($boeIdleOk._pending.Count -eq 1 -and $boeIdleOk.BpPushes -eq 1 -and @(BoeErrs $boeIdleOk).Count -eq 0) "$($boeIdleOk._pending.Count) staged"
+# The idle branch validates the module before staging it. With ids, the only modules that can arrive are the
+# ones the host listed, so an unusable one is planted in the LIST here to prove the check is still live.
+$idle = New-Object ClarionDebugger.Terminal.BridgePad
+$idle._svc.IsRunning = $false
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'BAD' '..\evil clw' 5))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'GOOD' 'clbrws011.clw' 42))
+$idle.RunPushProcedures('C:\App\app.exe')
+$idleList = $idle.Posts[$idle.Posts.Count - 1]
+$badId = if ($idleList -match '"id":"(p\d+\.0)"') { $Matches[1] } else { '' }
+$goodId = if ($idleList -match '"id":"(p\d+\.1)"') { $Matches[1] } else { '' }
+$idle.CmdBreakOnProcEntry('{"id":"' + $badId + '"}')
+Check 'an idle request for an unusable module stages nothing' ($idle._pending.Count -eq 0) "$($idle._pending.Count) staged"
+Check 'and says why' (@(Errs $idle).Count -eq 1) ($idle.Lines -join ' / ')
+$idle.CmdBreakOnProcEntry('{"id":"' + $goodId + '"}')
+Check 'CONTROL: an idle request for a good module is staged once' `
+  (($idle._pending.Count -eq 1) -and ($idle.BpPushes -eq 1)) "$($idle._pending.Count) staged"
+
+# ---- edits, through the real page ---------------------------------------------------------------------
+function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
+$watchData = if ($pageOut) { DataOf $pageOut.watchEdit } else { '' }
+$treeData  = if ($pageOut) { DataOf $pageOut.treeEdit } else { '' }
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'an edit on the Watch row the host sent is written' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
+Check 'with the tuple the host issued and the user''s value, untouched by the text inside it' `
+  (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A10F0|0x03|4|0|4812|X","va":"0x1","value":"7')) (Sets $pad)
+$pad._svc.Sets.Clear()
+$pad.EditVar($treeData)
+Check 'an edit on the NESTED Variables row is written - the grant reached inside children' `
+  (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A2200|0x0A|4|2|4812|2.25')) (Sets $pad)
+
+# Each part of the tuple is checked, one at a time, against the same real payload.
+$tamper = @(
+  @('an address the host never issued',         'va',       '"0x4A10F4"'),
+  @('a type code the host never issued',        'typeCode', '"0x12"'),
+  @('a size the host never issued',             'size',     '400'),
+  @('a scale the host never issued',            'places',   '3'),
+  @('a thread the row was not read on',         'tid',      '999')
+)
+foreach ($c in $tamper) {
+  $d = $watchData -replace ('"' + $c[1] + '":("[^"]*"|\d+)'), ('"' + $c[1] + '":' + $c[2])
+  $pad._svc.Sets.Clear(); $pad.Posts.Clear()
+  $pad.EditVar($d)
+  Check "refused: $($c[0])" (($d -cne $watchData) -and ($pad._svc.Sets.Count -eq 0)) (Sets $pad)
+}
+# A refusal is answered in the shape the engine's own refusal takes, so the page treats it as one.
+Check 'and a refusal is answered with a failed varset naming the address' `
+  (($pad.Posts.Count -ge 1) -and ($pad.Posts[0] -cmatch '"type":"varset","va":"0x4A10F0","ok":false')) ($pad.Posts -join ' / ')
+
+# CURRENT: a thread switch retires every grant, and a failed switch retires none.
+$pad.OnSvcThreadSelected(9001, $false, 'no such thread')
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'CONTROL: a switch the engine REFUSED leaves the grants alone' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
+$pad.OnSvcThreadSelected(9001, $true, $null)
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'after a thread switch the same edit is refused until the row is re-read' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+
+# A request the service would not send is said, not dropped: no varset would ever have come.
+$pad.OnWatch($watch)
+$pad._svc.AcceptSet = $false; $pad.Posts.Clear()
+$pad.EditVar($watchData)
+Check 'a write SetVariable refused is answered with a failed varset too' `
+  (($pad.Posts.Count -ge 1) -and ($pad.Posts[0] -cmatch '"ok":false') -and ($pad.Posts[0] -cmatch 'did not take')) ($pad.Posts -join ' / ')
+
+# The three other places a stop, resume or exit makes rows stale. Not reachable from this probe (they sit in
+# UI lambdas with live-editor side effects), so they are pinned by POSITION: the clear must come before the
+# re-reads that re-grant, or the fresh grants are wiped along with the stale ones.
+$onPaused = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $web)
+$iClearP = $onPaused.IndexOf('_editGrants.Clear()'); $iReq = $onPaused.IndexOf('_svc.RequestStack()')
+Check 'a new stop clears the grants BEFORE requesting the replies that re-grant' `
+  (($iClearP -ge 0) -and ($iReq -gt $iClearP)) "clear=$iClearP request=$iReq"
+Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
+Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
+Check 'the frame-locals and expand replies grant their rows as module data does' `
+  (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
+   ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
+
+# ---- the grant walker on its own ----------------------------------------------------------------------
+$g = New-Object ClarionDebugger.Terminal.EditGrants
+$g.GrantRows('{"va":"0x10","typeCode":"0x03","size":4,"places":0},{"name":"x","children":[{"va":"0x20","typeCode":"0x03","size":4}]}', $null)
+Check 'unscoped rows (an expanded reference) grant for any thread' `
+  ($g.IsGranted('0x10', '0x03', 4, 0, 77) -and $g.IsGranted('0x20', '0x03', 4, 0, $null)) "$($g.Count) grant(s)"
+$g2 = New-Object ClarionDebugger.Terminal.EditGrants
+$g2.GrantRows('{"va":"0x10","typeCode":"0x03","size":4,"places":0},{"va":"0x20",', 5)
+Check 'a malformed reply grants NOTHING, not the rows before the fault' ($g2.Count -eq 0) "$($g2.Count) grant(s)"
+$g3 = New-Object ClarionDebugger.Terminal.EditGrants
+$g3.Grant('0x10', '0x03', 4, 0, 5)
+Check 'a thread-scoped grant does not answer a page with no thread selection' (-not $g3.IsGranted('0x10', '0x03', 4, 0, $null)) ''
+Check 'CONTROL: ...and does answer its own thread' ($g3.IsGranted('0x10', '0x03', 4, 0, 5)) ''
+
+# ---- the other request DTOs ---------------------------------------------------------------------------
+# These payloads are delimiter strings, parsed exactly as before and now in one place each. Checked on the
+# shapes the page builds and on the malformed shapes each one must drop.
+$x = [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|clbrws011.clw|123|0x4A0000')
+Check 'expand: reqId|module|typeRef|addr reads as four typed fields' `
+  (($null -ne $x) -and $x.ReqId -eq 7 -and $x.Module -ceq 'clbrws011.clw' -and $x.TypeRef -eq 123 -and $x.Addr -ceq '0x4A0000') ''
+Check 'expand: a wrong field count, or a typeRef that is not a number, is dropped' `
+  (($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123')) -and ($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|-1|0x1'))) ''
+$fl = [ClarionDebugger.Terminal.FrameLocalsRequest]::Parse('3|0x401000|0x19FF00')
+Check 'framelocals: reqId|va|ebp reads as three typed fields' (($null -ne $fl) -and $fl.ReqId -eq 3 -and $fl.Ebp -ceq '0x19FF00') ''
+$ml = [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('a:b.clw:12')
+Check 'module:line splits on the LAST colon' (($null -ne $ml) -and $ml.Module -ceq 'a:b.clw' -and $ml.Line -eq 12) ''
+Check 'module:line with no module, or no number, is dropped' `
+  (($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse(':12')) -and ($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('m.clw:x'))) ''
+$ob = [ClarionDebugger.Terminal.OpenBpRequest]::Parse("42`tC:\src\m.clw")
+Check 'openbp: line<TAB>path' (($null -ne $ob) -and $ob.Line -eq 42 -and $ob.Path -ceq 'C:\src\m.clw') ''
+$u = [uint32] 0
+Check 'a thread id is a DWORD: a sign is not accepted' `
+  (-not [ClarionDebugger.Terminal.PageNumbers]::TryUInt('-5', [ref] $u) -and [ClarionDebugger.Terminal.PageNumbers]::TryUInt('4294967295', [ref] $u)) ''
+Check 'no envelope without an action' `
+  (($null -eq [ClarionDebugger.Terminal.PageEnvelope]::Parse('{"data":"x"}')) -and ($null -eq [ClarionDebugger.Terminal.PageEnvelope]::Parse('not json'))) ''
+# The switch itself: no case may go back to picking its own fields out of raw text.
+$onMsg = Get-CSharpCodeOnly (Get-Method 'private void OnWebMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)' $web)
+Check 'OnWebMessage parses no payload inline - no Split, no bare TryParse' `
+  (($onMsg -notmatch '\.Split\(') -and ($onMsg -notmatch '\b(u?int)\.TryParse\(')) ''
 
 Write-Host ''
 Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-named .clw'
@@ -1479,7 +1781,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 234
+$EXPECTED_CHECKS = 274
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
