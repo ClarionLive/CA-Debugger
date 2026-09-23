@@ -290,19 +290,15 @@ namespace ClarionDebugger.Terminal
         /// CONTAINMENT, NEVER "NEAREST PRECEDING" (PM ruling, codex adversary gate). This used to return the last
         /// procedure starting at or above the line, with no upper bound - so module data, generated trailer code
         /// or a cursor below the last procedure armed the PREVIOUS procedure's entry. A procedure's range is
-        /// [its start, its end]: the end is the known extent (<see cref="ProcRef.EndLine"/>) when the engine
-        /// reported one, else the line before the next non-routine procedure in the same module. The LAST
-        /// procedure in a module has no next one, so with no known extent it is REFUSED rather than guessed.
+        /// [its start, <see cref="ProcRef.EndLine"/>], the extent the engine reports. A procedure with NO known
+        /// extent is REFUSED as an engine/host version mismatch, never bounded by a guess (pipeline run 2).
         /// </para>
         /// <para>
         /// ROUTINEs are skipped as candidates and as bounds: they sit INSIDE their procedure, so a routine is
         /// neither what "procedure entry" means nor where the procedure ends. Module is compared ignoring case:
         /// it is a Windows file name. A position is only a lookup key into what the host listed (e61e4f92).
         /// </para>
-        /// <para>
-        /// KNOWN LIMIT while the engine sends no extents (as of 2026-09-22): a line between one procedure's real
-        /// end and the next one's start is attributed to the first, because starts alone cannot tell them apart.
-        /// </para></summary>
+        /// </summary>
         public ProcRef Containing(string module, int line, out string why)
         {
             why = null;
@@ -322,15 +318,18 @@ namespace ClarionDebugger.Terminal
                                    : module + ":" + line + " is above the first listed procedure";
                 return null;
             }
-            if (at.EndLine > 0)
+            // FAIL CLOSED on an unknown end (PM ruling, codex adversary, pipeline run 2). The bundled engine sends
+            // endLine for every procedure since e049e07, and it ships in this addin with the host, so a
+            // procedure WITHOUT one means the two have come apart. Bounding it by the next procedure's start
+            // instead - the fallback this replaced - attributed module data between A's end and B's start to A.
+            if (at.EndLine <= 0)
             {
-                if (line <= at.EndLine) return at;
-                why = module + ":" + line + " is past the end of " + at.Name + " (line " + at.EndLine + "), outside every listed procedure";
+                why = "the debugger does not know where " + at.Name + " ends (the engine sent no endLine: an engine/host"
+                    + " version mismatch - reinstall the CA Debugger so both come from one build)";
                 return null;
             }
-            if (next != null) return at;     // bounded by the next procedure's start
-            why = module + ":" + line + " is below " + at.Name + ", the last procedure in " + module
-                + ", and the debugger does not know where that procedure ends";
+            if (line <= at.EndLine) return at;
+            why = module + ":" + line + " is past the end of " + at.Name + " (line " + at.EndLine + "), outside every listed procedure";
             return null;
         }    }
 

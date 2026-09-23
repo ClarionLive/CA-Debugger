@@ -247,8 +247,8 @@ namespace ClarionDebugger.Services
         /// (a routine is not independently navigable the way a procedure is).</summary>
         public string Kind;
         /// <summary>The procedure's LAST source line when the engine reports one (an <c>endLine</c> member), else
-        /// 0 = unknown. As of 2026-09-22 the engine's symbols output carries only the start, so this is 0 until
-        /// it does; ProcedureIds.Containing then bounds a procedure by the next one's start instead.</summary>
+        /// 0 = unknown. The bundled engine sends it for every procedure since e049e07 (6fa242ae); a position
+        /// lookup on a procedure without one is refused as an engine/host version mismatch.</summary>
         public int EndLine;
     }
 
