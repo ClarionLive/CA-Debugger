@@ -1418,14 +1418,15 @@
   // way to resolve one. The engine walks direct GROUP/QUEUE members from the head, and follows ONE reference:
   // a LOCAL &QUEUE/&GROUP at the head (QUEUE:BROWSE:1 is one). So the path stops (null, for the child and
   // everything under it) at an array or one of its "[n]" elements, at a reference anywhere below the head,
-  // and at a reference head that is not a local (Module Data). The head must also be a QUEUE or GROUP by the
-  // engine's own `refKind` on the ref node: a class reference looks exactly like a queue's otherwise, and
-  // the engine refuses a path through one. A node with no refKind (an engine from before that field)
-  // gets no path, so an older engine means fewer pins rather than pins that answer an error.
+  // and at a reference head that is not a local (Module Data). The head must also carry the engine's
+  // `refKind` "aggregate" (a QUEUE or GROUP; TSWD cannot tell those two apart), decided engine-side by the
+  // same LooksLikeClassLayout test the watch walker refuses a class head with, so the pin and the engine
+  // agree. "class", "other", or no refKind at all (an engine from before that field) gets no path: an
+  // older engine means fewer pins rather than pins that answer an error.
   function childWatchPath(parentWatchPath, parent, parentDepth, refHeadOk, child){
     if(parentWatchPath==null || !parent || !child || !child.name) return null;
     if(/^\[/.test(child.name) || /^ARRAY/.test(parent.type||'')) return null;
-    if(parent.ref && !(parentDepth===1 && refHeadOk && (parent.refKind==='queue' || parent.refKind==='group'))) return null;
+    if(parent.ref && !(parentDepth===1 && refHeadOk && parent.refKind==='aggregate')) return null;
     return parentWatchPath+'.'+child.name;
   }
 

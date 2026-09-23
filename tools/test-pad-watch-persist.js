@@ -376,7 +376,7 @@ ok(names.indexOf(QPATH) < 0 && names.length === 2, 'removing it in another case 
 
 section('17) which Variables-tree rows get a watch path');
 // childWatchPath is the page's whole decision; renderVarRow pins a LEAF exactly when it has one.
-const QREF = { name: 'QUEUE:BROWSE:1', type: '', ref: true, refKind: 'queue' };
+const QREF = { name: 'QUEUE:BROWSE:1', type: '', ref: true, refKind: 'aggregate' };
 const GRP = { name: 'BROWSEBUTTONS', type: '', children: [] };
 const ARR = { name: 'BRW1::SORT1:KEYDISTRIBUTION', type: 'ARRAY[1..100]', children: [] };
 const LEAF = { name: 'BRW1::JOB:JOBID', type: 'SHORT' };
@@ -386,16 +386,18 @@ ok(childWatchPath('G.SUB', GRP, 2, true, { name: 'X' }) === 'G.SUB.X', 'and a ne
 ok(childWatchPath('QUEUE:BROWSE:1', QREF, 1, true, LEAF) === 'QUEUE:BROWSE:1.BRW1::JOB:JOBID',
   'a member under a LOCAL reference head gets HEAD.MEMBER');
 ok(childWatchPath('MODQ', QREF, 1, false, LEAF) === null, 'but not under a Module Data (global) reference head');
-// refKind, frozen with the engine's var-row emission: only a QUEUE or GROUP head is walked through. A class
-// reference looks like a queue's in every other field, and an engine that predates refKind sends none.
+// refKind, frozen with the engine's var-row emission (revised 2026-09-23): "aggregate" | "class" | "other".
+// Only an "aggregate" head (a QUEUE or GROUP) is walked through. A class reference looks like a queue's in
+// every other field, and an engine that predates refKind sends none.
 const kindPath = k => { const h = { name: 'H', type: '', ref: true }; if (k !== undefined) h.refKind = k;
   return childWatchPath('H', h, 1, true, LEAF); };
-ok(kindPath('queue') === 'H.BRW1::JOB:JOBID', 'refKind "queue": the head is walked through');
-ok(kindPath('group') === 'H.BRW1::JOB:JOBID', 'refKind "group": the head is walked through');
+ok(kindPath('aggregate') === 'H.BRW1::JOB:JOBID', 'refKind "aggregate": the head is walked through');
 ok(kindPath('class') === null, 'refKind "class": no path, so no pin that could only answer an error');
 ok(kindPath('other') === null, 'refKind "other": no path');
 ok(kindPath(undefined) === null, 'no refKind at all (an older engine): no path - fail closed');
-ok(kindPath('QUEUE') === null, 'refKind is matched exactly as frozen, not case-folded');
+ok(kindPath('queue') === null && kindPath('group') === null,
+  'the superseded "queue"/"group" spellings get no path either');
+ok(kindPath('Aggregate') === null, 'refKind is matched exactly as frozen, not case-folded');
 ok(childWatchPath('G.R', QREF, 2, true, LEAF) === null, 'nor under a reference BELOW the head');
 // a plain child name, so this is the ARRAY rule on its own and not the "[n]" one below
 ok(childWatchPath('BRW1::SORT1:KEYDISTRIBUTION', ARR, 1, true, { name: 'X', type: 'SHORT' }) === null,
