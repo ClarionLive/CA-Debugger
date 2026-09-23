@@ -64,7 +64,8 @@ namespace ClarionDbg.Cli
                          + "rectangle, answers none when another process's window (the IDE) is on top or a "
                          + "foreign child holds the point, and does not let a cloaked, click-through or "
                          + "invisible window swallow the hover; `hover` is accepted by both loops and its "
-                         + "event carries no tid for none; a poll is throttled and emits only on change. "
+                         + "event carries no tid for none; a poll is throttled and emits only on change, and every "
+                         + "stop gets one fresh answer even when no running poll ran since the last. "
                          + "Not covered: the Win32 reads themselves, which need the Owner's desktop.");
 
             var tops = new List<HoverWin> { HvFrame };
@@ -176,6 +177,25 @@ namespace ClarionDbg.Cli
             if (DebugEngine.IsResumeVerbForTest("hover"))
                 failures.Add("hover verb: IsResumeVerb accepts it — it would reset the thread selection while "
                              + "paused and be diverted from its case while running");
+
+            // ---- one fresh answer per stop (pipeline run 1, f6e547ce item 2). Two stops with the same
+            // (tid, paused) and NO running-state poll between them, which is what a step under 150 ms gives.
+            // The engine has no process, so every answer is none: the same answer at both stops, by design.
+            var st = NewEngine();
+            st.EmitJson = true;
+            string stop1 = CaptureConsole(() => st.HandleHoverCommandForTest("hover on", true));
+            System.Threading.Thread.Sleep(200);   // past HOVER_POLL_MS, so the control's poll is DUE
+            string same = CaptureConsole(() => st.PollHoverForTest(true));
+            if (stop1.IndexOf("\"event\":\"hover\"", StringComparison.Ordinal) < 0)
+                failures.Add("hover per-stop: precondition, stop 1 emitted no answer - " + stop1);
+            if (same.IndexOf("\"event\":\"hover\"", StringComparison.Ordinal) >= 0)
+                failures.Add("hover per-stop CONTROL: an unchanged answer within one stop was emitted again, so "
+                             + "the case below cannot tell a new stop from no suppression at all - " + same);
+            // No sleep here: a new stop must make the poll due at once, not 150 ms later.
+            string stop2 = CaptureConsole(() => { st.HoverNewStopForTest(); st.PollHoverForTest(true); });
+            if (stop2.IndexOf("@JSON {\"event\":\"hover\",\"on\":true,\"paused\":true}", StringComparison.Ordinal) < 0)
+                failures.Add("hover per-stop: the second stop, same answer as the first with no running poll "
+                             + "between, emitted nothing - the page never learns the stop's hover: " + stop2);
 
             // ---- the tracker: throttle, change-only, reset
             var tr = new HoverTracker();

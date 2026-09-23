@@ -127,7 +127,7 @@ function commitActiveEdit(text) {
 
 // the page's own thread state (declared with `let` in the page, so the tests own the bindings here)
 let threadRows = [], stopTid = null, selTid = null, threadSwitching = false, switchGen = 0, stackPendingTid = null;
-let hoverOn = false, hoverTid = null, hoverPaused = false, hoverTimer = null, hoverRunState = 'idle';
+let hoverOn = false, hoverTid = null, hoverPaused = false, hoverTimer = null, hoverRunState = 'idle', hoverBaseline = false;
 
 let failures = 0;
 function check(label, cond, detail) {
@@ -178,7 +178,7 @@ function resetAll() {
   threadRows = []; stopTid = null; selTid = null; threadSwitching = false; stackPendingTid = null;
   lastFrames = null; isPaused = true;
   if (hoverTimer !== null) clearTimeout(hoverTimer);
-  hoverOn = false; hoverTid = null; hoverPaused = false; hoverTimer = null; hoverRunState = 'idle';
+  hoverOn = false; hoverTid = null; hoverPaused = false; hoverTimer = null; hoverRunState = 'idle'; hoverBaseline = false;
 }
 
 (async function run() {
@@ -1079,6 +1079,33 @@ console.log('\nH) identify thread by window (f6e547ce): report while running, se
   setHoverMode(false); clearSent();
   hov(BROWSE_TID, true); await settle();
   check('H7c a late answer after turning it off selects nothing', selects().length === 0, selects().join());
+
+  // H12. a NEW STOP never pulls the view off the stopped thread by itself (pipeline run 1). The engine
+  // sends one fresh answer per stop; the page takes it as the baseline, and only a later change selects.
+  // Two step lengths, which must behave the same: SHORT (under the 150 ms poll, so no running answer came
+  // between the stops) and LONG (a running answer for the same window came first).
+  const stopEv = () => onMessage(JSON.stringify({ type: 'paused', module: 'CUST.CLW', proc: 'Main', line: 1,
+                                                  tid: STOP_TID, regs: null }));
+  const stepThenStop = long => {
+    onMessage(JSON.stringify({ type: 'resumed' }));
+    if (long) hov(BROWSE_TID, false);
+    stopEv(); onThreads(threeThreads(STOP_TID));
+    hov(BROWSE_TID, true);                          // the stop's one fresh answer: the pointer rests on B
+  };
+  for (const long of [false, true]) {
+    const what = long ? 'LONG step' : 'SHORT step';
+    resetAll(); hoverOn = true;
+    stopEv(); onThreads(threeThreads(STOP_TID));
+    hov(BROWSE_TID, true);                          // stop 1's baseline
+    clearSent(); await settle();
+    check('H12 ' + what + ': the first answer at a stop does not select', selects().length === 0, selects().join());
+    stepThenStop(long); clearSent(); await settle();
+    check('   and after the ' + what + ' the next stop\'s first answer does not select either',
+          selects().length === 0 && selTid === STOP_TID, selects().join() + ' sel=' + selTid);
+    hov(OTHER_TID, true); await settle();
+    check('   a CHANGE of the hovered thread while paused does select',
+          selects().join() === String(OTHER_TID), selects().join() || 'none');
+  }
 
   // H8. a window whose thread is not in this stop's list earns no request (and so no refusal toast)
   resetAll(); hoverOn = true;
