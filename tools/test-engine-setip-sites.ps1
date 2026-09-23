@@ -73,6 +73,26 @@ function Get-TopLevelVerdict {
   return $null
 }
 
+# 3. (pipeline run 3) Run's EXCEPTION branch hands a first-chance exception back to the app with
+#    `status = Native.DBG_EXCEPTION_NOT_HANDLED;` - the app's handler can unwind a watched step - and the VERY
+#    NEXT statement must be SetIpOnExceptionPassed(tid);. The assignment must occur exactly once in Run, so a
+#    second hand-back cannot appear without this check noticing.
+$script:RunSig = 'public int Run('
+$script:PassStmt = 'status = Native.DBG_EXCEPTION_NOT_HANDLED;'
+$script:PassCall = 'SetIpOnExceptionPassed(tid);'
+function Get-ExceptionPassVerdict {
+  param([string] $Src)
+  $block = Get-CSharpBlock $script:RunSig $Src
+  if ($null -eq $block) { return 'Run not found' }
+  $code = Get-CSharpCodeOnly $block
+  $n = ([regex]::Matches($code, [regex]::Escape($script:PassStmt))).Count
+  if ($n -ne 1) { return "Run hands an exception back $n time(s); expected exactly 1" }
+  $at = $code.IndexOf($script:PassStmt, [StringComparison]::Ordinal) + $script:PassStmt.Length
+  $after = $code.Substring($at).TrimStart()
+  if ($after.StartsWith($script:PassCall, [StringComparison]::Ordinal)) { return $null }
+  return "the statement after the hand-back is: $($after.Substring(0, [Math]::Min(60, $after.Length)))"
+}
+
 $engineSrc = Get-Content -Raw -LiteralPath $EnginePath
 $stepSrc = Get-Content -Raw -LiteralPath $SteppingPath
 
@@ -86,7 +106,38 @@ Invoke-CheckSection 'every trap of a step records its ESP' {
   Check "StepMachine calls $($script:StepCall)...) unconditionally, before any return" ($null -eq $r) $r
 }
 
+Invoke-CheckSection 'an exception handed back to the app ends a watched step' {
+  $r = Get-ExceptionPassVerdict $engineSrc
+  Check "Run's DBG_EXCEPTION_NOT_HANDLED is followed at once by $($script:PassCall)" ($null -eq $r) $r
+}
+
 if ($SelfTest) {
+  Invoke-CheckSection 'mutation self-test, the exception hand-back (each must be CAUGHT)' {
+    $block = Get-CSharpBlock $script:RunSig $engineSrc
+    $lineRx = '(?m)^[ \t]*SetIpOnExceptionPassed\(tid\);[^\r\n]*\r?\n'
+    $n = ([regex]::Matches($block, $lineRx)).Count
+    Check 'the call line is found exactly once' ($n -eq 1) "$n match(es)"
+    $line = [regex]::Match($block, $lineRx).Value
+    $nl = if ($line.EndsWith("`r`n")) { "`r`n" } else { "`n" }
+    $indent = [regex]::Match($line, '^[ \t]*').Value
+    $exitRx = '(?m)^[ \t]*running = false;[^\r\n]*\r?\n'
+    $exitLine = [regex]::Match($block, $exitRx).Value
+    $without = $block.Replace($line, '')
+    $mutations = [ordered]@{
+      'the call deleted' = $without
+      'the call wrapped in if (DateTime.Now.Year < 0)' = $block.Replace($line, "${indent}if (DateTime.Now.Year < 0) SetIpOnExceptionPassed(tid);$nl")
+      'the call moved to another case (EXIT_PROCESS)' = $(if ($exitLine) { $without.Replace($exitLine, "$exitLine${indent}SetIpOnExceptionPassed(tid);$nl") } else { $block })
+      'a second hand-back without the call' = $block.Replace($line, "$line${indent}status = Native.DBG_EXCEPTION_NOT_HANDLED;$nl")
+    }
+    foreach ($name in $mutations.Keys) {
+      $mutated = $engineSrc.Replace($block, $mutations[$name])
+      $changed = $mutated -cne $engineSrc
+      $r = Get-ExceptionPassVerdict $mutated
+      Check "CAUGHT: $name" ($changed -and $null -ne $r) $(if ($changed) { $r } else { 'the mutation did not change the source' })
+    }
+    Check 'CONTROL: the unmutated source passes' ($null -eq (Get-ExceptionPassVerdict ($engineSrc.Replace($block, $block)))) ''
+  }
+
   Invoke-CheckSection 'mutation self-test, the resume choke point (each must be CAUGHT)' {
     $block = Get-CSharpBlock $script:ResumeSig $engineSrc
     $lineRx = '(?m)^[ \t]*SetIpOnResume\([^\r\n]*\r?\n'
@@ -138,8 +189,8 @@ if ($SelfTest) {
   }
 }
 
-# Clean: 2 checks. -SelfTest adds 1 find + 4 mutations + 1 control per site = 12.
-$EXPECTED_CHECKS = if ($SelfTest) { 14 } else { 2 }
+# Clean: 3 checks. -SelfTest adds 1 find + 4 mutations + 1 control per site, for 3 sites = 18.
+$EXPECTED_CHECKS = if ($SelfTest) { 21 } else { 3 }
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

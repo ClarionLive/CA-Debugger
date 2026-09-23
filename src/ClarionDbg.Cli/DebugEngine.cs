@@ -712,6 +712,7 @@ namespace ClarionDbg.Cli
                         {
                             // pass first-chance non-breakpoint exceptions back to the app
                             status = Native.DBG_EXCEPTION_NOT_HANDLED;
+                            SetIpOnExceptionPassed(tid);   // the app's handler may unwind a watched step: see DebugEngine.SetIp.cs
                         }
                         break;
 
@@ -1057,7 +1058,7 @@ namespace ClarionDbg.Cli
             // FIRST, before anything can return: every resume verb comes through here, so this is where setip's
             // observations are cut back for the run that follows (DebugEngine.SetIp.cs). Position pinned by
             // tools/test-engine-setip-sites.ps1.
-            SetIpOnResume(tid, stepping, haveCtx ? ctx.Esp : 0);
+            SetIpOnResume(tid, stepping, haveCtx, haveCtx ? ctx.Esp : 0);
             if (!haveCtx) return;
             bool needTf = stepping || _rearm.ContainsKey(tid);
             if (!needTf) return;
