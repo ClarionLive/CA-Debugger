@@ -290,19 +290,15 @@ namespace ClarionDebugger.Terminal
         /// CONTAINMENT, NEVER "NEAREST PRECEDING" (PM ruling, codex adversary gate). This used to return the last
         /// procedure starting at or above the line, with no upper bound - so module data, generated trailer code
         /// or a cursor below the last procedure armed the PREVIOUS procedure's entry. A procedure's range is
-        /// [its start, its end]: the end is the known extent (<see cref="ProcRef.EndLine"/>) when the engine
-        /// reported one, else the line before the next non-routine procedure in the same module. The LAST
-        /// procedure in a module has no next one, so with no known extent it is REFUSED rather than guessed.
+        /// [its start, <see cref="ProcRef.EndLine"/>], the extent the engine reports. A procedure with NO known
+        /// extent is REFUSED as an engine/host version mismatch, never bounded by a guess (pipeline run 2).
         /// </para>
         /// <para>
         /// ROUTINEs are skipped as candidates and as bounds: they sit INSIDE their procedure, so a routine is
         /// neither what "procedure entry" means nor where the procedure ends. Module is compared ignoring case:
         /// it is a Windows file name. A position is only a lookup key into what the host listed (e61e4f92).
         /// </para>
-        /// <para>
-        /// KNOWN LIMIT while the engine sends no extents (as of 2026-09-22): a line between one procedure's real
-        /// end and the next one's start is attributed to the first, because starts alone cannot tell them apart.
-        /// </para></summary>
+        /// </summary>
         public ProcRef Containing(string module, int line, out string why)
         {
             why = null;
@@ -322,15 +318,18 @@ namespace ClarionDebugger.Terminal
                                    : module + ":" + line + " is above the first listed procedure";
                 return null;
             }
-            if (at.EndLine > 0)
+            // FAIL CLOSED on an unknown end (PM ruling, codex adversary, pipeline run 2). The bundled engine sends
+            // endLine for every procedure since e049e07, and it ships in this addin with the host, so a
+            // procedure WITHOUT one means the two have come apart. Bounding it by the next procedure's start
+            // instead - the fallback this replaced - attributed module data between A's end and B's start to A.
+            if (at.EndLine <= 0)
             {
-                if (line <= at.EndLine) return at;
-                why = module + ":" + line + " is past the end of " + at.Name + " (line " + at.EndLine + "), outside every listed procedure";
+                why = "the debugger does not know where " + at.Name + " ends (the engine sent no endLine: an engine/host"
+                    + " version mismatch - reinstall the CA Debugger so both come from one build)";
                 return null;
             }
-            if (next != null) return at;     // bounded by the next procedure's start
-            why = module + ":" + line + " is below " + at.Name + ", the last procedure in " + module
-                + ", and the debugger does not know where that procedure ends";
+            if (line <= at.EndLine) return at;
+            why = module + ":" + line + " is past the end of " + at.Name + " (line " + at.EndLine + "), outside every listed procedure";
             return null;
         }    }
 
@@ -391,37 +390,48 @@ namespace ClarionDebugger.Terminal
         // for the engine's reply to that write - the reply is what re-issues it, so the row the user just
         // edited can be edited again. A clear drops these too: a reply after a stop must not resurrect a
         // grant for a row that is no longer on screen.
-        private readonly Dictionary<string, List<string>> _writesInFlight =
-            new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        //
+        // ONE WRITE PER ADDRESS AT A TIME (codex security, pipeline run 2). The engine's varset reply names only
+        // the address, so with two writes in flight to one va - two issued tuples, e.g. two type or thread views
+        // of it - the first reply could not tell which spent grant was its own, and re-issued BOTH before the
+        // second write was answered. A second write to an address whose write is pending is refused instead
+        // (IsWritePending), so each reply re-issues exactly the one grant its own write spent.
+        private readonly Dictionary<string, string> _writesInFlight =
+            new Dictionary<string, string>(StringComparer.Ordinal);
 
-        /// <summary>Check AND spend the grant for this tuple: true when it was granted, in which case it is
-        /// no longer granted until <see cref="Regrant"/> is called for its address.</summary>
+        /// <summary>True while a write to <paramref name="va"/> has been sent and not yet answered.</summary>
+        public bool IsWritePending(string va)
+        {
+            return !string.IsNullOrEmpty(va) && _writesInFlight.ContainsKey(va.ToUpperInvariant());
+        }
+
+        /// <summary>Check AND spend the grant for this tuple: true when it was granted and no other write to its
+        /// address is pending, in which case it is no longer granted until <see cref="Regrant"/> is called for
+        /// that address.</summary>
         public bool TryConsume(string va, string typeCode, int size, int places, uint? tid)
         {
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return false;
+            if (IsWritePending(va)) return false;
             string scoped = tid.HasValue ? Key(va, typeCode, size, places, TidKey(tid)) : null;
             string key = (scoped != null && _keys.Contains(scoped)) ? scoped
                        : _keys.Contains(Key(va, typeCode, size, places, Unscoped)) ? Key(va, typeCode, size, places, Unscoped)
                        : null;
             if (key == null) return false;
             _keys.Remove(key);
-            string vaKey = va.ToUpperInvariant();
-            List<string> spent;
-            if (!_writesInFlight.TryGetValue(vaKey, out spent)) _writesInFlight[vaKey] = spent = new List<string>();
-            spent.Add(key);
+            _writesInFlight[va.ToUpperInvariant()] = key;
             return true;
         }
 
-        /// <summary>The write to <paramref name="va"/> has been answered (or never left): re-issue the grant(s)
+        /// <summary>The write to <paramref name="va"/> has been answered (or never left): re-issue the one grant
         /// it spent, so the refreshed row is editable again.</summary>
         public void Regrant(string va)
         {
             if (string.IsNullOrEmpty(va)) return;
-            List<string> spent;
             string vaKey = va.ToUpperInvariant();
+            string spent;
             if (!_writesInFlight.TryGetValue(vaKey, out spent)) return;
             _writesInFlight.Remove(vaKey);
-            foreach (var k in spent) if (_keys.Count + _expandable.Count < MaxGrants) _keys.Add(k);
+            if (_keys.Count + _expandable.Count < MaxGrants) _keys.Add(spent);
         }
 
         /// <summary>Record an expandable row (a lazy reference / array-element group node) the host issued.</summary>

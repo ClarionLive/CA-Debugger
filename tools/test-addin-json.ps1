@@ -1204,12 +1204,14 @@ Check 'and after it arrives' (($gp._svc.Adds.Count -eq 0) -and (@(Errs $gp).Coun
 # refuses it - only the table having been emptied at the start of the refresh can.
 $gh = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
-[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+# WITH an extent, so the only thing that can refuse the lookup below is the table having been cleared.
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42 'procedure' 100))
 $gh.RunPushProcedures('C:\App\app.exe')
 $gh.HoldWork = $true
 $gh.RunPushProcedures('C:\Other\new.exe')
 $gh.CmdBreakOnProcEntryAt('C:\Src\clbrws011.clw', 50)
-Check 'mid-refresh, a POSITION in the old list resolves to nothing either' ($gh._svc.Adds.Count -eq 0) ($gh._svc.Adds -join ',')
+Check 'mid-refresh, a POSITION in the old list resolves to nothing either' `
+  (($gh._svc.Adds.Count -eq 0) -and (@(Errs $gh)[0] -match 'no listed procedure is in')) (($gh._svc.Adds -join ',') + ' / ' + ($gh.Lines -join ' / '))
 # The generation check and the install gate, ISOLATED on the table itself.
 $ids = New-Object ClarionDebugger.Terminal.ProcedureIds
 $ids.Begin(2)
@@ -1268,17 +1270,22 @@ Check 'CONTROL: an idle request for a good module is staged once' `
 # ---- break on entry by POSITION: the editor's cursor (e61e4f92) ---------------------------------------
 # ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
 # list, and it must be CONTAINED by a procedure (PM ruling, codex adversary gate) - never "the nearest one
-# above". clbrws011.clw here: MAIN 42 (no extent; bounded by OTHER), a routine inside it at 45, OTHER 80..120
-# (a known extent), and module data/trailer after 120. clbrws003.clw: LAST 20 with no extent and nothing after.
+# above". Containment needs the procedure's END, which the bundled engine sends as endLine since e049e07; a
+# procedure with no end is refused as an engine/host version mismatch (pipeline run 2), never bounded by the
+# next procedure's start. clbrws011.clw: MAIN 42..70 with a routine inside it at 45, OTHER 80..120.
+# clbrws003.clw: LAST 20, no end. clbrws004.clw: BOUNDED 10..30, AFTERDATA 60. clbrws005.clw: the adversary's
+# case, A 10 with NO end and B 50..70.
 $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
-[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42 'procedure' 70))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN::DOIT' 'clbrws011.clw' 45 'routine'))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80 'procedure' 120))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'ELSEWHERE' 'clbrws002.clw' 10))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'LAST' 'clbrws003.clw' 20))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'BOUNDED' 'clbrws004.clw' 10 'procedure' 30))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'AFTERDATA' 'clbrws004.clw' 60))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'A' 'clbrws005.clw' 10))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'B' 'clbrws005.clw' 50 'procedure' 70))
 $posPad.RunPushProcedures('C:\App\app.exe')
 function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
 function PosRefused { param($path, $line, $reason)
@@ -1296,7 +1303,15 @@ Check 'REFUSED: a cursor BETWEEN procedures, in module data past a known end (cl
 Check 'REFUSED: a cursor below a procedure''s known end, with nothing after it (OTHER ends at 120)' `
   (PosRefused 'C:\Src\clbrws011.clw' 130 'past the end of OTHER') ($posPad.Lines -join ' / ')
 Check 'REFUSED: a cursor below the LAST procedure in a module whose end is unknown' `
-  (PosRefused 'C:\Src\clbrws003.clw' 25 'does not know where that procedure ends') ($posPad.Lines -join ' / ')
+  (PosRefused 'C:\Src\clbrws003.clw' 25 'engine/host version mismatch') ($posPad.Lines -join ' / ')
+# THE ADVERSARY'S CASE (pipeline run 2): A starts at 10 with NO end and B at 50. Line 40 may be module data
+# between them; the next-start fallback armed A there. With no end it is REFUSED, naming the mismatch.
+Check 'REFUSED: A(10, no end), B(50), cursor 40 - an unknown end is a version mismatch, not a guess' `
+  (PosRefused 'C:\Src\clbrws005.clw' 40 'engine/host version mismatch') ($posPad.Lines -join ' / ')
+Check 'CONTROL: a procedure WITH an end still resolves in the same module (B 50..70, cursor 60)' `
+  ((PosAdd 'C:\Src\clbrws005.clw' 60) -ceq 'clbrws005.clw:50') ($posPad._svc.Adds -join ',')
+Check 'with an end of 30, cursor 20 resolves (BOUNDED 10..30)' ((PosAdd 'C:\Src\clbrws004.clw' 20) -ceq 'clbrws004.clw:10') ($posPad._svc.Adds -join ',')
+Check 'and cursor 40, past that end, is refused' (PosRefused 'C:\Src\clbrws004.clw' 40 'past the end of BOUNDED') ($posPad.Lines -join ' / ')
 Check 'REFUSED: a file the list does not cover' (PosRefused 'C:\Src\unlisted.clw' 50 'no listed procedure is in') ($posPad.Lines -join ' / ')
 Check 'the service reads an engine endLine when there is one, and treats one before the start as unknown' `
   (((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
@@ -1392,6 +1407,36 @@ Check 'the frame-locals and expand replies grant their rows as module data does'
   (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
    ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
 
+# ---- one write per address at a time (codex security, pipeline run 2) ---------------------------------
+# The varset reply names only the ADDRESS. With two issued tuples on one va (two type or thread views of it)
+# and both writes in flight, the first reply re-issued the second write's grant before its own reply came.
+# So a second write to an address whose write is pending is refused, and each reply restores exactly one.
+$sp = New-Object ClarionDebugger.Terminal.BridgePad
+$sp._editGrants.Grant('0x4A10F0', '0x03', 4, 0, 4812)          # view A of the address
+$sp._editGrants.Grant('0x4A10F0', '0x12', 4, 0, 4812)          # view B of the SAME address
+$editA = '{"va":"0x4A10F0","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"1"}'
+$editB = '{"va":"0x4A10F0","typeCode":"0x12","size":4,"places":0,"tid":4812,"value":"2"}'
+$sp.EditVar($editA)
+Check 'CONTROL: the first write to the address goes out' ($sp._svc.Sets.Count -eq 1) ($sp._svc.Sets -join ' ; ')
+$sp.Posts.Clear()
+$sp.EditVar($editB)
+Check 'a second write to the same address, under its OWN grant, is refused while the first is pending' `
+  (($sp._svc.Sets.Count -eq 1) -and ($sp.Posts.Count -eq 1) -and ($sp.Posts[0] -cmatch 'still pending')) ($sp.Posts -join ' / ')
+$sp.OnSvcVariableSet('0x4A10F0', $true, '1', $null)          # the engine answers write A
+$sp.EditVar($editB)
+Check 'after the reply, the second write proceeds' (($sp._svc.Sets.Count -eq 2) -and ($sp._svc.Sets[1] -cmatch '\|0x12\|')) ($sp._svc.Sets -join ' ; ')
+# ...and the reply to A restored A ONLY: with B now in flight, A is refused as pending, not written twice.
+$sp.Posts.Clear()
+$sp.EditVar($editA)
+Check 'and A is refused while B is pending: each reply restored exactly its own grant' `
+  (($sp._svc.Sets.Count -eq 2) -and ($sp.Posts[0] -cmatch 'still pending')) ($sp.Posts -join ' / ')
+# The WRITER holds the rule too, not only EditVar: TryConsume itself will not spend a second grant on a
+# pending address.
+$g2 = New-Object ClarionDebugger.Terminal.EditGrants
+$g2.Grant('0x10', '0x03', 4, 0, 5); $g2.Grant('0x10', '0x12', 4, 0, 5)
+$first = $g2.TryConsume('0x10', '0x03', 4, 0, 5)
+Check 'EditGrants.TryConsume refuses a second spend on an address whose write is pending' `
+  ($first -and -not $g2.TryConsume('0x10', '0x12', 4, 0, 5)) "first=$first"
 # ---- expand is issued like edit (afbc68c7, codex security gate) --------------------------------------
 # A forged expand needs no host-issued row: name a known group type at ANY address and the engine renders its
 # members WITH edit metadata. Forwarded unchecked, those replies minted grants, and EditVar trusts grants.
@@ -2081,7 +2126,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 319
+$EXPECTED_CHECKS = 328
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
