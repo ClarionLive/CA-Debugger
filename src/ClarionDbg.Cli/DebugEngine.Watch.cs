@@ -300,11 +300,22 @@ namespace ClarionDbg.Cli
                 return;
             }
             uint templateVa = owner.LoadBase + loc.Rva;
-            bool threaded = loc.Rva >= owner.CwtlsLo && loc.Rva < owner.CwtlsHi && owner.CwtlsHi != 0;
+            // Over the symbol's SPAN, through the shared test (ef0a941d): a start-only test showed a symbol
+            // straddling into the template as ordinary data, a silent wrong value with a pencil.
+            var span = ClassifyTemplateSpan(owner, templateVa, loc.Size);
 
-            if (!threaded)
+            if (span == TemplateSpan.Outside)
             {
                 EmitWatchValue(tid, name, templateVa, templateVa, false, loc.TypeCode, loc.Size);
+                return;
+            }
+            if (span == TemplateSpan.Straddling)
+            {
+                // Same words and same permission as the module-data panel's straddling row (Locals.cs), so
+                // one name at one stop never reads two ways.
+                EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                               note: "partly in the shared " + owner.Name + " template — not this thread's own data",
+                               editable: false);
                 return;
             }
 

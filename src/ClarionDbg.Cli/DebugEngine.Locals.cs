@@ -607,10 +607,10 @@ namespace ClarionDbg.Cli
                         uint templateVa = m.LoadBase + ds.Rva;
                         uint va = templateVa;
                         string note = null; bool editable = true;
-                        uint hitVa;
-                        if (TouchesThreadedTemplate(m, templateVa, (int)ds.Size, out hitVa))
+                        var span = ClassifyTemplateSpan(m, templateVa, ds.Size);
+                        if (span != TemplateSpan.Outside)
                         {
-                            if (hitVa != templateVa)
+                            if (span == TemplateSpan.Straddling)
                             {
                                 // STRADDLING: the symbol starts OUTSIDE the threaded block and reaches into
                                 // it. It cannot be relocated — only part of it is per-thread, and

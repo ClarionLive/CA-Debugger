@@ -253,14 +253,11 @@ namespace ClarionDbg.Cli
         /// until this shared it. Same defect class as the note that used to drift from the veto: a rule
         /// stated in two places is a rule that will be fixed in one of them.
         ///
-        /// IT IS NOT, HOWEVER, THE ONLY PLACE THE RULE APPEARS, and this comment used to claim it was.
-        /// The same `Rva >= CwtlsLo && Rva < CwtlsHi` test survives in three files this does NOT cover —
-        /// DebugEngine.Watch.cs, DebugEngine.ThreadScan.cs and DebugEngine.BpAdvanced.cs — each
-        /// classifying a resolved symbol rather than a caller-supplied range. They are NOT routed here,
-        /// and whether they are correct is an open question rather than a settled one: all three have the
-        /// symbol's `loc.Size` in scope at the point of the test, which is exactly what made the panel's
-        /// version wrong. Tracked as ticket ef0a941d; those files have no owner in this run and must not be
-        /// edited as a side effect of a comment. Scoped true beats ambitious and false.
+        /// Until ef0a941d (2026-09-22) the same `Rva >= CwtlsLo && Rva < CwtlsHi` point test survived in
+        /// DebugEngine.Watch.cs, DebugEngine.ThreadScan.cs and DebugEngine.BpAdvanced.cs, each with the
+        /// symbol's size in scope and unused. They now ask <see cref="ClassifyTemplateSpan"/>, which asks
+        /// this; tools/test-threaded-template-rule.ps1 fails if a direct Rva-vs-Cwtls comparison reappears
+        /// outside this file.
         /// <paramref name="hitVa"/> is the FIRST byte of the range inside the template, which is the start
         /// only when the range begins inside it.</summary>
         private static bool TouchesThreadedTemplate(LoadedModule m, uint va, int len, out uint hitVa)
@@ -275,6 +272,46 @@ namespace ClarionDbg.Cli
             if (!Overlaps(va, (ulong)va + (ulong)len, tmplLo, tmplSpan)) return false;
             hitVa = va >= tmplLo ? va : tmplLo;
             return true;
+        }
+
+        /// <summary>Where a resolved symbol's span sits against its image's shared .cwtls template.</summary>
+        internal enum TemplateSpan
+        {
+            /// <summary>No byte of the symbol is in the template: ordinary data, read where it is.</summary>
+            Outside,
+            /// <summary>The symbol STARTS in the template, so its per-thread instance is at the same offset
+            /// inside the thread's block and TryResolveThreadedInstance can relocate it.</summary>
+            StartsInside,
+            /// <summary>The symbol starts OUTSIDE the template and reaches into it. It cannot be relocated:
+            /// only part of it is per-thread, and the instance mapping works from an offset inside the block,
+            /// which this start is not.</summary>
+            Straddling,
+        }
+
+        /// <summary>The template question for a whole SYMBOL, asked over its span through
+        /// <see cref="TouchesThreadedTemplate"/>. Every path that classifies a resolved name asks this —
+        /// the module-data panel, Watch, the thread scan and breakpoint conditions — and each still decides
+        /// for itself what a straddling symbol means for it: a panel labels it, a condition refuses to answer.
+        /// The PREDICATE is shared; the verdict is not.</summary>
+        private static TemplateSpan ClassifyTemplateSpan(LoadedModule m, uint va, uint size)
+        {
+            uint hitVa;
+            int len = size > int.MaxValue ? int.MaxValue : (int)size;
+            if (!TouchesThreadedTemplate(m, va, len, out hitVa)) return TemplateSpan.Outside;
+            return hitVa == va ? TemplateSpan.StartsInside : TemplateSpan.Straddling;
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the shipped range test, so the straddling discriminator
+        /// is asserted against the real rule rather than a copy of it. Pure; touches no engine state.</summary>
+        internal static bool TouchesThreadedTemplateForTest(LoadedModule m, uint va, int len, out uint hitVa)
+        {
+            return TouchesThreadedTemplate(m, va, len, out hitVa);
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the shipped symbol classification. Pure.</summary>
+        internal static TemplateSpan ClassifyTemplateSpanForTest(LoadedModule m, uint va, uint size)
+        {
+            return ClassifyTemplateSpan(m, va, size);
         }
 
         /// <summary>Do the half-open intervals [wLo,wHi) and [bLo, bLo+bLen) share a byte?</summary>
