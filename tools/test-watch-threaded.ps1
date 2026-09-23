@@ -24,13 +24,28 @@
 # test-interactive.ps1 in engine-session.ps1 — this script used to carry its own compressed copy of all
 # of them (337b3222 item 10).
 #
+# IT IS A TEST, NOT ONLY A RIG, and it fails closed (a0becd69). Its default -Commands used to be just `quit`,
+# so an unattended run paused, read NOTHING, printed "=== done ===" and exited 0 - on 2026-09-22 it "passed"
+# while the HISTORY:: shadowing bug it exists to catch was live. It now exits non-zero unless the target
+# paused, at least one `watch` was sent, EVERY watch got a found reply that read bytes, and every name in
+# -ExpectThreaded read as THREADed from an instance address rather than its template.
+#
+# THE DEFAULT IS DISCRIMINATING, measured 2026-09-22 at the SPLASHSCREEN stop: STO:Store_name has a
+# History::STO:Record copy (clbrws030.clw). The engine before 6b48ad7c resolved the bare name to that STATIC
+# copy ("threaded":false, va == templateVa); the fixed engine resolves it to the FILE record
+# ("threaded":true, its own instance va). AUT:AU_LNAME has no HISTORY:: copy and reads threaded on both, so
+# it is the control: a run where it fails is not about the shadowing at all.
+#
 # e.g. tools\test-watch-threaded.ps1 -BreakArgs "--bp clbrws001.clw:561" -MenuItem "2/5" `
 #        -Commands @('watch AUT:AU_LNAME','watch AUTHORS$AUT:RECORD')
 param(
     [string]$Engine = "$PSScriptRoot\..\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe",
     [string]$Target = "C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe",
     [string]$BreakArgs = "--bp clbrws026.clw:42",
-    [string[]]$Commands = @("quit"),
+    [string[]]$Commands = @("watch STO:Store_name", "watch AUT:AU_LNAME", "quit"),
+    # Names that must read THREADed. Defaults to the two default watches ONLY when -Commands is not passed:
+    # a caller watching something else is not held to names it never asked about.
+    [string[]]$ExpectThreaded = @(),
     [int]$PauseTimeoutSec = 30,
     [int]$CmdWaitMs = 1500,
     [switch]$Burst,
@@ -40,6 +55,12 @@ param(
     [string]$LogFile = ""
 )
 . "$PSScriptRoot\engine-session.ps1"
+# Check / Invoke-CheckSection / Assert-CheckTotal. engine-session.ps1 does not load them.
+. "$PSScriptRoot\lib-check.ps1"
+
+if (-not $PSBoundParameters.ContainsKey('Commands') -and -not $PSBoundParameters.ContainsKey('ExpectThreaded')) {
+    $ExpectThreaded = @('STO:Store_name', 'AUT:AU_LNAME')
+}
 
 Add-Type @"
 using System; using System.Runtime.InteropServices; using System.Text;
@@ -69,6 +90,9 @@ $script:wva = @{}
 $script:tidByProc = @{}
 $script:ebp = $null
 $script:va = $null
+$script:watchReply = @{}      # name -> the LAST watch event line for it
+$script:watchesSent = @()     # names, in the order their `watch` commands went to the engine
+$script:everPaused = $false
 
 # Post the next queued menu item, if one is due and the debuggee is up. Called on every poll tick, so
 # it must be cheap and must not block. The window it pokes belongs to the pid the ENGINE reported —
@@ -90,11 +114,16 @@ function Try-Poke {
 
 # Remember the facts later commands substitute into: a watched name's instance VA, and the tid whose
 # topmost Clarion frame is a given procedure.
+# -cmatch and a case-sensitive [regex] on every WIRE spelling (09207c17): event names and member keys are
+# case-sensitive JSON, and -match would accept an "Event":"Watch" line the pad itself would never match.
 function Note-Line([string]$line) {
-    if ($line -match '"event":"watch","name":"([^"]+)".*?"va":"(0x[0-9A-F]+)"') {
+    if ($line -cmatch '"event":"watch","name":"([^"]+)"') {
+        $script:watchReply[$matches[1]] = $line
+    }
+    if ($line -cmatch '"event":"watch","name":"([^"]+)".*?"va":"(0x[0-9A-F]+)"') {
         $script:wva[$matches[1]] = $matches[2]
     }
-    if ($line -match '"event":"threads"') {
+    if ($line -cmatch '"event":"threads"') {
         foreach ($m in [regex]::Matches($line, '"tid":(\d+),"clarionThread":[^,]+,"proc":"([^"]+)"')) {
             $script:tidByProc[$m.Groups[2].Value] = $m.Groups[1].Value
         }
@@ -118,9 +147,10 @@ function Wait-Paused([int]$timeoutSec) {
     return (Wait-EnginePaused $script:session $timeoutSec -OnLine {
             param($line)
             Show-Line $line
-            if ($line -match '"event":"paused"') {
-                if ($line -match '"ebp":"(0x[0-9A-F]+)"') { $script:ebp = $matches[1] }
-                if ($line -match '"va":"(0x[0-9A-F]+)"') { $script:va = $matches[1] }
+            if ($line -cmatch '"event":"paused"') {
+                $script:everPaused = $true
+                if ($line -cmatch '"ebp":"(0x[0-9A-F]+)"') { $script:ebp = $matches[1] }
+                if ($line -cmatch '"va":"(0x[0-9A-F]+)"') { $script:va = $matches[1] }
             }
         } -EachTick { Try-Poke })
 }
@@ -136,84 +166,122 @@ function Expand-Tokens([string]$command) {
 $script:session = New-EngineSession -Engine $Engine -Target $Target -BreakArgs $BreakArgs `
     -WorkingDirectory (Split-Path $Target) -CaptureStdErr
 
-# -PrePauseSec: let the app run (and the menu queue drain) before breaking in.
-if ($PrePauseSec -gt 0) {
-    $sw0 = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($sw0.Elapsed.TotalSeconds -lt $PrePauseSec) {
-        Drain                      # also what teaches the session the debuggee pid Try-Poke needs
-        Try-Poke
-        Start-Sleep -Milliseconds 200
-    }
-    Drain
-    if ($script:pending.Count -gt 0) {
-        Write-Host ("!! " + $script:pending.Count + " menu item(s) never posted — raise -PrePauseSec")
-    }
-    Write-Host ">>> pause"
-    $script:session.Proc.StandardInput.WriteLine("pause")
-}
+Invoke-CheckSection 'drive the target: pause, then send the commands' {
+  # -PrePauseSec: let the app run (and the menu queue drain) before breaking in.
+  if ($PrePauseSec -gt 0) {
+      $sw0 = [System.Diagnostics.Stopwatch]::StartNew()
+      while ($sw0.Elapsed.TotalSeconds -lt $PrePauseSec) {
+          Drain                      # also what teaches the session the debuggee pid Try-Poke needs
+          Try-Poke
+          Start-Sleep -Milliseconds 200
+      }
+      Drain
+      if ($script:pending.Count -gt 0) {
+          Write-Host ("!! " + $script:pending.Count + " menu item(s) never posted — raise -PrePauseSec")
+      }
+      Write-Host ">>> pause"
+      $script:session.Proc.StandardInput.WriteLine("pause")
+  }
 
-if (-not (Wait-Paused $PauseTimeoutSec)) {
-    Write-Host "!! never paused"
-}
-elseif ($Burst) {
-    # the add-in's pause burst: everything at once, then read whatever came back
-    foreach ($c0 in $Commands) {
-        $cmd = Expand-Tokens $c0
-        if ($cmd -eq 'quit') { continue }
-        Write-Host ">>> $cmd"
-        $script:session.Proc.StandardInput.WriteLine($cmd)
-    }
-    Start-Sleep -Milliseconds ($CmdWaitMs * 2)
-    Drain
-}
-else {
-    foreach ($c0 in $Commands) {
-        $cmd = Expand-Tokens $c0
-        if ($cmd -eq 'quit') { continue }
+  if (-not (Wait-Paused $PauseTimeoutSec)) {
+      Write-Host "!! never paused"
+  }
+  elseif ($Burst) {
+      # the add-in's pause burst: everything at once, then read whatever came back
+      foreach ($c0 in $Commands) {
+          $cmd = Expand-Tokens $c0
+          if ($cmd -eq 'quit') { continue }
+          Write-Host ">>> $cmd"
+          $script:session.Proc.StandardInput.WriteLine($cmd)
+          if ($cmd -match '^watch\s+(\S.*)$') { $script:watchesSent += $matches[1].Trim() }
+      }
+      Start-Sleep -Milliseconds ($CmdWaitMs * 2)
+      Drain
+  }
+  else {
+      foreach ($c0 in $Commands) {
+          $cmd = Expand-Tokens $c0
+          if ($cmd -eq 'quit') { continue }
 
-        if ($cmd -eq 'go') {
-            Write-Host ">>> continue (no wait)"
-            $script:session.Proc.StandardInput.WriteLine('continue')
-            Start-Sleep -Milliseconds $CmdWaitMs
-            Drain
-            continue
-        }
-        if ($cmd -eq 'pause') {
-            Write-Host ">>> pause"
-            $script:session.Proc.StandardInput.WriteLine('pause')
-            if (-not (Wait-Paused $PauseTimeoutSec)) { Write-Host '!! never re-paused'; break }
-            continue
-        }
-        if ($cmd -eq 'wake') {
-            $cp = Get-EngineTargetProcess $script:session
-            if ($cp) { Write-Host ("## woke " + [MenuPoke]::Wake($cp.Id) + " window(s)") }
-            else { Write-Host "## wake skipped — no debuggee process to wake" }
-            Start-Sleep -Milliseconds $CmdWaitMs
-            Drain
-            continue
-        }
-        if ($cmd -like 'sleep *') {
-            Start-Sleep -Milliseconds ([int]$cmd.Substring(6))
-            Drain
-            continue
-        }
+          if ($cmd -eq 'go') {
+              Write-Host ">>> continue (no wait)"
+              $script:session.Proc.StandardInput.WriteLine('continue')
+              Start-Sleep -Milliseconds $CmdWaitMs
+              Drain
+              continue
+          }
+          if ($cmd -eq 'pause') {
+              Write-Host ">>> pause"
+              $script:session.Proc.StandardInput.WriteLine('pause')
+              if (-not (Wait-Paused $PauseTimeoutSec)) { Write-Host '!! never re-paused'; break }
+              continue
+          }
+          if ($cmd -eq 'wake') {
+              $cp = Get-EngineTargetProcess $script:session
+              if ($cp) { Write-Host ("## woke " + [MenuPoke]::Wake($cp.Id) + " window(s)") }
+              else { Write-Host "## wake skipped — no debuggee process to wake" }
+              Start-Sleep -Milliseconds $CmdWaitMs
+              Drain
+              continue
+          }
+          if ($cmd -like 'sleep *') {
+              Start-Sleep -Milliseconds ([int]$cmd.Substring(6))
+              Drain
+              continue
+          }
 
-        Write-Host ">>> $cmd"
-        $script:session.Proc.StandardInput.WriteLine($cmd)
-        if ($cmd -in @('step', 'stepover', 'stepout', 'continue')) {
-            if (-not (Wait-Paused $PauseTimeoutSec)) { Write-Host '!! no pause'; break }
-        }
-        else {
-            Start-Sleep -Milliseconds $CmdWaitMs
-            Drain
-        }
-    }
+          Write-Host ">>> $cmd"
+          $script:session.Proc.StandardInput.WriteLine($cmd)
+          if ($cmd -match '^watch\s+(\S.*)$') { $script:watchesSent += $matches[1].Trim() }
+          if ($cmd -in @('step', 'stepover', 'stepout', 'continue')) {
+              if (-not (Wait-Paused $PauseTimeoutSec)) { Write-Host '!! no pause'; break }
+          }
+          else {
+              Start-Sleep -Milliseconds $CmdWaitMs
+              Drain
+          }
+      }
+  }
+
+  Stop-EngineSession $script:session
+  Start-Sleep -Milliseconds 300
+  Drain
+  Stop-EngineTarget $script:session
+  Remove-EngineSession $script:session
+  if ($LogFile) { [IO.File]::WriteAllLines($LogFile, [string[]]$script:session.Sink.ToArray()) }
+  Check 'the target paused at the breakpoint' $script:everPaused $BreakArgs
 }
-
-Stop-EngineSession $script:session
-Start-Sleep -Milliseconds 300
-Drain
-Stop-EngineTarget $script:session
-Remove-EngineSession $script:session
-if ($LogFile) { [IO.File]::WriteAllLines($LogFile, [string[]]$script:session.Sink.ToArray()) }
 Write-Host "=== done ==="
+
+Invoke-CheckSection 'verdict: every watch read something, and the THREADed names read as threaded' {
+  # Nothing sent is a FAILURE, not an empty pass: a run that reads nothing proves nothing, which is the
+  # exact way this file passed with the bug live.
+  Check 'at least one watch command was sent' ($script:watchesSent.Count -gt 0) `
+    $(if ($script:watchesSent.Count) { '' } else { 'no `watch` in -Commands, so this run could not have caught anything' })
+  foreach ($n in $script:watchesSent) {
+    $r = $script:watchReply[$n]
+    Check "watch $n got a found reply that read bytes" `
+      ($null -ne $r -and $r -cmatch '"found":true' -and $r -cmatch '"read":[1-9]') (ShowVal $r)
+  }
+  foreach ($n in $ExpectThreaded) {
+    $r = $script:watchReply[$n]
+    $tmpl = if ($r -and $r -cmatch '"templateVa":"(0x[0-9A-F]+)"') { $matches[1] } else { $null }
+    $inst = if ($r -and $r -cmatch '"va":"(0x[0-9A-F]+)"') { $matches[1] } else { $null }
+    # threaded:true AND an instance address that is not the template's: the HISTORY:: copy that shadowed
+    # the FILE record read threaded:false with va == templateVa, so either half alone would have caught it,
+    # and together they also reject a "threaded" read that was really served from the shared template.
+    Check "$n reads as THREADed, from an instance rather than its template" `
+      ($null -ne $r -and $r -cmatch '"threaded":true' -and $null -ne $inst -and $inst -cne $tmpl) `
+      "templateVa=$(ShowVal $tmpl) va=$(ShowVal $inst) reply=$(ShowVal $r)"
+  }
+}
+
+# THE COUNT, ASSERTED AND PRINTED (60344b78). Derived from the INPUTS, not from what ran - one check per
+# watch sent plus one per expected-threaded name, plus the pause and the "anything sent" checks - so a loop
+# that silently stopped early is a short total. Measured 2026-09-22 with the defaults: 6.
+$EXPECTED_CHECKS = 2 + $script:watchesSent.Count + $ExpectThreaded.Count
+Assert-CheckTotal $EXPECTED_CHECKS
+Write-Host ''
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+Write-Host "ALL $($script:checks) CHECKS PASSED"
+exit 0
