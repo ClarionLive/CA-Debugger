@@ -60,6 +60,11 @@ $predicates = @(
 ) -join "`n"
 # The unload rule (af81c054, pipeline run 1) is an instance method over _bps, so it gets its own shim class.
 $siblingRule = Get-Method 'private bool HasArmAllSiblingOutside(UserBreakpoint bp, LoadedModule leaving)' $mod
+# The one resolve-and-snap sequence (f367a04f) and the snap rule it uses, compiled against a stub line table.
+$resolver = @(
+  (Get-Method 'private static bool TryResolveLine(TswdDebugInfo dbg, int mi, int line, out int planted, out List<uint> rvas)'),
+  (Get-Method 'private static int NearestIn(List<int> sorted, int line)')
+) -join "`n"
 
 $shim = @"
 using System;
@@ -82,6 +87,26 @@ $($predicates -replace 'private static', 'public static')
 public sealed class UnloadRule {
     public List<UserBreakpoint> _bps = new List<UserBreakpoint>();
 $($siblingRule -replace 'private bool', 'public bool')
+}
+
+// A line table: line -> record RVAs, one compiland. The two method names and signatures are asserted against
+// ClarionDbg.Core's real TswdDebugInfo further down. It records every compiland index it is asked about, so
+// a resolver that dropped or replaced `mi` is visible.
+public sealed class TswdDebugInfo {
+    public Dictionary<int, List<uint>> Recs = new Dictionary<int, List<uint>>();
+    public List<int> AskedMi = new List<int>();
+    public List<uint> LineToRvasInModuleIdx(int moduleIdx, int line) {
+        AskedMi.Add(moduleIdx);
+        List<uint> r; return Recs.TryGetValue(line, out r) ? new List<uint>(r) : new List<uint>();
+    }
+    public List<int> BreakableLinesInModuleIdx(int moduleIdx) {
+        AskedMi.Add(moduleIdx);
+        var l = new List<int>(Recs.Keys); l.Sort(); return l;
+    }
+}
+
+public static class LineResolve {
+$($resolver -replace 'private static', 'public static')
 }
 "@
 Add-Type -TypeDefinition $shim -Language CSharp | Out-Null
@@ -281,6 +306,48 @@ Check 'and for one that named an image' ($copy -match 'IsNullOrEmpty\(bp\.OwnerS
 # breakpoint and must not suppress this image's copy.
 Check 'and the already-covered test is on the REQUESTED line, not the planted one' `
   ($copy -match 'other\.RequestedLine == bp\.RequestedLine' -and $copy -notmatch 'other\.Line == bp\.Line') ''
+
+Write-Host ''
+Write-Host 'ONE resolve-and-snap sequence, shared by all three arming paths (f367a04f)'
+# Three hand-kept copies of "look the line up, snap to the nearest record if it has none" used to live in
+# AddBreakpointIn, BindPendingTo and CopyUnqualifiedInto. They were identical, which is exactly the state in
+# which one of them gets fixed and the other two do not. The shared body is exercised for real below.
+function Table { param([hashtable] $recs, [object[]] $order)
+  $d = New-Object TswdDebugInfo
+  foreach ($k in $order) { $l = New-Object 'System.Collections.Generic.List[uint32]'; foreach ($v in $recs[$k]) { $l.Add([uint32]$v) }; $d.Recs[[int]$k] = $l }
+  $d
+}
+$tbl = Table @{ 50 = @(0x100); 60 = @(0x200, 0x204) } @(50, 60)
+$planted = 0; $rv = $null
+$ok = [LineResolve]::TryResolveLine($tbl, 7, 50, [ref]$planted, [ref]$rv)
+Check 'a line WITH a record resolves to itself and its record' ($ok -and $planted -eq 50 -and $rv.Count -eq 1 -and $rv[0] -eq 0x100) "ok=$ok planted=$planted"
+$ok = [LineResolve]::TryResolveLine($tbl, 7, 55, [ref]$planted, [ref]$rv)
+Check 'a line with NO record snaps FORWARD to the next one, and takes all of its addresses' ($ok -and $planted -eq 60 -and $rv.Count -eq 2) "ok=$ok planted=$planted n=$($rv.Count)"
+$ok = [LineResolve]::TryResolveLine($tbl, 7, 70, [ref]$planted, [ref]$rv)
+Check 'past the last record it snaps BACK instead' ($ok -and $planted -eq 60 -and $rv.Count -eq 2) "ok=$ok planted=$planted"
+Check 'and every lookup is made in the compiland it was handed' (@($tbl.AskedMi | Where-Object { $_ -ne 7 }).Count -eq 0 -and $tbl.AskedMi.Count -gt 0) ($tbl.AskedMi -join ',')
+$empty = New-Object TswdDebugInfo
+$ok = [LineResolve]::TryResolveLine($empty, 7, 50, [ref]$planted, [ref]$rv)
+Check 'a compiland with no records at all is a FAILURE, not an empty success' (-not $ok) "ok=$ok"
+$core = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDbg.Core\TswdDebugInfo.cs')
+Check 'the stub''s two lookups are the real TswdDebugInfo''s signatures' `
+  ($core -match 'public List<uint> LineToRvasInModuleIdx\(int moduleIdx, int line\)' -and
+   $core -match 'public List<int> BreakableLinesInModuleIdx\(int moduleIdx\)') ''
+
+# The call sites. Get-Method has already failed the run if AddBreakpointIn has any other signature.
+$addIn = Get-Method 'private void AddBreakpointIn(LoadedModule owner, BpSpec spec)'
+Check 'AddBreakpoint hands each owner the WHOLE spec, not a list of its fields' ($add -match 'AddBreakpointIn\(owner, spec\)') ''
+Check 'AddBreakpointIn resolves through TryResolveLine, on the line the spec asked for' ($addIn -match 'TryResolveLine\(dbg, mi, line, out planted, out rvas\)' -and $addIn -match 'int line = spec\.Line;') ''
+# The REQUESTED line, not the planted one - a planted line is already the result of a snap in another image.
+Check 'BindPendingTo resolves through TryResolveLine, on the REQUESTED line' ($bind -match 'TryResolveLine\(m\.Dbg, mi, bp\.RequestedLine, out planted, out rvas\)') ''
+Check 'and so does CopyUnqualifiedInto' ($copy -match 'TryResolveLine\(m\.Dbg, mi, bp\.RequestedLine, out planted, out rvas\)') ''
+# NO SECOND COPY. Comments are stripped first: the helper's own summary names the methods it replaced.
+$bpsCode = Get-CSharpCodeOnly $bps
+$snapSites = [regex]::Matches($bpsCode, 'BreakableLinesInModuleIdx\(').Count
+$lookupSites = [regex]::Matches($bpsCode, 'LineToRvasInModuleIdx\(').Count
+Check 'the snap lookup is made in ONE place in the breakpoint code - 1 site' ($snapSites -eq 1) "$snapSites site(s)"
+Check 'and the record lookup only inside that same helper - 2 sites, both in it' `
+  ($lookupSites -eq 2 -and [regex]::Matches((Get-CSharpCodeOnly (Get-Method 'private static bool TryResolveLine(TswdDebugInfo dbg, int mi, int line, out int planted, out List<uint> rvas)')), 'LineToRvasInModuleIdx\(').Count -eq 2) "$lookupSites site(s)"
 
 Write-Host ''
 Write-Host 'an ambiguous single-target pick ANNOUNCES itself - it is the one first-match left in the tree'
