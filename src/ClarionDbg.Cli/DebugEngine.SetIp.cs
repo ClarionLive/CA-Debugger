@@ -46,6 +46,7 @@ namespace ClarionDbg.Cli
         internal const string SetIpPrologue        = "prologue";
         internal const string SetIpCodeUnreadable  = "code-unreadable";
         internal const string SetIpAcceptUnpaired  = "accept-unpaired";
+        internal const string SetIpStackUnproven   = "stack-unproven";
         internal const string SetIpAcceptBoundary  = "accept-boundary";
         internal const string SetIpWriteFailed     = "write-failed";
 
@@ -56,7 +57,7 @@ namespace ClarionDbg.Cli
         {
             SetIpBadArgs, SetIpNotPaused, SetIpOtherThread, SetIpNoContext, SetIpNotOnStatement,
             SetIpOtherModule, SetIpNoCode, SetIpAmbiguousLine, SetIpOtherProc, SetIpPrologue,
-            SetIpCodeUnreadable, SetIpAcceptUnpaired, SetIpAcceptBoundary, SetIpWriteFailed,
+            SetIpCodeUnreadable, SetIpAcceptUnpaired, SetIpStackUnproven, SetIpAcceptBoundary, SetIpWriteFailed,
         };
 
         /// <summary>The sentence the pad shows for a refusal code. Null for an unknown code, which
@@ -77,6 +78,7 @@ namespace ClarionDbg.Cli
                 case SetIpPrologue:       return "Can't move to or from a procedure's entry line: its stack frame is set up there.";
                 case SetIpCodeUnreadable: return "Can't read the current procedure's code to check that the move is safe.";
                 case SetIpAcceptUnpaired: return "Can't work out this procedure's ACCEPT loops, so no move inside it can be checked as safe.";
+                case SetIpStackUnproven:  return "Can't prove the stack is the same at that line: this procedure calls code whose effect on the stack was never measured.";
                 case SetIpAcceptBoundary: return "Can't move across an ACCEPT loop boundary: the runtime keeps the loop's state on the stack.";
                 case SetIpWriteFailed:    return "Couldn't set the thread's instruction pointer.";
                 default:                  return null;
@@ -223,6 +225,205 @@ namespace ClarionDbg.Cli
             return any ? best : 0;
         }
 
+        // ------------------------------------------------------------------ every call balanced (pure)
+        //
+        // THE PROPERTY setip needs is "ESP at the target equals ESP at the stop". Finding no ACCEPT crossing
+        // is NOT that property: it only rules out the ONE runtime construct that was measured to move ESP.
+        // Anything else the procedure calls could keep state on the stack the same way, and a move past it
+        // would corrupt the frame just as silently (pipeline run 1 on a77abd94, two HIGH findings). So every
+        // call site in the span must be one whose effect is KNOWN:
+        //   - a call to a Clarion procedure, routine or method (a TSWD symbol entry). Measured balanced: every
+        //     DO and every procedure call in the 2026-09-23 traces left ESP where it was at the next statement;
+        //   - a call to an import on MeasuredBalancedImports, directly (`call [slot]`) or through the image's
+        //     own `jmp [slot]` thunk (`call rel32` to it: clbrws calls PUSHBIND this way, 0x401300);
+        //   - Cla$StartEventLoop / Cla$EndEventLoop through `call [slot]`: the modelled ACCEPT pair, which
+        //     FindEventLoopRegions reads and the ACCEPT rule decides.
+        // ANYTHING ELSE makes the whole procedure `stack-unproven`: an unlisted import, an indirect call
+        // (a CLASS method call through a vtable is one), a call into in-image code that is neither a symbol
+        // nor a thunk (a LOCALLY-LINKED runtime is that: its entries are E8 calls to unnamed code in the EXE),
+        // the event-loop pair reached any other way, and any sign the linear decode is out of step with the
+        // code (an invalid instruction, a line record or a jump target that is not an instruction boundary).
+
+        /// <summary>
+        /// The imports whose calls were MEASURED to leave ESP unchanged at the next statement boundary.
+        ///
+        /// Measured 2026-09-23 on clbrws.exe (C11 HowToClarion\Browses) with `nexti` from ten breakpoints
+        /// (SplashScreen and its routines, INIRestoreWindow, INISaveWindow, BrowseAuthors, BRW1::FillRecord,
+        /// BRW1::FillQueue, SetupStringStops): an import is here only if it was EXECUTED inside a statement
+        /// whose two boundaries (same frame, both gap 0) had the SAME ESP, and never inside one whose
+        /// boundaries differed. Only the two event-loop entries ever appeared in an unbalanced statement.
+        ///
+        /// ADD NOTHING BY READING. An entry belongs here only when a trace shows it executed between two equal
+        /// boundaries. A name that merely looks harmless is how the ACCEPT case would have been missed.
+        /// </summary>
+        internal static readonly string[] MeasuredBalancedImports =
+        {
+            // 549 balanced statement segments, 2026-09-23; the count is how often each ran inside one.
+            // Through `call [slot]`:
+            "ClaRUN.dll!Cla$ADDqueue",            // 14
+            "ClaRUN.dll!Cla$CLEAR",               // 3
+            "ClaRUN.dll!Cla$comparestr",          // 2
+            "ClaRUN.dll!Cla$DecDistinct",         // 16
+            "ClaRUN.dll!Cla$DecDistinctR",        // 13
+            "ClaRUN.dll!Cla$DPopLong",            // 12
+            "ClaRUN.dll!Cla$DPushLong",           // 29
+            "ClaRUN.dll!Cla$FILE_GET_PROPERTY",   // 14
+            "ClaRUN.dll!Cla$FILE_SET_PROPERTY",   // 14
+            "ClaRUN.dll!Cla$freestr",             // 2
+            "ClaRUN.dll!Cla$FreeUfo",             // 8
+            "ClaRUN.dll!Cla$GetPropS",            // 23
+            "ClaRUN.dll!Cla$Mem2Ufo",             // 8
+            "ClaRUN.dll!Cla$PopCString",          // 20
+            "ClaRUN.dll!Cla$PopTemp",             // 2
+            "ClaRUN.dll!Cla$PushCString",         // 18
+            "ClaRUN.dll!Cla$PushLong",            // 93
+            "ClaRUN.dll!Cla$PushString",          // 164
+            "ClaRUN.dll!Cla$SetPropS",            // 4
+            "ClaRUN.dll!Cla$SetPropV",            // 8
+            "ClaRUN.dll!Cla$Stack2DStack",        // 41
+            "ClaRUN.dll!Cla$StackCompareN",       // 4
+            "ClaRUN.dll!Cla$StackRotate",         // 2
+            "ClaRUN.dll!Cla$storestr",            // 1
+            // Through the image's `jmp [slot]` thunk:
+            "ClaRUN.dll!Cla$CLOSEwindow",         // 2
+            "ClaRUN.dll!Cla$DISPLAY",             // 1
+            "ClaRUN.dll!Cla$ERRORCODE",           // 14
+            "ClaRUN.dll!Cla$EVENT",               // 21
+            "ClaRUN.dll!Cla$FIELD",               // 9
+            "ClaRUN.dll!Cla$FILE_NEXT",           // 14
+            "ClaRUN.dll!Cla$GETINI",              // 12
+            "ClaRUN.dll!Cla$IsAlpha",             // 20
+            "ClaRUN.dll!Cla$KEYCODE",             // 2
+            "ClaRUN.dll!Cla$OPENwindow",          // 1
+            "ClaRUN.dll!Cla$PopBind",             // 2
+            "ClaRUN.dll!Cla$POST",                // 2
+            "ClaRUN.dll!Cla$PushBind",            // 2
+            "ClaRUN.dll!Cla$PUTINI",              // 6
+            "ClaRUN.dll!Cla$SELECT",              // 2
+            "ClaRUN.dll!Cla$StackINSTRING",       // 40
+            "ClaRUN.dll!Cla$THREAD",              // 1
+        };
+
+        private static readonly HashSet<string> _measuredBalanced = BuildMeasuredSet();
+        private static HashSet<string> BuildMeasuredSet()
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var n in MeasuredBalancedImports) set.Add(NormalizeImportName(n));
+            return set;
+        }
+
+        /// <summary>"dll!func" with the DLL part lower-cased (the import table's spelling of a DLL varies)
+        /// and the function part as is (ClaRUN's names are case-sensitive).</summary>
+        private static string NormalizeImportName(string name)
+        {
+            int bang = name.LastIndexOf('!');
+            return bang <= 0 ? name : name.Substring(0, bang).ToLowerInvariant() + "!" + name.Substring(bang + 1);
+        }
+
+        /// <summary>Is <paramref name="name"/> ("dll!func") on the measured list?</summary>
+        internal static bool IsMeasuredBalancedImport(string name)
+        {
+            if (string.IsNullOrEmpty(name) || name.LastIndexOf('!') <= 0) return false;
+            return _measuredBalanced.Contains(NormalizeImportName(name));
+        }
+
+        /// <summary>
+        /// Prove every call in one procedure's code has a known effect on ESP. PURE: a function of the bytes,
+        /// the address of <paramref name="code"/>[0], and three lookups over absolute addresses:
+        /// <paramref name="slotName"/> (an IAT slot's "dll!func", or null), <paramref name="isSymbolEntry"/>
+        /// (a Clarion procedure/routine/method entry) and <paramref name="thunkSlot"/> (the slot a
+        /// `jmp [slot]` thunk at that address jumps through, or 0). <paramref name="recordVas"/> are the line
+        /// records inside the span. Returns null when proven, or a short reason naming what could not be.
+        /// </summary>
+        internal static string ProveCallsBalanced(byte[] code, int len, uint baseAddr, Func<uint, string> slotName,
+                                                  Func<uint, bool> isSymbolEntry, Func<uint, uint> thunkSlot,
+                                                  IEnumerable<uint> recordVas)
+        {
+            if (code == null || len <= 0 || len > code.Length) return "no code";
+            uint end = baseAddr + (uint)len;
+            var reader = new Iced.Intel.ByteArrayCodeReader(code, 0, len);
+            var decoder = Iced.Intel.Decoder.Create(32, reader);
+            decoder.IP = baseAddr;
+            var starts = new HashSet<uint>();
+            var ins = new List<Iced.Intel.Instruction>();
+            while (reader.CanReadByte)
+            {
+                Iced.Intel.Instruction i;
+                decoder.Decode(out i);
+                if (i.IsInvalid) return "undecodable bytes at 0x" + ((uint)i.IP).ToString("X");
+                starts.Add((uint)i.IP);
+                ins.Add(i);
+            }
+
+            // In step with the code: every line record, and every jump that lands inside the span, must fall
+            // on an instruction the sweep decoded. A sweep that drifted would disagree with one of them.
+            var records = new List<uint>();
+            if (recordVas != null)
+                foreach (uint r in recordVas)
+                {
+                    if (r < baseAddr || r >= end) continue;
+                    if (!starts.Contains(r)) return "the line record at 0x" + r.ToString("X") + " is not on an instruction boundary";
+                    records.Add(r);
+                }
+            records.Sort();
+
+            // THE PROLOGUE IS EXEMPT, and only the prologue: the code before the procedure's SECOND line
+            // record. That is its entry record - push ebp / sub esp,N, and for a large frame a call to
+            // ClaRUN!__a_chkstk that allocates it - and it runs once, before the first statement boundary.
+            // setip refuses the entry record as both stop and target (IsPrologueRecord), so nothing there is
+            // ever between two boundaries it moves across: whatever it does to ESP is already in the ESP
+            // every statement shares. Measured 2026-09-23: every routine's entry record stood 4 below the
+            // caller and its next record at the frame's base, which is that allocation.
+            // With fewer than two records there is no prologue to tell apart, so NOTHING is exempt. (It once
+            // fell back to `end`, exempting the whole procedure - a fail-open found by the mutation run: six
+            // fixtures that pass no records went red on the CLEAN build.)
+            uint bodyStart = records.Count >= 2 ? records[1] : baseAddr;
+
+            foreach (var i in ins)
+            {
+                var fc = i.FlowControl;
+                if (fc == Iced.Intel.FlowControl.ConditionalBranch || fc == Iced.Intel.FlowControl.UnconditionalBranch)
+                {
+                    if (i.Op0Kind == Iced.Intel.OpKind.NearBranch32 || i.Op0Kind == Iced.Intel.OpKind.NearBranch16)
+                    {
+                        uint t = (uint)i.NearBranchTarget;
+                        if (t >= baseAddr && t < end && !starts.Contains(t))
+                            return "a jump at 0x" + ((uint)i.IP).ToString("X") + " lands inside an instruction";
+                    }
+                    continue;
+                }
+                if (fc != Iced.Intel.FlowControl.Call && fc != Iced.Intel.FlowControl.IndirectCall) continue;
+                if ((uint)i.IP < bodyStart) continue;   // the prologue: see bodyStart above
+
+                string at = " at 0x" + ((uint)i.IP).ToString("X");
+                if (i.Code == Iced.Intel.Code.Call_rel32_32)
+                {
+                    uint t = (uint)i.NearBranchTarget;
+                    if (isSymbolEntry(t)) continue;                       // a Clarion procedure / routine / method
+                    uint slot = thunkSlot(t);
+                    string viaThunk = slot != 0 ? slotName(slot) : null;
+                    if (viaThunk == null)
+                        return "a call" + at + " to 0x" + t.ToString("X") + ", which is neither a procedure nor an import";
+                    if (EventLoopImportKind(viaThunk) != 0)
+                        return viaThunk + " reached through a thunk" + at + ", not in the modelled ACCEPT shape";
+                    if (!IsMeasuredBalancedImport(viaThunk)) return viaThunk + " not measured";
+                    continue;
+                }
+                if (i.Code == Iced.Intel.Code.Call_rm32 && i.Op0Kind == Iced.Intel.OpKind.Memory
+                    && i.MemoryBase == Iced.Intel.Register.None && i.MemoryIndex == Iced.Intel.Register.None)
+                {
+                    uint s = (uint)i.MemoryDisplacement64;
+                    string name = slotName(s);
+                    if (name == null) return "a call" + at + " through 0x" + s.ToString("X") + ", which is not an import slot";
+                    if (EventLoopImportKind(name) != 0) continue;           // the ACCEPT pair: the region rule decides
+                    if (!IsMeasuredBalancedImport(name)) return name + " not measured";
+                    continue;
+                }
+                return "an indirect call" + at + " (" + i.ToString() + ")";
+            }
+            return null;
+        }
+
         // ------------------------------------------------------------------ the decision (pure)
 
         /// <summary>Everything <see cref="DecideSetIp"/> needs, gathered by the handler. A plain bag so
@@ -245,6 +446,7 @@ namespace ClarionDbg.Cli
             public uint TargetRva;
             public uint FirstRecordRva;    // the stop symbol's entry record (0 = none of its own)
             public string RegionError;     // FindEventLoopRegions' reason; null = regions are good
+            public string StackError;      // ProveCallsBalanced's reason; null = every call has a known effect
             public bool CodeRead;          // the span's bytes were read
             public List<EventLoopRegion> Regions = new List<EventLoopRegion>();
             public uint LoadBase;          // regions are in VA; stop/target are RVAs
@@ -274,6 +476,10 @@ namespace ClarionDbg.Cli
             if (IsPrologueRecord(f.TargetRva, f.FirstRecordRva) || IsPrologueRecord(f.StopRva, f.FirstRecordRva)) return SetIpPrologue;
             if (!f.CodeRead) return SetIpCodeUnreadable;
             if (f.RegionError != null) return SetIpAcceptUnpaired;
+            // Before the ACCEPT rule, because that rule is only a proof when the ACCEPT pair is the ONLY call
+            // in the procedure that can move ESP. "No detected ACCEPT crossing" says nothing about a call
+            // nobody measured, so a procedure with one refuses every move (pipeline run 1).
+            if (f.StackError != null) return SetIpStackUnproven;
             // THE ACCEPT RULE: the same innermost loop, or both outside every loop. This is also what refuses
             // BREAK out of an ACCEPT and any target past the loop's end from inside it: the target is outside
             // the region, so the innermost regions differ. That refusal is deliberate - leaving the loop by
@@ -307,15 +513,23 @@ namespace ClarionDbg.Cli
         /// <summary>A refusal. <paramref name="module"/> null / <paramref name="line"/> &lt;= 0 omit the
         /// member (an unparsable request has neither); <paramref name="candidates"/> is written only for
         /// ambiguous-line.</summary>
-        internal static string SetIpRefusedJson(string code, string module, int line, int candidates)
+        internal static string SetIpRefusedJson(string code, string module, int line, int candidates, string detail = null)
         {
             var sb = new StringBuilder("{\"event\":\"setip\",\"ok\":false");
             sb.Append(",\"reason\":").Append(Json.Str(code));
-            sb.Append(",\"error\":").Append(Json.Str(SetIpMessage(code) ?? code));
+            sb.Append(",\"error\":").Append(Json.Str(SetIpText(code, detail)));
             if (module != null) sb.Append(",\"module\":").Append(Json.Str(module));
             if (line > 0) sb.Append(",\"line\":").Append(line);
             if (code == SetIpAmbiguousLine) sb.Append(",\"candidates\":").Append(candidates);
             return sb.Append('}').ToString();
+        }
+
+        /// <summary>The sentence, plus what exactly was not proven when there is a detail:
+        /// "Can't prove ... measured. (ClaRUN.dll!Cla$X not measured)".</summary>
+        internal static string SetIpText(string code, string detail)
+        {
+            string msg = SetIpMessage(code) ?? code;
+            return detail != null ? msg + " (" + detail + ")" : msg;
         }
 
         /// <summary>Parse `setip module:line`, splitting on the LAST colon like the host's ModuleLineRequest.
@@ -405,7 +619,8 @@ namespace ClarionDbg.Cli
             string refusal = DecideSetIp(f);
             if (refusal != null)
             {
-                EmitSetIpRefusal(tid, refusal, module, line, rvas != null ? rvas.Count : 0);
+                EmitSetIpRefusal(tid, refusal, module, line, rvas != null ? rvas.Count : 0,
+                                 refusal == SetIpStackUnproven ? f.StackError : null);
                 return false;
             }
 
@@ -465,16 +680,37 @@ namespace ClarionDbg.Cli
                 return abs >= loadBase && iat.TryGetValue(abs - loadBase, out nm) ? nm : null;
             };
             f.RegionError = FindEventLoopRegions(buf, got, loadBase + f.StopEntryRva, slotName, f.Regions);
+
+            // Every call must have a known effect on ESP (ProveCallsBalanced). Clarion code - a procedure,
+            // routine or method entry - is one known case; the image's `jmp [slot]` thunks are read from the
+            // live image, and only when the target is inside it.
+            var entries = new HashSet<uint>();
+            if (m.Dbg.Symbols != null)
+                foreach (var sym in m.Dbg.Symbols)
+                    if (sym.Kind == SymbolKind.Procedure || sym.Kind == SymbolKind.Routine || sym.Kind == SymbolKind.Method)
+                        entries.Add(loadBase + sym.EntryRva);
+            var records = new List<uint>();
+            if (m.Dbg.AddrTable != null)
+                foreach (var r in m.Dbg.AddrTable)
+                    if (r.Rva >= f.StopEntryRva && r.Rva < f.NextEntryRva) records.Add(loadBase + r.Rva);
+            Func<uint, uint> thunkSlot = va =>
+            {
+                if (!m.ContainsVa(va) || !m.ContainsVa(va + 5)) return 0;
+                var t = new byte[6];
+                if (ReadCleanBlock(va, t) != 6 || t[0] != 0xFF || t[1] != 0x25) return 0;   // jmp dword ptr [disp32]
+                return BitConverter.ToUInt32(t, 2);
+            };
+            f.StackError = ProveCallsBalanced(buf, got, loadBase + f.StopEntryRva, slotName, entries.Contains, thunkSlot, records);
         }
 
         /// <summary>1 MB: far past any real procedure (the largest measured was 0x4188 bytes), and a bound on
         /// what a garbage span can make us read.</summary>
         private const uint MAX_SETIP_SPAN = 0x100000;
 
-        private void EmitSetIpRefusal(uint tid, string code, string module, int line, int candidates)
+        private void EmitSetIpRefusal(uint tid, string code, string module, int line, int candidates, string detail = null)
         {
-            if (EmitJson) EmitThreadEvent(tid, SetIpRefusedJson(code, module, line, candidates));
-            Console.WriteLine("  setip refused (" + code + "): " + SetIpMessage(code));
+            if (EmitJson) EmitThreadEvent(tid, SetIpRefusedJson(code, module, line, candidates, detail));
+            Console.WriteLine("  setip refused (" + code + "): " + SetIpText(code, detail));
         }
     }
 }
