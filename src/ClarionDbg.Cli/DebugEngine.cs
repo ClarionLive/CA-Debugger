@@ -607,6 +607,9 @@ namespace ClarionDbg.Cli
             uint pollMs = _interactive ? 200u : (uint)_waitMs;
             while (running)
             {
+                // Every pass, not only the timeout branch: a stream of debug events never reaches that branch,
+                // and its 200 ms is coarser than the hover's 150. PollHover throttles itself by timestamp.
+                if (_interactive) PollHover(false);
                 if (!Native.WaitForDebugEvent(buf, pollMs))
                 {
                     if (_interactive)
@@ -837,7 +840,7 @@ namespace ClarionDbg.Cli
             while (true)
             {
                 string cmd;
-                if (!_cmds.TryDequeue(out cmd)) { Thread.Sleep(20); continue; }
+                if (!_cmds.TryDequeue(out cmd)) { PollHover(true); Thread.Sleep(20); continue; }
                 cmd = cmd.Trim();
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
@@ -941,6 +944,10 @@ namespace ClarionDbg.Cli
 
                     case "thread":
                         HandleThreadSelectCommand(parts, tid);
+                        break;
+
+                    case "hover":   // identify-thread-by-window mode (DebugEngine.Hover.cs)
+                        HandleHoverCommand(parts, true);
                         break;
 
                     case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
@@ -1073,6 +1080,9 @@ namespace ClarionDbg.Cli
                                            false, "no thread selection while the target is running");
                         break;
                     }
+                    case "hover":   // identify-thread-by-window mode: report-only while running
+                        HandleHoverCommand(parts, false);
+                        break;
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
                         break;

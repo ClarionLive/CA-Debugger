@@ -470,5 +470,39 @@ namespace ClarionDbg.Cli
         {
             return "{\"event\":\"error\",\"message\":" + Str(message) + "}";
         }
+
+        /// <summary>`procs --json` (ProcsCommand.cs): the attach picker's process list, one line. The host parses
+        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd}], skipped, and
+        /// with verbose a trailing skips[{pid,name,reason}].</summary>
+        public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)
+        {
+            var sb = new StringBuilder("{\"event\":\"procs\",\"procs\":[");
+            for (int i = 0; i < procs.Count; i++)
+            {
+                var p = procs[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"pid\":").Append(p.Pid)
+                  .Append(",\"name\":").Append(Str(p.Name))
+                  .Append(",\"path\":").Append(Str(p.Path))
+                  .Append(",\"tswd\":").Append(p.Tswd ? "true" : "false")
+                  .Append('}');
+            }
+            sb.Append("],\"skipped\":").Append(skips.Count);
+            if (verbose)
+            {
+                sb.Append(",\"skips\":[");
+                for (int i = 0; i < skips.Count; i++)
+                {
+                    var s = skips[i];
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"pid\":").Append(s.Pid)
+                      .Append(",\"name\":").Append(Str(s.Name))
+                      .Append(",\"reason\":").Append(Str(s.Reason))
+                      .Append('}');
+                }
+                sb.Append(']');
+            }
+            return sb.Append('}').ToString();
+        }
     }
 }

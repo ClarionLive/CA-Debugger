@@ -251,7 +251,22 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
             ($exeCalls.Count -ge 1 -and $notPc.Count -eq 0) "$($exeCalls.Count) call(s); not protocolcheck: $(($notPc | ForEach-Object { $_.Extent.Text }) -join ' | ')"
     }
     else { Check 'run-all.ps1 exists, so its exemption below is about a real file' $false '' }
-    $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and (Test-NamesEngineBinary $_.FullName) })
+    # The third exclusion is earned the same way: a suite that runs the engine only as the one-shot `procs`
+    # verb (the attach picker's process list, tools\test-procs.ps1) starts no debuggee either. Asserted from
+    # its AST - every call of `$Engine` passes exactly `procs` first - so a real launch there ends the
+    # exemption and puts the file back in the harness count below.
+    $oneShot = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and (Test-NamesEngineBinary $_.FullName) } | Where-Object {
+        $calls = @((Get-Ast $_.FullName).FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $n.CommandElements[0].VariablePath.UserPath -eq 'Engine'
+        }, $true))
+        $calls.Count -ge 1 -and @($calls | Where-Object { $_.CommandElements.Count -lt 2 -or $_.CommandElements[1].Extent.Text -cne 'procs' }).Count -eq 0
+    })
+    Check 'exactly 1 script runs the engine only as the one-shot `procs`, so it launches no debuggee' `
+        ($oneShot.Count -eq 1 -and $oneShot[0].Name -eq 'test-procs.ps1') (($oneShot.Name) -join ', ')
+    $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and $oneShot.Name -notcontains $_.Name -and (Test-NamesEngineBinary $_.FullName) })
     # A number, not "every": if a fourth harness appears this says so instead of quietly covering three.
     Check 'exactly 3 scripts here launch the engine binary' ($harnesses.Count -eq 3) (($harnesses.Name) -join ', ')
 
@@ -452,7 +467,7 @@ Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionNa
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 59
+$EXPECTED_CHECKS = 60
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

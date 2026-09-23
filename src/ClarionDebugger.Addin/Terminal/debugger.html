@@ -213,6 +213,16 @@
   .thsel .thsel-ar { color:var(--fg-dim); font-size:9px; }
   /* viewing a thread other than the one the engine stopped on — amber everywhere it shows */
   .thsel.other { border-color:var(--warn); color:var(--warn); background:var(--warn-bg); }
+  /* identify-thread-by-window toggle (f6e547ce): off is a bare glyph; on shows which thread owns the window
+     under the mouse, and while PAUSED hovering selects that thread */
+  .thhover { margin-left:4px; display:inline-flex; align-items:center; gap:4px; flex:0 1 auto; min-width:0; max-width:170px;
+             padding:1px 6px; border:1px solid var(--popup-border); border-radius:10px; background:var(--input); color:var(--fg-dim);
+             font-size:10px; font-weight:600; letter-spacing:0; text-transform:none; cursor:pointer; }
+  .thhover:hover { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thhover.on { border-color:var(--accent-hi); color:var(--fg-bright); }
+  .thhover .thhover-ic { flex:none; }
+  .thhover .thhover-t { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thhover .thhover-t:empty { display:none; }
   .thpick { display:none; margin:2px 8px 4px; border:1px solid var(--popup-border); border-radius:4px; background:var(--popup); overflow:hidden; }
   .thpick.show { display:block; }
   .thpick .thhdr { padding:4px 9px; font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase;
@@ -439,7 +449,7 @@
         </div>
       </details>
       <details class="section" open data-sec="stack">
-        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="sec-x" title="Hide section">✕</span></summary>
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Call Stack <span class="count" id="stackCount">0</span><span class="thsel" id="thSel" title="Thread being read — click to choose which thread every panel shows"><span class="thsel-ic">⋔</span><span class="thsel-t" id="thSelText">thread —</span><span class="thsel-ar">▾</span></span><span class="thhover" id="thHover" title="Identify thread by window: off. Click, then point at one of your program's windows."><span class="thhover-ic">⌖</span><span class="thhover-t" id="thHoverText"></span></span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body">
           <div class="thwarn" id="thWarn"><span id="thWarnText"></span><span class="thback" id="thBack" title="Show the thread the engine stopped on">Back to stopped thread</span></div>
           <div class="thpick" id="thPick"><div class="thhdr">Read panels against</div><div id="thList"></div></div>
@@ -1412,7 +1422,9 @@
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
   // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
   // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
-  function renderVarGroup(el, label, extra, items){
+  // `localTree`: the rows are the paused frame's LOCALS, so a top-level &QUEUE/&GROUP's members are watchable
+  // through it (see childWatchPath). Module Data passes false.
+  function renderVarGroup(el, label, extra, items, localTree){
     if(!el) return;
     el.innerHTML='';
     if(!items.length) return;
@@ -1422,18 +1434,35 @@
       +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+arr.length+'</span>';
     el.appendChild(hdr);
     const state={open:true};
-    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label); const hay=varHay(v);
+    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label, v.name||null, !!localTree); const hay=varHay(v);
       h.el._applyVis=()=>{ const m=(!varQ||hay.indexOf(varQ)>=0); h.setVisible((state.open||!!varQ) && m); }; return h; });
     function applyAll(){ tops.forEach(h=>h.el._applyVis()); }
     hdr.onclick=()=>{ state.open=!state.open; hdr.querySelector('.ar').textContent=state.open?'▾':'▸'; applyAll(); };
     applyAll();
   }
 
+  // The WATCH path of a child row (HEAD.MEMBER[.MEMBER], ticket 3a0c915d), or null when the engine has no
+  // way to resolve one. The engine walks direct GROUP/QUEUE members from the head, and follows ONE reference:
+  // a LOCAL &QUEUE/&GROUP at the head (QUEUE:BROWSE:1 is one). So the path stops (null, for the child and
+  // everything under it) at an array or one of its "[n]" elements, at a reference anywhere below the head,
+  // and at a reference head that is not a local (Module Data). The head must also be a QUEUE or GROUP by the
+  // engine's own `refKind` on the ref node: a class reference looks exactly like a queue's otherwise, and
+  // the engine refuses a path through one. A node with no refKind (an engine from before that field)
+  // gets no path, so an older engine means fewer pins rather than pins that answer an error.
+  function childWatchPath(parentWatchPath, parent, parentDepth, refHeadOk, child){
+    if(parentWatchPath==null || !parent || !child || !child.name) return null;
+    if(/^\[/.test(child.name) || /^ARRAY/.test(parent.type||'')) return null;
+    if(parent.ref && !(parentDepth===1 && refHeadOk && (parent.refKind==='queue' || parent.refKind==='group'))) return null;
+    return parentWatchPath+'.'+child.name;
+  }
+
   // Render one variable row into `container`, with its descendants in a child box inserted right after it
   // (nested-container model: collapsing a node just hides its box, so lazy children slot in cleanly).
-  // `parentPath` is the dotted name-path of this row's ancestors — used only to persist expand-state (see
-  // openPaths above) across re-renders; it carries no other meaning.
-  function renderVarRow(container, v, depth, parentPath){
+  // `parentPath` is the '>'-joined name-path of this row's ancestors — used only to persist expand-state
+  // (see openPaths above) across re-renders; it is NOT a watch name. `watchPath` is this row's own watch
+  // name, or null when it has none (see childWatchPath); `refHeadOk` says a top-level reference in this
+  // tree is a LOCAL, whose members the engine can reach through it.
+  function renderVarRow(container, v, depth, parentPath, watchPath, refHeadOk){
     const path = (parentPath||'')+'>'+(v.name||'');
     const eager = v.children || null;            // DIRECT group: members already supplied
     const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
@@ -1453,18 +1482,19 @@
     // for the SAME name at the SAME stop says otherwise.
     applyNote(row.querySelector('.vval'), v.note);
 
-    // TOP-LEVEL scalar leaf (a local or module-data item): make it watchable by name — pin star + right-click
-    // "Add to Watch", the same affordances a Global gets. Watches resolve against the current frame FIRST (a
-    // local shadows a global), so a local name added here tracks its live stack slot. Gated to depth===1:
-    // NESTED group/queue members (e.g. BRW1::JOB:JOBID inside QUEUE:BROWSE:1) have no standalone resolvable
-    // name — the engine reads them by address while walking the group, but the watch-by-name resolver only
-    // knows top-level local entries and globals, so watching a member would just show "(not found)". They
-    // stay visible with live values (and the edit pencil); they just don't get a misleading watch button.
-    if(!expandable && v.name && depth===1){
+    // A LEAF with a watch path is watchable — pin star + right-click "Add to Watch", the same affordances a
+    // Global gets. A top-level row's path is its own name; a member's is HEAD.MEMBER (e.g.
+    // QUEUE:BROWSE:1.BRW1::JOB:JOBID), which the engine re-resolves by name at every pause, so nothing
+    // address-bound is stored and a restored watch list still means the same variables. Watches resolve
+    // against the current frame FIRST (a local shadows a global). A nested row sends its FULL path, never
+    // the bare leaf name, which for a global could name some other container's field. Rows with no path
+    // (under an array, or through a reference the engine does not follow) keep their live values and the
+    // edit pencil; they just don't get a watch button that could only answer "(not found)".
+    if(!expandable && watchPath){
       row.classList.add('selrow');
-      row.dataset.name=v.name;
+      row.dataset.name=watchPath;
       const pin=document.createElement('span'); pin.className='pin'; pin.title='Add to Watch'; pin.innerHTML=STAR;
-      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(v.name); };
+      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(watchPath); };
       row.appendChild(pin);
       wireSel(row);
     }
@@ -1474,7 +1504,7 @@
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
       container.insertBefore(box, row.nextSibling); } return box; }
     function renderKids(items){ const b=ensureBox(); b.innerHTML='';
-      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path));
+      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path, childWatchPath(watchPath, v, depth, refHeadOk, c), refHeadOk));
       if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
     if(eager && eager.length){ renderKids(eager); loaded=true; }
 
@@ -1639,7 +1669,7 @@
   // Raw data kept so the sort toggle can re-render without re-fetching.
   let lastModule='', lastModuleItems=null, lastSymbols=null;
   function buildModuleData(module, items){ lastModule=module; lastModuleItems=items||[]; renderModuleData(); }
-  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[]); applyVarFilter(); }
+  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[], false); applyVarFilter(); }
 
   // ---- current-frame locals mirrored into the Variables pane ("Local Variables" section) ----
   // Same data the Call Stack shows for frame 0, surfaced in the Variables pane so locals sit alongside
@@ -1647,7 +1677,7 @@
   // buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop.
   let lastLocals=null, lastLocalsProc='';
   function buildLocals(proc, items){ lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
-  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[]); applyVarFilter(); }
+  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[], true); applyVarFilter(); }
 
   function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
   function renderVarTree(){
@@ -1848,6 +1878,7 @@
     const badge=$('thBadgeTop');
     if(badge) badge.textContent = other ? ('viewing '+threadName(t,selTid)+' — not the stopped thread') : '';
     renderThreadPicker();
+    renderHoverUi();             // the hover label names threads from the same rows
   }
 
   function selectThread(tid){
@@ -2036,6 +2067,90 @@
     switchGen++;                 // invalidates any armed sweep
     if(typeof stoppedTid==='number' && stoppedTid>0){ stopTid=stoppedTid; selTid=stoppedTid; }
     closeThreadPicker(); renderThreadUi();
+    cancelHoverSelect();         // a hover that settled on LAST stop's world must not switch this one
+  }
+
+  // ---- identify thread by window (f6e547ce) ----
+  // The ENGINE polls the window under the mouse (about every 150 ms, message-free) and sends a `hover`
+  // event only when the answer changes: {on, paused, tid}, where an absent tid means "not over one of the
+  // debuggee's windows". It is NOT a thread-scoped reply, so it never goes through tidAccepted.
+  //
+  // While RUNNING it only reports, because there is no stop to read. While PAUSED a hover selects that
+  // thread, through the same selectThread the picker uses, which already refuses when the page is not
+  // paused and when the thread is the one already shown. A switch re-reads every panel, so a hover selects
+  // only once the pointer has SETTLED on one thread for HOVER_SETTLE_MS: every new answer cancels the
+  // pending settle. It also never starts a switch while another is in flight. selectThread has no such
+  // guard of its own, and a second switch sent over the first would leave the rows' TOCTOU state belonging
+  // to neither.
+  //
+  // ONE GUARD PER RULE. The first cut also re-checked isPaused, the selected thread, a generation counter
+  // and the toggle inside the settle, and a mutation run showed every one of them dead: selectThread and
+  // clearTimeout already held each rule. A guard no test can fail reads as protection it does not give.
+  const HOVER_SETTLE_MS=300;
+  let hoverOn=false;          // the user's toggle; it outlives stops and sessions
+  let hoverTid=null;          // the engine's last answer (null = none)
+  let hoverPaused=false;      // ...and whether the ENGINE was paused when it gave it
+  let hoverTimer=null;        // the pending settle
+  let hoverRunState='idle';   // last runstate seen, to re-arm the engine when a session starts
+
+  function setHoverMode(on){
+    hoverOn=!!on;
+    cancelHoverSelect();
+    hoverTid=null; hoverPaused=false;
+    send('hover', hoverOn ? 'on' : 'off');
+    renderHoverUi();
+  }
+  function cancelHoverSelect(){
+    if(hoverTimer!==null){ clearTimeout(hoverTimer); hoverTimer=null; }
+  }
+  // A new engine starts with hover off. Re-arm it when a session begins, not on every resume (the engine
+  // re-announces on `hover on`, so a resend per resume would be chatter for nothing).
+  function hoverOnRunState(state){
+    const prev=hoverRunState; hoverRunState=state||'idle';
+    if(hoverOn && prev==='idle' && hoverRunState!=='idle') send('hover','on');
+    if(hoverRunState==='idle'){ cancelHoverSelect(); hoverTid=null; renderHoverUi(); }
+  }
+  // `on:false` needs no branch of its own: it carries no tid, so it reads as "none", and the toggle is
+  // the page's state, not the engine's.
+  function onHover(m){
+    if(!m) return;
+    cancelHoverSelect();
+    hoverTid=(typeof m.tid==='number' && m.tid>0) ? m.tid : null;
+    hoverPaused=m.paused===true;
+    renderHoverUi();
+    // hoverPaused, not isPaused: an answer the engine gave while RUNNING can land just after the page has
+    // seen the stop, and it describes a window from before the stop. (A null tid needs no check here:
+    // selectThread refuses one.)
+    if(!hoverOn || !hoverPaused) return;
+    const tid=hoverTid;
+    hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);
+  }
+  function hoverSettle(tid){
+    hoverTimer=null;
+    if(threadSwitching){                                                 // one switch at a time: try again
+      hoverTimer=setTimeout(()=>hoverSettle(tid), HOVER_SETTLE_MS);      // once the one in flight lands
+      return;
+    }
+    // A window whose thread is not in this stop's list (the list is complete for a stop: threads cannot
+    // start while the process is frozen) would only earn a refusal toast. An EMPTY list means the
+    // inventory has not arrived yet, so the engine is left to judge.
+    if(threadRows.length && !threadRowFor(tid)) return;
+    selectThread(tid);
+  }
+  function renderHoverUi(){
+    const el=$('thHover'), txt=$('thHoverText');
+    if(el) el.classList.toggle('on', hoverOn);
+    let label='', title;
+    if(!hoverOn) title="Identify thread by window: off. Click, then point at one of your program's windows.";
+    else if(hoverTid===null){ label='—'; title='Identify thread by window: on. The mouse is not over one of your program\'s windows.'; }
+    else {
+      const nm=threadName(threadRowFor(hoverTid), hoverTid);
+      label=nm;
+      title = hoverPaused ? ('The window under the mouse belongs to '+nm+'. Rest on it to show that thread.')
+                          : ('The window under the mouse belongs to '+nm+'. Pause to read that thread.');
+    }
+    if(txt) txt.textContent=label;   // textContent: nothing here is markup
+    if(el) el.title=title;
   }
 
   (function wireThreadUi(){
@@ -2044,6 +2159,9 @@
     if(chip) chip.onclick=e=>{ e.preventDefault(); e.stopPropagation(); toggleThreadPicker(); };
     const back=$('thBack');
     if(back) back.onclick=e=>{ e.stopPropagation(); if(stopTid!=null) selectThread(stopTid); };
+    const hv=$('thHover');
+    // Same as the chip: it lives in the <summary>, where a click would collapse the section.
+    if(hv) hv.onclick=e=>{ e.preventDefault(); e.stopPropagation(); setHoverMode(!hoverOn); };
   })();
 
   // ---- call stack ----
@@ -2101,7 +2219,7 @@
             b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(thread changed — expand again to re-read)</div>';
             if(box) box.style.display=open?'':'none'; return; }
           if(!items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
-          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx));
+          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx, c.name||null, true));
           if(box) box.style.display=open?'':'none'; }); }
       function toggle(){ if(!canLoc) return; open=!open; el._open=open; el.querySelector('.ar').textContent=open?'▾':'▸';
         if(open) load(); if(box) box.style.display=open?'':'none'; }
@@ -2557,7 +2675,7 @@
     switch(m.type){
       case 'about': setAbout(m); break;
       case 'target': setTarget(m); break;
-      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); break;
+      case 'runstate': setRunState(m.state); setPaused(m.state==='paused'); hoverOnRunState(m.state); break;
       case 'paused':
         // Where the stop is, in the source header — the band this used to write is gone (87c66af6).
         // Written HERE and not only by the 'source' reply because a `source` message does not always
@@ -2578,6 +2696,7 @@
       case 'globals': buildVarTree(m.symbols); allSyms=collectSyms(m.symbols); break;
       case 'threads': onThreads(m); break;
       case 'threadselected': onThreadSelected(m); break;
+      case 'hover': onHover(m); break;   // NOT tidAccepted: its tid names the window's thread, not a reply's
       case 'engineerror': onEngineError(m); break;
       // Thread-scoped replies: a reply for a thread we are no longer showing is dropped before it can
       // repaint anything (tidAccepted also lets through an engine that doesn't stamp its replies).

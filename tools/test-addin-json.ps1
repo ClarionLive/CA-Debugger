@@ -29,6 +29,8 @@ param(
   # about which side may ORIGINATE a thread id, and that is decided in these two methods.
   [string] $EngineThreadsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Threads.cs'),
   [string] $EngineVarEditPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.VarEdit.cs'),
+  # identify-thread-by-window (f6e547ce): the hover event's real writer
+  [string] $EngineHoverPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Hover.cs'),
   # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
@@ -2181,6 +2183,87 @@ Check 'and the event is declared wide enough to carry it' `
 Check 'RequestDisasmAt validates the tag it is handed' `
   ((Get-Method 'public bool RequestDisasmAt(string vaHex, int count, string tag = null, int before = 0)') -match 'Regex\.IsMatch\(tag') ''
 
+Write-Host ''
+Write-Host 'the hover event, engine writer to page, with none as an ABSENT tid (f6e547ce)'
+# EVERY HOP REAL but one. The engine's HoverJson and its tid writer, the service's readers, and the WebView's
+# OnSvcHover are compiled out of the shipped source and RUN. The one hand-written hop is the service's
+# `case "hover"` line, which sits in the middle of OnLine; its exact reader calls are pinned by text below,
+# and the probe makes those same three calls.
+$hoverEngineSrc = Get-Content -Raw -LiteralPath $EngineHoverPath
+$engineTidDecls = @('private const string TidMemberTid', 'private const string TidMemberStopped',
+  'private const string TidMemberSelected', 'private static readonly string[] TidValuedMemberNames') |
+  ForEach-Object { Get-Statement $_ $engineSrc }
+$engineTidDeclsText = $engineTidDecls -join "`n"
+# Hoisted out of the here-string: its $() scanner counts the '(' inside the quoted signature and never
+# finds the close.
+$onSvcHoverSrc = (Get-ArrowHandler 'private void OnSvcHover(') -replace '^private void', 'public void'
+$hoverProbeSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+public static class HoverEngineSide {
+$engineTidDeclsText
+$((Get-Method 'private static bool TidIsKnown(uint tid)' $engineSrc) -replace 'private static', 'public static')
+$((Get-Method 'private static void AppendTidValuedMember(StringBuilder sb, string name, uint tid)' $engineSrc) -replace 'private static', 'public static')
+$((Get-Method 'private static void AppendTidMember(StringBuilder sb, uint tid)' $engineSrc) -replace 'private static', 'public static')
+$((Get-Method 'private static string HoverJson(bool on, bool paused, uint tid)' $hoverEngineSrc) -replace 'private static', 'public static')
+}
+public static class HoverServiceSide {
+$((Get-Method 'private static string ScanNumberToken(string json, string key)') -replace 'private static', 'public static')
+$((Get-Method 'private static uint? GetUIntOrNull(string json, string key)') -replace 'private static', 'public static')
+$((Get-Method 'private static bool GetBool(string json, string key)') -replace 'private static', 'public static')
+}
+public sealed class HoverWebSide {
+$($tidNameDecls)
+  public List<string> Posts = new List<string>();
+  private void Post(string json) { Posts.Add(json); }
+  private void UI(Action a) { a(); }
+$(Get-Method 'private static string TidJson(uint? tid)' $web)
+$(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+$onSvcHoverSrc
+  // the service's `case "hover"` hop, making the calls pinned below
+  public void Deliver(string engineJson) {
+    OnSvcHover(HoverServiceSide.GetUIntOrNull(engineJson, "tid"), HoverServiceSide.GetBool(engineJson, "on"),
+               HoverServiceSide.GetBool(engineJson, "paused"));
+  }
+}
+"@
+Add-Type -TypeDefinition $hoverProbeSrc -Language CSharp | Out-Null
+
+Check 'the service reads the hover event with exactly the calls this probe makes (tid stays nullable)' `
+  ($src -match 'case "hover":\s*(//[^\n]*\n\s*)*HoverChanged\?\.Invoke\(GetUIntOrNull\(json, "tid"\), GetBool\(json, "on"\), GetBool\(json, "paused"\)\);') ''
+$hw = New-Object HoverWebSide
+$hw.Deliver([HoverEngineSide]::HoverJson($true, $true, [uint32] 5140))
+$pg = $hw.Posts[0] | ConvertFrom-Json
+Check 'a known thread reaches the page as the hover type, with its tid and state' `
+  (($pg.type -ceq 'hover') -and ($pg.tid -eq 5140) -and ($pg.on -eq $true) -and ($pg.paused -eq $true)) $hw.Posts[0]
+foreach ($none in @([uint32] 0, [uint32]::MaxValue)) {
+  $hw.Posts.Clear()
+  $hw.Deliver([HoverEngineSide]::HoverJson($true, $false, $none))
+  $pg = $hw.Posts[0] | ConvertFrom-Json
+  Check "none ($none) arrives with NO tid member, not a 0 the page would read as a thread" `
+    (($pg.type -ceq 'hover') -and (-not ($pg.PSObject.Properties.Name -contains 'tid')) -and ($pg.paused -eq $false)) $hw.Posts[0]
+}
+$hw.Posts.Clear()
+$hw.Deliver([HoverEngineSide]::HoverJson($false, $true, [uint32] 0))
+$pg = $hw.Posts[0] | ConvertFrom-Json
+Check '`hover off` arrives as on:false' (($pg.on -eq $false) -and ($pg.paused -eq $true)) $hw.Posts[0]
+
+# The page->host half. NOT paused-gated, unlike selectthread beside it: the engine answers while running too.
+$onMsgHover = Get-CSharpCodeOnly (Get-Method 'private void OnWebMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)' $web)
+$hoverCase = [regex]::Match($onMsgHover, 'case "hover":[^\n]*')
+Check 'the page''s hover action reaches SetHover, and only for on/off' `
+  ($hoverCase.Success -and ($hoverCase.Value -match 'data == "on" \|\| data == "off"') -and ($hoverCase.Value -match '_svc\.SetHover\(data == "on"\)')) $hoverCase.Value
+Check 'and it is NOT gated on Paused (the engine polls while running too)' `
+  ($hoverCase.Success -and ($hoverCase.Value -notmatch 'DebugSessionState')) $hoverCase.Value
+Check 'OnSvcHover is subscribed and unsubscribed, once each' `
+  ((([regex]::Matches($web, '_svc\.HoverChanged\s*\+=\s*OnSvcHover;')).Count -eq 1) -and `
+   (([regex]::Matches($web, '_svc\.HoverChanged\s*-=\s*OnSvcHover;')).Count -eq 1)) ''
+Check 'SetHover sends the engine''s verb' `
+  ((Get-Method 'public bool SetHover(bool on)') -match 'SendCommand\(on \? "hover on" : "hover off"\)') ''
+
 # THE COUNT, ASSERTED AND PRINTED. This suite ran 222 checks and said only "ALL CHECKS PASSED" - a
 # sentence that is true of 222 checks and equally true of 69, which is what a skipped block actually
 # leaves. cb9324f2 fixed that class in Invoke-CheckSection, and this file - the largest consumer, 192
@@ -2193,7 +2276,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 358
+$EXPECTED_CHECKS = 367
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

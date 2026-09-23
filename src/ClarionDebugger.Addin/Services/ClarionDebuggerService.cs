@@ -303,6 +303,8 @@ namespace ClarionDebugger.Services
         // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
         // the selection it had and asks 'threads' for the authoritative one.
         public event Action<uint?, bool, string> ThreadSelected;
+        // Hover mode (f6e547ce): (thread owning the window under the cursor, or null for none; on; paused).
+        public event Action<uint?, bool, bool> HoverChanged;
         // Disassembly listing (tag, instrs, tid). The tid is the thread the engine actually DECODED, and it
         // was the one thread-scoped reply whose invoke dropped it while the decoder below already parsed it
         // — so the view could only ever gate on its own bookkeeping, never on the engine's own answer.
@@ -708,6 +710,10 @@ namespace ClarionDebugger.Services
             return tid > 0 && SendCommand("thread " + tid.ToString(CultureInfo.InvariantCulture));
         }
 
+        /// <summary>Turn the engine's identify-thread-by-window mode on or off; answers via HoverChanged.
+        /// Valid running OR paused: the engine polls in both loops, and only reports while running.</summary>
+        public bool SetHover(bool on) { return SendCommand(on ? "hover on" : "hover off"); }
+
         /// <summary>Re-read the selected thread's registers (paused only); via RegsReceived. The 'paused'
         /// event carries the STOPPED thread's registers, so this is how the pane follows a thread switch.</summary>
         public bool RequestRegs() { return SendCommand("regs"); }
@@ -1095,6 +1101,11 @@ namespace ClarionDebugger.Services
                     // — passed through as null rather than 0, because 0 would be a sentinel the pad reads
                     // as a real thread id. Absent is the only way to say "unknown".
                     ThreadSelected?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "ok"), GetStr(json, "error"));
+                    break;
+
+                case "hover":
+                    // The thread under the cursor. Absent means NONE and stays null, never 0.
+                    HoverChanged?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "on"), GetBool(json, "paused"));
                     break;
 
                 case "watch":
