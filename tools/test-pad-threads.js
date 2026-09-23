@@ -67,6 +67,7 @@ function buildRegs(r) { CALLS.push('buildRegs:' + (r ? 'regs' : 'null')); }
 function renderLibState() { CALLS.push('renderLibState'); }
 function refreshLibState() { CALLS.push('refreshLibState'); }
 function onLibState() { CALLS.push('onLibState'); }
+function memReread() { CALLS.push('memReread'); } function onMem() { CALLS.push('onMem'); }   // Memory panel: tools/test-pad-memory.js
 function renderModuleData() { }
 function applyStackFilter() { }
 function sortVars(x) { return x; }

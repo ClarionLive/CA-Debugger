@@ -94,6 +94,42 @@ namespace ClarionDebugger.Terminal
         }
     }
 
+    /// <summary>A Memory-panel read: <c>reqId|0xADDR|len</c>. The address must be hex with its 0x and fit in 32
+    /// bits, and len must be 1..<see cref="MaxLen"/> (the engine's cap). Anything else returns null and is
+    /// dropped, like every other request here.</summary>
+    internal sealed class MemRequest
+    {
+        public const int MaxLen = 4096;
+
+        public int ReqId;
+        public string Addr;
+        public int Len;
+
+        public static MemRequest Parse(string data)
+        {
+            if (string.IsNullOrEmpty(data)) return null;
+            var a = data.Split('|');
+            int rq, len;
+            if (a.Length != 3 || !PageNumbers.TryInt(a[0], out rq) || rq < 0) return null;
+            if (!IsHexAddr(a[1])) return null;
+            if (!PageNumbers.TryInt(a[2], out len) || len < 1 || len > MaxLen) return null;
+            return new MemRequest { ReqId = rq, Addr = a[1], Len = len };
+        }
+
+        /// <summary>^0x[0-9A-Fa-f]{1,8}$ - the form the engine emits, and nothing that could split into a
+        /// second word on the engine's space-separated stdin.</summary>
+        internal static bool IsHexAddr(string s)
+        {
+            if (s == null || s.Length < 3 || s.Length > 10 || s[0] != '0' || s[1] != 'x') return false;
+            for (int i = 2; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+            }
+            return true;
+        }
+    }
+
     /// <summary>Open a breakpoint's source by the exact path the gutter gave: <c>line\tfullPath</c>.</summary>
     internal sealed class OpenBpRequest
     {

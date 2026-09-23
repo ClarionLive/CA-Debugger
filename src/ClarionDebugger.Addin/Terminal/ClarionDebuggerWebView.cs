@@ -96,6 +96,7 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
             _svc.LibStateReceived      += OnSvcLibState;
+            _svc.MemReceived           += OnSvcMem;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
@@ -243,6 +244,7 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
             _svc.LibStateReceived       -= OnSvcLibState;
+            _svc.MemReceived            -= OnSvcMem;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
@@ -321,6 +323,11 @@ namespace ClarionDebugger.Terminal
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        // Memory panel. Grants nothing: a dump is display only (see RequestMem's security note).
+        private void OnSvcMem(string reqId, string addr, int len, int read, string bytes, string error) => UI(() =>
+            Post("{\"type\":\"mem\",\"reqId\":" + Str(reqId) + ",\"addr\":" + Str(addr)
+                 + ",\"len\":" + len.ToString(CultureInfo.InvariantCulture) + ",\"read\":" + read.ToString(CultureInfo.InvariantCulture)
+                 + ",\"bytes\":" + Str(bytes) + ",\"error\":" + Str(error) + "}"));
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
@@ -594,6 +601,13 @@ namespace ClarionDebugger.Terminal
                         {
                             var fl = FrameLocalsRequest.Parse(data);
                             if (fl != null) _svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp);
+                        }
+                        break;
+                    case "mem":   // Memory panel read: data = "reqId|0xADDR|len"
+                        if (_svc.State == DebugSessionState.Paused)
+                        {
+                            var mr = MemRequest.Parse(data);
+                            if (mr != null) _svc.RequestMem(mr.ReqId, mr.Addr, mr.Len);
                         }
                         break;
                     case "libstate":   // per-thread Library State refresh: data = reqId
