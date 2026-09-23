@@ -79,6 +79,9 @@ namespace ClarionDbg.Cli
                 CheckTemplateSpanDiscriminator,
                 CheckFileRecordShape,
                 CheckDataNameIndexFromParsedBlob,
+                CheckEmulationFaultBranches,
+                CheckEmulatorImportsPerImage,
+                CheckStackWindowRevalidated,
             };
 
             foreach (var check in checks)

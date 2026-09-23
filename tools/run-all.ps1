@@ -60,10 +60,8 @@ $Suites = @(
   @{ File = 'test-host-tid-members.ps1' }
   @{ File = 'test-host-tid-members.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-disasm-seat.ps1' }
-  @{ File = 'test-file-record-predicate.ps1'
-     NoTotal = 'wave 3 integration: Bea opts it in to Assert-CheckTotal with her phase-2 merge (04d7b4c8)' }
-  @{ File = 'test-threaded-template-rule.ps1'
-     NoTotal = 'wave 3 integration: Bea opts it in to Assert-CheckTotal with her phase-2 merge (3c031cdc)' }
+  @{ File = 'test-file-record-predicate.ps1' }
+  @{ File = 'test-threaded-template-rule.ps1' }
   @{ File = 'test-engine-bpowner.ps1'; Success = '^ALL CHECKS PASSED$'
      NoTotal = 'not yet opted in to Assert-CheckTotal and prints no count - ticket 6493d226' }
   @{ File = 'test-engine-session.ps1' }
