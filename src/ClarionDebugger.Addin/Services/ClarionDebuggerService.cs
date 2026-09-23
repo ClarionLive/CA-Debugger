@@ -223,9 +223,13 @@ namespace ClarionDebugger.Services
         /// itself names only the pid).</summary>
         public string Name;
         public int Drained;         // queued debug events the engine drained before it let go
-        public bool Restored;       // every planted breakpoint byte was put back
-        /// <summary>Why a breakpoint byte could not be restored, or null. Non-null means the app still holds
-        /// an INT3 it will hit with no debugger attached, which will most likely crash it.</summary>
+        /// <summary>How many breakpoint bytes the engine put back (Json.Detached writes a COUNT), or -1 when the
+        /// event carried no readable number. INFORMATIONAL ONLY: 0 is a clean detach with nothing planted, and
+        /// unknown is not a failure. Whether a restore failed is <see cref="Error"/>'s job alone.</summary>
+        public int Restored;
+        /// <summary>Why a restore (or the stop itself) failed, or null. The engine sets it whenever any restore
+        /// failed, so non-null - and only non-null - means the app may still hold an INT3 it will hit with no
+        /// debugger attached, which will most likely crash it.</summary>
         public string Error;
     }
 
@@ -1577,7 +1581,7 @@ namespace ClarionDebugger.Services
                 Pid = GetUIntOrNull(json, "pid"),
                 Name = target != null ? target.Name : null,
                 Drained = GetInt(json, "drained"),
-                Restored = GetBool(json, "restored"),
+                Restored = GetIntOrNull(json, "restored") ?? -1,   // a count, not a bool (Json.Detached)
                 Error = GetStr(json, "error")
             };
         }
