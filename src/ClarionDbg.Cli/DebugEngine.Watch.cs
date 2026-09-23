@@ -315,32 +315,51 @@ namespace ClarionDbg.Cli
                 return;
             }
 
+            // What the rest reads: a global's template address and type, or a global-headed watch PATH's
+            // member. target/places stay 0 for a plain global, whose DataLocation does not carry them.
+            // spanSize is what the symbol OCCUPIES, which differs from the render size for a &STRING member
+            // (a 4-byte pointer that renders its referent's length).
             TswdDebugInfo.DataLocation loc; LoadedModule owner;
-            if (!ResolveDataAcrossModules(name, out owner, out loc))
+            uint templateVa, size, spanSize; byte typeCode, target = 0; int places = 0;
+            if (ResolveDataAcrossModules(name, out owner, out loc))
             {
-                // Not a current-frame local and not a global. If it IS a local of some other procedure, it is
-                // merely out of scope right now (we are paused elsewhere) — flag that so the Watch row reads
-                // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
-                bool outOfScope = haveCtx && IsKnownLocalName(name);
-                EmitThreadEvent(tid, Json.WatchMiss(name, outOfScope));
-                Console.WriteLine($"  watch {name}: {(outOfScope ? "out of scope" : "not found")}");
-                return;
+                templateVa = owner.LoadBase + loc.Rva;
+                typeCode = loc.TypeCode; size = loc.Size; spanSize = loc.Size;
             }
-            uint templateVa = owner.LoadBase + loc.Rva;
+            else
+            {
+                // A watch PATH (GROUP.MEMBER) is tried only here, after both lookups above missed, so no
+                // name that resolves today changes meaning (a restored watch list reads as it did).
+                var path = TryWatchPath(name, tid, ref ctx, haveCtx, out owner, out templateVa, out typeCode, out target,
+                                        out size, out places, out spanSize);
+                if (path == PathResolve.Answered) return;
+                if (path == PathResolve.NoHead)
+                {
+                    // Not a current-frame local and not a global. If it IS a local of some other procedure, it is
+                    // merely out of scope right now (we are paused elsewhere) — flag that so the Watch row reads
+                    // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
+                    bool outOfScope = haveCtx && IsKnownLocalName(name);
+                    EmitThreadEvent(tid, Json.WatchMiss(name, outOfScope));
+                    Console.WriteLine($"  watch {name}: {(outOfScope ? "out of scope" : "not found")}");
+                    return;
+                }
+                // PathResolve.GlobalMember: a member's TEMPLATE address, classified over its own span below
+                // and mapped to this thread's instance like any other THREADed name.
+            }
             // Over the symbol's SPAN, through the shared test (ef0a941d): a start-only test showed a symbol
             // straddling into the template as ordinary data, a silent wrong value with a pencil.
-            var span = ClassifyTemplateSpan(owner, templateVa, loc.Size);
+            var span = ClassifyTemplateSpan(owner, templateVa, spanSize);
 
             if (span == TemplateSpan.Outside)
             {
-                EmitWatchValue(tid, name, templateVa, templateVa, false, loc.TypeCode, loc.Size);
+                EmitWatchValue(tid, name, templateVa, templateVa, false, typeCode, size, target, places);
                 return;
             }
             if (span == TemplateSpan.Straddling)
             {
                 // Same words and same permission as the module-data panel's straddling row (Locals.cs), so
                 // one name at one stop never reads two ways.
-                EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                EmitWatchValue(tid, name, templateVa, templateVa, true, typeCode, size, target, places,
                                note: "partly in the shared " + owner.Name + " template — not this thread's own data",
                                editable: false);
                 return;
@@ -350,14 +369,14 @@ namespace ClarionDbg.Cli
             switch (TryResolveThreadedInstance(owner, templateVa, tid, hThread, out instanceVa, out reason))
             {
                 case ThreadedResolve.Ok:
-                    EmitWatchValue(tid, name, templateVa, instanceVa, true, loc.TypeCode, loc.Size);
+                    EmitWatchValue(tid, name, templateVa, instanceVa, true, typeCode, size, target, places);
                     break;
 
                 case ThreadedResolve.Unallocated:
                     // The thread has never touched this data, so there is no instance to read. Its first touch
                     // will start from the template's initial value, so show that — read-only, since writing the
                     // template would change what EVERY future thread starts from.
-                    EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                    EmitWatchValue(tid, name, templateVa, templateVa, true, typeCode, size, target, places,
                                    note: "not yet used on this thread — initial value", editable: false);
                     break;
 
@@ -365,7 +384,7 @@ namespace ClarionDbg.Cli
                     // Not a Clarion thread (e.g. a pause that landed on a worker or the injected break thread):
                     // the template IS what code here reads, so show it — but it is shared data, not this
                     // thread's own, and writing it would change what every future thread starts from.
-                    EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                    EmitWatchValue(tid, name, templateVa, templateVa, true, typeCode, size, target, places,
                                    note: reason, editable: false);
                     break;
 
@@ -373,6 +392,193 @@ namespace ClarionDbg.Cli
                     EmitWatchError(tid, name, reason);
                     break;
             }
+        }
+
+        // ------------------------------------------------------------------ watch (by path)
+
+        /// <summary>What <see cref="WalkWatchPath"/> made of a path.</summary>
+        internal enum WatchPathOutcome
+        {
+            /// <summary>Every member resolved; the leaf's address and type are set.</summary>
+            Ok,
+            /// <summary>A member is not declared there (or a segment is empty): an ordinary "(not found)".</summary>
+            Miss,
+            /// <summary>The path goes through something a name path does not follow: a reference below the
+            /// head, a class reference, a global reference head, or an array. Reported as a watch ERROR, so
+            /// the row says why instead of "(not found)" for a name that plainly exists.</summary>
+            Unsupported,
+            /// <summary>The head is a reference and holds null, or its pointer could not be read.</summary>
+            BadReference,
+        }
+
+        internal const string PathUnsupported = "path through a reference/array is not supported";
+        internal const string PathClassRef = "path through a class reference is not supported";
+        internal const string PathNullRef = "reference is null";
+        internal const string PathUnreadableRef = "could not read the reference";
+
+        /// <summary>
+        /// Walk the MEMBERS of a watch path (HEAD.MEMBER[.MEMBER]) from its head's layout, adding each
+        /// member's byte offset. Pure: no process is touched except through <paramref name="readPointer"/>,
+        /// so protocolcheck drives this exact function with a hand-built type.
+        ///
+        /// The head is a DIRECT GROUP/QUEUE, read at <paramref name="headVa"/> + offsets, or (a LOCAL only)
+        /// a reference to a GROUP/QUEUE: the one hop the Owner allowed (3a0c915d, 2026-09-23). Then
+        /// <paramref name="headVa"/> is the frame SLOT, and the members are read from the pointer it holds,
+        /// fetched here on every call. That is the point of a name path: nothing is stored between pauses,
+        /// so a stack frame re-entered at a new address or a queue buffer the runtime moved is read where it
+        /// is now. Below the head only direct groups are followed.
+        /// </summary>
+        /// <param name="headCode">the head symbol's type code; 0x16 marks it by-reference even when its type
+        /// record points straight at a group (the same test NodeJson uses to draw the lazy node).</param>
+        /// <param name="readPointer">reads a u32 from the target, or null when it cannot be read.</param>
+        internal static WatchPathOutcome WalkWatchPath(ClarionType headType, byte headCode, bool headIsLocal, uint headVa,
+                                                       IList<string> members, Func<uint, uint?> readPointer,
+                                                       out uint leafVa, out ClarionType leafType, out string error)
+        {
+            leafVa = 0; leafType = null; error = null;
+            if (members == null || members.Count == 0) return WatchPathOutcome.Miss;
+
+            ClarionType g;
+            uint baseVa;
+            bool byRef = headCode == 0x16 || (headType != null && headType.Kind == TypeKind.Reference);
+            if (byRef)
+            {
+                g = GroupTypeOf(headType);
+                // A global reference head is out of scope (3a0c915d); so is a reference to anything but a group.
+                if (!headIsLocal || g == null) { error = PathUnsupported; return WatchPathOutcome.Unsupported; }
+                if (LooksLikeClassLayout(g)) { error = PathClassRef; return WatchPathOutcome.Unsupported; }
+                uint? ptr = readPointer(headVa);
+                if (!ptr.HasValue) { error = PathUnreadableRef; return WatchPathOutcome.BadReference; }
+                if (ptr.Value == 0) { error = PathNullRef; return WatchPathOutcome.BadReference; }
+                baseVa = ptr.Value;
+            }
+            else if (headType != null && headType.Kind == TypeKind.Group)
+            {
+                g = headType;
+                baseVa = headVa;
+            }
+            else if (headType != null && headType.Kind == TypeKind.Array)
+            {
+                error = PathUnsupported; return WatchPathOutcome.Unsupported;
+            }
+            else return WatchPathOutcome.Miss;   // a scalar (or untyped) head declares no members
+
+            for (int i = 0; i < members.Count; i++)
+            {
+                // IsValidWatchName lets "A." and ".A" through. An empty segment needs no test of its own:
+                // no member is named "", so it misses below (a guard here was mutated away on 2026-09-23
+                // and nothing went red).
+                string seg = members[i];
+                TypeMember hit = null;
+                if (g.Members != null)
+                    foreach (var mb in g.Members)
+                        if (string.Equals(mb.Name, seg, StringComparison.OrdinalIgnoreCase)) { hit = mb; break; }
+                if (hit == null || hit.Type == null) return WatchPathOutcome.Miss;
+
+                uint va = (uint)((long)baseVa + hit.Offset);
+                var t = hit.Type;
+                if (t.Kind == TypeKind.Array) { error = PathUnsupported; return WatchPathOutcome.Unsupported; }
+                if (i == members.Count - 1)
+                {
+                    leafVa = va; leafType = t;
+                    return WatchPathOutcome.Ok;
+                }
+                if (t.Kind == TypeKind.Group) { g = t; baseVa = va; continue; }
+                if (t.Kind == TypeKind.Reference || t.Tag == 0x16 || t.Tag == 0x26 || t.Tag == 0x29)
+                {
+                    error = PathUnsupported; return WatchPathOutcome.Unsupported;
+                }
+                return WatchPathOutcome.Miss;   // a scalar member has no members of its own
+            }
+            return WatchPathOutcome.Miss;
+        }
+
+        /// <summary>A class instance starts with its VMT pointer, so its first data member sits at +4; a
+        /// GROUP or QUEUE record starts at +0. The TSWD type record carries no class flag: WINRESIZE (a
+        /// WindowResizeClass reference) and QUEUE:BROWSE:1 both decode as a 0x16 reference to a 0x08 group
+        /// (measured on clbrws.exe BrowseJobs, 2026-09-23: WINRESIZE's members begin at +4, the queue's at
+        /// +0). A heuristic, so it errs one way: a layout with no member at +0 is refused.</summary>
+        internal static bool LooksLikeClassLayout(ClarionType g)
+        {
+            if (g == null || g.Members == null) return true;
+            foreach (var mb in g.Members)
+                if (mb.Offset == 0) return false;
+            return true;
+        }
+
+        /// <summary>What <see cref="TryWatchPath"/> left for its caller.</summary>
+        private enum PathResolve
+        {
+            /// <summary>The head is neither a current-frame local nor a global: the caller's ordinary miss
+            /// decides "(out of scope)" by the head's name.</summary>
+            NoHead,
+            /// <summary>A reply was emitted here (a local-headed value, a miss or an error).</summary>
+            Answered,
+            /// <summary>A global-headed member: its template address and type are in the out parameters, for
+            /// the caller's shared THREADed classification.</summary>
+            GlobalMember,
+        }
+
+        /// <summary>watch HEAD.MEMBER[.MEMBER]: resolve the head as a current-frame local, then as a global
+        /// data symbol, and walk to the leaf (see <see cref="WalkWatchPath"/>). A local-headed leaf is
+        /// answered here: a local lives on the stack, and a reference head's buffer on the heap, never in
+        /// .cwtls. A global-headed leaf goes back to HandleWatchCommand, so the span classification and the
+        /// instance mapping stay the one copy every global goes through.</summary>
+        private PathResolve TryWatchPath(string name, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx,
+                                         out LoadedModule owner, out uint templateVa, out byte code, out byte target,
+                                         out uint size, out int places, out uint spanSize)
+        {
+            owner = null; templateVa = 0; code = 0; target = 0; size = 0; places = 0; spanSize = 0;
+            if (name.IndexOf('.') < 0) return PathResolve.NoHead;   // a plain name is not a path
+            string[] parts = name.Split('.');
+            string head = parts[0];
+            if (head.Length == 0) return PathResolve.NoHead;
+            var members = new List<string>(parts.Length - 1);
+            for (int i = 1; i < parts.Length; i++) members.Add(parts[i]);
+            Func<uint, uint?> readPointer = va =>
+            {
+                var b = new byte[4];
+                return ReadBlock(va, b) == 4 ? BitConverter.ToUInt32(b, 0) : (uint?)null;
+            };
+
+            uint leafVa; ClarionType leafType; string error;
+            WatchPathOutcome outcome;
+
+            uint slotVa; LocalSym lsym; LoadedModule lowner;
+            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, head, out slotVa, out lsym, out lowner))
+            {
+                outcome = WalkWatchPath(lsym.Type, lsym.TypeCode, true, slotVa, members, readPointer,
+                                        out leafVa, out leafType, out error);
+                if (outcome != WatchPathOutcome.Ok) { EmitPathFailure(tid, name, outcome, error); return PathResolve.Answered; }
+                CodeForType(leafType, out code, out target, out size, out places);
+                EmitWatchValue(tid, name, leafVa, leafVa, false, code, size, target, places);
+                return PathResolve.Answered;
+            }
+
+            DataSymbol ds = null;
+            if (_exe != null && _exe.Dbg != null && _exe.Dbg.TryGetDataSymbol(head, out ds)) owner = _exe;
+            else
+                foreach (var m in _modules)
+                    if (m != _exe && m.Dbg != null && m.Dbg.TryGetDataSymbol(head, out ds)) { owner = m; break; }
+            if (owner == null) return PathResolve.NoHead;
+
+            outcome = WalkWatchPath(ds.Type, ds.TypeCode, false, owner.LoadBase + ds.Rva, members, readPointer,
+                                    out leafVa, out leafType, out error);
+            if (outcome != WatchPathOutcome.Ok) { EmitPathFailure(tid, name, outcome, error); return PathResolve.Answered; }
+            CodeForType(leafType, out code, out target, out size, out places);
+            templateVa = leafVa;
+            spanSize = leafType.Size != 0 ? leafType.Size : size;
+            return PathResolve.GlobalMember;
+        }
+
+        private void EmitPathFailure(uint tid, string name, WatchPathOutcome outcome, string error)
+        {
+            if (outcome == WatchPathOutcome.Miss)
+            {
+                EmitThreadEvent(tid, Json.WatchMiss(name, false));
+                Console.WriteLine($"  watch {name}: not found");
+            }
+            else EmitWatchError(tid, name, error);
         }
 
         /// <summary>A watch that could not be read. Emitted against the NAME so the host can resolve that row
