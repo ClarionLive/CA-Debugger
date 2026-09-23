@@ -259,8 +259,16 @@ namespace ClarionDebugger.Disassembly
         /// you asked for".</summary>
         public uint ForeignSeatedTid(uint selTid, uint stoppedTid)
         {
-            return _seatedTid != 0 && _seatedTid == selTid && stoppedTid != 0 && _seatedTid != stoppedTid
-                ? _seatedTid : 0;
+            return _seatedTid == selTid && IsOtherThread(selTid, stoppedTid) ? _seatedTid : 0;
+        }
+
+        /// <summary>Is <paramref name="selTid"/> a thread other than the one execution stopped on? Both must be
+        /// known: an unknown side is the ordinary single-thread case, where saying anything is noise. The ONE
+        /// statement of that rule - the banner, the stop symbol and the step tooltips all read it - and the
+        /// same rule as the pad's viewingOtherThread, so the two never disagree about when to speak.</summary>
+        public static bool IsOtherThread(uint selTid, uint stoppedTid)
+        {
+            return selTid != 0 && stoppedTid != 0 && selTid != stoppedTid;
         }
 
         /// <summary>The stop's symbol, when the strip's subject IS the stopped thread (or either side is
@@ -269,7 +277,7 @@ namespace ClarionDebugger.Disassembly
         /// It is gated rather than cleared, because for the stopped thread it is still the true label.</summary>
         public string SymbolFor(uint selTid, uint stoppedTid)
         {
-            return (selTid == 0 || stoppedTid == 0 || selTid == stoppedTid) ? _stopSym : null;
+            return IsOtherThread(selTid, stoppedTid) ? null : _stopSym;
         }
     }
 }

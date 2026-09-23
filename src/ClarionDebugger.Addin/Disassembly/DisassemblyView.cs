@@ -200,14 +200,6 @@ namespace ClarionDebugger.Disassembly
         private const string TipInto = "Step one machine instruction (into calls)";
         private const string TipOut  = "Step out of the procedure (source level)";
 
-        /// <summary>Is the view following a thread other than the one execution stopped on? Both must be
-        /// known: an unknown side is the ordinary single-thread case, where saying anything is noise. The
-        /// same rule as the pad's viewingOtherThread, so the two never disagree about when to speak.</summary>
-        private static bool IsOtherThread(uint selTid, uint stoppedTid)
-        {
-            return selTid != 0 && stoppedTid != 0 && selTid != stoppedTid;
-        }
-
         /// <summary>A step button's tooltip. STEPPING IS DEFINED ON THE STOPPED THREAD (ticket 375d463b): while
         /// the view follows another one, Over/Into/Out still run the stopped thread, and the next stop brings
         /// the view back to it. That is correct engine behaviour and the buttons stay enabled — taking a
@@ -225,7 +217,7 @@ namespace ClarionDebugger.Disassembly
         /// re-derived on every selection, inventory, stop and seat change.</summary>
         private void UpdateStepTips()
         {
-            string stopped = IsOtherThread(_selTid, _stoppedTid) ? ThreadName(_stoppedTid) : null;
+            string stopped = SeatState.IsOtherThread(_selTid, _stoppedTid) ? ThreadName(_stoppedTid) : null;
             if (_bOver != null) _bOver.ToolTipText = StepTip(TipOver, stopped);
             if (_bInto != null) _bInto.ToolTipText = StepTip(TipInto, stopped);
             if (_bOut  != null) _bOut.ToolTipText  = StepTip(TipOut,  stopped);
@@ -687,7 +679,7 @@ namespace ClarionDebugger.Disassembly
                         // THE LOCATION STRIP IS A THREAD CLAIM TOO. The fields below describe the instruction
                         // that WAS current; this seat found none, and the listing is about to be erased.
                         // Leaving them let the pane say "no code to show for B" while the strip still read
-                        // A's module:line with Show Source enabled â€” one click from jumping the IDE to
+                        // A's module:line with Show Source enabled — one click from jumping the IDE to
                         // another thread's source. Only an empty SEAT does this: after a plain seek the
                         // thread really is still stopped where the strip says. (The stop's symbol is not
                         // cleared: it is gated on read by SeatState.SymbolFor, and is still the true label
