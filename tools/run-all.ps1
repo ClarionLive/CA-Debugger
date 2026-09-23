@@ -57,6 +57,8 @@ $Suites = @(
   @{ File = 'test-addin-hooks.ps1' }
   @{ File = 'test-addin-json.ps1' }
   @{ File = 'test-addin-lifecycle.ps1' }
+  @{ File = 'test-addin-attach.ps1' }
+  @{ File = 'test-addin-attach.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-host-tid-members.ps1' }
   @{ File = 'test-host-tid-members.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-disasm-seat.ps1' }
@@ -78,6 +80,7 @@ $Suites = @(
   @{ File = 'test-pad-contrast.js' }
   @{ File = 'test-pad-editmeta.js' }
   @{ File = 'test-pad-memory.js' }
+  @{ File = 'test-pad-attach.js' }
   @{ File = 'test-pad-parse.js'; Success = '^all \d+ inline script block\(s\) parse OK$' }
   @{ File = 'test-pad-source.js' }
   @{ File = 'test-pad-setip.js' }

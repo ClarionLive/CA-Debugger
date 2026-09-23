@@ -1,0 +1,633 @@
+# Regression check: the HOST side of "Attach to a running process" (ticket 3f2d747f part C).
+#
+#   pwsh -NoProfile -File tools\test-addin-attach.ps1
+#   pwsh -NoProfile -File tools\test-addin-attach.ps1 -SelfTest     # break each guard once; each must go red
+#
+# What it guards, against the FROZEN engine contract (part A is built separately):
+#   1. the bridge attaches ONLY to a pid the host itself listed in its latest `procs` reply, and one listing
+#      authorises one attach (ListedProcesses + CmdAttach);
+#   2. the engine's `procs --json` line is read as the engine writes it - its REAL writer is run here - and a
+#      --verbose skip entry never becomes an attachable process;
+#   3. Stop in attach mode sends `detach` and waits DetachWaitMs, never `quit`; a kill is the last resort and
+#      says the app may crash;
+#   4. the `detached` event ends the session and names the app; an older engine's `detached` does not end a
+#      newer session;
+#   5. the pad resets exactly what a session end resets, says "Detached; <name> is still running.", warns when
+#      a breakpoint byte was not restored, and keeps an attach failure's reason visible past the console clear.
+#
+# HOW. The service is not extracted: ClarionDebuggerService.cs is compiled WHOLE, with the reader and the DTOs
+# it depends on, and driven through reflection - its real OnLine and its real Stop, against real child
+# processes standing in for the engine. The pad cannot be compiled whole (WinForms, WebView2), so its attach
+# methods are lifted out of ClarionDebuggerWebView.cs by brace matching and compiled beside the real service
+# types, with the pad's collaborators replaced by recorders. Substitutions in code under test, stated: the
+# thread-pool work item runs through RunNow (so a test can hold it), and ClarionDebuggerService.ListProcesses
+# is replaced by FakeLists.ListProcesses (so no real engine is spawned for the listing).
+#
+# NOT COVERED: the engine itself (part A, tools/test-attach.ps1), and anything live - no app is attached to.
+#
+# ASCII only, for Windows PowerShell 5.1.
+
+param(
+  # Defaulted in the body: Windows PowerShell 5.1 leaves $PSScriptRoot empty in this block.
+  [string] $ServicePath = '',
+  [string] $WebViewPath = '',
+  [string] $PageMessagesPath = '',
+  [string] $ReaderPath = '',
+  [string] $RedPath = '',
+  [string] $VersionPath = '',
+  [string] $EngineJsonPath = '',
+  [string] $ProcsCommandPath = '',
+  [string] $PagePath = '',
+  [switch] $SelfTest
+)
+
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib-extract.ps1')
+$root = Join-Path $PSScriptRoot '..'
+if (-not $ServicePath) { $ServicePath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs' }
+if (-not $WebViewPath) { $WebViewPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs' }
+if (-not $PageMessagesPath) { $PageMessagesPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\PageMessages.cs' }
+if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs' }
+if (-not $RedPath) { $RedPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\RedFileService.cs' }
+if (-not $VersionPath) { $VersionPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionVersionService.cs' }
+if (-not $EngineJsonPath) { $EngineJsonPath = Join-Path $root 'src\ClarionDbg.Cli\Json.cs' }
+if (-not $ProcsCommandPath) { $ProcsCommandPath = Join-Path $root 'src\ClarionDbg.Cli\ProcsCommand.cs' }
+if (-not $PagePath) { $PagePath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\debugger.html' }
+
+# ================================================================================================ -SelfTest
+# Each mutation breaks ONE guard in a copy of the sources, and the matching suite is run against the copy in a
+# fresh process (Add-Type cannot redefine a loaded type). A mutation is CAUGHT only when that run exits non-zero
+# AND never prints its success line; a find that does not match exactly once is itself a failure, so a
+# mutation that silently changed nothing can never count as caught. The two controls run the same suites on
+# unmutated copies and must pass, which is what makes a red run mean the mutation and not the harness.
+if ($SelfTest) {
+  $sources = [ordered]@{
+    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; reader = $ReaderPath; red = $RedPath
+    version = $VersionPath; json = $EngineJsonPath; procs = $ProcsCommandPath; page = $PagePath
+  }
+  $M = @(
+    @{ Id = 'M1';  Suite = 'ps';   File = 'msgs';    Why = 'an unlisted pid resolves';
+       Find = 'if (!_byPid.TryGetValue(pid, out p)) return null;'; Repl = 'if (!_byPid.TryGetValue(pid, out p)) return new AttachableProcess { Pid = pid, Name = "forged" };' }
+    @{ Id = 'M2';  Suite = 'ps';   File = 'msgs';    Why = 'a listing can be replayed into a second attach';
+       Find = "_byPid = new Dictionary<uint, AttachableProcess>();`n            return p;"; Repl = 'return p;' }
+    @{ Id = 'M3';  Suite = 'ps';   File = 'msgs';    Why = 'an older listing overwrites a newer one';
+       Find = "if (generation != _generation) return false;`n            var t = new Dictionary<uint, AttachableProcess>();"; Repl = 'var t = new Dictionary<uint, AttachableProcess>();' }
+    @{ Id = 'M4';  Suite = 'ps';   File = 'msgs';    Why = 'pid 0 parses';
+       Find = 'if (!PageNumbers.TryUInt(data, out pid) || pid == 0) return null;'; Repl = 'if (!PageNumbers.TryUInt(data, out pid)) return null;' }
+    @{ Id = 'M5';  Suite = 'ps';   File = 'service'; Why = 'Stop quits an attached app';
+       Find = 'return attached ? "detach" : "quit";'; Repl = 'return "quit";' }
+    @{ Id = 'M6';  Suite = 'ps';   File = 'service'; Why = 'Stop waits only the launch-mode 1.5 s for a detach';
+       Find = '_proc.WaitForExit(attached ? DetachWaitMs : QuitWaitMs)'; Repl = '_proc.WaitForExit(QuitWaitMs)' }
+    @{ Id = 'M7';  Suite = 'ps';   File = 'service'; Why = 'a --verbose skip entry becomes attachable';
+       Find = 'if (tswd == null) return;'; Repl = 'if (tswd == null) tswd = "false";' }
+    @{ Id = 'M8';  Suite = 'ps';   File = 'service'; Why = 'the detached event is never raised';
+       Find = 'Detached?.Invoke(d);'; Repl = 'if (d == null) Detached?.Invoke(d);' }
+    @{ Id = 'M9';  Suite = 'ps';   File = 'service'; Why = 'an older engine''s detached ends the new session';
+       Find = 'if (ReferenceEquals(source, _proc))' + "`n" + '                    {' + "`n" + '                        var d = ParseDetached'; Repl = 'if (source != null)' + "`n" + '                    {' + "`n" + '                        var d = ParseDetached' }
+    @{ Id = 'M10'; Suite = 'ps';   File = 'web';     Why = 'CmdAttach attaches to any pid';
+       Find = 'var target = _listedProcs.Take(req.Pid);'; Repl = 'var target = new AttachableProcess { Pid = req.Pid, Name = "forged" };' }
+    @{ Id = 'M11'; Suite = 'ps';   File = 'web';     Why = 'CmdAttach is not gated on the pad being idle';
+       Find = "if (CurrentState != DebugSessionState.Idle) return;`n            if (DebugSessionController.State != DebugControllerState.Idle) return;`n            var req = AttachRequest.Parse(data);"; Repl = "if (DebugSessionController.State != DebugControllerState.Idle) return;`n            var req = AttachRequest.Parse(data);" }
+    @{ Id = 'M12'; Suite = 'ps';   File = 'web';     Why = 'the exit after a detach wipes the Detached line';
+       Find = 'if (attach.Detached) return;'; Repl = 'if (attach.Detached && attach == null) return;' }
+    @{ Id = 'M13'; Suite = 'ps';   File = 'web';     Why = 'a failed breakpoint restore is not warned about';
+       Find = '(!d.Restored || !string.IsNullOrEmpty(d.Error))'; Repl = '(d == null)' }
+    @{ Id = 'M14'; Suite = 'ps';   File = 'web';     Why = 'an attach failure''s reason is lost in the clear';
+       Find = '_attach.LastError = msg;'; Repl = '_attach.Name = _attach.Name;' }
+    @{ Id = 'M15'; Suite = 'ps';   File = 'web';     Why = 'process paths are written into the procs JSON unescaped';
+       Find = '.Append(",\"path\":").Append(Str(p.Path)).Append(''}'');'; Repl = '.Append(",\"path\":\"").Append(p.Path).Append("\"}");' }
+    @{ Id = 'M16'; Suite = 'node'; File = 'page';    Why = 'a process name is written as markup';
+       Find = "name.textContent=p.name==null?'':String(p.name);"; Repl = "name.innerHTML=p.name==null?'':String(p.name);" }
+    @{ Id = 'M17'; Suite = 'node'; File = 'page';    Why = 'a row with a non-integer pid is shown';
+       Find = 'if(!p || !Number.isInteger(p.pid) || p.pid<=0) return;'; Repl = 'if(!p) return;' }
+    @{ Id = 'M18'; Suite = 'node'; File = 'page';    Why = 'a pick sends attach while a session runs';
+       Find = "if(pid==null || runState!=='idle') return;"; Repl = 'if(pid==null) return;' }
+    @{ Id = 'M19'; Suite = 'node'; File = 'page';    Why = 'the picker opens while a session runs';
+       Find = "if(runState!=='idle'){ toast('Stop the current session before attaching'); return; }"; Repl = '' }
+    @{ Id = 'M20'; Suite = 'node'; File = 'page';    Why = 'Stop''s tip still says terminate while attached';
+       Find = "c.id==='stop' && attachMode ? STOP_TIP_ATTACHED"; Repl = "c.id==='stop' && attachMode && false ? STOP_TIP_ATTACHED" }
+    @{ Id = 'M21'; Suite = 'node'; File = 'page';    Why = 'going idle does not end attach mode';
+       Find = "if(runState==='idle' && attachMode) setAttachMode(false);"; Repl = '' }
+  )
+  $base = Join-Path ([IO.Path]::GetTempPath()) ('attach-selftest-' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $base | Out-Null
+  $nodeSuite = Join-Path $PSScriptRoot 'test-pad-attach.js'
+  $self = $PSCommandPath
+  try {
+    $runs = @(@{ Id = 'CONTROL-ps'; Suite = 'ps' }, @{ Id = 'CONTROL-node'; Suite = 'node' }) + $M
+    Invoke-CheckSection 'mutation self-test: every find matches exactly once' {
+      foreach ($m in $M) {
+        $dir = Join-Path $base $m.Id
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        foreach ($k in $sources.Keys) { Copy-Item -LiteralPath $sources[$k] -Destination (Join-Path $dir ([IO.Path]::GetFileName($sources[$k]))) }
+        $target = Join-Path $dir ([IO.Path]::GetFileName($sources[$m.File]))
+        $text = [IO.File]::ReadAllText($target)
+        # Match line endings of either kind: the .cs files are LF, the page may not be.
+        $pattern = [regex]::Escape($m.Find) -replace '\\n', '\r?\n'
+        $n = [regex]::Matches($text, $pattern).Count
+        Check "$($m.Id) find matches once ($($m.Why))" ($n -eq 1) "$n match(es)"
+        if ($n -eq 1) { [IO.File]::WriteAllText($target, [regex]::Replace($text, $pattern, $m.Repl.Replace('$', '$$'))) }
+      }
+      foreach ($c in 'CONTROL-ps', 'CONTROL-node') {
+        $dir = Join-Path $base $c
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        foreach ($k in $sources.Keys) { Copy-Item -LiteralPath $sources[$k] -Destination (Join-Path $dir ([IO.Path]::GetFileName($sources[$k]))) }
+      }
+    }
+    Invoke-CheckSection 'mutation self-test: each mutation CAUGHT, each control clean' {
+      $results = $runs | ForEach-Object -ThrottleLimit 6 -Parallel {
+        $r = $_; $dir = Join-Path $using:base $r.Id
+        $f = { param($name) Join-Path $dir ([IO.Path]::GetFileName(($using:sources)[$name])) }
+        if ($r.Suite -eq 'ps') {
+          $out = & pwsh -NoProfile -File $using:self -ServicePath (& $f 'service') -WebViewPath (& $f 'web') `
+            -PageMessagesPath (& $f 'msgs') -ReaderPath (& $f 'reader') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
+            -EngineJsonPath (& $f 'json') -ProcsCommandPath (& $f 'procs') -PagePath (& $f 'page') 2>&1
+          $ok = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
+        } else {
+          $out = & node $using:nodeSuite (& $f 'page') 2>&1
+          $ok = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
+        }
+        [pscustomobject]@{ Id = $r.Id; Exit = $LASTEXITCODE; Passed = $ok; Fails = (@($out) -match '^\s*FAIL' | Select-Object -First 2) -join ' / ' }
+      }
+      foreach ($r in ($results | Sort-Object { [int](($_.Id -replace '\D', '0')) }, Id)) {
+        if ($r.Id -like 'CONTROL-*') {
+          Check "$($r.Id): the unmutated copy passes" (($r.Exit -eq 0) -and $r.Passed) "exit=$($r.Exit) $($r.Fails)"
+        } else {
+          $why = ($M | Where-Object { $_.Id -eq $r.Id }).Why
+          Check "$($r.Id) CAUGHT: $why" (($r.Exit -ne 0) -and (-not $r.Passed)) "exit=$($r.Exit) $($r.Fails)"
+        }
+      }
+    }
+  } finally {
+    Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  # 21 finds + 21 mutations + 2 controls
+  $EXPECTED_CHECKS = 44
+  Assert-CheckTotal $EXPECTED_CHECKS
+  Write-Host ''
+  if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+  Write-Host "ALL $($script:checks) CHECKS PASSED"
+  exit 0
+}
+
+# ================================================================================================ compile
+$web = Get-Content -Raw -LiteralPath $WebViewPath
+$svcSrc = Get-Content -Raw -LiteralPath $ServicePath
+Set-ExtractSource $web
+
+function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
+function Public { param([string] $s) $s -replace '^(private|internal) ', 'public ' }
+
+# Hoisted out of the here-string: a quoted '(' inside $() there breaks the parse.
+$xStr = Get-Method 'private static string Str(string s)'
+$xList = (Get-Method 'private void CmdListProcs()') -replace '^private', 'public' `
+  -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow(' -replace 'ClarionDebuggerService\.ListProcesses\(', 'FakeLists.ListProcesses('
+$xProcsJson = Public (Get-Method 'private static string ProcsJson(List<AttachableProcess> procs, string error)')
+$xAttach = Get-Method 'public void CmdAttach(string data)'
+$xAttachSession = (Get-Method 'private void AttachSession(AttachableProcess target)') -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
+$xCtx = Get-Method 'private sealed class AttachContext'
+$xExited = Public (Get-ArrowHandler 'private void OnSvcExited(int code)')
+$xDetached = Public (Get-ArrowHandler 'private void OnSvcDetached(DebugDetach d)')
+$xEngErr = Public (Get-ArrowHandler 'private void OnSvcEngineError(string msg)')
+
+$padProbe = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using ClarionDebugger.Services;
+
+namespace ClarionDebugger.Terminal
+{
+  // Stand-ins for the pad's collaborators. None of them decides anything the checks below are about.
+  public enum DebugControllerState { Idle, Launching, Running, Paused }
+  public static class DebugSessionController { public static DebugControllerState State = DebugControllerState.Idle; }
+  public static class ProjectTargetService {
+    public static List<string> Dlls = new List<string>();
+    public static List<string> ResolveSolutionDlls() { return new List<string>(Dlls); }
+  }
+  public static class FakeLists {
+    public static List<AttachableProcess> Next; public static string NextError; public static int Calls; public static int LastExclude;
+    public static List<AttachableProcess> ListProcesses(int exclude, out string error) {
+      Calls++; LastExclude = exclude; error = NextError;
+      return Next == null ? null : new List<AttachableProcess>(Next);
+    }
+  }
+  public sealed class FakeSvc {
+    public DebugSessionState State = DebugSessionState.Idle;
+    public bool IsEngineStillClosing;
+    public List<AttachableProcess> Attached = new List<AttachableProcess>();
+    public int LastBpCount = -1;
+    public void AttachSession(AttachableProcess t, IEnumerable<DebugBreakpoint> bps, IEnumerable<string> dlls) {
+      Attached.Add(t); LastBpCount = new List<DebugBreakpoint>(bps).Count;
+    }
+  }
+
+  public sealed class AttachPad
+  {
+    public FakeSvc _svc = new FakeSvc();
+    public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+    private readonly ListedProcesses _listedProcs = new ListedProcesses();
+    private int _procsGen;
+    private AttachContext _attach;
+    private readonly EditGrants _editGrants = new EditGrants();
+    public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    public string _pendingRtcKey;
+    // Posts and console lines in ONE ordered list, because the order is the point: `clear` empties the
+    // page's console, so a line posted before it is gone.
+    public List<string> Posts = new List<string>();
+    public int ClearedLine, Rearms, Merges;
+    public List<string> Pushed = new List<string>();
+
+    private DebugSessionState CurrentState { get { return _svc.State; } }
+    private void Console(string level, string text) { Posts.Add("console|" + level + "|" + text); }
+    private void Post(string json) { Posts.Add(json); }
+    private void UI(Action a) { a(); }
+    public bool HoldWork; public List<Action<object>> Held = new List<Action<object>>();
+    private void RunNow(Action<object> w) { if (HoldWork) Held.Add(w); else w(null); }
+    public void Release(int i) { var w = Held[i]; w(null); }
+    private void ClearExecutionLine() { ClearedLine++; }
+    private void RearmAndReportMonacoHooks() { Rearms++; }
+    private void MergeGutterIntoPending() { Merges++; }
+    private void PushProcedures(string exe) { Pushed.Add(exe); }
+
+    public bool HasAttach { get { return _attach != null; } }
+    public int ListedCount { get { return _listedProcs.Count; } }
+    public int GrantCount { get { return _editGrants.Count; } }
+    public void GrantOne() { _editGrants.Grant("0x401000", "0x11", 4, 0, null); }
+
+    $xStr
+    $xList
+    $xProcsJson
+    $xAttach
+    $xAttachSession
+    $xCtx
+    $xExited
+    $xDetached
+    $xEngErr
+  }
+}
+"@
+
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ('attach-probe-' + [guid]::NewGuid().ToString('N') + '.cs')
+[IO.File]::WriteAllText($tmp, $padProbe)
+try {
+  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $PageMessagesPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
+  Add-Type -Path ($paths + $tmp) -IgnoreWarnings -WarningAction SilentlyContinue -ReferencedAssemblies @(
+    'System.Xml', 'System.Xml.ReaderWriter', 'System.Diagnostics.Process', 'System.Diagnostics.FileVersionInfo',
+    'System.ComponentModel.Primitives', 'System.Text.RegularExpressions', 'System.Collections', 'System.Linq',
+    'System.Threading', 'System.Threading.Thread', 'System.Runtime.InteropServices') | Out-Null
+} finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
+
+# The engine's REAL procs writer, so the host's reader is tested against what the engine writes.
+$engineJson = Get-Content -Raw -LiteralPath $EngineJsonPath
+$procsCmd = Get-Content -Raw -LiteralPath $ProcsCommandPath
+$engineProbe = @"
+using System;
+using System.Collections.Generic;
+using System.Text;
+namespace AttachEngineSide {
+  $((Get-Method 'internal sealed class ProcEntry' $procsCmd) -replace '^internal', 'public')
+  $((Get-Method 'internal sealed class ProcSkip' $procsCmd) -replace '^internal', 'public')
+  public static class EngineJson {
+    $(Get-Method 'public static string Str(string s)' $engineJson)
+    $(Get-Method 'public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)' $engineJson)
+  }
+}
+"@
+Add-Type -TypeDefinition $engineProbe -Language CSharp | Out-Null
+
+$SvcT = [ClarionDebugger.Services.ClarionDebuggerService]
+$SF = [Reflection.BindingFlags]'NonPublic,Static'
+$IF = [Reflection.BindingFlags]'NonPublic,Instance'
+# Reflection wants the objects themselves; PowerShell hands over PSObject wrappers.
+function Unwrap { param($v) if ($v -is [psobject]) { $v.psobject.BaseObject } else { $v } }
+function Invoke-Static { param([string] $Name, [object[]] $A)
+  $raw = New-Object object[] $A.Count
+  for ($i = 0; $i -lt $A.Count; $i++) { $raw[$i] = Unwrap $A[$i] }
+  return ,($SvcT.GetMethod($Name, $SF).Invoke($null, $raw)) }
+function Proc { param([uint32] $Id, [string] $Name, [string] $Path)
+  $p = New-Object ClarionDebugger.Terminal.AttachableProcess; $p.Pid = $Id; $p.Name = $Name; $p.Path = $Path; $p.Tswd = $true; $p }
+$ClearJson = '{"type":"clear"}'
+
+# ================================================================================================ 1. DTOs
+Invoke-CheckSection '1. the attach request and the host-issued pid table (PageMessages.cs)' {
+  $AR = $SvcT.Assembly.GetType('ClarionDebugger.Terminal.AttachRequest', $true)   # internal: reached through reflection
+  $parse = { param($d) $AR.GetMethod('Parse').Invoke($null, @($d)) }
+  $ok = & $parse '4242'
+  Check 'a decimal pid parses' (($null -ne $ok) -and ($ok.GetType().GetField('Pid').GetValue($ok) -eq 4242)) ''
+  Check 'the largest pid parses (uint, not int)' ((& $parse '4294967295') -ne $null) ''
+  foreach ($bad in @($null, '', '0', '-1', '+5', ' 5', '5 ', '12 34', '0x10', '1e3', '4294967296', 'abc', '5;quit')) {
+    Check "`"$(ShowVal $bad)`" does not parse" ($null -eq (& $parse $bad)) ''
+  }
+
+  $LP = $SvcT.Assembly.GetType('ClarionDebugger.Terminal.ListedProcesses', $true)
+  $t = [Activator]::CreateInstance($LP, $true)
+  $call = { param($name, [object[]] $a) $LP.GetMethod($name).Invoke($t, $a) }
+  $list = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new()
+  $list.Add((Proc 10 'a.exe' 'C:\a.exe')); $list.Add((Proc 20 'b.exe' 'C:\b.exe'))
+  Check 'CONTROL: an empty table resolves nothing' ($null -eq (& $call 'Take' @([uint32] 10))) ''
+  & $call 'Begin' @(1) | Out-Null
+  Check 'the current generation installs' ((& $call 'Replace' @(1, $list)) -eq $true) ''
+  Check 'an unlisted pid resolves to nothing' ($null -eq (& $call 'Take' @([uint32] 30))) ''
+  Check 'and a miss consumes nothing' (($LP.GetProperty('Count').GetValue($t)) -eq 2) ''
+  $hit = & $call 'Take' @([uint32] 20)
+  Check 'a listed pid resolves to its listed process' (($null -ne $hit) -and ($hit.Name -eq 'b.exe')) ''
+  Check 'one listing authorises ONE attach: a hit empties the table' (($LP.GetProperty('Count').GetValue($t)) -eq 0) ''
+  Check 'so the other listed pid no longer resolves either' ($null -eq (& $call 'Take' @([uint32] 10))) ''
+  & $call 'Begin' @(2) | Out-Null
+  & $call 'Begin' @(3) | Out-Null
+  Check 'an OLDER listing arriving late is refused' ((& $call 'Replace' @(2, $list)) -eq $false) ''
+  Check 'and installs nothing' ($null -eq (& $call 'Take' @([uint32] 10))) ''
+  $zero = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $zero.Add((Proc 0 'z.exe' 'C:\z.exe'))
+  & $call 'Replace' @(3, $zero) | Out-Null
+  Check 'a pid-0 entry is never listed' (($LP.GetProperty('Count').GetValue($t)) -eq 0) ''
+}
+
+# ================================================================================================ 2. procs reader
+Invoke-CheckSection '2. the engine''s procs line, read by the host (ParseProcsJson against the REAL engine writer)' {
+  $entries = [System.Collections.Generic.List[AttachEngineSide.ProcEntry]]::new()
+  $skips = [System.Collections.Generic.List[AttachEngineSide.ProcSkip]]::new()
+  $hostile = @(
+    @{ Pid = 4242; Name = '<img src=x onerror=alert(1)>.exe'; Path = 'C:\"quoted"\<b>\app.exe' },
+    @{ Pid = 77; Name = "line`nbreak.exe"; Path = "C:\tab`there\x.exe" },
+    @{ Pid = 4294967295; Name = 'max.exe'; Path = 'C:\max.exe' }
+  )
+  foreach ($h in $hostile) { $e = New-Object AttachEngineSide.ProcEntry; $e.Pid = $h.Pid; $e.Name = $h.Name; $e.Path = $h.Path; $e.Tswd = $true; $entries.Add($e) }
+  $s = New-Object AttachEngineSide.ProcSkip; $s.Pid = 9; $s.Name = 'skipped.exe'; $s.Reason = 'no-tswd'; $skips.Add($s)
+  $line = [AttachEngineSide.EngineJson]::Procs($entries, $skips, $true)
+  $got = Invoke-Static 'ParseProcsJson' @("noise before`r`n" + $line + "`r`n")
+  Check 'every listed entry is read, and the --verbose skip entry is NOT' (($null -ne $got) -and ($got.Count -eq 3)) "$(if ($got) { $got.Count } else { '(null)' }) entries"
+  for ($i = 0; $i -lt $hostile.Count -and $got -and $i -lt $got.Count; $i++) {
+    Check "entry $i reads back exactly: pid, name and path" (($got[$i].Pid -eq $hostile[$i].Pid) -and ($got[$i].Name -ceq $hostile[$i].Name) -and ($got[$i].Path -ceq $hostile[$i].Path)) "$($got[$i].Pid) $($got[$i].Name) $($got[$i].Path)"
+  }
+  Check 'no entry is the skipped process' (-not ($got | Where-Object { $_.Pid -eq 9 })) ''
+  Check 'no procs line at all reads as null (an error), not as an empty list' ($null -eq (Invoke-Static 'ParseProcsJson' @('procs: --exclude needs a process id'))) ''
+  Check 'a malformed procs line reads as null' ($null -eq (Invoke-Static 'ParseProcsJson' @('{"event":"procs","procs":[{"pid":1,'))) ''
+  $empty = Invoke-Static 'ParseProcsJson' @('{"event":"procs","procs":[],"skipped":12}')
+  Check 'an empty listing reads as an empty list' (($null -ne $empty) -and ($empty.Count -eq 0)) ''
+  # The engine BINARY is deliberately not run here: test-engine-session.ps1 holds every script that launches
+  # it to the shared lifecycle, and test-procs.ps1 already checks what the built engine prints. The writer
+  # above is the engine's own code, which is what makes this a check of both sides.
+}
+
+# ================================================================================================ 3. detached + Stop
+# A stand-in engine: reads one command line, records it, then exits or hangs as told.
+$fakeEngine = Join-Path ([IO.Path]::GetTempPath()) ('attach-fake-engine-' + [guid]::NewGuid().ToString('N') + '.ps1')
+[IO.File]::WriteAllText($fakeEngine, @'
+param([string] $Out, [string] $Mode)
+$l = [Console]::In.ReadLine()
+[IO.File]::WriteAllText($Out, [string] $l)
+if ($Mode -eq 'slow') { Start-Sleep -Milliseconds 3000 }
+elseif ($Mode -eq 'never') { Start-Sleep -Seconds 60 }
+exit 0
+'@)
+function Start-FakeEngine { param([string] $Mode)
+  $out = [IO.Path]::GetTempFileName()
+  $psi = New-Object System.Diagnostics.ProcessStartInfo 'pwsh', "-NoProfile -File `"$fakeEngine`" -Out `"$out`" -Mode $Mode"
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  [pscustomobject]@{ Process = $p; Out = $out }
+}
+function New-Service { param($Engine, $AttachTo)
+  $svc = New-Object ClarionDebugger.Services.ClarionDebuggerService
+  $SvcT.GetField('_proc', $IF).SetValue($svc, $Engine)
+  $SvcT.GetField('_attachTarget', $IF).SetValue($svc, (Unwrap $AttachTo))
+  $svc
+}
+function Invoke-OnLine { param($Svc, $Source, [string] $Line) $SvcT.GetMethod('OnLine', $IF).Invoke($Svc, @($Source, $Line)) | Out-Null }
+
+try {
+Invoke-CheckSection '3. the engine''s detached event (the service''s real OnLine)' {
+  $d = Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":3,"restored":true}', (Proc 4242 'app.exe' 'C:\app.exe'))
+  Check 'a clean detach: pid, drained, restored, no error, and the listed name' `
+    (($d.Pid -eq 4242) -and ($d.Drained -eq 3) -and $d.Restored -and ($null -eq $d.Error) -and ($d.Name -eq 'app.exe')) "$($d.Pid) $($d.Drained) $($d.Restored) $(ShowVal $d.Error) $($d.Name)"
+  $d2 = Invoke-Static 'ParseDetached' @('{"event":"detached","pid":4242,"drained":0,"restored":false,"error":"bp 0x401000: \"denied\""}', $null)
+  Check 'a failed restore: restored false and the error text, unescaped' ((-not $d2.Restored) -and ($d2.Error -ceq 'bp 0x401000: "denied"')) (ShowVal $d2.Error)
+
+  $engine = Start-FakeEngine 'never'
+  $svc = New-Service $engine.Process (Proc 4242 'app.exe' 'C:\app.exe')
+  $script:dets = [System.Collections.Generic.List[object]]::new()
+  $svc.add_Detached([Action[ClarionDebugger.Services.DebugDetach]] { param($x) $script:dets.Add($x) })
+  Check 'an attached engine counts as an attach session' ($svc.IsAttachSession) ''
+  Invoke-OnLine $svc $engine.Process '@JSON {"event":"loaded","pid":4242,"attached":true}'
+  Check 'loaded (with the additive attached:true) runs the session' ($svc.State -eq 'Running') "$($svc.State)"
+  Invoke-OnLine $svc $engine.Process '@JSON {"event":"detached","pid":4242,"drained":2,"restored":true}'
+  Check 'detached ends the session at once' ($svc.State -eq 'Idle') "$($svc.State)"
+  Check 'and raises Detached once, naming the app' (($script:dets.Count -eq 1) -and ($script:dets[0].Name -eq 'app.exe') -and ($script:dets[0].Pid -eq 4242)) "$($script:dets.Count)"
+
+  # An OLDER engine's buffered line, read after a new session began, must not end the new session.
+  $old = $engine.Process
+  $newer = Start-FakeEngine 'never'
+  $svc2 = New-Service $newer.Process (Proc 5 'new.exe' 'C:\new.exe')
+  $SvcT.GetMethod('SetState', $IF).Invoke($svc2, @([ClarionDebugger.Services.DebugSessionState]::Running)) | Out-Null
+  $script:dets2 = [System.Collections.Generic.List[object]]::new()
+  $script:logs2 = [System.Collections.Generic.List[string]]::new()
+  $svc2.add_Detached([Action[ClarionDebugger.Services.DebugDetach]] { param($x) $script:dets2.Add($x) })
+  $svc2.add_LogReceived([Action[string]] { param($x) $script:logs2.Add($x) })
+  Invoke-OnLine $svc2 $old '@JSON {"event":"detached","pid":4242,"drained":0,"restored":true}'
+  Check 'an older engine''s detached leaves the new session running' ($svc2.State -eq 'Running') "$($svc2.State)"
+  Check 'raises no Detached for it' ($script:dets2.Count -eq 0) ''
+  Check 'and says so in the log instead' (($script:logs2 -join '|') -match 'previous session''s engine detached from pid 4242') ($script:logs2 -join '|')
+  foreach ($p in $engine.Process, $newer.Process) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+}
+
+Invoke-CheckSection '4. Stop: detach in attach mode, quit otherwise, kill only as the last resort' {
+  Check 'TeardownCommand: attached -> detach' ((Invoke-Static 'TeardownCommand' @($true)) -ceq 'detach') ''
+  Check 'TeardownCommand: launched -> quit' ((Invoke-Static 'TeardownCommand' @($false)) -ceq 'quit') ''
+  $detachMs = $SvcT.GetField('DetachWaitMs', $SF).GetValue($null); $quitMs = $SvcT.GetField('QuitWaitMs', $SF).GetValue($null)
+  Check "the detach wait ($detachMs ms) is the contract's 8 s, longer than quit's ($quitMs ms)" (($detachMs -eq 8000) -and ($quitMs -eq 1500)) ''
+
+  # attached, and the engine detaches promptly
+  $e = Start-FakeEngine 'obey'
+  $svc = New-Service $e.Process (Proc 4242 'app.exe' 'C:\app.exe')
+  $logs = [System.Collections.Generic.List[string]]::new(); $svc.add_LogReceived([Action[string]] { param($x) $logs.Add($x) }.GetNewClosure())
+  $ok = $svc.Stop()
+  Check 'attached: Stop sends detach' (((Get-Content -Raw -LiteralPath $e.Out) -replace '\s') -ceq 'detach') (Get-Content -Raw -LiteralPath $e.Out)
+  Check 'and, the engine having exited, reports the session over with no kill' ($ok -and ($svc.State -eq 'Idle') -and -not (($logs -join '|') -match 'kill')) ($logs -join '|')
+
+  # attached, and the detach takes longer than a quit is given (a pause round-trip first): no kill
+  $e = Start-FakeEngine 'slow'
+  $svc = New-Service $e.Process (Proc 4242 'app.exe' 'C:\app.exe')
+  $logs = [System.Collections.Generic.List[string]]::new(); $svc.add_LogReceived([Action[string]] { param($x) $logs.Add($x) }.GetNewClosure())
+  $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $svc.Stop(); $sw.Stop()
+  Check "attached: a detach that takes about 3 s is waited for, not killed at $quitMs ms" `
+    ($ok -and ($sw.ElapsedMilliseconds -gt $quitMs) -and -not (($logs -join '|') -match 'kill')) "$($sw.ElapsedMilliseconds) ms $($logs -join '|')"
+
+  # attached, and the engine never exits: the last resort, said out loud
+  $e = Start-FakeEngine 'never'
+  $svc = New-Service $e.Process (Proc 4242 'app.exe' 'C:\app.exe')
+  $logs = [System.Collections.Generic.List[string]]::new(); $svc.add_LogReceived([Action[string]] { param($x) $logs.Add($x) }.GetNewClosure())
+  $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = $svc.Stop(); $sw.Stop()
+  Check 'attached, engine wedged: Stop waited the full detach time before killing' ($sw.ElapsedMilliseconds -ge ($detachMs - 100)) "$($sw.ElapsedMilliseconds) ms"
+  Check 'and warned that the app may crash' (($logs -join '|') -match 'did not detach.*being killed.*may crash') ($logs -join '|')
+  Check 'and the engine is gone' ($ok -and $e.Process.HasExited) ''
+
+  # CONTROL: a launched session still quits
+  $e = Start-FakeEngine 'obey'
+  $svc = New-Service $e.Process $null
+  $ok = $svc.Stop()
+  Check 'CONTROL: launched: Stop sends quit' (((Get-Content -Raw -LiteralPath $e.Out) -replace '\s') -ceq 'quit') (Get-Content -Raw -LiteralPath $e.Out)
+}
+} finally { Remove-Item -LiteralPath $fakeEngine -ErrorAction SilentlyContinue }
+
+# ================================================================================================ 5. the pad
+Invoke-CheckSection '5. the pad lists, and attaches only to what it listed' {
+  [ClarionDebugger.Terminal.DebugSessionController]::State = 'Idle'
+  $pad = New-Object ClarionDebugger.Terminal.AttachPad
+  $next = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new()
+  $next.Add((Proc 4242 '<b>"evil"</b>.exe' 'C:\"x"\app.exe')); $next.Add((Proc 77 'ok.exe' 'C:\ok.exe'))
+  [ClarionDebugger.Terminal.FakeLists]::Next = $next; [ClarionDebugger.Terminal.FakeLists]::NextError = $null
+  $pad.CmdListProcs()
+  Check 'the listing excludes this process (the IDE)' ([ClarionDebugger.Terminal.FakeLists]::LastExclude -eq $PID) "$([ClarionDebugger.Terminal.FakeLists]::LastExclude)"
+  $msg = $pad.Posts[$pad.Posts.Count - 1] | ConvertFrom-Json
+  Check 'the page gets a procs message with every listed process' (($msg.type -eq 'procs') -and (@($msg.procs).Count -eq 2)) $pad.Posts[$pad.Posts.Count - 1]
+  Check 'a hostile name and path arrive byte for byte (escaped JSON, not markup)' (($msg.procs[0].name -ceq '<b>"evil"</b>.exe') -and ($msg.procs[0].path -ceq 'C:\"x"\app.exe')) $pad.Posts[$pad.Posts.Count - 1]
+
+  $pad.Posts.Clear()
+  $pad.CmdAttach('999')
+  Check 'an UNLISTED pid is refused' ($pad._svc.Attached.Count -eq 0) ''
+  Check 'with a console line saying so' (($pad.Posts -join "`n") -match 'console\|err\|attach: pid 999 was not in the process list') ($pad.Posts -join ' / ')
+  Check 'and the refusal consumes nothing' ($pad.ListedCount -eq 2) ''
+  foreach ($bad in @('abc', '0', '-1', '4242;quit', $null)) {
+    $pad.Posts.Clear(); $pad.CmdAttach($bad)
+    Check "malformed `"$(ShowVal $bad)`": dropped with a console line" (($pad._svc.Attached.Count -eq 0) -and (($pad.Posts -join '') -match 'console\|err\|attach: dropped')) ($pad.Posts -join ' / ')
+  }
+  $pad._svc.State = 'Running'; $pad.Posts.Clear()
+  $pad.CmdAttach('4242')
+  Check 'a session already running: nothing is attached' ($pad._svc.Attached.Count -eq 0) ''
+  Check 'and the listing is not spent' ($pad.ListedCount -eq 2) ''
+  $pad._svc.State = 'Idle'
+  [ClarionDebugger.Terminal.DebugSessionController]::State = 'Running'
+  $pad.CmdAttach('4242')
+  Check 'another pad''s session live (controller not idle): nothing is attached' ($pad._svc.Attached.Count -eq 0) ''
+  [ClarionDebugger.Terminal.DebugSessionController]::State = 'Idle'
+
+  $pad.Posts.Clear()
+  $pad.CmdAttach('4242')
+  Check 'a LISTED pid attaches to exactly that listed process' (($pad._svc.Attached.Count -eq 1) -and ($pad._svc.Attached[0].Pid -eq 4242) -and ($pad._svc.Attached[0].Path -ceq 'C:\"x"\app.exe')) ''
+  Check 'the page is told Stop now detaches' ($pad.Posts -contains '{"type":"attachmode","on":true}') ($pad.Posts -join ' / ')
+  Check 'the pad remembers it is attached' ($pad.HasAttach) ''
+  Check 'the session steps a launch takes are taken (hooks re-armed, gutter merged)' (($pad.Rearms -eq 1) -and ($pad.Merges -eq 1)) ''
+  $pad._svc.Attached.Clear()
+  $pad.CmdAttach('77')
+  Check 'one listing, ONE attach: the other listed pid is now refused' ($pad._svc.Attached.Count -eq 0) ''
+
+  # Refresh retires the previous listing's pids at once, and a late older listing never installs.
+  $p2 = New-Object ClarionDebugger.Terminal.AttachPad
+  $p2.HoldWork = $true
+  $a = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $a.Add((Proc 11 'old.exe' 'C:\old.exe'))
+  [ClarionDebugger.Terminal.FakeLists]::Next = $a; $p2.CmdListProcs()
+  $b = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $b.Add((Proc 22 'new.exe' 'C:\new.exe'))
+  [ClarionDebugger.Terminal.FakeLists]::Next = $b; $p2.CmdListProcs()
+  $p2.Release(1); $p2.Release(0)   # the newer listing lands first, the older one late
+  $p2.CmdAttach('11')
+  Check 'a pid only in an OLDER listing that arrived late is refused' ($p2._svc.Attached.Count -eq 0) ''
+  Check 'and the older listing was never posted to the page' (@($p2.Posts | Where-Object { $_ -like '*old.exe*' }).Count -eq 0) ($p2.Posts -join ' / ')
+  $p3 = New-Object ClarionDebugger.Terminal.AttachPad
+  [ClarionDebugger.Terminal.FakeLists]::Next = $a; $p3.CmdListProcs()
+  $p3.HoldWork = $true
+  [ClarionDebugger.Terminal.FakeLists]::Next = $b; $p3.CmdListProcs()   # a refresh, still being read
+  $p3.CmdAttach('11')
+  Check 'a refresh in flight retires the previous listing''s pids at once' ($p3._svc.Attached.Count -eq 0) ''
+  [ClarionDebugger.Terminal.FakeLists]::Next = $null; [ClarionDebugger.Terminal.FakeLists]::NextError = 'boom'
+  $p4 = New-Object ClarionDebugger.Terminal.AttachPad
+  $p4.CmdListProcs()
+  $m4 = $p4.Posts[0] | ConvertFrom-Json
+  Check 'a listing that failed posts an empty list with the error' ((@($m4.procs).Count -eq 0) -and ($m4.error -eq 'boom')) $p4.Posts[0]
+  [ClarionDebugger.Terminal.FakeLists]::NextError = $null
+}
+
+function New-AttachedPad {
+  $p = New-Object ClarionDebugger.Terminal.AttachPad
+  $l = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $l.Add((Proc 4242 'app.exe' 'C:\app.exe'))
+  [ClarionDebugger.Terminal.FakeLists]::Next = $l; $p.CmdListProcs(); $p.CmdAttach('4242')
+  $p.GrantOne(); $p._transientBps.Add('x.clw:1') | Out-Null; $p._pendingRtcKey = 'x.clw:1'
+  $p.Posts.Clear(); $p.ClearedLine = 0
+  $p
+}
+function New-Detach { param([bool] $Restored = $true, [string] $Error = $null)
+  $d = New-Object ClarionDebugger.Services.DebugDetach; $d.Pid = 4242; $d.Name = 'app.exe'; $d.Restored = $Restored; $d.Error = $Error; $d }
+
+Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits' {
+  $pad = New-AttachedPad
+  Check 'CONTROL: the attached pad holds state a session end must clear' (($pad.GrantCount -eq 1) -and ($pad._transientBps.Count -eq 1) -and ($null -ne $pad._pendingRtcKey)) ''
+  $pad.OnSvcDetached((New-Detach))
+  Check 'detached clears the edit grants, the transient breakpoints and the run-to-cursor key' `
+    (($pad.GrantCount -eq 0) -and ($pad._transientBps.Count -eq 0) -and ($null -eq $pad._pendingRtcKey)) ''
+  Check 'and the execution line' ($pad.ClearedLine -eq 1) ''
+  Check 'it clears the page FIRST, then says the app is still running' `
+    (($pad.Posts.Count -ge 2) -and ($pad.Posts[0] -ceq $ClearJson) -and ($pad.Posts[1] -ceq 'console|info|Detached; app.exe is still running.')) ($pad.Posts -join ' / ')
+  Check 'a clean detach warns about nothing' (-not (($pad.Posts -join "`n") -match 'console\|err\|')) ($pad.Posts -join ' / ')
+  $pad.Posts.Clear()
+  $pad.OnSvcExited(0)
+  Check 'the engine''s exit after a detach posts nothing, so the Detached line survives' ($pad.Posts.Count -eq 0) ($pad.Posts -join ' / ')
+  Check 'and the attach session is over' (-not $pad.HasAttach) ''
+
+  # The other order: the process exit is handled before the buffered detached line.
+  $pad = New-AttachedPad
+  $pad.OnSvcExited(0)
+  $pad.OnSvcDetached((New-Detach))
+  $last = $pad.Posts[$pad.Posts.Count - 1]
+  Check 'exit first, detached second: the Detached line is still the last thing on the page' ($last -ceq 'console|info|Detached; app.exe is still running.') ($pad.Posts -join ' / ')
+  Check 'and it follows a clear' ($pad.Posts[$pad.Posts.Count - 2] -ceq $ClearJson) ($pad.Posts -join ' / ')
+
+  $pad = New-AttachedPad
+  $pad.OnSvcDetached((New-Detach $false 'bp at 0x401000 not restored'))
+  $txt = $pad.Posts -join "`n"
+  Check 'detached with an error: an ERR line warns the app may crash, with the reason' `
+    ($txt -match 'console\|err\|detach could not restore every breakpoint \(bp at 0x401000 not restored\): app\.exe will probably crash') ($pad.Posts -join ' / ')
+  $pad = New-AttachedPad
+  $pad.OnSvcDetached((New-Detach $false $null))
+  Check 'restored:false with no error text still warns' (($pad.Posts -join "`n") -match 'console\|err\|detach could not restore every breakpoint: app\.exe') ($pad.Posts -join ' / ')
+}
+
+Invoke-CheckSection '7. the pad: an attach that fails, and a launch''s exit (unchanged)' {
+  $pad = New-AttachedPad
+  $pad.OnSvcEngineError('attach failed: Access is denied. (5)')
+  $pad.Posts.Clear()
+  $pad.OnSvcExited(2)
+  Check 'a failed attach: the exit clears the page, THEN repeats why the attach failed' `
+    (($pad.Posts.Count -eq 3) -and ($pad.Posts[0] -ceq $ClearJson) -and ($pad.Posts[1] -ceq 'console|err|engine: attach failed: Access is denied. (5)') -and ($pad.Posts[2] -match 'session ended \(exit 2\)')) ($pad.Posts -join ' / ')
+  $pad = New-AttachedPad
+  $pad.OnSvcEngineError('thread 12: not found')
+  $pad.Posts.Clear(); $pad.OnSvcExited(0)
+  Check 'an unrelated engine error is not repeated at the exit' (-not (($pad.Posts -join "`n") -match 'thread 12')) ($pad.Posts -join ' / ')
+
+  $launch = New-Object ClarionDebugger.Terminal.AttachPad
+  $launch.OnSvcExited(0)
+  Check 'CONTROL: a launch''s exit is unchanged: the session-ended line, then clear' `
+    (($launch.Posts.Count -eq 2) -and ($launch.Posts[0] -match 'session ended \(exit 0\)') -and ($launch.Posts[1] -ceq $ClearJson)) ($launch.Posts -join ' / ')
+}
+
+Invoke-CheckSection '8. where the pieces are wired (position and text pins)' {
+  $onMsg = Get-CSharpCodeOnly (Get-Method 'private void OnWebMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)')
+  Check 'the page''s procs action lists processes' ($onMsg -match 'case "procs": CmdListProcs\(\); break;') ''
+  Check 'the page''s attach action goes through CmdAttach with its data' ($onMsg -match 'case "attach": CmdAttach\(data\); break;') ''
+  Check 'Detached is subscribed and unsubscribed, once each' `
+    ((([regex]::Matches($web, '_svc\.Detached\s*\+=\s*OnSvcDetached;')).Count -eq 1) -and (([regex]::Matches($web, '_svc\.Detached\s*-=\s*OnSvcDetached;')).Count -eq 1)) ''
+  $dispose = Get-CSharpCodeOnly (Get-Method 'protected override void Dispose(bool disposing)')
+  Check 'closing the pad tears down through Stop (which detaches) and never kills the engine itself' `
+    (($dispose -match 'svc\.Stop\(\)') -and ($dispose -notmatch '\.Kill\(')) ''
+  $cmdStop = Get-CSharpCodeOnly (Get-Method 'public void CmdStop()')
+  Check 'the Stop command tears down through Stop too' (($cmdStop -match 'svc\.Stop\(\)') -and ($cmdStop -notmatch '\.Kill\(')) ''
+  $attachSvc = Get-CSharpCodeOnly (Get-Method 'public void AttachSession(AttachableProcess target, IEnumerable<DebugBreakpoint> breakpoints, IEnumerable<string> solutionDlls)' $svcSrc)
+  Check 'the service launches `attach <pid> --interactive --json`' ($attachSvc -match 'args\.Append\("attach "\)\.Append\(target\.Pid\.ToString\(CultureInfo\.InvariantCulture\)\)\.Append\(" --interactive --json"\);') ''
+  Check 'with the same --bp / --solution-dll options as a launch (one shared builder)' `
+    (([regex]::Matches((Get-CSharpCodeOnly $svcSrc), 'AppendSessionOptions\(args, breakpoints, solutionDlls\);')).Count -eq 2) ''
+  Check 'and marks the engine as attached, so Stop detaches' ($attachSvc -match 'Launch\(target\.Path, args\.ToString\(\), true, target\);') ''
+  $stop = Get-CSharpCodeOnly (Get-Method 'public bool Stop()' $svcSrc)
+  Check 'Stop picks its verb and its wait from IsAttachSession' `
+    (($stop -match 'bool attached = IsAttachSession;') -and ($stop -match 'SendCommand\(TeardownCommand\(attached\)\)')) ''
+  Check 'the only literal "quit" in the service is TeardownCommand''s' (([regex]::Matches((Get-CSharpCodeOnly $svcSrc), '"quit"')).Count -eq 1) ''
+}
+
+# Runtime counts on a clean run, per section: 25, 8, 9, 10, 23, 11, 3, 10.
+$EXPECTED_CHECKS = 99
+Assert-CheckTotal $EXPECTED_CHECKS
+
+Write-Host ''
+if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
+Write-Host "ALL $($script:checks) CHECKS PASSED"
+exit 0

@@ -50,7 +50,7 @@ foreach ($s in $states) {
   Check "engine alive, $s -> $want" ([Lifecycle]::DecideLaunch($true, $st) -eq [Lifecycle+LaunchGate]::$want) ([Lifecycle]::DecideLaunch($true, $st))
 }
 
-$launch = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive)')
+$launch = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive, AttachableProcess attachTo)')
 $iGate = $launch.IndexOf('DecideLaunch(IsRunning, State)')
 $iProc = $launch.IndexOf('new ProcessStartInfo')
 Check 'Launch asks DecideLaunch before it starts anything' (($iGate -ge 0) -and ($iProc -gt $iGate)) "gate=$iGate start=$iProc"
@@ -182,7 +182,7 @@ try {
 }
 
 # Wiring: every handler Launch attaches is bound to ITS process, and the "exited" arm hands over the source.
-$launchCode = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive)')
+$launchCode = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive, AttachableProcess attachTo)')
 Check 'Launch binds output and Exited to the process it created, not to _proc' `
   (($launchCode -match 'OnLine\(p, e\.Data\)') -and ($launchCode -match 'p\.Exited \+= \(s, e\) => OnEngineProcessExited\(p\)') -and `
    ($launchCode -notmatch '_proc\.(ExitCode|OutputDataReceived|Exited)')) ''
