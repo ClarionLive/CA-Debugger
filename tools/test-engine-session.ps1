@@ -252,8 +252,9 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     }
     else { Check 'run-all.ps1 exists, so its exemption below is about a real file' $false '' }
     $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and (Test-NamesEngineBinary $_.FullName) })
-    # A number, not "every": if a fourth harness appears this says so instead of quietly covering three.
-    Check 'exactly 3 scripts here launch the engine binary' ($harnesses.Count -eq 3) (($harnesses.Name) -join ', ')
+    # A number, not "every": if another harness appears this says so instead of quietly covering the old set.
+    # 4 since test-setip.ps1 (a77abd94, 2026-09-23).
+    Check 'exactly 4 scripts here launch the engine binary' ($harnesses.Count -eq 4) (($harnesses.Name) -join ', ')
 
     foreach ($h in $harnesses) {
         $text = Get-Content -Raw -LiteralPath $h.FullName
@@ -452,7 +453,7 @@ Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionNa
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 59
+$EXPECTED_CHECKS = 63   # 59, plus test-setip.ps1's four per-harness checks in section 5
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

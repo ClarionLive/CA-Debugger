@@ -76,6 +76,7 @@ $Suites = @(
   @{ File = 'test-pad-watch-persist.js' }
   @{ File = 'test-bp-threaded.ps1'; Live = $true }
   @{ File = 'test-watch-threaded.ps1'; Live = $true }
+  @{ File = 'test-setip.ps1'; Live = $true }
   @{ File = 'test-interactive.ps1'; Live = $true; Success = '^=== exit code: 0 ===$'
      NoTotal = 'a paced step/stepover/stepout smoke run with no Check calls; its verdict is the engine exit code' }
 )
