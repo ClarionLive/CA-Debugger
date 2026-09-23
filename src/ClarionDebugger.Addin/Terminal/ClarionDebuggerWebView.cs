@@ -307,7 +307,10 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
         {
-            _editGrants.GrantRows(itemsJson, null);
+            // Only a reply to an expand the host VERIFIED and forwarded may grant (afbc68c7): its rows are
+            // members of a group the host itself offered. Any other reply is posted for display, and grants
+            // nothing - its rows cannot be edited or expanded further.
+            if (_editGrants.ExpandVerified(reqId)) _editGrants.GrantRows(itemsJson, null);
             Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}");
         });
 
@@ -335,12 +338,22 @@ namespace ClarionDebugger.Terminal
                                   + ": " + (error ?? "could not select"));
         });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
+        // The ENGINE's answer to a write the host sent: it re-issues the grant that write spent, so the row can
+        // be edited again (afbc68c7). A refusal the host makes itself goes through PostVarSet and re-issues
+        // nothing - it spent nothing.
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
+        {
+            _editGrants.Regrant(va);
+            PostVarSet(va, ok, value, error);
+        });
+
+        private void PostVarSet(string va, bool ok, string value, string error)
         {
             Post("{\"type\":\"varset\",\"va\":" + Str(va) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"value\":" + Str(value) + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "edit value failed: " + (error ?? "unknown"));
-        });
+        }
+
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() =>
         {
             // Phase 2 of run-to-cursor: the transient is now confirmed armed, so it's safe to resume. There is
@@ -575,13 +588,7 @@ namespace ClarionDebugger.Terminal
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
-                    case "expand":   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
-                        if (_svc.State == DebugSessionState.Paused)
-                        {
-                            var x = ExpandRequest.Parse(data);
-                            if (x != null) _svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr);
-                        }
-                        break;
+                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
                     case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
                         if (_svc.State == DebugSessionState.Paused)
                         {
@@ -829,11 +836,12 @@ namespace ClarionDebugger.Terminal
             string module = null;
             try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
             catch (ArgumentException) { module = null; }
-            var proc = _procIds.Containing(module, line);
+            string why;
+            var proc = _procIds.Containing(module, line, out why);
             if (proc == null)
             {
-                Console("err", "break on entry: no listed procedure contains " + (module ?? "(no file)") + ":" + line
-                    + " — open the app's solution so the Procedures pane is filled, or refresh it.");
+                // A visible refusal, never a guess at the nearest procedure above (codex adversary gate).
+                Console("err", "break on entry: " + why + " — nothing was set. (If the Procedures pane is empty, open the app's solution or refresh it.)");
                 return;
             }
             BreakOnEntry(proc);
@@ -846,7 +854,12 @@ namespace ClarionDebugger.Terminal
             string module = proc.Module;
             int line = proc.Line;
             string name = proc.Name;
-            if (line <= 0) return;
+            if (line <= 0)
+            {
+                Console("err", "break on entry: " + (string.IsNullOrEmpty(name) ? "that procedure" : name)
+                    + " has no definition line to break on.");
+                return;
+            }
 
             // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
             // the idle branch staged whatever module it was handed, so a name the engine would refuse sat
@@ -955,6 +968,10 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(exe)) return;
             _svc.PrimeTarget(exe);          // anchor the .red resolver to this EXE so PRE-RUN clicks resolve (UI thread)
             int gen = ++_procGen;
+            // The old list's ids stop resolving NOW, not when the parse below finishes, and the page is told to
+            // drop them: a right-click in that window used to arm the PREVIOUS exe's row (codex adversary gate).
+            _procIds.Begin(gen);
+            Post("{\"type\":\"procedures\",\"procs\":[],\"loading\":true}");
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
@@ -970,7 +987,7 @@ namespace ClarionDebugger.Terminal
                     {
                         var p = procs[i];
                         string id = ProcedureIds.IdFor(gen, i);
-                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind };
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine };
                         if (i > 0) sb.Append(',');
                         sb.Append("{\"id\":").Append(Str(id))
                           .Append(",\"name\":").Append(Str(p.Name))
@@ -982,7 +999,7 @@ namespace ClarionDebugger.Terminal
                     sb.Append("]}");
                     string json = sb.ToString();
                     // ignore an out-of-date parse — a newer push won, and its table with it
-                    UI(() => { if (gen == _procGen) { _procIds.Replace(ids); Post(json); } });
+                    UI(() => { if (gen == _procGen && _procIds.Replace(gen, ids)) Post(json); });
                 }
                 catch { }
             });
@@ -1412,8 +1429,9 @@ namespace ClarionDebugger.Terminal
                 if (i > 0) sb.Append(',');
                 // The row's own tid goes through the one writer too (c299aced). It used to be typed inline as
                 // `{"tid":` + t.Tid, which is correct only while every row has a real id; the writer makes
-                // that a rule rather than a fact about today's parser. clarionThread opens the row because
-                // TidMember writes a leading comma - the page reads members by key, so order is free.
+                // that a rule rather than a fact about the parser (which, as of 2026-09-22, drops a row with no
+                // tid). clarionThread opens the row because TidMember writes a leading comma - the page reads
+                // members by key, so order is free.
                 sb.Append("{\"clarionThread\":").Append(t.ClarionThread.HasValue
                         ? t.ClarionThread.Value.ToString(CultureInfo.InvariantCulture) : "null")
                   .Append(TidMember(TidMemberTid, t.Tid))
@@ -1522,12 +1540,49 @@ namespace ClarionDebugger.Terminal
             if (_svc.State != DebugSessionState.Paused) return;
             var req = EditVarRequest.Parse(data);
             if (req == null) return;
+            // The grant is SPENT by the write it authorises, so the same request cannot be replayed; the
+            // engine's varset reply re-issues it (OnSvcVariableSet). A write that never left re-issues it now,
+            // because no reply is coming.
             string why = null;
-            if (!_editGrants.IsGranted(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
+            if (!_editGrants.TryConsume(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
                 why = "that value is no longer current (or was never offered for editing) — let it refresh, then edit again";
             else if (!_svc.SetVariable(req.Va, req.TypeCode, req.Size, req.Places, req.Value, req.Tid))
+            {
+                _editGrants.Regrant(req.Va);
                 why = "the engine did not take the request";
-            if (why != null) OnSvcVariableSet(req.Va, false, null, why);
+            }
+            if (why != null) PostVarSet(req.Va, false, null, why);
+        }
+
+        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
+        /// is forwarded ONLY when that exact tuple is an expandable row the host issued for the rows now current
+        /// (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
+        /// address the page named - edit metadata included - and a forged expand would mint the edit grants
+        /// that EditVar checks. A refusal, or a request the service would not send, is ANSWERED with an empty
+        /// expanded reply for that reqId, so the node the page is opening does not wait forever.</summary>
+        private void Expand(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var x = ExpandRequest.Parse(data);
+            if (x == null) return;
+            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "that node is no longer current (or was never offered) — let the view refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.ExpandForwarded(x.ReqId);
+        }
+
+        private void RefuseExpand(int reqId, string why)
+        {
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "expand refused: " + why);
         }
 
         private void SendBps()

@@ -963,7 +963,7 @@ $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal
 # `);` that closes UI( is put back here.
 function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
 $pushProcs = (Get-Method 'private void PushProcedures(string exe)' $web) -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
-$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(' |
+$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(', 'private void OnSvcExpanded(' |
   ForEach-Object { (Get-ArrowHandler $_) -replace '^private void', 'public void' }) -join "`n"
 
 $bridgeSrc = @"
@@ -991,6 +991,9 @@ public sealed class FakeSvc {
   public bool IsRunning = true; public bool Accept = true; public bool AcceptSet = true;
   public List<string> Adds = new List<string>();
   public List<string> Sets = new List<string>();
+  public List<string> Expands = new List<string>();
+  public bool AcceptExpand = true;
+  public bool RequestExpand(int reqId, string module, uint typeRef, string addr) { Expands.Add(reqId + "|" + module + "|" + typeRef + "|" + addr); return AcceptExpand; }
   public void PrimeTarget(string exe) { }
   public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
   public bool SetVariable(string va, string typeCode, int size, int places, string value, uint? tid) {
@@ -1011,7 +1014,13 @@ public sealed class BridgePad {
   private void Post(string json) { Posts.Add(json); }
   private void SendBps() { BpPushes++; }
   private void UI(Action a) { a(); }
-  private static void RunNow(Action<object> work) { work(null); }
+  // The thread-pool work item runs inline - or is HELD, so a test can act while a refresh is mid-parse.
+  public bool HoldWork; public List<Action<object>> Held = new List<Action<object>>();
+  private void RunNow(Action<object> work) { if (HoldWork) Held.Add(work); else work(null); }
+  public void ReleaseHeld(bool newestFirst) {
+    var h = new List<Action<object>>(Held); Held.Clear(); if (newestFirst) h.Reverse();
+    foreach (var w in h) w(null);
+  }
   $(Get-Method 'private static string Str(string s)' $web)
   $(Get-Method 'private static string TidJson(uint? tid)' $web)
   $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
@@ -1023,6 +1032,9 @@ public sealed class BridgePad {
   $(Get-Method 'private void BreakOnEntry(ProcRef proc)' $web)
   $((Get-Method 'private void OnWatch(DebugWatch w)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
+  $((Get-Method 'private void Expand(string data)' $web) -replace '^private void', 'public void')
+  $(Get-Method 'private void RefuseExpand(int reqId, string why)' $web)
+  $(Get-Method 'private void PostVarSet(string va, bool ok, string value, string error)' $web)
   $arrowHandlers
   public void RunPushProcedures(string exe) { PushProcedures(exe); }
 }
@@ -1031,8 +1043,8 @@ public sealed class BridgePad {
 Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
 function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
-function Proc { param($name, $module, $line, $kind = 'procedure')
-  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p
+function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0)
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine; $p
 }
 
 # ---- host writers, run --------------------------------------------------------------------------------
@@ -1042,7 +1054,8 @@ $pad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
 $pad.RunPushProcedures('C:\App\app.exe')
 $procMsg = if ($pad.Posts.Count -ge 1) { $pad.Posts[$pad.Posts.Count - 1] } else { '' }
-Check 'CONTROL: PushProcedures posted exactly one list' ($pad.Posts.Count -eq 1) "$($pad.Posts.Count) post(s)"
+Check 'CONTROL: PushProcedures posts an empty "loading" list, then the list' `
+  (($pad.Posts.Count -eq 2) -and ($pad.Posts[0] -cmatch '"procs":\[\],"loading":true') -and ($procMsg -cmatch '"name":"MAIN"')) "$($pad.Posts.Count) post(s)"
 
 $watch = New-Object ClarionDebugger.Terminal.DebugWatch
 $watch.Name = 'GLO:Count'; $watch.Found = $true; $watch.Value = '5'; $watch.TypeName = 'LONG'
@@ -1052,7 +1065,7 @@ $watchMsg = $pad.Posts[$pad.Posts.Count - 1]
 
 # The engine's Variables row: a GROUP whose one editable member sits in `children`, so the grant has to be
 # found below the top level. Shape pinned against the writer just below.
-$engineRows = '{"name":"G:REC","type":"GROUP","value":"","children":[{"name":"G:X","type":"DECIMAL(7,2)","value":"1.50","va":"0x4A2200","typeCode":"0x0A","size":4,"places":2}]}'
+$engineRows = '{"name":"G:REC","type":"GROUP","value":"","children":[{"name":"G:X","type":"DECIMAL(7,2)","value":"1.50","va":"0x4A2200","typeCode":"0x0A","size":4,"places":2},{"name":"G:PTR","type":"","value":"0x4B0000","ref":true,"addr":"0x4B0000","module":"clbrws011.clw","typeRef":77}]}'
 $engineLocals = Get-Content -Raw -LiteralPath $EngineLocalsPath
 Check 'the engine row writer still emits va, typeCode, size and places under those names' `
   (($engineLocals -match '\\"va\\":\\"0x') -and ($engineLocals -match '\\"typeCode\\":\\"0x') -and `
@@ -1060,6 +1073,11 @@ Check 'the engine row writer still emits va, typeCode, size and places under tho
 $pad.OnSvcModuleData('clbrws011.clw', $engineRows, 4812)
 $moduleMsg = $pad.Posts[$pad.Posts.Count - 1]
 Check 'CONTROL: the nested row was granted and the group itself was not' ($pad._editGrants.Count -eq 2) "$($pad._editGrants.Count) grant(s) incl. the watch"
+
+# The engine's answer to that edit, as the host posts it: the real OnSvcVariableSet, on a scratch pad.
+$vsPad = New-Object ClarionDebugger.Terminal.BridgePad
+$vsPad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
+$varsetMsg = $vsPad.Posts[$vsPad.Posts.Count - 1]
 
 # ---- the page, run ------------------------------------------------------------------------------------
 $pageJs = @(
@@ -1071,10 +1089,12 @@ $pageJs = @(
   (Get-Method 'function editAttrs(v){' $page),
   (Get-Method 'function setEditMeta(cell, meta){' $page),
   (Get-Method 'function stripEditQuotes(s){' $page),
-  (Get-Method 'function beginEdit(cell){' $page)
+  (Get-Method 'function beginEdit(cell){' $page),
+  (Get-Method 'function requestExpand(v, cb){' $page),
+  (Get-Method 'function onVarSet(m){' $page)
 ) -join "`n"
 $inputFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-in-' + [Guid]::NewGuid().ToString('N') + '.json')
-@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
+@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg; varset = $varsetMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
 $bridgeJs = @'
 const fs = require('fs');
 const INPUT = JSON.parse(fs.readFileSync(process.argv[2], 'utf8').replace(/^\uFEFF/, ''));
@@ -1090,6 +1110,7 @@ let wire = null; const wv = { postMessage(s){ wire = s; } };
 let allProcs = [], procIndex = null, bps = [], procCtx = null;
 function buildBps(){} function filterProcs(){}
 let isPaused = true, activeEdit = null, selTid = null;
+let _expandSeq = 0; const _expandCbs = {};
 function editThreadSuffix(){ return ''; } function viewingOtherThread(){ return false; } function toast(){}
 '@ + "`n" + $pageJs + "`n" + @'
 
@@ -1108,12 +1129,21 @@ const wm = JSON.parse(INPUT.watch);
 const wcell = mkEl('span'); setEditMeta(wcell, { va:wm.va, typeCode:wm.typeCode, size:wm.size, places:wm.places });
 selTid = wm.tid;
 out.watchEdit = commit(wcell, 'X","va":"0x1","value":"7');
+// The engine answers; the page's real onVarSet repaints the cell. Then the user edits the SAME row again.
+document.querySelectorAll = function(){ return [wcell]; };
+function dtApply(){}
+onVarSet(JSON.parse(INPUT.varset));
+out.watchEdit2 = commit(wcell, 'second');
 
 // An edit on the NESTED Variables row: editAttrs writes the attributes the tree row is built with.
 const child = JSON.parse(INPUT.moduledata).items[0].children[0];
 const tcell = mkEl('span'); const attrs = editAttrs(child); let m; const re = / data-(\w+)="([^"]*)"/g;
 while ((m = re.exec(attrs))) tcell.dataset[m[1]] = m[2];
 out.treeEdit = commit(tcell, '2.25');
+
+// Opening the reference row the host posted: the page's own expand request for it.
+const refRow = JSON.parse(INPUT.moduledata).items[0].children[1];
+wire = null; requestExpand(refRow, function(){}); out.expand = wire;
 console.log(JSON.stringify(out));
 '@
 $bridgeFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-' + [Guid]::NewGuid().ToString('N') + '.js')
@@ -1149,6 +1179,63 @@ $pad._svc.Adds.Clear(); $pad.Lines.Clear()
 $pad.CmdBreakOnProcEntry('{"module":"EVIL.CLW","line":1,"name":"X"}')
 Check 'the old {module,line} payload is not honoured' ($pad._svc.Adds.Count -eq 0) ($pad._svc.Adds -join ',')
 
+# ---- an id is bound to its GENERATION (codex adversary gate) ------------------------------------------
+# The parse is asynchronous. The table used to be swapped only when it finished, so for the whole parse the
+# PREVIOUS exe's ids still resolved. Held here, so "mid-refresh" is a state the test is IN, not a race.
+function ProcIdAt { param($json, $i) if ($json -match ('"id":"(p\d+\.' + $i + ')"')) { $Matches[1] } else { '' } }
+$gp = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+$gp.RunPushProcedures('C:\App\app.exe')
+$oldId = ProcIdAt $gp.Posts[$gp.Posts.Count - 1] 0
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'NEWMAIN' 'newapp.clw' 7))
+$gp.HoldWork = $true
+$gp.RunPushProcedures('C:\Other\new.exe')      # the new target's parse starts, and is held
+Check 'a refresh tells the page to drop its ids at once' ($gp.Posts[$gp.Posts.Count - 1] -cmatch '"procs":\[\],"loading":true') $gp.Posts[$gp.Posts.Count - 1]
+$gp.CmdBreakOnProcEntry('{"id":"' + $oldId + '"}')
+Check 'an id from the previous list is refused WHILE the new one is being parsed' `
+  (($gp._svc.Adds.Count -eq 0) -and (@(Errs $gp).Count -eq 1)) "id=$oldId adds=$($gp._svc.Adds -join ',')"
+$gp.ReleaseHeld($false)
+$gp.Lines.Clear()
+$gp.CmdBreakOnProcEntry('{"id":"' + $oldId + '"}')
+Check 'and after it arrives' (($gp._svc.Adds.Count -eq 0) -and (@(Errs $gp).Count -eq 1)) ($gp._svc.Adds -join ',')
+# The synchronous clear, ISOLATED: a position lookup uses no id, so the generation check cannot be what
+# refuses it - only the table having been emptied at the start of the refresh can.
+$gh = New-Object ClarionDebugger.Terminal.BridgePad
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
+$gh.RunPushProcedures('C:\App\app.exe')
+$gh.HoldWork = $true
+$gh.RunPushProcedures('C:\Other\new.exe')
+$gh.CmdBreakOnProcEntryAt('C:\Src\clbrws011.clw', 50)
+Check 'mid-refresh, a POSITION in the old list resolves to nothing either' ($gh._svc.Adds.Count -eq 0) ($gh._svc.Adds -join ',')
+# The generation check and the install gate, ISOLATED on the table itself.
+$ids = New-Object ClarionDebugger.Terminal.ProcedureIds
+$ids.Begin(2)
+$foreign = [ClarionDebugger.Terminal.ProcedureIds]::NewTable()
+$ref = New-Object ClarionDebugger.Terminal.ProcRef; $ref.Module = 'x.clw'; $ref.Line = 1
+$foreign['p1.0'] = $ref
+[void]$ids.Replace(2, $foreign)
+Check 'an id of another generation does not resolve, even if a table somehow holds it' ($null -eq $ids.Resolve('p1.0')) ''
+Check 'a table for a generation that is no longer current is not installed' (-not $ids.Replace(1, $foreign)) ''
+$newId = ProcIdAt $gp.Posts[$gp.Posts.Count - 1] 0
+$gp.CmdBreakOnProcEntry('{"id":"' + $newId + '"}')
+Check 'CONTROL: the new list''s id arms the new row' (($gp._svc.Adds.Count -eq 1) -and ($gp._svc.Adds[0] -ceq 'newapp.clw:7')) "id=$newId adds=$($gp._svc.Adds -join ',')"
+# Two refreshes in flight, the OLDER parse finishing LAST: it must not install its table over the newer one.
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'FIRST' 'first.clw' 3))
+$gp.RunPushProcedures('C:\A\a.exe')
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'SECOND' 'second.clw' 5))
+$gp.RunPushProcedures('C:\B\b.exe')
+$gp.ReleaseHeld($true)                           # newest parse first, then the stale one
+$lastList = $gp.Posts[$gp.Posts.Count - 1]
+Check 'a slower, older parse cannot replace a newer list' (($lastList -cmatch '"name":"SECOND"') -and ($lastList -cnotmatch '"name":"FIRST"')) $lastList
+$gp._svc.Adds.Clear()
+$gp.CmdBreakOnProcEntry('{"id":"' + (ProcIdAt $lastList 0) + '"}')
+Check 'and the newer list''s ids are the ones that resolve' (($gp._svc.Adds.Count -eq 1) -and ($gp._svc.Adds[0] -ceq 'second.clw:5')) ($gp._svc.Adds -join ',')
+
 # The cheap half of the ticket, which the id rework must not lose: a live add the engine never took is said.
 $freshId = if ($pad.Posts[$pad.Posts.Count - 1] -match '"id":"(p\d+\.1)"') { $Matches[1] } else { '' }
 $pad._svc.Accept = $false; $pad._svc.Adds.Clear(); $pad.Lines.Clear()
@@ -1180,24 +1267,40 @@ Check 'CONTROL: an idle request for a good module is staged once' `
 
 # ---- break on entry by POSITION: the editor's cursor (e61e4f92) ---------------------------------------
 # ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
-# list: the breakpoint goes where the list says the containing procedure starts.
+# list, and it must be CONTAINED by a procedure (PM ruling, codex adversary gate) - never "the nearest one
+# above". clbrws011.clw here: MAIN 42 (no extent; bounded by OTHER), a routine inside it at 45, OTHER 80..120
+# (a known extent), and module data/trailer after 120. clbrws003.clw: LAST 20 with no extent and nothing after.
 $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN::DOIT' 'clbrws011.clw' 45 'routine'))
-[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'OTHER' 'clbrws011.clw' 80 'procedure' 120))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'ELSEWHERE' 'clbrws002.clw' 10))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'LAST' 'clbrws003.clw' 20))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'BOUNDED' 'clbrws004.clw' 10 'procedure' 30))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'AFTERDATA' 'clbrws004.clw' 60))
 $posPad.RunPushProcedures('C:\App\app.exe')
 function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
+function PosRefused { param($path, $line, $reason)
+  $a = PosAdd $path $line
+  ($a -eq '') -and (@(Errs $posPad).Count -eq 1) -and ((@(Errs $posPad)[0]) -match $reason)
+}
 Check 'a cursor inside MAIN, below one of its ROUTINEs, breaks on MAIN''s entry (42), not the routine''s' `
   ((PosAdd 'C:\Src\CLBRWS011.CLW' 50) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
-Check 'a cursor further down breaks on the procedure it is actually in (OTHER, 80)' `
+Check 'a cursor inside a procedure with a known extent resolves (OTHER, 80..120)' `
   ((PosAdd 'C:\Src\clbrws011.clw' 90) -ceq 'clbrws011.clw:80') ($posPad._svc.Adds -join ',')
 Check 'a cursor ON the definition line counts as inside it' ((PosAdd 'C:\Src\clbrws011.clw' 42) -ceq 'clbrws011.clw:42') ($posPad._svc.Adds -join ',')
-$none = PosAdd 'C:\Src\clbrws011.clw' 10
-Check 'a cursor above every listed procedure arms nothing, and says why' `
-  (($none -eq '') -and (@(Errs $posPad).Count -eq 1)) ($posPad.Lines -join ' / ')
-Check 'and neither does a file the list does not cover' ((PosAdd 'C:\Src\unlisted.clw' 50) -eq '') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor above the first procedure' (PosRefused 'C:\Src\clbrws011.clw' 10 'above the first') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor BETWEEN procedures, in module data past a known end (clbrws004 31..59)' `
+  (PosRefused 'C:\Src\clbrws004.clw' 45 'past the end of BOUNDED') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor below a procedure''s known end, with nothing after it (OTHER ends at 120)' `
+  (PosRefused 'C:\Src\clbrws011.clw' 130 'past the end of OTHER') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a cursor below the LAST procedure in a module whose end is unknown' `
+  (PosRefused 'C:\Src\clbrws003.clw' 25 'does not know where that procedure ends') ($posPad.Lines -join ' / ')
+Check 'REFUSED: a file the list does not cover' (PosRefused 'C:\Src\unlisted.clw' 50 'no listed procedure is in') ($posPad.Lines -join ' / ')
+Check 'the service reads an engine endLine when there is one, and treats one before the start as unknown' `
+  (((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
+   ((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'end\.HasValue && end\.Value >= line\) \? end\.Value : 0')) ''
 
 # ---- edits, through the real page ---------------------------------------------------------------------
 function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
@@ -1208,6 +1311,24 @@ $pad.EditVar($watchData)
 Check 'an edit on the Watch row the host sent is written' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
 Check 'with the tuple the host issued and the user''s value, untouched by the text inside it' `
   (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A10F0|0x03|4|0|4812|X","va":"0x1","value":"7')) (Sets $pad)
+
+# CONSUMED (codex security gate): the write SPENDS its grant, so the identical request replayed is refused -
+# a grant used to stay good for the whole pause.
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'the identical edit replayed is refused: the grant was spent by the first write' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+# ...and the ENGINE's reply re-issues it, so the user can still edit the same row twice in one pause. The
+# second request is the one the page really sends after its own onVarSet has repainted the cell.
+$watchData2 = if ($pageOut) { DataOf $pageOut.watchEdit2 } else { '' }
+$pad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData2)
+Check 'edit, engine reply, edit again: the second edit through the pad is written' `
+  (($pad._svc.Sets.Count -eq 1) -and ($pad._svc.Sets[0] -ceq '0x4A10F0|0x03|4|0|4812|second')) (Sets $pad)
+# A refusal the HOST makes re-issues nothing: it spent nothing. Replay, refused, then replay again.
+$pad.EditVar($watchData2); $pad._svc.Sets.Clear(); $pad.EditVar($watchData2)
+Check 'a host refusal does not re-issue the grant (only the engine''s reply does)' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+$pad.OnSvcVariableSet('0x4A10F0', $true, 'second', $null)   # the engine answers the second write
 $pad._svc.Sets.Clear()
 $pad.EditVar($treeData)
 Check 'an edit on the NESTED Variables row is written - the grant reached inside children' `
@@ -1240,6 +1361,12 @@ $pad.OnSvcThreadSelected(9001, $true, $null)
 $pad._svc.Sets.Clear()
 $pad.EditVar($watchData)
 Check 'after a thread switch the same edit is refused until the row is re-read' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
+# The write made just before that switch is answered AFTER it: the reply must not resurrect a grant for a row
+# that is no longer current (the clear drops spent grants too).
+$pad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
+$pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'a reply arriving after the rows went stale re-issues nothing' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
 
 # A request the service would not send is said, not dropped: no varset would ever have come.
 $pad.OnWatch($watch)
@@ -1247,6 +1374,10 @@ $pad._svc.AcceptSet = $false; $pad.Posts.Clear()
 $pad.EditVar($watchData)
 Check 'a write SetVariable refused is answered with a failed varset too' `
   (($pad.Posts.Count -ge 1) -and ($pad.Posts[0] -cmatch '"ok":false') -and ($pad.Posts[0] -cmatch 'did not take')) ($pad.Posts -join ' / ')
+# That write never left, so no reply will come to re-issue its grant: it is re-issued at once.
+$pad._svc.AcceptSet = $true; $pad._svc.Sets.Clear()
+$pad.EditVar($watchData)
+Check 'and a write that never left keeps its grant, so a retry goes through' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
 
 # The three other places a stop, resume or exit makes rows stale. Not reachable from this probe (they sit in
 # UI lambdas with live-editor side effects), so they are pinned by POSITION: the clear must come before the
@@ -1260,6 +1391,42 @@ Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'p
 Check 'the frame-locals and expand replies grant their rows as module data does' `
   (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
    ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
+
+# ---- expand is issued like edit (afbc68c7, codex security gate) --------------------------------------
+# A forged expand needs no host-issued row: name a known group type at ANY address and the engine renders its
+# members WITH edit metadata. Forwarded unchecked, those replies minted grants, and EditVar trusts grants.
+# So the host records the expandable rows it issues, forwards only those, and grants an expand reply's rows
+# only when it forwarded that very request.
+$expandData = if ($pageOut) { DataOf $pageOut.expand } else { '' }
+Check 'the page asks to expand the reference row exactly as the host sent it' ($expandData -ceq '1|clbrws011.clw|77|0x4B0000') $expandData
+$xp = New-Object ClarionDebugger.Terminal.BridgePad
+$xp.OnSvcModuleData('clbrws011.clw', $engineRows, 4812)
+Check 'CONTROL: the host recorded the reference row as expandable' ($xp._editGrants.ExpandableCount -eq 1) "$($xp._editGrants.ExpandableCount)"
+$xp.Expand($expandData)
+Check 'an issued reference row is expanded' (($xp._svc.Expands.Count -eq 1) -and ($xp._svc.Expands[0] -ceq '1|clbrws011.clw|77|0x4B0000')) ($xp._svc.Expands -join ',')
+$children = '{"name":"P:N","type":"LONG","value":"3","va":"0x4B0004","typeCode":"0x03","size":4,"places":0},{"name":"P:SUB","type":"","value":"0x4C0000","ref":true,"addr":"0x4C0000","module":"clbrws011.clw","typeRef":78}'
+$xp.OnSvcExpanded('1', $children)
+$xp.EditVar('{"va":"0x4B0004","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"9"}')
+Check 'and the verified reply''s members are editable' ($xp._svc.Sets.Count -eq 1) ($xp._svc.Sets -join ' ; ')
+$xp.Expand('2|clbrws011.clw|78|0x4C0000')
+Check 'and its nested reference can be opened in turn (expand is recursive)' ($xp._svc.Expands.Count -eq 2) ($xp._svc.Expands -join ',')
+
+# THE FORGERY: the same real type, at an address the host never offered.
+$xp._svc.Expands.Clear(); $xp.Posts.Clear(); $xp.Lines.Clear()
+$xp.Expand('3|clbrws011.clw|77|0x500000')
+Check 'a forged expand (an issued type at a non-issued address) is not forwarded' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
+Check 'and is answered: an empty, refused reply for that reqId, and a console line' `
+  (($xp.Posts.Count -eq 1) -and ($xp.Posts[0] -cmatch '"type":"expanded","reqId":"3","items":\[\],"refused":true') -and (@(Errs $xp).Count -eq 1)) ($xp.Posts -join ' / ')
+# Even if an engine reply for it arrived anyway, the host never forwarded it, so its rows grant nothing.
+$xp.OnSvcExpanded('3', '{"name":"F:N","type":"LONG","value":"0","va":"0x500004","typeCode":"0x03","size":4,"places":0}')
+$xp._svc.Sets.Clear()
+$xp.EditVar('{"va":"0x500004","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"9"}')
+Check 'a reply to an expand the host did not forward creates no edit grant' ($xp._svc.Sets.Count -eq 0) ($xp._svc.Sets -join ' ; ')
+# CURRENT, as for edits: a thread switch retires the issued expandable rows.
+$xp.OnSvcThreadSelected(9001, $true, $null)
+$xp._svc.Expands.Clear()
+$xp.Expand($expandData)
+Check 'after a thread switch the old reference row cannot be expanded until re-read' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
 
 # ---- the grant walker on its own ----------------------------------------------------------------------
 $g = New-Object ClarionDebugger.Terminal.EditGrants
@@ -1914,7 +2081,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 292
+$EXPECTED_CHECKS = 319
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

@@ -95,17 +95,106 @@ $stopCalls2 = 0
 $reaped2 = [Lifecycle]::ReapLingeringEngine($quick, 10000, [Func[bool]] { $script:stopCalls2++; $true })
 Check 'CONTROL: an engine that exits within its grace is not stopped' (($reaped2 -eq $false) -and ($stopCalls2 -eq 0)) "reaped=$reaped2 stops=$stopCalls2"
 
-$exitedAt = $svc.IndexOf('case "exited":')
-$exitedArm = if ($exitedAt -ge 0) { $svc.Substring($exitedAt, $svc.IndexOf('break;', $exitedAt) - $exitedAt) } else { '' }
-$exitedArm = Get-CSharpCodeOnly $exitedArm
-$iIdle = $exitedArm.IndexOf('SetState(DebugSessionState.Idle)')
-$iReap = $exitedArm.IndexOf('ReapLingeringEngine(')
-Check 'the "exited" arm goes Idle at once, then starts the reap' (($iIdle -ge 0) -and ($iReap -gt $iIdle)) "idle=$iIdle reap=$iReap"
-Check 'the reap runs off the reader thread' ($exitedArm -match 'Task\.Run\(') ''
-Check 'and stops only the engine it was started for, never a newer session''s' `
-  ($exitedArm -match 'ReferenceEquals\(_proc, exitedEngine\) && Stop\(\)') ''
+Write-Host ''
+Write-Host 'an OLD engine''s late "exited" or Exited cannot end or reap a NEW session (0449e5c9, pipeline run 1)'
+# THE RACE: the engine writes "exited" and dies; its Process.Exited sets Idle before the buffered line is
+# read; the user presses Start and a NEW engine becomes _proc; THEN the old line is handled. The first version
+# captured `_proc` there - the NEW engine - reaped it, and killed the new session 1.5s later.
+#
+# DETERMINISTIC: the two handlers are compiled out of the service and driven with REAL processes in exactly
+# that order. The old engine has already exited (or, second case, is still lingering); the new one is a 30s
+# ping, so "it survived the grace period" cannot be timing luck. TWO SUBSTITUTIONS: the probe's ReapGraceMs is
+# 300 instead of the shipped 1500, so the run is short (the shipped value is pinned separately); and the two
+# ?.Invoke event raises go through probe helpers, for Windows PowerShell 5.1's C# 5 compiler.
+$reportedExitSrc = ((Get-Method 'private void OnEngineReportedExit(Process source)') -replace '^private void', 'public void') -replace 'LogReceived\?\.Invoke\(', 'RaiseLog('
+$processExitedSrc = ((Get-Method 'private void OnEngineProcessExited(Process source)') -replace '^private void', 'public void') -replace 'Exited\?\.Invoke\(', 'RaiseExited('
+$raceSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+namespace Race {
+$(Get-Method 'public enum DebugSessionState')
+public sealed class RaceProbe {
+  public Process _proc;
+  public List<DebugSessionState> States = new List<DebugSessionState>();
+  public DebugSessionState State = DebugSessionState.Launching;
+  public int ExitedRaised = -999;
+  public string CurrentVa = "0x1";
+  public event Action<string> LogReceived;
+  public event Action<int> Exited;
+  public RaceProbe() { Exited += c => ExitedRaised = c; LogReceived += s => { }; }
+  private void SetState(DebugSessionState s) { State = s; States.Add(s); }
+  internal const int ReapGraceMs = 300;
+  $((Get-Method 'internal static bool ReapLingeringEngine(Process engine, int graceMs, Func<bool> stop)') -replace 'internal static', 'public static')
+  $((Get-Method 'internal static bool KillEngine(Process engine)') -replace 'internal static', 'public static')
+  $reportedExitSrc
+  $processExitedSrc
+  // Windows PowerShell 5.1's Add-Type compiles C# 5, which has no ?. - so the two event raises above are
+  // routed through these. The substitution is textual and names the same events; nothing else is edited.
+  private void RaiseLog(string s) { var h = LogReceived; if (h != null) h(s); }
+  private void RaiseExited(int c) { var h = Exited; if (h != null) h(c); }
+}
+}
+"@
+Add-Type -TypeDefinition $raceSrc -Language CSharp | Out-Null
 
-Assert-CheckTotal 19
+function Start-Lingering { $s = New-Object System.Diagnostics.ProcessStartInfo 'ping.exe', '-n 30 127.0.0.1'
+  $s.UseShellExecute = $false; $s.CreateNoWindow = $true; $s.RedirectStandardOutput = $true; [System.Diagnostics.Process]::Start($s) }
+function Start-Exited { $s = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', '/c exit 0'
+  $s.UseShellExecute = $false; $s.CreateNoWindow = $true; $p = [System.Diagnostics.Process]::Start($s); [void]$p.WaitForExit(10000); $p }
+$spawned = New-Object System.Collections.ArrayList
+try {
+  # 1. Diana's sequence exactly: old engine already dead, new one launched, THEN the old "exited" line.
+  $old = Start-Exited; $new = Start-Lingering; [void]$spawned.Add($new)
+  $rp = New-Object Race.RaceProbe; $rp._proc = $new
+  $rp.OnEngineReportedExit($old)
+  Start-Sleep -Milliseconds 1200          # four times the probe's grace
+  Check 'the NEW engine survives the old engine''s late "exited" past the grace period' (-not $new.HasExited) ''
+  Check 'and the new session is not forced Idle' (($rp.States.Count -eq 0) -and ($rp.State -eq [Race.DebugSessionState]::Launching)) "states: $($rp.States -join ',')"
+
+  # 2. The old engine is STILL alive when its line arrives: it, and only it, is reaped.
+  $old2 = Start-Lingering; $new2 = Start-Lingering; [void]$spawned.Add($old2); [void]$spawned.Add($new2)
+  $rp2 = New-Object Race.RaceProbe; $rp2._proc = $new2
+  $rp2.OnEngineReportedExit($old2)
+  [void]$old2.WaitForExit(5000)
+  Check 'a still-lingering OLD engine is reaped' ($old2.HasExited) ''
+  Check 'and the new one is untouched' (-not $new2.HasExited) ''
+
+  # 3. CONTROL: the CURRENT engine's own "exited" still ends the session at once, and still reaps it.
+  $cur = Start-Lingering; [void]$spawned.Add($cur)
+  $rp3 = New-Object Race.RaceProbe; $rp3._proc = $cur
+  $rp3.OnEngineReportedExit($cur)
+  Check 'CONTROL: the current engine''s "exited" sets Idle at once' ($rp3.State -eq [Race.DebugSessionState]::Idle) "$($rp3.State)"
+  [void]$cur.WaitForExit(5000)
+  Check 'CONTROL: and a current engine that lingers is reaped' ($cur.HasExited) ''
+
+  # 4. The pre-existing LOW: an old engine's late Process.Exited cannot end the new session either.
+  $rp4 = New-Object Race.RaceProbe; $rp4._proc = $new
+  $rp4.OnEngineProcessExited($old)
+  Check 'an OLD engine''s Process.Exited neither sets Idle nor raises Exited' `
+    (($rp4.States.Count -eq 0) -and ($rp4.ExitedRaised -eq -999)) "states: $($rp4.States -join ','); exited=$($rp4.ExitedRaised)"
+  $rp5 = New-Object Race.RaceProbe; $rp5._proc = $old
+  $rp5.OnEngineProcessExited($old)
+  Check 'CONTROL: the current engine''s Process.Exited sets Idle and raises Exited with its code' `
+    (($rp5.State -eq [Race.DebugSessionState]::Idle) -and ($rp5.ExitedRaised -eq 0)) "state=$($rp5.State) exited=$($rp5.ExitedRaised)"
+} finally {
+  foreach ($p in $spawned) { try { if (-not $p.HasExited) { $p.Kill() } } catch { } }
+}
+
+# Wiring: every handler Launch attaches is bound to ITS process, and the "exited" arm hands over the source.
+$launchCode = Get-CSharpCodeOnly (Get-Method 'private void Launch(string targetExe, string args, bool interactive)')
+Check 'Launch binds output and Exited to the process it created, not to _proc' `
+  (($launchCode -match 'OnLine\(p, e\.Data\)') -and ($launchCode -match 'p\.Exited \+= \(s, e\) => OnEngineProcessExited\(p\)') -and `
+   ($launchCode -notmatch '_proc\.(ExitCode|OutputDataReceived|Exited)')) ''
+$exitedAt = $svc.IndexOf('case "exited":')
+$exitedArm = if ($exitedAt -ge 0) { Get-CSharpCodeOnly ($svc.Substring($exitedAt, $svc.IndexOf('break;', $exitedAt) - $exitedAt)) } else { '' }
+Check 'the "exited" arm hands the SOURCE process to its handler' ($exitedArm -match 'OnEngineReportedExit\(source\)') ''
+$reportedExit = Get-CSharpCodeOnly (Get-Method 'private void OnEngineReportedExit(Process source)')
+Check 'the reap runs off the reader thread and kills the source, never via Stop()' `
+  (($reportedExit -match 'Task\.Run\(') -and ($reportedExit -match 'KillEngine\(source\)') -and ($reportedExit -notmatch 'Stop\(\)')) ''
+Check 'the shipped grace is 1500ms (the probe above uses 300)' ($svc -match 'internal const int ReapGraceMs = 1500;') ''
+
+Assert-CheckTotal 28
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

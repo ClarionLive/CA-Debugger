@@ -246,6 +246,10 @@ namespace ClarionDebugger.Services
         /// ROUTINE it sits in and the procedure that encloses it; the Procedures PANEL filters them back out
         /// (a routine is not independently navigable the way a procedure is).</summary>
         public string Kind;
+        /// <summary>The procedure's LAST source line when the engine reports one (an <c>endLine</c> member), else
+        /// 0 = unknown. As of 2026-09-22 the engine's symbols output carries only the start, so this is 0 until
+        /// it does; ProcedureIds.Containing then bounds a procedure by the next one's start instead.</summary>
+        public int EndLine;
     }
 
     /// <summary>
@@ -486,21 +490,66 @@ namespace ClarionDebugger.Services
                 WorkingDirectory = Path.GetDirectoryName(targetExe)
             };
 
-            _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
-            _proc.OutputDataReceived += (s, e) => { if (e.Data != null) OnLine(e.Data); };
-            _proc.ErrorDataReceived += (s, e) => { if (e.Data != null) LogReceived?.Invoke(e.Data); };
-            _proc.Exited += (s, e) =>
-            {
-                int code = 0;
-                try { code = _proc.ExitCode; } catch { }
-                SetState(DebugSessionState.Idle);
-                Exited?.Invoke(code);
-            };
+            // Every handler is bound to THIS process, `p`, never to the field. _proc names whichever engine
+            // is CURRENT, and an old engine's buffered output or late Exited can arrive after a new one has
+            // been launched into it - reading _proc there acts on the wrong engine (0449e5c9, pipeline run 1).
+            var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+            p.OutputDataReceived += (s, e) => { if (e.Data != null) OnLine(p, e.Data); };
+            p.ErrorDataReceived += (s, e) => { if (e.Data != null) LogReceived?.Invoke(e.Data); };
+            p.Exited += (s, e) => OnEngineProcessExited(p);
+            _proc = p;
 
             SetState(DebugSessionState.Launching);
-            _proc.Start();
-            _proc.BeginOutputReadLine();
-            _proc.BeginErrorReadLine();
+            p.Start();
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+        }
+
+        /// <summary>An engine PROCESS ended. Only the current engine's end means the session is over: an old
+        /// engine that dies after a new one was launched must not set the new session Idle, nor raise Exited
+        /// (whose handler clears the pad's session state) on its behalf.</summary>
+        private void OnEngineProcessExited(Process source)
+        {
+            if (!ReferenceEquals(source, _proc)) return;
+            int code = 0;
+            try { code = source.ExitCode; } catch { }
+            SetState(DebugSessionState.Idle);
+            Exited?.Invoke(code);
+        }
+
+        /// <summary>The engine reported "exited": its DEBUGGEE finished. Idle at once, by the Owner's decision
+        /// (0449e5c9 option C) - but only when <paramref name="source"/> is the CURRENT engine. The line is
+        /// read off a buffered pipe and can arrive after that engine's own Exited has already set Idle and a
+        /// new session has been launched; acting on it then would declare the NEW session over.
+        /// <para>
+        /// The reap is always of <paramref name="source"/>: it is given ReapGraceMs to exit and is then killed
+        /// by <see cref="KillEngine"/>, which acts on that process object and nothing else. A Start meanwhile
+        /// is refused honestly (<see cref="DecideLaunch"/>).
+        /// </para></summary>
+        private void OnEngineReportedExit(Process source)
+        {
+            if (ReferenceEquals(source, _proc))
+            {
+                CurrentVa = null;
+                SetState(DebugSessionState.Idle);
+            }
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try { ReapLingeringEngine(source, ReapGraceMs, () => KillEngine(source)); }
+                catch (Exception ex) { LogReceived?.Invoke("[stop] reap after exit failed: " + ex.Message); }
+            });
+        }
+
+        /// <summary>Kill <paramref name="engine"/> - that process, not whatever _proc names by now - and wait,
+        /// bounded, for it to go. True when it is confirmed gone. Used only for an engine that has already
+        /// reported its debuggee exited, so there is no session left in it to quit cleanly.</summary>
+        internal static bool KillEngine(Process engine)
+        {
+            if (engine == null) return true;
+            try { if (!engine.HasExited) engine.Kill(); }
+            catch { }
+            try { return engine.WaitForExit(3000); }
+            catch { return false; }
         }
 
         /// <summary>True when the engine process is CONFIRMED gone — no process at all, or the OS says this
@@ -533,7 +582,8 @@ namespace ClarionDebugger.Services
         ///
         /// The one path that reports Idle WITHOUT this check is the engine's "exited" event (the DEBUGGEE
         /// finished): it sets Idle at once by decision (0449e5c9 option C), and covers the engine process's
-        /// remaining lifetime by reaping it (<see cref="ReapLingeringEngine"/>, which calls this) and by
+        /// remaining lifetime by reaping THAT process (<see cref="ReapLingeringEngine"/> with <see cref="KillEngine"/>, not
+        /// this method - Stop() reads _proc, which may name a newer engine by then) and by
         /// refusing a Start until it is gone (<see cref="DecideLaunch"/>).
         ///
         /// BLOCKS (WaitForExit) — must be called OFF the UI thread when a session is live. Current callers comply
@@ -845,7 +895,9 @@ namespace ClarionDebugger.Services
 
         // ------------------------------------------------------------------ event stream parsing
 
-        private void OnLine(string line)
+        /// <param name="source">The engine process that wrote this line. Only the "exited" arm needs it
+        /// today (as of 2026-09-22); it is passed for every line so no arm can reach for _proc instead.</param>
+        private void OnLine(Process source, string line)
         {
             if (!line.StartsWith("@JSON ", StringComparison.Ordinal))
             {
@@ -1041,21 +1093,7 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "exited":
-                    CurrentVa = null;
-                    // Idle at once, by the Owner's decision (0449e5c9 option C): the run is over as far as the
-                    // user is concerned. The engine PROCESS may still be closing, so it is given ReapGraceMs to
-                    // exit and then stopped, off this reader thread; a Start meanwhile is refused honestly.
-                    SetState(DebugSessionState.Idle);
-                    var exitedEngine = _proc;
-                    System.Threading.Tasks.Task.Run(() =>
-                    {
-                        try
-                        {
-                            ReapLingeringEngine(exitedEngine, ReapGraceMs,
-                                () => ReferenceEquals(_proc, exitedEngine) && Stop());
-                        }
-                        catch (Exception ex) { LogReceived?.Invoke("[stop] reap after exit failed: " + ex.Message); }
-                    });
+                    OnEngineReportedExit(source);
                     break;
 
                 default:
@@ -1462,7 +1500,9 @@ namespace ClarionDebugger.Services
                     if (kind != "procedure" && kind != "method" && kind != "routine") continue;
                     int line = GetInt(obj, "line");
                     if (line <= 0) continue;
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind });
+                    int? end = GetIntOrNull(obj, "endLine");
+                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
+                                                  EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0 });
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }
