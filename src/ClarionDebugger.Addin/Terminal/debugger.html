@@ -1056,16 +1056,15 @@
   $('procList').addEventListener('contextmenu',e=>{
     const row=e.target.closest('.proc'); if(!row) return;
     e.preventDefault();
-    procCtx={ name:row.dataset.name||'', module:row.dataset.module||'', line:parseInt(row.dataset.line||'0',10) };
+    procCtx={ id:row.dataset.pid||'', name:row.dataset.name||'' };
     const m=$('procMenu'); m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; m.style.top=e.clientY+'px'; m.classList.add('show');
   });
   $('miBpEntry').onclick=()=>{ $('procMenu').classList.remove('show');
-    if(!procCtx||!procCtx.module||!procCtx.line||isNaN(procCtx.line)) return;
-    // Field order here is free. This used to read "module+line FIRST so the host's minimal JSON parser
-    // reads them before the (untrusted) proc name" — a real constraint of the IndexOf scanner that
-    // ae5b678a stage 1 retired. The host now reads by key (JsonVal -> JsonMessageReader.ReadField), which
-    // walks the object and matches only top-level members, so no field can be reached past another.
-    send('breakonprocentry', JSON.stringify({ module:procCtx.module, line:procCtx.line, name:procCtx.name })); };
+    if(!procCtx||!procCtx.id) return;
+    // Only the row's id goes back (afbc68c7). The host issued it with the list and resolves it to a module
+    // and line on its own side, so nothing the page holds - including a name out of the debuggee's own
+    // symbols - decides where the breakpoint lands.
+    send('breakonprocentry', JSON.stringify({ id:procCtx.id })); };
   function removeWatch(name){ const k=watchedKey(name);
     // saveWatches() on removal too, or a name you deleted comes back at the next startup. With no target
     // resolved there is nowhere to write it, so remember that a removal is outstanding — see untargetedRemoval.
@@ -2221,8 +2220,9 @@
     // so interpolating them into an HTML attribute would be an injection sink).
     listed.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
-      // module/line/name for the right-click "Break on entry" action (dataset assignment is injection-safe)
-      d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
+      // The host's id for this row is what the right-click "Break on entry" sends back; the host looks up
+      // the module and line itself (dataset assignment is injection-safe).
+      d.dataset.pid=p.id||''; d.dataset.module=module; d.dataset.line=p.line; d.dataset.name=name;
       const nm=document.createElement('span'); nm.className='procname'; nm.textContent=name;
       const fl=document.createElement('span'); fl.className='procfile'; fl.textContent=module;
       fl.title='Open '+module+' at line '+p.line;

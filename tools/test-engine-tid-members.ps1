@@ -212,30 +212,36 @@ Write-Host ''
 $ruleSrc = [IO.File]::ReadAllText($ruleFile)
 $names = @(Get-DeclaredTidMemberNames $ruleSrc)
 
-Check 'DebugEngine.cs declares the thread-id member names in one array' ($names.Count -gt 0) `
-      'TidValuedMemberNames was not found -- the set this check reads is gone'
-Check 'all declared names resolved through their TidMember* constants' `
-      (-not ($names | Where-Object { $_ -like '<unresolved:*' })) "got: $($names -join ', ')"
-# THREE, and the number is read off the code above rather than asserted against a retyped list. It is
-# stated here so that adding a name is a decision someone makes on purpose, in two files, not a drift.
-Check 'the engine declares 3 thread-id member names' ($names.Count -eq 3) "got $($names.Count): $($names -join ', ')"
+Invoke-CheckSection 'the declared thread-id member names are read off DebugEngine.cs' {
+  Check 'DebugEngine.cs declares the thread-id member names in one array' ($names.Count -gt 0) `
+        'TidValuedMemberNames was not found -- the set this check reads is gone'
+  Check 'all declared names resolved through their TidMember* constants' `
+        (-not ($names | Where-Object { $_ -like '<unresolved:*' })) "got: $($names -join ', ')"
+  # THREE, and the number is read off the code above rather than asserted against a retyped list. It is
+  # stated here so that adding a name is a decision someone makes on purpose, in two files, not a drift.
+  Check 'the engine declares 3 thread-id member names' ($names.Count -eq 3) "got $($names.Count): $($names -join ', ')"
+}
 
 # The writer must be name-AGNOSTIC: it builds the member from its parameter, so it contains no declared
 # name as JSON text. If it ever grows one, this check's absolute would need an exception, and it does not.
-$writer = Get-CSharpBlock 'private static void AppendTidValuedMember(' $ruleSrc
-Check 'the shared writer exists' ($null -ne $writer) 'AppendTidValuedMember was not found in DebugEngine.cs'
-if ($writer) {
-  $writerHits = 0
-  foreach ($n in $names) { $writerHits += (Get-MemberNameHits $writer $n) }
-  Check 'the shared writer types no member name of its own' ($writerHits -eq 0) `
-        'it builds the name from its parameter, so the rule below needs no exception for it'
+Invoke-CheckSection 'the shared writer types no member name of its own' {
+  $writer = Get-CSharpBlock 'private static void AppendTidValuedMember(' $ruleSrc
+  Check 'the shared writer exists' ($null -ne $writer) 'AppendTidValuedMember was not found in DebugEngine.cs'
+  if ($writer) {
+    $writerHits = 0
+    foreach ($n in $names) { $writerHits += (Get-MemberNameHits $writer $n) }
+    Check 'the shared writer types no member name of its own' ($writerHits -eq 0) `
+          'it builds the name from its parameter, so the rule below needs no exception for it'
+  }
 }
 
 # The checker's exclusion, earned rather than assumed: it writes nothing to the wire.
-$checkerSrc = [IO.File]::ReadAllText((Join-Path $engineDir $checkerFile))
-Check "$checkerFile emits nothing to the wire, so excluding it is safe" `
-      ($checkerSrc.IndexOf('"@JSON', [StringComparison]::Ordinal) -lt 0) `
-      'it now carries the @JSON emit marker and can no longer be treated as a pure checker'
+Invoke-CheckSection 'the checker''s exclusion is earned' {
+  $checkerSrc = [IO.File]::ReadAllText((Join-Path $engineDir $checkerFile))
+  Check "$checkerFile emits nothing to the wire, so excluding it is safe" `
+        ($checkerSrc.IndexOf('"@JSON', [StringComparison]::Ordinal) -lt 0) `
+        'it now carries the @JSON emit marker and can no longer be treated as a pure checker'
+}
 
 $sources = @{}
 foreach ($f in (Get-ChildItem -Path $engineDir -Filter *.cs -File | Sort-Object Name)) {
@@ -243,26 +249,30 @@ foreach ($f in (Get-ChildItem -Path $engineDir -Filter *.cs -File | Sort-Object 
   $sources[$f.Name] = [IO.File]::ReadAllText($f.FullName)
 }
 # CONTROL for the exclusion above: the marker it keys on has to be real somewhere, or the check is empty.
-Check 'the @JSON emit marker exists in the scanned sources' `
-      (@($sources.Values | Where-Object { $_.IndexOf('"@JSON', [StringComparison]::Ordinal) -ge 0 }).Count -gt 0) `
-      'nothing emits @JSON any more -- the marker this keys on has moved'
+Invoke-CheckSection 'the @JSON emit marker is real in the scanned sources' {
+  Check 'the @JSON emit marker exists in the scanned sources' `
+        (@($sources.Values | Where-Object { $_.IndexOf('"@JSON', [StringComparison]::Ordinal) -ge 0 }).Count -gt 0) `
+        'nothing emits @JSON any more -- the marker this keys on has moved'
+}
 
-$hits = @(Invoke-Scan $sources $names)
-$bypasses = @($hits | Where-Object { -not $_.Boolean })
-$booleans = @($hits | Where-Object { $_.Boolean })
+Invoke-CheckSection 'no thread-id member name is typed as JSON text outside the writer' {
+  $hits = @(Invoke-Scan $sources $names)
+  $bypasses = @($hits | Where-Object { -not $_.Boolean })
+  $booleans = @($hits | Where-Object { $_.Boolean })
 
-Check 'no declared thread-id member name is written as JSON text outside the writer' ($bypasses.Count -eq 0) `
-      ($(if ($bypasses.Count) {
-           ($bypasses | ForEach-Object { "$($_.File):$($_.Line) typed $($_.Name) as $($_.Literal)" }) -join ' | '
-         } else { '' }))
+  Check 'no declared thread-id member name is written as JSON text outside the writer' ($bypasses.Count -eq 0) `
+        ($(if ($bypasses.Count) {
+             ($bypasses | ForEach-Object { "$($_.File):$($_.Line) typed $($_.Name) as $($_.Literal)" }) -join ' | '
+           } else { '' }))
 
-# The per-row BOOLEANS that share these names. THREE of them, each named, because "some booleans are fine"
-# would let a fourth one in without anybody looking at it. They are:
-#   DebugEngine.Threads.cs    a row's "stopped"  (is this the thread execution halted on?)
-#   DebugEngine.Threads.cs    a row's "selected" (is this the thread the reads are pointed at?)
-#   DebugEngine.ThreadScan.cs a row's "stopped"
-Check 'exactly 3 same-named members are per-row booleans' ($booleans.Count -eq 3) `
-      "got $($booleans.Count): $(($booleans | ForEach-Object { "$($_.File):$($_.Line) $($_.Name)" }) -join ', ')"
+  # The per-row BOOLEANS that share these names. THREE of them, each named, because "some booleans are fine"
+  # would let a fourth one in without anybody looking at it. They are:
+  #   DebugEngine.Threads.cs    a row's "stopped"  (is this the thread execution halted on?)
+  #   DebugEngine.Threads.cs    a row's "selected" (is this the thread the reads are pointed at?)
+  #   DebugEngine.ThreadScan.cs a row's "stopped"
+  Check 'exactly 3 same-named members are per-row booleans' ($booleans.Count -eq 3) `
+        "got $($booleans.Count): $(($booleans | ForEach-Object { "$($_.File):$($_.Line) $($_.Name)" }) -join ', ')"
+}
 
 # ---------------------------------------------------------------- the hole in the check above
 #
@@ -325,24 +335,26 @@ function Get-NamelessDelimiters([hashtable] $Sources, [array] $AllowedRanges) {
   return $out
 }
 
-$allowedRanges = Get-AllowedRanges $ruleSrc
-Check 'both rule-holder blocks were located in DebugEngine.cs' ($allowedRanges.Count -eq 2) `
-      "found $($allowedRanges.Count) of 2 (AppendTidValuedMember, WithTid) - without them every writer line reads as a bypass"
+Invoke-CheckSection 'no member name is assembled around a variable outside the rule holder' {
+  $allowedRanges = Get-AllowedRanges $ruleSrc
+  Check 'both rule-holder blocks were located in DebugEngine.cs' ($allowedRanges.Count -eq 2) `
+        "found $($allowedRanges.Count) of 2 (AppendTidValuedMember, WithTid) - without them every writer line reads as a bypass"
 
-$nameless_hits = @(Get-NamelessDelimiters $sources $allowedRanges)
-$namelessBad = @($nameless_hits | Where-Object { -not $_.Allowed })
-Check 'no member name is ASSEMBLED around a variable outside the rule holder' ($namelessBad.Count -eq 0) `
-      ($(if ($namelessBad.Count) {
-           ($namelessBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ' | '
-         } else { '' }))
-# CONTROL: the writer's own delimiters must still be FOUND, or the check above passes because the walk
-# sees nothing rather than because there is nothing to see. FOUR, and the number is checkable against the
-# two rule holders: AppendTidValuedMember opens with `,\"` and closes with `\":`, WithTid opens with `{\"`
-# and closes with `\":`. (It said 3 first, from a grep that did not show WithTid's opener; the check
-# disagreed with the claim and the check was right, which is the entire argument for stating a number.)
-$namelessOk = @($nameless_hits | Where-Object { $_.Allowed })
-Check 'and the rule holder still assembles its own (4 delimiter literals)' ($namelessOk.Count -eq 4) `
-      "got $($namelessOk.Count): $(($namelessOk | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ', ')"
+  $nameless_hits = @(Get-NamelessDelimiters $sources $allowedRanges)
+  $namelessBad = @($nameless_hits | Where-Object { -not $_.Allowed })
+  Check 'no member name is ASSEMBLED around a variable outside the rule holder' ($namelessBad.Count -eq 0) `
+        ($(if ($namelessBad.Count) {
+             ($namelessBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ' | '
+           } else { '' }))
+  # CONTROL: the writer's own delimiters must still be FOUND, or the check above passes because the walk
+  # sees nothing rather than because there is nothing to see. FOUR, and the number is checkable against the
+  # two rule holders: AppendTidValuedMember opens with `,\"` and closes with `\":`, WithTid opens with `{\"`
+  # and closes with `\":`. (It said 3 first, from a grep that did not show WithTid's opener; the check
+  # disagreed with the claim and the check was right, which is the entire argument for stating a number.)
+  $namelessOk = @($nameless_hits | Where-Object { $_.Allowed })
+  Check 'and the rule holder still assembles its own (4 delimiter literals)' ($namelessOk.Count -eq 4) `
+        "got $($namelessOk.Count): $(($namelessOk | ForEach-Object { "$($_.File):$($_.Line) $($_.Text)" }) -join ', ')"
+}
 
 # ---------------------------------------------------------------- a thread id headed for a HUMAN
 #
@@ -403,35 +415,39 @@ function Get-ThreadPrefixSites([hashtable] $Sources) {
 
 $tidSrc = @{}
 foreach ($f in $tidTextFiles) { $tidSrc[$f] = [IO.File]::ReadAllText((Join-Path $engineDir $f)) }
-$tidSites = @(Get-ThreadPrefixSites $tidSrc)
-$tidBad = @($tidSites | Where-Object { -not $_.ViaTidText -and -not $_.Exempt })
-Check 'every "thread " message that is not an echo renders its id through TidText' ($tidBad.Count -eq 0) `
-      ($(if ($tidBad.Count) { ($tidBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Literal) $($_.Tail)" }) -join ' | ' } else { '' }))
-# CONTROL: the scan must SEE the real sites, or the rule above is satisfied by finding nothing at all.
-$tidGood = @($tidSites | Where-Object { $_.ViaTidText })
-Check 'and the scan actually reaches them (9 sites go through TidText)' ($tidGood.Count -eq 9) `
-      "found $($tidGood.Count)"
-# A NUMBER, not "some": a fourth exemption must be argued for, not absorbed.
-$tidEx = @($tidSites | Where-Object { $_.Exempt })
-Check 'exactly 3 exempt sites, all of them echoes or a Clarion thread number' ($tidEx.Count -eq 3) `
-      "found $($tidEx.Count): $(($tidEx | ForEach-Object { "$($_.File):$($_.Line)" }) -join ', ')"
+Invoke-CheckSection 'every thread id headed for a human goes through TidText' {
+  $tidSites = @(Get-ThreadPrefixSites $tidSrc)
+  $tidBad = @($tidSites | Where-Object { -not $_.ViaTidText -and -not $_.Exempt })
+  Check 'every "thread " message that is not an echo renders its id through TidText' ($tidBad.Count -eq 0) `
+        ($(if ($tidBad.Count) { ($tidBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Literal) $($_.Tail)" }) -join ' | ' } else { '' }))
+  # CONTROL: the scan must SEE the real sites, or the rule above is satisfied by finding nothing at all.
+  $tidGood = @($tidSites | Where-Object { $_.ViaTidText })
+  Check 'and the scan actually reaches them (9 sites go through TidText)' ($tidGood.Count -eq 9) `
+        "found $($tidGood.Count)"
+  # A NUMBER, not "some": a fourth exemption must be argued for, not absorbed.
+  $tidEx = @($tidSites | Where-Object { $_.Exempt })
+  Check 'exactly 3 exempt sites, all of them echoes or a Clarion thread number' ($tidEx.Count -eq 3) `
+        "found $($tidEx.Count): $(($tidEx | ForEach-Object { "$($_.File):$($_.Line)" }) -join ', ')"
+}
 
 # ---------------------------------------------------------------- the scope this check assumes
 #
 # It scans src\ClarionDbg.Cli and nothing else, which is only correct while that is where the wire is
 # written. ClarionDbg.Core carries no JSON emitter today; if one appears there, this check goes quiet
 # rather than wrong, which is the worse failure. So the assumption is asserted rather than left implicit.
-$coreDir = Join-Path $repo 'src\ClarionDbg.Core'
-$coreJson = @()
-if (Test-Path $coreDir) {
-  $coreJson = @(Get-ChildItem -Path $coreDir -Filter *.cs -File -Recurse | Where-Object {
-    $t = [IO.File]::ReadAllText($_.FullName)
-    $t.IndexOf('"@JSON', [StringComparison]::Ordinal) -ge 0 -or $t.IndexOf('\"event\":', [StringComparison]::Ordinal) -ge 0
-  })
+Invoke-CheckSection 'ClarionDbg.Core writes no wire JSON' {
+  $coreDir = Join-Path $repo 'src\ClarionDbg.Core'
+  $coreJson = @()
+  if (Test-Path $coreDir) {
+    $coreJson = @(Get-ChildItem -Path $coreDir -Filter *.cs -File -Recurse | Where-Object {
+      $t = [IO.File]::ReadAllText($_.FullName)
+      $t.IndexOf('"@JSON', [StringComparison]::Ordinal) -ge 0 -or $t.IndexOf('\"event\":', [StringComparison]::Ordinal) -ge 0
+    })
+  }
+  Check 'ClarionDbg.Core writes no wire JSON, so scanning only ClarionDbg.Cli is the whole surface' `
+        ($coreJson.Count -eq 0) `
+        "$(($coreJson | ForEach-Object { $_.Name }) -join ', ') now emit(s) events - widen the scan or this check is silently partial"
 }
-Check 'ClarionDbg.Core writes no wire JSON, so scanning only ClarionDbg.Cli is the whole surface' `
-      ($coreJson.Count -eq 0) `
-      "$(($coreJson | ForEach-Object { $_.Name }) -join ', ') now emit(s) events - widen the scan or this check is silently partial"
 
 # ---------------------------------------------------------------- mutation self-test
 #
@@ -441,90 +457,137 @@ Check 'ClarionDbg.Core writes no wire JSON, so scanning only ClarionDbg.Cli is t
 
 if ($SelfTest) {
   Write-Host ''
-  Write-Host '  -- mutation self-test (each must be CAUGHT) --'
+  Invoke-CheckSection 'mutation self-test (each must be CAUGHT)' {
 
-  function Test-Mutation([string] $What, [string] $File, [string] $Find, [string] $Replace, [string] $Expect) {
+    # EVERY RULE THIS FILE ENFORCES, by the name Test-Mutation's switch knows it under (ticket 6874c2d1). The
+    # last check below requires each to have been CAUGHT at least once, so a rule added to the file without a
+    # mutation here fails the self-test instead of leaving the table claiming less than the file enforces -
+    # which is what happened to the TidText rule, proved once by a pipeline verifier and then nowhere.
+    $RuleKinds = @('bypass', 'boolean', 'nameless', 'namelessCount', 'tidtext', 'tidtextCount')
+    $script:caughtKinds = @()
+
+    function Test-Mutation([string] $What, [string] $File, [string] $Find, [string] $Replace, [string] $Expect) {
+      $mut = @{}
+      foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
+      if (-not $mut.ContainsKey($File)) { Check "mutation '$What'" $false "no such file $File"; return }
+      if ($mut[$File].IndexOf($Find, [StringComparison]::Ordinal) -lt 0) {
+        Check "mutation '$What'" $false "the text it mutates is not in $File -- the mutation is vacuous"
+        return
+      }
+      $mut[$File] = $mut[$File].Replace($Find, $Replace)
+      $h = @(Invoke-Scan $mut $names)
+      $b = @($h | Where-Object { -not $_.Boolean })
+      $bl = @($h | Where-Object { $_.Boolean })
+      # The nameless-delimiter scan re-derives its allowed ranges from the MUTATED DebugEngine.cs, or a
+      # mutation that shifted offsets in that file would show up as a bypass for the wrong reason.
+      $nd = @(Get-NamelessDelimiters $mut (Get-AllowedRanges $mut[$ruleFileName]))
+      $ndBad = @($nd | Where-Object { -not $_.Allowed })
+      $ndOk  = @($nd | Where-Object { $_.Allowed })
+      # The TidText scan over the same mutated copy, restricted to the files the real scan reads.
+      $mutTid = @{}
+      foreach ($f in $tidTextFiles) { $mutTid[$f] = $mut[$f] }
+      $ts = @(Get-ThreadPrefixSites $mutTid)
+      $tsBad  = @($ts | Where-Object { -not $_.ViaTidText -and -not $_.Exempt })
+      $tsGood = @($ts | Where-Object { $_.ViaTidText })
+      $caught = switch ($Expect) {
+        'bypass'        { $b.Count -gt 0 }
+        'boolean'       { $bl.Count -ne 3 }
+        'nameless'      { $ndBad.Count -gt 0 }
+        'namelessCount' { $ndOk.Count -ne 4 }
+        'tidtext'       { $tsBad.Count -gt 0 }
+        'tidtextCount'  { $tsGood.Count -ne 9 }
+        default         { $false }
+      }
+      if ($caught) { $script:caughtKinds += $Expect }
+      Check "CAUGHT: $What" $caught `
+            ("bypasses=$($b.Count) booleans=$($bl.Count) assembled-outside=$($ndBad.Count) writer-delims=$($ndOk.Count)" +
+             " raw-thread-sites=$($tsBad.Count) tidtext-sites=$($tsGood.Count)")
+    }
+
+    # 1. The exact defect the rule exists to stop: a new emitter types the member.
+    Test-Mutation 'a fifth emitter types ,"tid": into a StringBuilder' 'DebugEngine.Threads.cs' `
+      'sb.Append("{\"event\":\"threads\"");' `
+      'sb.Append("{\"event\":\"threads\"").Append(",\"tid\":").Append(stoppedTid);' 'bypass'
+
+    # 2. The same thing under one of the OTHER names -- the hole this ticket was opened for.
+    Test-Mutation 'a top-level "stopped" goes back to a raw append' 'DebugEngine.ThreadScan.cs' `
+      'AppendTidValuedMember(sb, TidMemberStopped, stoppedTid);' `
+      'sb.Append(",\"stopped\":").Append(stoppedTid);' 'bypass'
+
+    # 3. A row's boolean flag turned into a thread id -- the name is unchanged, so only the VALUE test sees
+    #    it. This is the case a name-based scanner would wave through.
+    Test-Mutation 'a row boolean is swapped for a raw tid under the same name' 'DebugEngine.Threads.cs' `
+      '.Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")' `
+      '.Append(",\"stopped\":").Append(p.Tid)' 'bypass'
+
+    # 4. A bypass hidden in a verbatim string, which the escape form would miss.
+    Test-Mutation 'a bypass laundered through a verbatim string' 'DebugEngine.Threads.cs' `
+      'sb.Append("{\"event\":\"threads\"");' `
+      'sb.Append("{\"event\":\"threads\"").Append(@",""tid"":").Append(stoppedTid);' 'bypass'
+
+    # 5. A boolean row flag deleted: the count is a claim, so it has to fail when it stops being true.
+    Test-Mutation 'a per-row boolean disappears' 'DebugEngine.ThreadScan.cs' `
+      '.Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")' `
+      '.Append("")' 'boolean'
+
+    # 6. THE HOLE IN EVERY CHECK ABOVE: a member whose NAME IS NEVER IN A LITERAL, assembled around a
+    #    variable the way the shared writer itself does it. Every name-based check is blind to this by
+    #    construction, which is why the delimiter rule exists at all.
+    Test-Mutation 'a member name assembled around a variable, outside the writer' 'DebugEngine.Threads.cs' `
+      'sb.Append("{\"event\":\"threads\"");' `
+      'sb.Append("{\"event\":\"threads\"").Append(",\"").Append(TidMemberStopped).Append("\":").Append(stoppedTid);' `
+      'nameless'
+
+    # 7. And the CONTROL for that rule: the writer's own 4 delimiters must still be found where they are.
+    #    Without this, mutation 6 would pass just as well against a version that found nothing anywhere.
+    Test-Mutation 'one of the writer''s own delimiters goes missing' 'DebugEngine.cs' `
+      'sb.Append(",\"").Append(name).Append("\":").Append(tid);' `
+      'sb.Append(",").Append(Json.Str(name)).Append(":").Append(tid);' `
+      'namelessCount'
+
+    # 8-9. THE TidText RULE, the two mutations the Run 2 verifier ran by hand (6874c2d1). A REVERTED site: an
+    #    existing TidText(...) changed back to the raw id. It must be reported by file:line, AND the control
+    #    must drop from 9 to 8 - one mutation, two rules, so it is run once per rule.
+    Test-Mutation 'a TidText site reverted to the raw id is reported' 'DebugEngine.VarEdit.cs' `
+      '" touches thread " + TidText(OwnerTid) + "''s copy of the "' `
+      '" touches thread " + OwnerTid + "''s copy of the "' 'tidtext'
+    Test-Mutation '...and the same revert drops the TidText control from 9' 'DebugEngine.VarEdit.cs' `
+      '" touches thread " + TidText(OwnerTid) + "''s copy of the "' `
+      '" touches thread " + OwnerTid + "''s copy of the "' 'tidtextCount'
+
+    # 10. A BRAND-NEW raw site nobody has written yet - the case the runtime check in ProtocolCheck cannot
+    #    see, and the reason this source rule exists. The 9 real sites are untouched, so only the rule fires.
+    Test-Mutation 'a new raw "thread " + id site is reported' 'DebugEngine.VarEdit.cs' `
+      '" and thread " + TidText(SelectedTid) + " has no instance of it";' `
+      '" and thread " + TidText(SelectedTid) + " has no instance of it" + "; last written by thread " + OwnerTid;' 'tidtext'
+
+    # 6. THE CONTROL FOR THE WALK ITSELF. A member name typed in a COMMENT must NOT be reported -- the rule
+    #    holder's own comments are full of them, and a check that cries wolf on prose gets deleted.
     $mut = @{}
     foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
-    if (-not $mut.ContainsKey($File)) { Check "mutation '$What'" $false "no such file $File"; return }
-    if ($mut[$File].IndexOf($Find, [StringComparison]::Ordinal) -lt 0) {
-      Check "mutation '$What'" $false "the text it mutates is not in $File -- the mutation is vacuous"
-      return
-    }
-    $mut[$File] = $mut[$File].Replace($Find, $Replace)
+    $mut['DebugEngine.Threads.cs'] = $mut['DebugEngine.Threads.cs'].Replace(
+      'sb.Append("{\"event\":\"threads\"");',
+      "// a comment that writes ,\`"tid\`": and ,\`"stopped\`": in prose" + [Environment]::NewLine +
+      '            sb.Append("{\"event\":\"threads\"");')
     $h = @(Invoke-Scan $mut $names)
-    $b = @($h | Where-Object { -not $_.Boolean })
-    $bl = @($h | Where-Object { $_.Boolean })
-    # The nameless-delimiter scan re-derives its allowed ranges from the MUTATED DebugEngine.cs, or a
-    # mutation that shifted offsets in that file would show up as a bypass for the wrong reason.
-    $nd = @(Get-NamelessDelimiters $mut (Get-AllowedRanges $mut[$ruleFileName]))
-    $ndBad = @($nd | Where-Object { -not $_.Allowed })
-    $ndOk  = @($nd | Where-Object { $_.Allowed })
-    $caught = switch ($Expect) {
-      'bypass'        { $b.Count -gt 0 }
-      'boolean'       { $bl.Count -ne 3 }
-      'nameless'      { $ndBad.Count -gt 0 }
-      'namelessCount' { $ndOk.Count -ne 4 }
-      default         { $false }
-    }
-    Check "CAUGHT: $What" $caught `
-          "bypasses=$($b.Count) booleans=$($bl.Count) assembled-outside=$($ndBad.Count) writer-delims=$($ndOk.Count)"
+    Check 'NOT caught (correctly): the same text in a COMMENT' `
+          ((@($h | Where-Object { -not $_.Boolean })).Count -eq 0) `
+          'a member name discussed in prose was reported as an emit'
+
+    # The table covers the file: every rule above was seen to fail at least once.
+    $uncovered = @($RuleKinds | Where-Object { $script:caughtKinds -notcontains $_ })
+    Check "every rule has a caught self-test mutation ($($RuleKinds.Count) rules)" ($uncovered.Count -eq 0) `
+          $(if ($uncovered.Count) { "no caught mutation for: $($uncovered -join ', ')" } else { '' })
   }
-
-  # 1. The exact defect the rule exists to stop: a new emitter types the member.
-  Test-Mutation 'a fifth emitter types ,"tid": into a StringBuilder' 'DebugEngine.Threads.cs' `
-    'sb.Append("{\"event\":\"threads\"");' `
-    'sb.Append("{\"event\":\"threads\"").Append(",\"tid\":").Append(stoppedTid);' 'bypass'
-
-  # 2. The same thing under one of the OTHER names -- the hole this ticket was opened for.
-  Test-Mutation 'a top-level "stopped" goes back to a raw append' 'DebugEngine.ThreadScan.cs' `
-    'AppendTidValuedMember(sb, TidMemberStopped, stoppedTid);' `
-    'sb.Append(",\"stopped\":").Append(stoppedTid);' 'bypass'
-
-  # 3. A row's boolean flag turned into a thread id -- the name is unchanged, so only the VALUE test sees
-  #    it. This is the case a name-based scanner would wave through.
-  Test-Mutation 'a row boolean is swapped for a raw tid under the same name' 'DebugEngine.Threads.cs' `
-    '.Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")' `
-    '.Append(",\"stopped\":").Append(p.Tid)' 'bypass'
-
-  # 4. A bypass hidden in a verbatim string, which the escape form would miss.
-  Test-Mutation 'a bypass laundered through a verbatim string' 'DebugEngine.Threads.cs' `
-    'sb.Append("{\"event\":\"threads\"");' `
-    'sb.Append("{\"event\":\"threads\"").Append(@",""tid"":").Append(stoppedTid);' 'bypass'
-
-  # 5. A boolean row flag deleted: the count is a claim, so it has to fail when it stops being true.
-  Test-Mutation 'a per-row boolean disappears' 'DebugEngine.ThreadScan.cs' `
-    '.Append(",\"stopped\":").Append(p.IsStopped ? "true" : "false")' `
-    '.Append("")' 'boolean'
-
-  # 6. THE HOLE IN EVERY CHECK ABOVE: a member whose NAME IS NEVER IN A LITERAL, assembled around a
-  #    variable the way the shared writer itself does it. Every name-based check is blind to this by
-  #    construction, which is why the delimiter rule exists at all.
-  Test-Mutation 'a member name assembled around a variable, outside the writer' 'DebugEngine.Threads.cs' `
-    'sb.Append("{\"event\":\"threads\"");' `
-    'sb.Append("{\"event\":\"threads\"").Append(",\"").Append(TidMemberStopped).Append("\":").Append(stoppedTid);' `
-    'nameless'
-
-  # 7. And the CONTROL for that rule: the writer's own 4 delimiters must still be found where they are.
-  #    Without this, mutation 6 would pass just as well against a version that found nothing anywhere.
-  Test-Mutation 'one of the writer''s own delimiters goes missing' 'DebugEngine.cs' `
-    'sb.Append(",\"").Append(name).Append("\":").Append(tid);' `
-    'sb.Append(",").Append(Json.Str(name)).Append(":").Append(tid);' `
-    'namelessCount'
-
-  # 6. THE CONTROL FOR THE WALK ITSELF. A member name typed in a COMMENT must NOT be reported -- the rule
-  #    holder's own comments are full of them, and a check that cries wolf on prose gets deleted.
-  $mut = @{}
-  foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
-  $mut['DebugEngine.Threads.cs'] = $mut['DebugEngine.Threads.cs'].Replace(
-    'sb.Append("{\"event\":\"threads\"");',
-    "// a comment that writes ,\`"tid\`": and ,\`"stopped\`": in prose" + [Environment]::NewLine +
-    '            sb.Append("{\"event\":\"threads\"");')
-  $h = @(Invoke-Scan $mut $names)
-  Check 'NOT caught (correctly): the same text in a COMMENT' `
-        ((@($h | Where-Object { -not $_.Boolean })).Count -eq 0) `
-        'a member name discussed in prose was reported as an emit'
 }
+
+# THE COUNT, ASSERTED AND PRINTED (60344b78). This file used to PRINT a count and assert none, so a section
+# that returned early simply shrank the number. Invoke-CheckSection above closes a section that throws or
+# breaks out of the script; this closes one that returns early or is skipped. COUNTING RULE: the RUNTIME
+# count of Check calls ($script:checks before this line) on a clean run, measured 2026-09-22 - the
+# -SelfTest run adds its 12 mutation checks. Update both deliberately with the checks.
+$EXPECTED_CHECKS = if ($SelfTest) { 28 } else { 16 }
+Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
 $fail = $script:failures
@@ -536,7 +599,10 @@ if ($fail -eq 0) {
   Write-Host '  per-row booleans that share them; a hand-written thread-id member anywhere else fails this,'
   Write-Host '  and so does one whose name never appears in a literal at all because it was assembled around'
   Write-Host '  a variable -- the 4 delimiters that do that belong to the writer and are where they were.'
+  Write-Host ''
+  Write-Host "ALL $($script:checks) CHECKS PASSED"
   exit 0
 }
 Write-Host "test-engine-tid-members: FAIL ($fail of $($fail + $pass) checks)" -ForegroundColor Red
+Write-Host "$fail of $($script:checks) CHECKS FAILED"
 exit 1

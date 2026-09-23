@@ -34,7 +34,7 @@ namespace ClarionDbg.Cli
         // Only the FIRST touch of a variable on a thread allocates (a write) — see TryResolveThreadedInstance.
 
         /// <summary>How a THREADed name resolved on the paused thread.</summary>
-        private enum ThreadedResolve
+        internal enum ThreadedResolve
         {
             Ok,            // instanceVa is this thread's live instance
             Template,      // this thread has no instance of its own: the template itself is what it reads
@@ -126,10 +126,37 @@ namespace ClarionDbg.Cli
             try { emu = BuildEmulator(rt, tid, teb); }
             catch (Exception ex) { reason = "could not build the RTL emulator: " + ex.Message; return ThreadedResolve.Failed; }
 
+            uint result, blockBase;
+            var verdict = ClassifyEmulatedInstance(owner, templateVa, emu, helper, out result, out blockBase, out reason);
+            if (verdict == ThreadedResolve.Template) instanceVa = templateVa;
+            if (verdict != ThreadedResolve.Ok) return verdict;
+
+            var probe = new byte[1];
+            if (ReadBlock(result, probe) < 1)
+            {
+                reason = $"THR$GetInstance returned an unreadable instance (0x{result:X})";
+                return ThreadedResolve.Failed;
+            }
+            _threadedBlockCache[key] = blockBase;
+
+            instanceVa = result;
+            return ThreadedResolve.Ok;
+        }
+
+        /// <summary>The verdict on ONE emulation of THR$GetInstance: run it, then decide what its result
+        /// and its debuggee writes mean. Split out of <see cref="TryResolveThreadedInstance"/> so a harness can
+        /// drive these branches: they only run when something has gone wrong, and no live target made them
+        /// fire (38b75897). It touches the debuggee only through <paramref name="emu"/>'s own read delegate
+        /// and reports through NoteThreadedEmulation. Ok means a CANDIDATE: the caller still probes
+        /// <paramref name="result"/> before trusting it, and caches <paramref name="blockBase"/> only then.</summary>
+        private ThreadedResolve ClassifyEmulatedInstance(LoadedModule owner, uint templateVa, RtlEmulator emu, uint helper,
+                                                         out uint result, out uint blockBase, out string reason)
+        {
+            result = 0; blockBase = 0; reason = null;
+            uint cwtlsBase = owner.LoadBase + owner.CwtlsLo;
             uint delta = templateVa - cwtlsBase;                    // this name's offset inside the .cwtls span
             uint cwtlsSize = owner.CwtlsHi > owner.CwtlsLo ? owner.CwtlsHi - owner.CwtlsLo : 0;
 
-            uint result;
             try
             {
                 result = emu.Call(helper, templateVa, cwtlsBase);
@@ -171,7 +198,7 @@ namespace ClarionDbg.Cli
                 reason = $"THR$GetInstance returned 0x{result:X}, below this name's .cwtls offset (0x{delta:X})";
                 return ThreadedResolve.Failed;
             }
-            uint blockBase = result - delta;
+            blockBase = result - delta;
 
             // The allocate-on-first-touch discriminator. This USED to be a one-way door: ANY debuggee write
             // discarded the result, so a single incidental scratch write in THR$GetInstance's read path made
@@ -204,21 +231,21 @@ namespace ClarionDbg.Cli
             // image's block for a thread that HAS one.
             if (result == templateVa)
             {
-                instanceVa = templateVa;
                 reason = "no thread instance — shared template value";
                 return ThreadedResolve.Template;
             }
 
-            var probe = new byte[1];
-            if (ReadBlock(result, probe) < 1)
-            {
-                reason = $"THR$GetInstance returned an unreadable instance (0x{result:X})";
-                return ThreadedResolve.Failed;
-            }
-            _threadedBlockCache[key] = blockBase;
-
-            instanceVa = result;
             return ThreadedResolve.Ok;
+        }
+
+        /// <summary>Test seam for `protocolcheck` (38b75897): the REAL post-emulation verdict, run on an
+        /// emulator the harness built over its own memory and code. The fault is injected through what the
+        /// harness hands in, never through a switch a production caller could set; this touches no target.</summary>
+        internal ThreadedResolve ClassifyEmulatedInstanceForTest(LoadedModule owner, uint templateVa, RtlEmulator emu,
+                                                                 uint helper, out uint result, out string reason)
+        {
+            uint blockBase;
+            return ClassifyEmulatedInstance(owner, templateVa, emu, helper, out result, out blockBase, out reason);
         }
 
         /// <summary>Report an emulation whose outcome the user will never see stated in the value itself — a
@@ -300,11 +327,22 @@ namespace ClarionDbg.Cli
                 return;
             }
             uint templateVa = owner.LoadBase + loc.Rva;
-            bool threaded = loc.Rva >= owner.CwtlsLo && loc.Rva < owner.CwtlsHi && owner.CwtlsHi != 0;
+            // Over the symbol's SPAN, through the shared test (ef0a941d): a start-only test showed a symbol
+            // straddling into the template as ordinary data, a silent wrong value with a pencil.
+            var span = ClassifyTemplateSpan(owner, templateVa, loc.Size);
 
-            if (!threaded)
+            if (span == TemplateSpan.Outside)
             {
                 EmitWatchValue(tid, name, templateVa, templateVa, false, loc.TypeCode, loc.Size);
+                return;
+            }
+            if (span == TemplateSpan.Straddling)
+            {
+                // Same words and same permission as the module-data panel's straddling row (Locals.cs), so
+                // one name at one stop never reads two ways.
+                EmitWatchValue(tid, name, templateVa, templateVa, true, loc.TypeCode, loc.Size,
+                               note: "partly in the shared " + owner.Name + " template — not this thread's own data",
+                               editable: false);
                 return;
             }
 

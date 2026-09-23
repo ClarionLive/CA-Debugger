@@ -1296,10 +1296,26 @@ namespace ClarionDbg.Core
         private static int DataNameRank(string container)
         {
             if (container == null) return 0;
-            bool fileRecord = container.IndexOf("::", StringComparison.Ordinal) < 0
-                              && container.IndexOf('$') >= 0
-                              && container.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase);
+            // The SHAPE is the shared test; being unscoped is this ranking's own extra condition, because a
+            // PROC::FILE$PRE:RECORD is still a file record to the module-data panel (04d7b4c8).
+            bool fileRecord = container.IndexOf("::", StringComparison.Ordinal) < 0 && IsFileRecordName(container);
             return fileRecord ? 0 : 1;
+        }
+
+        /// <summary>Is this symbol name a FILE record buffer's — the FILE$PRE:RECORD shape: it carries '$'
+        /// and ends ":RECORD". Scope-agnostic, so PROC::FILE$PRE:RECORD qualifies. A form's
+        /// HISTORY::COU:RECORD does NOT: it is a GROUP declared LIKE the record, not the record itself, and
+        /// a bare ":RECORD" suffix used to be enough to count it (04d7b4c8). The pad's Tables tree tests
+        /// the same shape (`/\$.*:record$/i` in debugger.html).
+        ///
+        /// ONE predicate, two callers that want different verdicts: the module-data panel excludes every
+        /// name of this shape, since the Tables tree shows them; <see cref="DataNameRank"/> also requires
+        /// no "::" scope. Share the test, not the answer.</summary>
+        public static bool IsFileRecordName(string name)
+        {
+            return name != null
+                   && name.IndexOf('$') >= 0
+                   && name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase);
         }
 
         // Register every leaf member of a resolved GROUP by name -> absolute RVA, so watch-by-name resolves

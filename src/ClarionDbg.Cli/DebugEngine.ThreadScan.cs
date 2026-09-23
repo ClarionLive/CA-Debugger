@@ -83,11 +83,19 @@ namespace ClarionDbg.Cli
                 return;
             }
             uint templateVa = owner.LoadBase + loc.Rva;
-            bool threaded = owner.CwtlsHi != 0 && loc.Rva >= owner.CwtlsLo && loc.Rva < owner.CwtlsHi;
+            // Over the symbol's SPAN, through the shared test (ef0a941d): a start-only test labelled a symbol
+            // straddling into the template "[not threaded]" on every thread, an explicit false claim.
+            var span = ClassifyTemplateSpan(owner, templateVa, loc.Size);
 
             foreach (var p in probes)
             {
-                if (!threaded) { p.Probed = FormatValueAt(loc.TypeCode, 0, loc.Size, 0, templateVa) + "  [not threaded]"; continue; }
+                if (span == TemplateSpan.Outside) { p.Probed = FormatValueAt(loc.TypeCode, 0, loc.Size, 0, templateVa) + "  [not threaded]"; continue; }
+                if (span == TemplateSpan.Straddling)
+                {
+                    p.Probed = FormatValueAt(loc.TypeCode, 0, loc.Size, 0, templateVa)
+                             + "  [partly in the shared " + owner.Name + " template — not one thread's own data]";
+                    continue;
+                }
                 IntPtr h = OpenThreadForContext(p.Tid);
                 if (h == IntPtr.Zero) { p.Probed = "(no thread handle)"; continue; }
                 try

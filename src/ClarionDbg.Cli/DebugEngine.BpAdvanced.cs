@@ -219,8 +219,14 @@ namespace ClarionDbg.Cli
 
             uint templateVa = owner.LoadBase + loc.Rva;
             uint va = templateVa;
-            bool threaded = owner.CwtlsHi != 0 && loc.Rva >= owner.CwtlsLo && loc.Rva < owner.CwtlsHi;
-            if (threaded)
+            // Over the symbol's SPAN, through the shared test (ef0a941d). A start-only test here read a
+            // symbol straddling into the template as ordinary data and answered the condition from the
+            // template — changing whether the developer stops, with nothing on screen to doubt.
+            var span = ClassifyTemplateSpan(owner, templateVa, loc.Size);
+            if (span == TemplateSpan.Straddling)
+                return 0;   // only part of it is this thread's: indeterminate, as in `default` below — a
+                            // condition pauses and says so, a tracepoint prints {?name}
+            if (span == TemplateSpan.StartsInside)
             {
                 // Same resolver, same vocabulary as the Watch panel and the Variables tree (see
                 // DebugEngine.Locals.cs) — one shape for "what does this THREADed name read here", not three.

@@ -348,13 +348,21 @@ namespace ClarionDbg.Cli
         // enough to isolate CancelStep's reset — the guard being asserted is "CancelStep clears it", not
         // "BeginStep sets it", and those are separate claims.
 
+        /// <summary>Arm the prologue-bypass FLAG and entry RVA, for asserting that CancelStep clears them.
+        /// <para>
+        /// NOT A STATE A REAL STEP CAN REACH (f367a04f item 4): BeginStep sets <c>_startAtProcEntry</c> only
+        /// together with a non-null <c>_startSymModule</c>, while this leaves the module null.
+        /// <see cref="PrologueBypassApplies"/> rejects that combination on its first line, so a stop check
+        /// run against an engine armed here sees NO bypass. Use this seam only for the reset claim; a check
+        /// on whether the bypass APPLIES needs a module and a real line table, which this does not supply.
+        /// </para></summary>
         internal void ArmPrologueBypassForTest(uint entryRva)
         {
             // MUTATES the step-start state a live BeginStep/StepMachine reads.
             RefuseSeamIfAttached("ArmPrologueBypassForTest");
             _startAtProcEntry = true;
             _startSymEntryRva = entryRva;
-            _startSymModule = null;   // no module needed: the seam below reads the armed flag, not the bound
+            _startSymModule = null;   // see the summary: deliberate, and the reason this seam is reset-only
         }
 
         internal bool PrologueBypassArmedForTest { get { return _startAtProcEntry; } }

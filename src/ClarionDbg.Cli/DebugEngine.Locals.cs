@@ -21,20 +21,6 @@ namespace ClarionDbg.Cli
         /// rows; reference locals (incl. by-ref GROUP/QUEUE) are lazy (expanded on demand). Shared by the
         /// method and host-procedure groups. <paramref name="module"/> tags ref rows so the host can request
         /// expansion against the right image's TSWD.</summary>
-///        private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
-///        {
-///            var rows = new List<string>();
-///            List<LocalSym> locals;
-///            if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
-///                foreach (var l in locals)
-///                {
-///                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-///                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
-///                }
-///            return rows;
-///        }
-
-
 		private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp, bool suppressSelf)
 		{
 			var rows = new List<string>();
@@ -88,13 +74,6 @@ namespace ClarionDbg.Cli
 				bool inGap = sym.Kind == SymbolKind.Method
 							 && nextEntry != 0
 							 && queryRva >= nextEntry;
-				Console.WriteLine("@JSON {\"event\":\"console\",\"level\":\"warn\",\"text\":\"GAP CHECK:"
-					+ " sym=" + sym.Name
-					+ " kind=" + sym.Kind
-					+ " entryRva=0x" + sym.EntryRva.ToString("X")
-					+ " nextEntry=0x" + nextEntry.ToString("X")
-					+ " queryRva=0x" + queryRva.ToString("X")
-					+ " inGap=" + inGap + "\"}");
 				rows = LocalRowsFor(m, entry, ebp, inGap);
 			}
 			EmitThreadEvent(tid, "{\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
@@ -567,7 +546,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
-        /// in this module's DATA section), read live. Excludes file record buffers (*:RECORD) which already
+        /// in this module's DATA section), read live. Excludes file record buffers (FILE$PRE:RECORD) which already
         /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
         private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
                                              IntPtr hThread)
@@ -587,8 +566,11 @@ namespace ClarionDbg.Cli
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
                         if (ds.ModuleIdx != mi) continue;
-                        if (ds.Name != null && ds.Name.EndsWith(":RECORD", StringComparison.OrdinalIgnoreCase))
-                            continue;   // file record buffer — belongs to the file-buffer tree, not module data
+                        // File record buffer: belongs to the file-buffer tree, not module data. The SHAPE test,
+                        // shared with the name index. A bare ":RECORD" suffix also hid a form's
+                        // HISTORY::COU:RECORD, which is a module GROUP the Tables tree does not show (04d7b4c8).
+                        if (TswdDebugInfo.IsFileRecordName(ds.Name))
+                            continue;
                         // A ,THREAD module symbol lives in .cwtls and has one instance PER THREAD, exactly
                         // like the record buffers `watch` resolves. Reading the link-time template here would
                         // show every thread the same shared value — and, now that this panel is re-read on a
@@ -607,10 +589,10 @@ namespace ClarionDbg.Cli
                         uint templateVa = m.LoadBase + ds.Rva;
                         uint va = templateVa;
                         string note = null; bool editable = true;
-                        uint hitVa;
-                        if (TouchesThreadedTemplate(m, templateVa, (int)ds.Size, out hitVa))
+                        var span = ClassifyTemplateSpan(m, templateVa, ds.Size);
+                        if (span != TemplateSpan.Outside)
                         {
-                            if (hitVa != templateVa)
+                            if (span == TemplateSpan.Straddling)
                             {
                                 // STRADDLING: the symbol starts OUTSIDE the threaded block and reaches into
                                 // it. It cannot be relocated — only part of it is per-thread, and

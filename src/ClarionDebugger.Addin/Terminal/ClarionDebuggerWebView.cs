@@ -63,6 +63,11 @@ namespace ClarionDebugger.Terminal
         private string _pendingRtcKey;
         private int _pendingRtcLine;   // requested line of the pending run-to-cursor — matches the engine's bp echo by line
         private readonly HashSet<string> _watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // What the page may hand back, as the HOST issued it (afbc68c7). The page names a Procedures row by
+        // the id it was sent with, and an edit by the row's own tuple; both are checked here rather than
+        // trusted. UI-thread only, like every other piece of pad state.
+        private readonly ProcedureIds _procIds = new ProcedureIds();
+        private readonly EditGrants _editGrants = new EditGrants();
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
         private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
@@ -213,6 +218,7 @@ namespace ClarionDebugger.Terminal
                     if (CurrentState != DebugSessionState.Idle) return;
                     _exe = null; _exeAuto = false; _exeManualKey = null;
                     _procGen++;                       // invalidate any in-flight procedure parse
+                    _procIds.Clear();                 // and every id the old list was sent with
                     Post("{\"type\":\"procedures\",\"procs\":[]}");
                     PushTarget();                     // blanks the target bar
                     Console("info", "solution closed — target cleared");
@@ -284,20 +290,35 @@ namespace ClarionDebugger.Terminal
         // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
         // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
         // emit 'resumed', so they leave the marker alone.
-        private void OnSvcResumed(string mode) => UI(() => { ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames, uint? tid) => UI(() => OnStack(frames, tid));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
         // fields); forward its array bodies verbatim so the structure survives intact.
 
+        // Each of the three row replies GRANTS its editable rows before it posts them (afbc68c7): these are the
+        // rows whose address/type tuple the page may later send back in an edit, and EditVar honours only a
+        // tuple issued here. An expanded reference carries no tid, so its rows are granted unscoped.
         private void OnSvcModuleData(string module, string itemsJson, uint? tid) => UI(() =>
-            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        {
+            _editGrants.GrantRows(itemsJson, tid);
+            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
+        });
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
-            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}"));
+        {
+            // Only a reply to an expand the host VERIFIED and forwarded may grant (afbc68c7): its rows are
+            // members of a group the host itself offered. Any other reply is posted for display, and grants
+            // nothing - its rows cannot be edited or expanded further.
+            if (_editGrants.ExpandVerified(reqId)) _editGrants.GrantRows(itemsJson, null);
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}");
+        });
 
         private void OnSvcFrameLocals(string reqId, string itemsJson, uint? tid) => UI(() =>
-            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        {
+            _editGrants.GrantRows(itemsJson, tid);
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
+        });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
@@ -309,18 +330,30 @@ namespace ClarionDebugger.Terminal
         // it had and re-asks 'threads' for the authoritative one.
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
+            // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
+            if (ok) _editGrants.Clear();
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
                                   + ": " + (error ?? "could not select"));
         });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
+        // The ENGINE's answer to a write the host sent: it re-issues the grant that write spent, so the row can
+        // be edited again (afbc68c7). A refusal the host makes itself goes through PostVarSet and re-issues
+        // nothing - it spent nothing.
         private void OnSvcVariableSet(string va, bool ok, string value, string error) => UI(() =>
+        {
+            _editGrants.Regrant(va);
+            PostVarSet(va, ok, value, error);
+        });
+
+        private void PostVarSet(string va, bool ok, string value, string error)
         {
             Post("{\"type\":\"varset\",\"va\":" + Str(va) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"value\":" + Str(value) + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "edit value failed: " + (error ?? "unknown"));
-        });
+        }
+
         private void OnSvcBreakpointSet(DebugBreakpoint bp) => UI(() =>
         {
             // Phase 2 of run-to-cursor: the transient is now confirmed armed, so it's safe to resume. There is
@@ -330,11 +363,11 @@ namespace ClarionDebugger.Terminal
             // later RemoveBreakpoint (OnPaused) matches engine truth even if the engine canonicalizes the module
             // name differently from the UI's curFile — no stranded, untracked one-shot.
             if (_pendingRtcKey != null && bp != null && bp.Module != null
-                && (bp.RequestedLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
+                && (bp.DisplayLine == _pendingRtcLine || bp.Line == _pendingRtcLine))
             {
                 _transientBps.Remove(_pendingRtcKey);
                 _pendingRtcKey = null;
-                _transientBps.Add(TransientKey(bp.Module, bp.RequestedLine));   // engine-confirmed identity
+                _transientBps.Add(TransientKey(bp.Module, bp.DisplayLine));   // engine-confirmed identity
                 SendBps();
                 if (CurrentState == DebugSessionState.Paused) _svc.Continue();
                 return;
@@ -370,7 +403,7 @@ namespace ClarionDebugger.Terminal
         private void OnSvcModuleLoaded(DebugModule m) => UI(() => OnModuleLoaded(m));
         private void OnSvcModuleUnloaded(DebugModule m) => UI(() => Post("{\"type\":\"module-unloaded\",\"name\":" + Str(m.Name) + "}"));
         private void OnSvcLog(string s) => UI(() => Console("info", s));
-        private void OnSvcExited(int code) => UI(() => { _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
+        private void OnSvcExited(int code) => UI(() => { _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine(); Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); });
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
@@ -522,10 +555,12 @@ namespace ClarionDebugger.Terminal
                     return;
                 }
 
-                string json = e.TryGetWebMessageAsString();
-                string action = JsonVal(json, "action");
-                string data = JsonVal(json, "data");
-                switch (action)
+                // Typed once, here: a message that is not a well-formed envelope is dropped whole. Each case
+                // below parses its own payload through the DTO in PageMessages.cs and drops a malformed one.
+                var msg = PageEnvelope.Parse(e.TryGetWebMessageAsString());
+                if (msg == null) return;
+                string data = msg.Data;
+                switch (msg.Action)
                 {
                     // The page also asks for About data whenever the panel is opened, so it reflects
                     // live state rather than a value captured once at startup. The push on "ready"
@@ -553,24 +588,16 @@ namespace ClarionDebugger.Terminal
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
-                    case "expand":   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
-                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
-                        {
-                            var a = data.Split('|');
-                            if (a.Length == 4 && int.TryParse(a[0], out int rq) && uint.TryParse(a[2], out uint tr))
-                                _svc.RequestExpand(rq, a[1], tr, a[3]);
-                        }
-                        break;
+                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
                     case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
-                        if (!string.IsNullOrEmpty(data) && _svc.State == DebugSessionState.Paused)
+                        if (_svc.State == DebugSessionState.Paused)
                         {
-                            var a = data.Split('|');
-                            if (a.Length == 3 && int.TryParse(a[0], out int rq))
-                                _svc.RequestFrameLocals(rq, a[1], a[2]);
+                            var fl = FrameLocalsRequest.Parse(data);
+                            if (fl != null) _svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp);
                         }
                         break;
                     case "libstate":   // per-thread Library State refresh: data = reqId
-                        if (_svc.State == DebugSessionState.Paused && int.TryParse(data, out int lrq))
+                        if (_svc.State == DebugSessionState.Paused && PageNumbers.TryInt(data, out int lrq))
                             _svc.RequestLibState(lrq);
                         break;
 
@@ -579,7 +606,7 @@ namespace ClarionDebugger.Terminal
                     // on screen. Each of these is paused-only; the engine refuses them otherwise anyway.
                     case "threads": if (_svc.State == DebugSessionState.Paused) _svc.RequestThreads(); break;
                     case "selectthread":
-                        if (_svc.State == DebugSessionState.Paused && uint.TryParse(data, out uint seltid))
+                        if (_svc.State == DebugSessionState.Paused && PageNumbers.TryUInt(data, out uint seltid))
                             _svc.SelectThread(seltid);
                         break;
                     case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
@@ -675,11 +702,10 @@ namespace ClarionDebugger.Terminal
                 spec = ResolveMonacoCursorSpec();
                 if (spec == null) return;   // ResolveMonacoCursorSpec already reported why to the console
             }
-            int c = spec.LastIndexOf(':');
-            if (c <= 0) return;
-            string module = spec.Substring(0, c);
-            int line;
-            if (!int.TryParse(spec.Substring(c + 1), out line)) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            string module = at.Module;
+            int line = at.Line;
 
             // A persistent breakpoint on the SAME REQUESTED line is the only conflict: the engine collapses a
             // re-add at an identical requested line into a props-update (and removal is by requested line), so
@@ -692,7 +718,7 @@ namespace ClarionDebugger.Terminal
             //   • nothing on this requested line → plant the transient one-shot and continue.
             DebugBreakpoint exact = null;
             foreach (var b in _svc.Breakpoints)
-                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.RequestedLine == line) { exact = b; break; }
+                if (string.Equals(b.Module, module, StringComparison.OrdinalIgnoreCase) && b.DisplayLine == line) { exact = b; break; }
 
             if (exact != null)
             {
@@ -780,25 +806,87 @@ namespace ClarionDebugger.Terminal
 
         /// <summary>Break on procedure entry: plant a normal (persistent) breakpoint at a procedure's
         /// definition line, surfaced from a right-click on a Procedures-pane row. Data is a JSON object
-        /// {name, module, line} — the row already carries module+line, so no re-resolution is needed. Running
-        /// or paused → push straight to the engine; idle → stage in _pending (deduped), exactly like a gutter
-        /// breakpoint. Deliberately does NOT touch the IDE gutter (no red dot), matching how _pending bps work.</summary>
+        /// {id} naming the row by the id <see cref="PushProcedures"/> sent it with; the module and line are
+        /// looked up HERE, in the table that push issued, never read from the page (afbc68c7). An id the
+        /// current list did not issue - a stale list, or one nobody listed - arms nothing and says so.
+        /// Running or paused → push straight to the engine; idle → stage in _pending (deduped), exactly like a
+        /// gutter breakpoint. Deliberately does NOT touch the IDE gutter (no red dot), matching how _pending
+        /// bps work.</summary>
         public void CmdBreakOnProcEntry(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            string module = JsonVal(data, "module");
-            if (string.IsNullOrEmpty(module)) return;
-            int line;
-            if (!int.TryParse(JsonVal(data, "line") ?? "", out line) || line <= 0) return;
-            string name = JsonVal(data, "name");
+            var req = BreakOnProcEntryRequest.Parse(data);
+            if (req == null) return;
+            var proc = _procIds.Resolve(req.ProcId);
+            if (proc == null)
+            {
+                Console("err", "break on entry: that procedure is not in the current list — refresh the Procedures pane and try again.");
+                return;
+            }
+            BreakOnEntry(proc);
+        }
+
+        /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
+        /// name="line"/> - the editor cursor, reached from ClarionAssistant through
+        /// <see cref="DebugSessionController.BreakOnProcEntry"/> (e61e4f92). The position is ONLY a lookup key
+        /// into the list <see cref="PushProcedures"/> issued; which procedure it falls in, and where that one
+        /// starts, are the list's answer, exactly as with an id. The module is the file's name, the same
+        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).</summary>
+        public void CmdBreakOnProcEntryAt(string filePath, int line)
+        {
+            string module = null;
+            try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
+            catch (ArgumentException) { module = null; }
+            string why;
+            var proc = _procIds.Containing(module, line, out why);
+            if (proc == null)
+            {
+                // A visible refusal, never a guess at the nearest procedure above (codex adversary gate).
+                Console("err", "break on entry: " + why + " — nothing was set. (If the Procedures pane is empty, open the app's solution or refresh it.)");
+                return;
+            }
+            BreakOnEntry(proc);
+        }
+
+        /// <summary>The one body both break-on-entry paths share: validate, announce, then arm (live) or stage
+        /// (idle). Everything it knows about the procedure came from the host's own list.</summary>
+        private void BreakOnEntry(ProcRef proc)
+        {
+            string module = proc.Module;
+            int line = proc.Line;
+            string name = proc.Name;
+            if (line <= 0)
+            {
+                Console("err", "break on entry: " + (string.IsNullOrEmpty(name) ? "that procedure" : name)
+                    + " has no definition line to break on.");
+                return;
+            }
+
+            // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
+            // the idle branch staged whatever module it was handed, so a name the engine would refuse sat
+            // in the pane as a breakpoint until the next Start silently dropped it (StartSession skips an
+            // invalid module).
+            if (!ClarionDebuggerService.IsValidModuleName(module))
+            {
+                Console("err", "break on entry: not a module name the debugger can use: " + module);
+                return;
+            }
 
             Console("info", "break on entry: " + (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line);
 
-            if (_svc.IsRunning) _svc.AddBreakpoint(module, line);   // engine echoes bp-set → pane refresh
+            if (_svc.IsRunning)
+            {
+                // The engine echoes bp-set and the pane refreshes from that. A false return means the
+                // command never reached the engine, so no echo will ever come - and this used to be
+                // ignored, leaving the info line above as the only word on a breakpoint that was never
+                // armed. Say so instead.
+                if (!_svc.AddBreakpoint(module, line))
+                    Console("err", "break on entry: could not set a breakpoint at " + module + ":" + line
+                        + " — the engine did not take the request.");
+            }
             else
             {
                 foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
                 SendBps();
             }
         }
@@ -830,6 +918,10 @@ namespace ClarionDebugger.Terminal
                 // only one worth paying for it at.
                 RearmAndReportMonacoHooks();
 
+                // The run just reported itself over, but its engine has not exited yet (0449e5c9): say so and
+                // stop here, before anything below announces a start that is not going to happen.
+                if (_svc.IsEngineStillClosing) { Console("err", ClarionDebuggerService.EngineClosingMessage); return; }
+
                 // The Target EXE field is intentionally gone — Start always sources the target from the app.
                 // On EVERY Start we re-resolve from the active project and use the fresh result. A manual Browse
                 // pick is honoured only as a ONE-SHOT tied to the solution/project context it was chosen for: if
@@ -843,7 +935,7 @@ namespace ClarionDebugger.Terminal
                 foreach (var gb in _gutter.Snapshot())
                 {
                     bool known = false;
-                    foreach (var b in _pending) if (SameBp(b, gb.Module, gb.RequestedLine)) { known = true; break; }
+                    foreach (var b in _pending) if (SameBp(b, gb.Module, gb.DisplayLine)) { known = true; break; }
                     if (!known) _pending.Add(gb);
                 }
                 Post("{\"type\":\"clear\"}");
@@ -876,18 +968,29 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(exe)) return;
             _svc.PrimeTarget(exe);          // anchor the .red resolver to this EXE so PRE-RUN clicks resolve (UI thread)
             int gen = ++_procGen;
+            // The old list's ids stop resolving NOW, not when the parse below finishes, and the page is told to
+            // drop them: a right-click in that window used to arm the PREVIOUS exe's row (codex adversary gate).
+            _procIds.Begin(gen);
+            Post("{\"type\":\"procedures\",\"procs\":[],\"loading\":true}");
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
                 try
                 {
                     var procs = ClarionDebuggerService.GetProcedures(exe);
+                    // Each row goes out with an id, and the table behind the ids goes live in the SAME UI step
+                    // that posts the list, so the page can never hold an id the host cannot resolve (short of
+                    // a newer list replacing it, which is the point).
+                    var ids = ProcedureIds.NewTable();
                     var sb = new StringBuilder();
                     sb.Append("{\"type\":\"procedures\",\"procs\":[");
                     for (int i = 0; i < procs.Count; i++)
                     {
                         var p = procs[i];
+                        string id = ProcedureIds.IdFor(gen, i);
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine };
                         if (i > 0) sb.Append(',');
-                        sb.Append("{\"name\":").Append(Str(p.Name))
+                        sb.Append("{\"id\":").Append(Str(id))
+                          .Append(",\"name\":").Append(Str(p.Name))
                           .Append(",\"module\":").Append(Str(p.Module))
                           .Append(",\"line\":").Append(p.Line)
                           .Append(",\"kind\":").Append(Str(p.Kind))
@@ -895,7 +998,8 @@ namespace ClarionDebugger.Terminal
                     }
                     sb.Append("]}");
                     string json = sb.ToString();
-                    UI(() => { if (gen == _procGen) Post(json); });   // ignore an out-of-date parse — a newer push won
+                    // ignore an out-of-date parse — a newer push won, and its table with it
+                    UI(() => { if (gen == _procGen && _procIds.Replace(gen, ids)) Post(json); });
                 }
                 catch { }
             });
@@ -1056,11 +1160,10 @@ namespace ClarionDebugger.Terminal
 
         private void Jump(string spec)
         {
-            if (string.IsNullOrEmpty(spec)) return;
-            int c = spec.LastIndexOf(':');
-            if (c <= 0) return;
-            string module = spec.Substring(0, c);
-            int line; if (!int.TryParse(spec.Substring(c + 1), out line)) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            string module = at.Module;
+            int line = at.Line;
             string path = ResolvePath(module);
             if (path != null) NavigateTo(path, line);
             else Console("info", "(can't resolve " + module + " — open the app's solution so the .red is active)");
@@ -1070,12 +1173,10 @@ namespace ClarionDebugger.Terminal
         /// gutter gave us (no fragile re-resolution). Data is "line\tfullPath".</summary>
         private void OpenBp(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            int t = data.IndexOf('\t');
-            if (t <= 0) return;
-            int line;
-            if (!int.TryParse(data.Substring(0, t), out line)) return;
-            string path = data.Substring(t + 1);
+            var req = OpenBpRequest.Parse(data);
+            if (req == null) return;
+            int line = req.Line;
+            string path = req.Path;
             if (!string.IsNullOrEmpty(path) && File.Exists(path)) NavigateTo(path, line);
             else Console("info", "(can't open " + path + " — file not found)");
         }
@@ -1095,12 +1196,10 @@ namespace ClarionDebugger.Terminal
         /// </para></summary>
         private void RemoveBp(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            int c = data.LastIndexOf(':');
-            if (c <= 0) return;
-            string module = data.Substring(0, c);
-            int line;
-            if (!int.TryParse(data.Substring(c + 1), out line)) return;
+            var at = ModuleLineRequest.Parse(data);
+            if (at == null) return;
+            string module = at.Module;
+            int line = at.Line;
             if (!_gutter.RemoveByModuleLine(module, line, PaneBpPath(module, line)))
                 OnGutterBpRemoved(module, line); // no gutter bookmark matched — keep the pane/engine consistent
         }
@@ -1136,16 +1235,15 @@ namespace ClarionDebugger.Terminal
         /// are re-applied via the launch spec; on a live session they are pushed to the engine immediately.</summary>
         private void SetBpProps(string data)
         {
-            if (string.IsNullOrEmpty(data)) return;
-            string module = JsonVal(data, "module");
-            if (string.IsNullOrEmpty(module)) return;
-            int line;
-            if (!int.TryParse(JsonVal(data, "line") ?? "", out line)) return;
+            var req = BpPropsRequest.Parse(data);
+            if (req == null) return;
+            string module = req.Module;
+            int line = req.Line;
 
-            string condition = JsonVal(data, "condition");
-            string hitMode = JsonVal(data, "hitMode");
-            int hitValue; int.TryParse(JsonVal(data, "hitValue") ?? "0", out hitValue);
-            string trace = JsonVal(data, "trace");
+            string condition = req.Condition;
+            string hitMode = req.HitMode;
+            int hitValue = req.HitValue;
+            string trace = req.Trace;
 
             // normalize empties to null = "no such property"
             if (string.IsNullOrWhiteSpace(condition)) condition = null;
@@ -1157,7 +1255,7 @@ namespace ClarionDebugger.Terminal
             foreach (var b in _pending) if (SameBp(b, module, line)) { target = b; break; }
             if (target == null)
             {
-                target = new DebugBreakpoint { Module = module, RequestedLine = line, Line = line };
+                target = new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line };
                 _pending.Add(target);
             }
             target.Condition = condition;
@@ -1175,6 +1273,10 @@ namespace ClarionDebugger.Terminal
         {
             UI(() =>
             {
+                // A new stop: nothing on screen is current any more, and the replies requested below re-grant
+                // the rows that are.
+                _editGrants.Clear();
+
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
@@ -1273,8 +1375,18 @@ namespace ClarionDebugger.Terminal
         /// dropped. Emitting 0 for "unknown" would make every such reply look like a different thread's.</summary>
         private static string TidJson(uint? tid)
         {
-            return TidMember("tid", tid);
+            return TidMember(TidMemberTid, tid);
         }
+
+        // The host's thread-id-valued member names, declared once (c299aced). tools/test-host-tid-members.ps1
+        // READS this array, so a name added here comes under its scan automatically, and it fails any host
+        // source that writes one of these as JSON text instead of passing it to TidMember - the same
+        // structure the engine side has had since 3b043dfc. `stopped` and `selected` are also the names of
+        // two per-row BOOLEANS in OnThreads; the scanner tells them apart by the value, not the name.
+        private const string TidMemberTid = "tid";
+        private const string TidMemberStopped = "stopped";
+        private const string TidMemberSelected = "selected";
+        private static readonly string[] TidValuedMemberNames = { TidMemberTid, TidMemberStopped, TidMemberSelected };
 
         /// <summary>THE host's one writer of a thread-id-valued member, whatever the member is called.
         /// Writes <paramref name="name"/> only when the id is KNOWN, and nothing at all when it is not.
@@ -1294,6 +1406,8 @@ namespace ClarionDebugger.Terminal
         /// </para></summary>
         private static string TidMember(string name, uint? tid)
         {
+            System.Diagnostics.Debug.Assert(Array.IndexOf(TidValuedMemberNames, name) >= 0,
+                "TidMember was handed an undeclared name; add it to TidValuedMemberNames");
             if (!tid.HasValue || tid.Value == 0) return string.Empty;
             return ",\"" + name + "\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
@@ -1306,16 +1420,21 @@ namespace ClarionDebugger.Terminal
             // Both go through the one writer, so an unknown stopped/selected is ABSENT rather than the
             // thread-0 it used to claim to be — the same rule the per-row tid has always had here.
             var sb = new StringBuilder("{\"type\":\"threads\"")
-                .Append(TidMember("stopped", list.StoppedTid))
-                .Append(TidMember("selected", list.SelectedTid))
+                .Append(TidMember(TidMemberStopped, list.StoppedTid))
+                .Append(TidMember(TidMemberSelected, list.SelectedTid))
                 .Append(",\"threads\":[");
             for (int i = 0; i < list.Threads.Count; i++)
             {
                 var t = list.Threads[i];
                 if (i > 0) sb.Append(',');
-                sb.Append("{\"tid\":").Append(t.Tid)
-                  .Append(",\"clarionThread\":").Append(t.ClarionThread.HasValue
+                // The row's own tid goes through the one writer too (c299aced). It used to be typed inline as
+                // `{"tid":` + t.Tid, which is correct only while every row has a real id; the writer makes
+                // that a rule rather than a fact about the parser (which, as of 2026-09-22, drops a row with no
+                // tid). clarionThread opens the row because TidMember writes a leading comma - the page reads
+                // members by key, so order is free.
+                sb.Append("{\"clarionThread\":").Append(t.ClarionThread.HasValue
                         ? t.ClarionThread.Value.ToString(CultureInfo.InvariantCulture) : "null")
+                  .Append(TidMember(TidMemberTid, t.Tid))
                   .Append(",\"proc\":").Append(Str(t.Proc))
                   .Append(",\"module\":").Append(Str(t.Module))
                   .Append(",\"line\":").Append(t.Line)
@@ -1376,6 +1495,8 @@ namespace ClarionDebugger.Terminal
         {
             var sb = new StringBuilder("{\"type\":\"watch\",\"name\":").Append(Str(w.Name))
                 .Append(",\"found\":").Append(w.Found ? "true" : "false");
+            // The one row reply the host builds itself; it grants its tuple the way the engine-row replies do.
+            if (w.Found) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
             if (w.Found)
                 sb.Append(",\"value\":").Append(Str(w.Value))
                   .Append(",\"typeName\":").Append(Str(w.TypeName))
@@ -1398,23 +1519,72 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Edit-variable-value: the page asked to write a new value into a live variable. Data is a
-        /// JSON object {va, typeCode, size, places, value} carried from the row's own metadata. Only valid
+        /// JSON object {va, typeCode, size, places, tid, value} carried from the row's own metadata. Only valid
         /// while paused; the service validates va/typeCode as hex and base64-encodes the value. The result
-        /// comes back via <see cref="OnSvcVariableSet"/>.</summary>
+        /// comes back via <see cref="OnSvcVariableSet"/>.
+        /// <para>
+        /// Only <c>value</c> is the user's. The other five decide WHERE and HOW the write lands, and they are
+        /// honoured only when the host itself issued that exact tuple for a row that is still current
+        /// (<see cref="_editGrants"/>, afbc68c7). They used to be forwarded as sent, so anything that could
+        /// put a message on the bridge could write any address under any type it named. The tid is part of
+        /// the tuple: it is also passed on so the engine can refuse a write whose thread is no longer the
+        /// selected one; absent when the page has no thread selection to name.
+        /// </para>
+        /// <para>
+        /// A refusal is ANSWERED with a failed varset, the same shape the engine's own refusal takes, so the
+        /// page treats it as the failure it is - and so does a false from SetVariable, which means the
+        /// request never reached the engine and no varset would ever have come.
+        /// </para></summary>
         private void EditVar(string data)
         {
-            if (string.IsNullOrEmpty(data) || _svc.State != DebugSessionState.Paused) return;
-            string va = JsonVal(data, "va");
-            string typeCode = JsonVal(data, "typeCode");
-            int size; int.TryParse(JsonVal(data, "size") ?? "", out size);
-            int places; int.TryParse(JsonVal(data, "places") ?? "0", out places);
-            // The thread the address was read on. The page puts it AHEAD of "value" for JsonVal's benefit
-            // (it takes the first "key": in the text, and value is user-typed). Passed on so the engine can
-            // refuse a write whose thread is no longer the selected one rather than writing another
-            // thread's memory; absent when the page has no thread selection to name.
-            uint tid; bool haveTid = uint.TryParse(JsonVal(data, "tid") ?? "", out tid);
-            string value = JsonVal(data, "value") ?? string.Empty;
-            _svc.SetVariable(va, typeCode, size, places, value, haveTid ? (uint?)tid : null);
+            if (_svc.State != DebugSessionState.Paused) return;
+            var req = EditVarRequest.Parse(data);
+            if (req == null) return;
+            // The grant is SPENT by the write it authorises, so the same request cannot be replayed; the
+            // engine's varset reply re-issues it (OnSvcVariableSet). A write that never left re-issues it now,
+            // because no reply is coming.
+            string why = null;
+            if (_editGrants.IsWritePending(req.Va))
+                why = "a write to this address is still pending — wait for its result, then edit again";
+            else if (!_editGrants.TryConsume(req.Va, req.TypeCode, req.Size, req.Places, req.Tid))
+                why = "that value is no longer current (or was never offered for editing) — let it refresh, then edit again";
+            else if (!_svc.SetVariable(req.Va, req.TypeCode, req.Size, req.Places, req.Value, req.Tid))
+            {
+                _editGrants.Regrant(req.Va);
+                why = "the engine did not take the request";
+            }
+            if (why != null) PostVarSet(req.Va, false, null, why);
+        }
+
+        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
+        /// is forwarded ONLY when that exact tuple is an expandable row the host issued for the rows now current
+        /// (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
+        /// address the page named - edit metadata included - and a forged expand would mint the edit grants
+        /// that EditVar checks. A refusal, or a request the service would not send, is ANSWERED with an empty
+        /// expanded reply for that reqId, so the node the page is opening does not wait forever.</summary>
+        private void Expand(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var x = ExpandRequest.Parse(data);
+            if (x == null) return;
+            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "that node is no longer current (or was never offered) — let the view refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr))
+            {
+                RefuseExpand(x.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.ExpandForwarded(x.ReqId);
+        }
+
+        private void RefuseExpand(int reqId, string why)
+        {
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "expand refused: " + why);
         }
 
         private void SendBps()
@@ -1426,7 +1596,7 @@ namespace ClarionDebugger.Terminal
             foreach (var b in (_svc.IsRunning ? _svc.Breakpoints : _pending.ToArray()))
             {
                 if (b.Module != null && (_transientBps.Contains(TransientKey(b.Module, b.Line))
-                                      || _transientBps.Contains(TransientKey(b.Module, b.RequestedLine)))) continue;
+                                      || _transientBps.Contains(TransientKey(b.Module, b.DisplayLine)))) continue;
                 list.Add(b);
             }
 
@@ -1446,7 +1616,7 @@ namespace ClarionDebugger.Terminal
                 string path = GutterPathFor(paths, b, out pathState);
                 sb.Append("{\"module\":").Append(Str(b.Module))
                   .Append(",\"line\":").Append(b.Line)
-                  .Append(",\"requested\":").Append(b.RequestedLine)
+                  .Append(",\"requested\":").Append(b.DisplayLine)
                   .Append(",\"path\":").Append(Str(path))
                   .Append(",\"pathState\":").Append(Str(PathStateName(pathState)))
                   .Append(",\"condition\":").Append(Str(b.Condition))
@@ -1483,7 +1653,7 @@ namespace ClarionDebugger.Terminal
                 {
                     if (string.IsNullOrEmpty(g.Path) || string.IsNullOrEmpty(g.Module)) continue;
                     ClaimGutterPath(paths, g.Module + "|" + g.Line, g.Path);
-                    ClaimGutterPath(paths, g.Module + "|" + g.RequestedLine, g.Path);
+                    ClaimGutterPath(paths, g.Module + "|" + g.DisplayLine, g.Path);
                 }
             }
             catch { }
@@ -1568,7 +1738,7 @@ namespace ClarionDebugger.Terminal
                 if (p != null) { state = BpPathState.Ok; return p; }
                 contested = true;                      // the key exists but two files claim it
             }
-            if (paths.TryGetValue(b.Module + "|" + b.RequestedLine, out p))
+            if (paths.TryGetValue(b.Module + "|" + b.DisplayLine, out p))
             {
                 if (p != null) { state = BpPathState.Ok; return p; }
                 contested = true;
@@ -1641,7 +1811,7 @@ namespace ClarionDebugger.Terminal
             else
             {
                 foreach (var b in _pending) if (SameBp(b, module, line)) return;
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLine = line, Line = line });
+                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
                 SendBps();
             }
         }
@@ -1678,7 +1848,7 @@ namespace ClarionDebugger.Terminal
         /// It used to also match <c>b.Line == line</c>, a two-way OR that let ONE removal trim a
         /// DIFFERENT staged entry whose planted line happened to equal the removed one's requested line -
         /// silently losing it from the next session's launch spec (b1db9a76 item 2). That OR was
-        /// unreachable in-tree, because every _pending entry is created with Line == RequestedLine and
+        /// unreachable in-tree, because every _pending entry is created with Line equal to its requested line and
         /// nothing writes the engine's snapped line back into _pending. It was held back from wave 1
         /// until 05959085 settled which line is the key; it has, so the OR is gone rather than left as a
         /// promise the rest of the identity code no longer makes.
@@ -2225,26 +2395,6 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append('"');
             return sb.ToString();
-        }
-
-        /// <summary>Read one field out of a message from the page. Null when the field is absent, is JSON
-        /// <c>null</c>, or the message is not a well-formed object.
-        /// <para>
-        /// THERE IS NO LONGER A RULE ABOUT FIELD ORDER. This used to scan for <c>"key":</c> with no idea
-        /// where strings began or ended, so a value containing <c>"line":9</c> could impersonate a field,
-        /// and payloads were expected to put untrusted content LAST to work around it — a convention the
-        /// comment that used to sit here instructed every new payload to follow. That was never a boundary:
-        /// it held only while every sender remembered, and it would fail silently the first time one did
-        /// not. Field order is now irrelevant to correctness, and a new payload may order its members
-        /// however reads best.
-        /// </para>
-        /// <para>
-        /// See <see cref="JsonMessageReader"/> for what replaced it, and for why the debuggee's own names
-        /// are the untrusted input that made it necessary.
-        /// </para></summary>
-        private static string JsonVal(string json, string key)
-        {
-            return JsonMessageReader.ReadField(json, key);
         }
 
         protected override void Dispose(bool disposing)

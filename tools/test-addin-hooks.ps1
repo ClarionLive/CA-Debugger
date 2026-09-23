@@ -29,17 +29,57 @@ $ErrorActionPreference = 'Stop'
 
 # ─────────────────────────────────────────────────────────────────────── parent: fan the scenarios out
 
-$AllScenarios = @('absent', 'bound', 'older-build', 'wrong-shape', 'wrong-assembly', 'cached-miss', 'stale-copy', 'off-thread', 'source')
+# EVERY SCENARIO AND ITS EXPECTED CHECK COUNT, in one table, so the list of scenarios and the totals cannot
+# drift apart. THE COUNTING RULE (ticket 60344b78, which found two static counts of this file disagreeing
+# by nearly 2x - 20 and 38 - because they counted different things): a number here is the RUNTIME count of
+# lib-check's Check calls in that scenario's child process, i.e. $script:checks just before
+# Assert-CheckTotal, measured 2026-09-22 on a clean run. A Check inside a loop counts once per pass, which
+# is why no grep for `^\s*Check\b` reproduces these. off-thread is 2: its own two Checks on the WinForms
+# probe's verdict. The probe's seven C# checks are counted INSIDE the probe and asserted by the second.
+$ExpectedByScenario = [ordered] @{
+  'absent'         = 8
+  'bound'          = 7
+  'older-build'    = 5
+  'wrong-shape'    = 10
+  'wrong-assembly' = 3
+  'cached-miss'    = 5
+  'stale-copy'     = 5
+  'off-thread'     = 2
+  'source'         = 8
+}
+$AllScenarios = @($ExpectedByScenario.Keys)
 
 if (-not $Scenario) {
-  $failed = 0
-  foreach ($s in $AllScenarios) {
-    & (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath -Scenario $s -WebViewPath $WebViewPath -ControllerPath $ControllerPath
-    if ($LASTEXITCODE -ne 0) { $failed++ }
-    Write-Host ''
+  # A child's exit code alone is not its verdict. A child that died without throwing - a top-level `break`
+  # - exits 0 and prints nothing, which is how a suite passes with half its checks gone (60344b78). So each
+  # child must ALSO print its result line, and the line must name its expected total. Invoke-CheckSection
+  # in the child turns a thrown or broken-out-of scenario into a non-zero exit; this turns a child that
+  # printed no verdict at all into a failed check here.
+  $script:childChecks = 0
+  Invoke-CheckSection 'run every scenario in its own process' {
+    foreach ($s in $AllScenarios) {
+      $out = @(& (Get-Process -Id $PID).Path -NoProfile -File $PSCommandPath -Scenario $s -WebViewPath $WebViewPath -ControllerPath $ControllerPath 2>&1 |
+               ForEach-Object { "$_" })
+      $code = $LASTEXITCODE
+      $out | ForEach-Object { Write-Host $_ }
+      $want = $ExpectedByScenario[$s] + 1     # + the child's own Assert-CheckTotal, which is a check too
+      $line = @($out | Where-Object { $_ -match '^##SCENARIO-RESULT ' }) | Select-Object -Last 1
+      $got = -1; $bad = -1
+      if ($line -and $line -match "^##SCENARIO-RESULT $([regex]::Escape($s)) checks=(\d+) failures=(\d+)$") {
+        $got = [int] $matches[1]; $bad = [int] $matches[2]
+        $script:childChecks += $got
+      }
+      Check "scenario '$s' exited 0 and reported $want checks, none failed" `
+        ($code -eq 0 -and $got -eq $want -and $bad -eq 0) "exit $code, result line: $(ShowVal $line)"
+      Write-Host ''
+    }
   }
-  if ($failed) { Write-Host "$failed SCENARIO(S) FAILED"; exit 1 }
-  Write-Host 'ALL CHECKS PASSED'
+  # One check per scenario, so a scenario dropped from the loop is a short total here.
+  Assert-CheckTotal $AllScenarios.Count
+  Write-Host ''
+  $total = $script:checks + $script:childChecks
+  if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) SCENARIO CHECKS FAILED"; exit 1 }
+  Write-Host "ALL $total CHECKS PASSED ($($script:childChecks) across $($AllScenarios.Count) scenario processes, $($script:checks) in this one)"
   exit 0
 }
 
@@ -54,8 +94,14 @@ Set-ExtractSource $web
 
 
 
+if (-not $ExpectedByScenario.Contains($Scenario)) { Write-Host "  FAIL  unknown scenario '$Scenario'"; exit 1 }
+
+# The child's verdict: its pinned total, then ONE machine-readable line the parent requires. Printed only
+# from here, so a child that never reached this point has no result line for the parent to find.
 function Done {
+  Assert-CheckTotal $ExpectedByScenario[$Scenario]
   Write-Host ''
+  Write-Host "##SCENARIO-RESULT $Scenario checks=$($script:checks) failures=$($script:failures)"
   if ($script:failures) { Write-Host "  $($script:failures) FAILURE(S) in scenario '$Scenario'"; exit 1 }
   exit 0
 }
@@ -63,37 +109,37 @@ function Done {
 # ── the source-level checks need no fake assemblies ───────────────────────────────────────────────────
 
 if ($Scenario -eq 'source') {
-  Write-Host "[$Scenario] the shape of the code itself"
+  Invoke-CheckSection "[$Scenario] the shape of the code itself" {
 
-  # Finding 1: three copies of the AppDomain scan became one. -le 1 would also pass at zero, i.e. if someone
-  # deleted the scan entirely, so this pins the exact count.
-  $scans = [regex]::Matches($web, 'AppDomain\.CurrentDomain\.GetAssemblies\(\)')
-  Check 'exactly one AppDomain scan in the bridge, not three' ($scans.Count -eq 1) "$($scans.Count) occurrence(s)"
+    # Finding 1: three copies of the AppDomain scan became one. -le 1 would also pass at zero, i.e. if someone
+    # deleted the scan entirely, so this pins the exact count.
+    $scans = [regex]::Matches($web, 'AppDomain\.CurrentDomain\.GetAssemblies\(\)')
+    Check 'exactly one AppDomain scan in the bridge, not three' ($scans.Count -eq 1) "$($scans.Count) occurrence(s)"
 
-  # Finding 3: the old name inverted the usual Try* meaning by returning true on the FALLBACK path.
-  $old = [regex]::Matches($web, '\bTryJump\b')
-  Check 'no TryJump left anywhere, doc comments included' ($old.Count -eq 0) "$($old.Count) occurrence(s)"
-  Check 'JumpToLine exists and says its return value is not success' `
-    ($web -match 'private static bool JumpToLine' -and (Get-Method 'private static bool JumpToLine(string path, int line)') -ne $null -and $web -match 'usedNativeMarker')
-  # Finding 3 [NIT]: the native-marker paint was duplicated between the jump helper and MarkExecutionLine.
-  # Match the CALL - fully qualified, open paren - not the bare name, which also appears in a doc comment
-  # about 0-based line conversion. Counting mentions would make this check claim more than it verifies.
-  $paint = [regex]::Matches($web, 'ICSharpCode\.SharpDevelop\.Debugging\.DebuggerService\.JumpToCurrentLine\s*\(')
-  Check 'exactly one call site paints the native marker' ($paint.Count -eq 1) "$($paint.Count) call(s)"
-  Check 'and it is PaintNativeMarker that owns it' `
-    ((Get-Method 'private static void PaintNativeMarker(string path, int line)') -match 'JumpToCurrentLine')
+    # Finding 3: the old name inverted the usual Try* meaning by returning true on the FALLBACK path.
+    $old = [regex]::Matches($web, '\bTryJump\b')
+    Check 'no TryJump left anywhere, doc comments included' ($old.Count -eq 0) "$($old.Count) occurrence(s)"
+    Check 'JumpToLine exists and says its return value is not success' `
+      ($web -match 'private static bool JumpToLine' -and (Get-Method 'private static bool JumpToLine(string path, int line)') -ne $null -and $web -match 'usedNativeMarker')
+    # Finding 3 [NIT]: the native-marker paint was duplicated between the jump helper and MarkExecutionLine.
+    # Match the CALL - fully qualified, open paren - not the bare name, which also appears in a doc comment
+    # about 0-based line conversion. Counting mentions would make this check claim more than it verifies.
+    $paint = [regex]::Matches($web, 'ICSharpCode\.SharpDevelop\.Debugging\.DebuggerService\.JumpToCurrentLine\s*\(')
+    Check 'exactly one call site paints the native marker' ($paint.Count -eq 1) "$($paint.Count) call(s)"
+    Check 'and it is PaintNativeMarker that owns it' `
+      ((Get-Method 'private static void PaintNativeMarker(string path, int line)') -match 'JumpToCurrentLine')
 
-  # Finding 2: the miss must be cached, and re-armed at session start - not on some other event.
-  Check 'the hooks are re-armed from StartSession' ((Get-Method 'private void StartSession()') -match 'RearmAndReportMonacoHooks')
+    # Finding 2: the miss must be cached, and re-armed at session start - not on some other event.
+    Check 'the hooks are re-armed from StartSession' ((Get-Method 'private void StartSession()') -match 'RearmAndReportMonacoHooks')
 
-  # THE FROZEN CONTRACT. ClarionAssistant's ClarionDebuggerBridge.Bind() requires BOTH of these to resolve,
-  # or the entire debugger context menu disappears on that side. They are the wire; this is the guard that
-  # says so in a place a future change will trip over.
-  Check 'DebugSessionController still exposes: public static DebugControllerState State' `
-    ($ctrl -match 'public\s+static\s+DebugControllerState\s+State')
-  Check 'DebugSessionController still exposes: public static void RunToCursor()' `
-    ($ctrl -match 'public\s+static\s+void\s+RunToCursor\s*\(\s*\)')
-
+    # THE FROZEN CONTRACT. ClarionAssistant's ClarionDebuggerBridge.Bind() requires BOTH of these to resolve,
+    # or the entire debugger context menu disappears on that side. They are the wire; this is the guard that
+    # says so in a place a future change will trip over.
+    Check 'DebugSessionController still exposes: public static DebugControllerState State' `
+      ($ctrl -match 'public\s+static\s+DebugControllerState\s+State')
+    Check 'DebugSessionController still exposes: public static void RunToCursor()' `
+      ($ctrl -match 'public\s+static\s+void\s+RunToCursor\s*\(\s*\)')
+  }
   Done
 }
 
@@ -200,108 +246,116 @@ function Explain { param([string] $Hook) [MonacoProbe]::$Hook.Explain() }
 switch ($Scenario) {
 
   'absent' {
-    Write-Host "[$Scenario] ClarionAssistant is not loaded at all - the normal state for anyone not using Monaco"
-    foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
-      Check "$h reads NotLoaded" ((Status $h) -eq 'NotLoaded') (Status $h)
-      Check "$h hands back no method, so callers take the native path" ($null -eq [MonacoProbe]::$h.Method) ''
+    Invoke-CheckSection "[$Scenario] ClarionAssistant is not loaded at all - the normal state for anyone not using Monaco" {
+      foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
+        Check "$h reads NotLoaded" ((Status $h) -eq 'NotLoaded') (Status $h)
+        Check "$h hands back no method, so callers take the native path" ($null -eq [MonacoProbe]::$h.Method) ''
+      }
+      Check 'and it says so in words a user can act on' ((Explain '_hookCursor') -match "isn't loaded") (Explain '_hookCursor')
+      Check 'no stale-copy warning when there is only one far side' ($null -eq [MonacoProbe]::_monacoDupeNote) ''
     }
-    Check 'and it says so in words a user can act on' ((Explain '_hookCursor') -match "isn't loaded") (Explain '_hookCursor')
-    Check 'no stale-copy warning when there is only one far side' ($null -eq [MonacoProbe]::_monacoDupeNote) ''
   }
 
   'bound' {
-    Write-Host "[$Scenario] the real contract still binds against a correctly shaped far side"
-    # Guards the signatures themselves: if someone tightens a hook declaration past what ClarionAssistant
-    # actually ships, this is what fails instead of the feature silently vanishing in the IDE.
-    New-FarSide $Good
-    foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
-      Check "$h binds" ((Status $h) -eq 'Bound') (Status $h)
-      Check "$h has nothing left to explain" ($null -eq (Explain $h)) ''
+    Invoke-CheckSection "[$Scenario] the real contract still binds against a correctly shaped far side" {
+      # Guards the signatures themselves: if someone tightens a hook declaration past what ClarionAssistant
+      # actually ships, this is what fails instead of the feature silently vanishing in the IDE.
+      New-FarSide $Good
+      foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
+        Check "$h binds" ((Status $h) -eq 'Bound') (Status $h)
+        Check "$h has nothing left to explain" ($null -eq (Explain $h)) ''
+      }
+      # The out-parameter hook is the one read through an object[]; prove the bound MethodInfo is callable
+      # exactly the way ResolveMonacoCursorSpec calls it.
+      # Not named $args: that is an automatic variable inside the section's scriptblock.
+      $cursorArgs = [object[]] @($null, 0, 0)
+      $ok = [MonacoProbe]::_hookCursor.Method.Invoke($null, $cursorArgs)
+      Check 'the cursor hook is invokable with the object[] the caller actually passes' `
+        ($ok -eq $true -and $cursorArgs[0] -eq 'MAIN.CLW' -and $cursorArgs[1] -eq 7) "$($cursorArgs[0]):$($cursorArgs[1])"
     }
-    # The out-parameter hook is the one read through an object[]; prove the bound MethodInfo is callable
-    # exactly the way ResolveMonacoCursorSpec calls it.
-    $args = [object[]] @($null, 0, 0)
-    $ok = [MonacoProbe]::_hookCursor.Method.Invoke($null, $args)
-    Check 'the cursor hook is invokable with the object[] the caller actually passes' `
-      ($ok -eq $true -and $args[0] -eq 'MAIN.CLW' -and $args[1] -eq 7) "$($args[0]):$($args[1])"
   }
 
   'older-build' {
-    Write-Host "[$Scenario] ClarionAssistant IS loaded, but predates two of the three hooks"
-    New-FarSide $Older
-    Check 'the hook it does have still binds' ((Status '_hookNavigate') -eq 'Bound') (Status '_hookNavigate')
-    foreach ($h in '_hookExecLine', '_hookCursor') {
-      Check "$h reads OlderBuild, not NotLoaded" ((Status $h) -eq 'OlderBuild') (Status $h)
-      Check "$h tells the user to upgrade rather than to install" ((Explain $h) -match 'upgrade it') (Explain $h)
+    Invoke-CheckSection "[$Scenario] ClarionAssistant IS loaded, but predates two of the three hooks" {
+      New-FarSide $Older
+      Check 'the hook it does have still binds' ((Status '_hookNavigate') -eq 'Bound') (Status '_hookNavigate')
+      foreach ($h in '_hookExecLine', '_hookCursor') {
+        Check "$h reads OlderBuild, not NotLoaded" ((Status $h) -eq 'OlderBuild') (Status $h)
+        Check "$h tells the user to upgrade rather than to install" ((Explain $h) -match 'upgrade it') (Explain $h)
+      }
     }
   }
 
   'wrong-shape' {
-    Write-Host "[$Scenario] every hook is present under a DRIFTED signature - the failure nothing else reports"
-    New-FarSide $Skew
-    foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
-      Check "$h refuses to bind to the wrong shape" ($null -eq [MonacoProbe]::$h.Method) ''
-      Check "$h reads WrongShape, distinctly from OlderBuild and NotLoaded" ((Status $h) -eq 'WrongShape') (Status $h)
-      Check "$h names the real problem: the two addins have drifted" ((Explain $h) -match 'drifted apart') ''
+    Invoke-CheckSection "[$Scenario] every hook is present under a DRIFTED signature - the failure nothing else reports" {
+      New-FarSide $Skew
+      foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
+        Check "$h refuses to bind to the wrong shape" ($null -eq [MonacoProbe]::$h.Method) ''
+        Check "$h reads WrongShape, distinctly from OlderBuild and NotLoaded" ((Status $h) -eq 'WrongShape') (Status $h)
+        Check "$h names the real problem: the two addins have drifted" ((Explain $h) -match 'drifted apart') ''
+      }
+      # SetExecutionLine here differs ONLY in return type (void, not bool). A bind that checked parameters but
+      # not the return type would accept it and then blow up in InvokeExecutionLine's cast.
+      Check 'a hook that differs only in RETURN type is still refused' ((Status '_hookExecLine') -eq 'WrongShape') (Status '_hookExecLine')
     }
-    # SetExecutionLine here differs ONLY in return type (void, not bool). A bind that checked parameters but
-    # not the return type would accept it and then blow up in InvokeExecutionLine's cast.
-    Check 'a hook that differs only in RETURN type is still refused' ((Status '_hookExecLine') -eq 'WrongShape') (Status '_hookExecLine')
   }
 
   'wrong-assembly' {
-    Write-Host "[$Scenario] the right type name in the wrong assembly is not our far side"
-    New-FarSide $Good -AssemblyName 'NotClarionAssistant'
-    foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
-      Check "$h does not bind to an assembly that merely defines the type name" ((Status $h) -eq 'NotLoaded') (Status $h)
+    Invoke-CheckSection "[$Scenario] the right type name in the wrong assembly is not our far side" {
+      New-FarSide $Good -AssemblyName 'NotClarionAssistant'
+      foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
+        Check "$h does not bind to an assembly that merely defines the type name" ((Status $h) -eq 'NotLoaded') (Status $h)
+      }
     }
   }
 
   'cached-miss' {
-    Write-Host "[$Scenario] the MISS is cached for the session, and a session start re-arms it"
-    # Finding 2, proved by behaviour rather than by counting scans: if the miss were not cached, step 2 below
-    # would re-scan and find the far side that has since loaded.
-    Check 'starts NotLoaded with nothing loaded' ((Status '_hookNavigate') -eq 'NotLoaded') (Status '_hookNavigate')
-    New-FarSide $Good
-    Check 'STILL NotLoaded after a good far side loads - the miss was cached, not re-scanned' `
-      ((Status '_hookNavigate') -eq 'NotLoaded') (Status '_hookNavigate')
-    [MonacoProbe]::RearmMonacoHooks()
-    foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
-      Check "$h binds after the session-start re-arm" ((Status $h) -eq 'Bound') (Status $h)
+    Invoke-CheckSection "[$Scenario] the MISS is cached for the session, and a session start re-arms it" {
+      # Finding 2, proved by behaviour rather than by counting scans: if the miss were not cached, step 2 below
+      # would re-scan and find the far side that has since loaded.
+      Check 'starts NotLoaded with nothing loaded' ((Status '_hookNavigate') -eq 'NotLoaded') (Status '_hookNavigate')
+      New-FarSide $Good
+      Check 'STILL NotLoaded after a good far side loads - the miss was cached, not re-scanned' `
+        ((Status '_hookNavigate') -eq 'NotLoaded') (Status '_hookNavigate')
+      [MonacoProbe]::RearmMonacoHooks()
+      foreach ($h in '_hookNavigate', '_hookExecLine', '_hookCursor') {
+        Check "$h binds after the session-start re-arm" ((Status $h) -eq 'Bound') (Status $h)
+      }
     }
   }
 
   'stale-copy' {
-    Write-Host "[$Scenario] two ClarionAssistant builds in one process is reported, not silently resolved"
-    New-FarSide $Good -Version '5.9.0.1235'
-    New-FarSide $Good -Version '5.9.0.9999'
-    Check 'the hooks still bind (to the first copy)' ((Status '_hookNavigate') -eq 'Bound') (Status '_hookNavigate')
-    $note = [MonacoProbe]::_monacoDupeNote
-    Check 'a stale-copy note is recorded' ($null -ne $note) ''
-    Check 'it counts them' ($note -match '2 loaded copies') $note
-    Check 'it names both versions, so the stale one is identifiable' `
-      ($note -match '5\.9\.0\.1235' -and $note -match '5\.9\.0\.9999') $note
-    [MonacoProbe]::RearmMonacoHooks()
-    Check 'the note is cleared by the re-arm so it cannot be reported twice for one scan' `
-      ($null -eq [MonacoProbe]::_monacoDupeNote) ''
+    Invoke-CheckSection "[$Scenario] two ClarionAssistant builds in one process is reported, not silently resolved" {
+      New-FarSide $Good -Version '5.9.0.1235'
+      New-FarSide $Good -Version '5.9.0.9999'
+      Check 'the hooks still bind (to the first copy)' ((Status '_hookNavigate') -eq 'Bound') (Status '_hookNavigate')
+      $note = [MonacoProbe]::_monacoDupeNote
+      Check 'a stale-copy note is recorded' ($null -ne $note) ''
+      Check 'it counts them' ($note -match '2 loaded copies') $note
+      Check 'it names both versions, so the stale one is identifiable' `
+        ($note -match '5\.9\.0\.1235' -and $note -match '5\.9\.0\.9999') $note
+      [MonacoProbe]::RearmMonacoHooks()
+      Check 'the note is cleared by the re-arm so it cannot be reported twice for one scan' `
+        ($null -eq [MonacoProbe]::_monacoDupeNote) ''
+    }
   }
 
   'off-thread' {
-    Write-Host "[$Scenario] a reflected call from a non-UI thread is marshalled, not raced and not dropped"
-    # Finding 4. RunToCursor is PUBLIC and reached by reflection from ClarionAssistant, and CmdRunToCursor
-    # mutates the transient-breakpoint list with no lock of its own, so an off-thread caller is a live data
-    # race. The REAL Invoke helper is lifted out of DebugSessionController.cs and driven against a stub pad
-    # that is a genuine WinForms Control running a genuine message loop on its own thread.
-    #
-    # Built as a small console app rather than through Add-Type: deriving from Control drags in WinForms'
-    # internal COM interop types, and no workable reference set for that exists in-process here - the
-    # runtime assemblies break on types forwarded into System.Private.CoreLib, and the reference packs
-    # collide with the host's own framework version. A csproj is how WinForms code is meant to be compiled,
-    # and it keeps the probe out of this process entirely.
-    $proj = Join-Path ([System.IO.Path]::GetTempPath()) ("camarshal-" + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $proj | Out-Null
+    Invoke-CheckSection "[$Scenario] a reflected call from a non-UI thread is marshalled, not raced and not dropped" {
+      # Finding 4. RunToCursor is PUBLIC and reached by reflection from ClarionAssistant, and CmdRunToCursor
+      # mutates the transient-breakpoint list with no lock of its own, so an off-thread caller is a live data
+      # race. The REAL Invoke helper is lifted out of DebugSessionController.cs and driven against a stub pad
+      # that is a genuine WinForms Control running a genuine message loop on its own thread.
+      #
+      # Built as a small console app rather than through Add-Type: deriving from Control drags in WinForms'
+      # internal COM interop types, and no workable reference set for that exists in-process here - the
+      # runtime assemblies break on types forwarded into System.Private.CoreLib, and the reference packs
+      # collide with the host's own framework version. A csproj is how WinForms code is meant to be compiled,
+      # and it keeps the probe out of this process entirely.
+      $proj = Join-Path ([System.IO.Path]::GetTempPath()) ("camarshal-" + [Guid]::NewGuid().ToString('N'))
+      New-Item -ItemType Directory -Path $proj | Out-Null
 
-    @'
+      @'
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -313,7 +367,7 @@ switch ($Scenario) {
 </Project>
 '@ | Set-Content (Join-Path $proj 'marshalprobe.csproj')
 
-    $program = @"
+      $program = @"
 using System;
 using System.Diagnostics;
 using System.Threading;
@@ -337,6 +391,7 @@ public class PadStub : Control, IDebugSessionTarget {
         RanOnThread = Thread.CurrentThread.ManagedThreadId;
         Calls++;
     }
+    public void CmdBreakOnProcEntryAt(string filePath, int line) { }
 }
 
 public static class Program {
@@ -417,42 +472,65 @@ $((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
         Check("an on-thread caller still runs synchronously, with no extra hop",
               _pad.Calls == 2, _pad.Calls + " call(s)");
 
-        // 4. a target that is not a Control at all must still be forwarded, not silently skipped.
+        // 4. a target that is not a Control at all. Since fc8d63f5 the interface requires ISynchronizeInvoke,
+        //    and the claim is no longer "forwarded on the caller's thread" but "posted through its OWN marshal".
         _target = new PlainTarget();
         Invoke(delegate(IDebugSessionTarget t) { t.CmdRunToCursor(null); }, true, IsPaused);
-        Check("a non-Control target is still forwarded rather than dropped by the thread guard",
-              PlainTarget.Calls == 1, PlainTarget.Calls + " call(s)");
+        Check("a non-Control target is marshalled through its own BeginInvoke, not run on the caller's thread",
+              PlainTarget.BeginInvokeCalls == 1 && PlainTarget.Calls == 1 && PlainTarget.RanPosted,
+              PlainTarget.BeginInvokeCalls + " post(s), " + PlainTarget.Calls + " call(s), posted=" + PlainTarget.RanPosted);
 
         if (_ctx != null) _pad.BeginInvoke((Action) delegate { _ctx.ExitThread(); });
         return _failures == 0 ? 0 : 1;
     }
 
-    /// Not every IDebugSessionTarget has to be a Control. The thread guard must fall through for one that
-    /// is not, instead of treating "cannot marshal" as "do not run".
+    /// Not every IDebugSessionTarget has to be a Control, but every one now carries a marshal (fc8d63f5).
+    /// This one reports "wrong thread" until its own BeginInvoke is running the posted delegate, and records
+    /// whether a command ran inside that post.
     private class PlainTarget : IDebugSessionTarget {
         public static int Calls;
+        public static int BeginInvokeCalls;
+        public static bool RanPosted;
+        [ThreadStatic] private static bool _inPost;
         public bool IsReady { get { return true; } }
         public bool IsSessionIdle { get { return true; } }
+        public bool InvokeRequired { get { return !_inPost; } }
+        public IAsyncResult BeginInvoke(Delegate method, object[] args) {
+            BeginInvokeCalls++; _inPost = true;
+            try { method.DynamicInvoke(args); } finally { _inPost = false; }
+            return null;
+        }
+        public object EndInvoke(IAsyncResult result) { return null; }
+        public object Invoke(Delegate method, object[] args) { return method.DynamicInvoke(args); }
         public void CmdStart() { } public void CmdContinue() { } public void CmdPause() { }
         public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
         public void CmdStop() { }
-        public void CmdRunToCursor(string spec) { Calls++; }
+        public void CmdRunToCursor(string spec) { Calls++; RanPosted = _inPost; }
+        public void CmdBreakOnProcEntryAt(string filePath, int line) { }
     }
 }
 "@
-    Set-Content (Join-Path $proj 'Program.cs') -Value $program
+      Set-Content (Join-Path $proj 'Program.cs') -Value $program
 
-    $build = & dotnet build (Join-Path $proj 'marshalprobe.csproj') -v q --nologo 2>&1
-    $exe = Join-Path $proj 'bin\Debug\net9.0-windows\marshalprobe.exe'
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $exe)) {
-      Write-Host '  FAIL  could not build the WinForms marshal probe'
-      $build | ForEach-Object { Write-Host "        $_" }
-      exit 1
+      $build = & dotnet build (Join-Path $proj 'marshalprobe.csproj') -v q --nologo 2>&1
+      $exe = Join-Path $proj 'bin\Debug\net9.0-windows\marshalprobe.exe'
+      # A Check and a return, not `exit 1`: an exit inside a section is flow control, which
+      # Invoke-CheckSection would report as a section that terminated the script - true, but not the reason.
+      $built = ($LASTEXITCODE -eq 0 -and (Test-Path $exe))
+      Check 'the WinForms marshal probe builds' $built $(if ($built) { '' } else { ($build | ForEach-Object { "$_" }) -join ' | ' })
+      if (-not $built) { return }
+
+      # The probe counts its own checks in C#, so neither its exit code nor its PASS lines alone say it ran
+      # them all: an exit 0 from a probe that asserted nothing is the vacuous pass this file is guarded
+      # against. Both are asserted, and the count is the probe's seven Check calls in Main.
+      $probeOut = @(& $exe 2>&1 | ForEach-Object { "$_" })
+      $probeExit = $LASTEXITCODE
+      $probeOut | ForEach-Object { Write-Host $_ }
+      $probeRan = @($probeOut | Where-Object { $_ -cmatch '^  (PASS|FAIL)  ' }).Count
+      Check 'the probe exited 0 and ran all 7 of its checks' ($probeExit -eq 0 -and $probeRan -eq 7) `
+        "exit $probeExit, $probeRan check(s) reported"
+      try { Remove-Item -Recurse -Force $proj -ErrorAction SilentlyContinue } catch { }
     }
-
-    & $exe
-    if ($LASTEXITCODE -ne 0) { $script:failures++ }
-    try { Remove-Item -Recurse -Force $proj -ErrorAction SilentlyContinue } catch { }
   }
 
   default { Write-Host "  FAIL  unknown scenario '$Scenario'"; exit 1 }

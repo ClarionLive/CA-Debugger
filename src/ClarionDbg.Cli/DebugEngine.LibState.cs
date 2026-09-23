@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using ClarionDbg.Core;
 
 namespace ClarionDbg.Cli
@@ -144,15 +145,8 @@ namespace ClarionDbg.Cli
         /// thunks (TlsGetValue/…) resolve to intrinsics.</summary>
         private RtlEmulator BuildEmulator(LoadedModule rt, uint tid, uint teb)
         {
-            // IAT slot VA -> bare import function name (BuildIatNameMap keys are slot RVAs, values "dll!func").
-            var imports = new Dictionary<uint, string>();
-            foreach (var kv in rt.Pe.BuildIatNameMap())
-            {
-                string fn = kv.Value;
-                int bang = fn.IndexOf('!');
-                imports[rt.LoadBase + kv.Key] = bang >= 0 ? fn.Substring(bang + 1) : fn;
-            }
-            uint stackBase = EmulatorStackWindow.Pick(_hProcess);
+            var imports = EmulatorImportsFor(rt);
+            uint stackBase = EmulatorStackBase(_hProcess);
             if (stackBase == 0)
                 throw new InvalidOperationException(
                     "no free address-space window for the emulator's modeled stack — refusing rather than "
@@ -167,6 +161,71 @@ namespace ClarionDbg.Cli
                 isCode: va => ModuleAt(va) != null,
                 stackBase: stackBase);
         }
+
+        /// <summary>Where the emulator's modeled stack goes: the window used last time if it is STILL free in
+        /// the target, otherwise a fresh <see cref="EmulatorStackWindow.Pick"/> (9b073cf9). This re-VALIDATES
+        /// the last window each time rather than reusing it on trust. The target ran since it was picked,
+        /// and a window it has since allocated into would make the emulator answer real reads from its own
+        /// zeroed buffer. Returns 0 when there is no free window at all.</summary>
+        private uint EmulatorStackBase(IntPtr hProcess)
+        {
+            if (_lastStackWindow != 0 && EmulatorStackWindow.StillFree(hProcess, _lastStackWindow))
+                return _lastStackWindow;
+            _lastStackWindow = EmulatorStackWindow.Pick(hProcess);
+            return _lastStackWindow;
+        }
+
+        /// <summary>The last window <see cref="EmulatorStackBase"/> handed out. Only ever a CANDIDATE: it is
+        /// re-checked against the live address space before every use, so nothing needs to clear it.</summary>
+        private uint _lastStackWindow;
+
+        /// <summary>Test seam for `protocolcheck`: the shipped window choice, against a process the harness
+        /// names. No refusal for an attached engine is needed: all it can leave behind is a candidate that
+        /// the next real call re-validates against the target before using.</summary>
+        internal uint EmulatorStackBaseForTest(IntPtr hProcess) { return EmulatorStackBase(hProcess); }
+
+        /// <summary>The runtime image's IAT slot VA -> bare import name map ("dll!func" -> "func"), rebased to
+        /// where the image is mapped. PER IMAGE, NOT PER EPISODE (9b073cf9): BuildEmulator runs on every
+        /// breakpoint hit that reads a THREADed name, and rebuilding this map is work whose answer cannot
+        /// change while the image stays mapped at one base. Measured 2026-09-22 on ClaRUN.dll (674 named
+        /// imports): ~50-60 us per rebuild.
+        ///
+        /// What is NOT cached here, deliberately: anything about a thread (the per-hit clear in ShouldPauseAtBp
+        /// owns that). The modeled-stack window is only re-validated, not cached; see EmulatorStackBase.
+        ///
+        /// KEYED ON THE LoadedModule AND ITS BASE. A pre-loaded solution DLL keeps its LoadedModule across an
+        /// unload and a reload (DebugEngine.Modules.cs sets LoadBase to 0, then to the new base), so the object
+        /// alone would hand back slot VAs from the old mapping. A base mismatch rebuilds.</summary>
+        private Dictionary<uint, string> EmulatorImportsFor(LoadedModule rt)
+        {
+            EmulatorImports held;
+            if (_emulatorImports.TryGetValue(rt, out held) && held.LoadBase == rt.LoadBase) return held.BySlot;
+            var bySlot = new Dictionary<uint, string>();
+            foreach (var kv in rt.Pe.BuildIatNameMap())   // keys are slot RVAs, values "dll!func"
+            {
+                string fn = kv.Value;
+                int bang = fn.IndexOf('!');
+                bySlot[rt.LoadBase + kv.Key] = bang >= 0 ? fn.Substring(bang + 1) : fn;
+            }
+            _emulatorImports.Remove(rt);
+            _emulatorImports.Add(rt, new EmulatorImports { LoadBase = rt.LoadBase, BySlot = bySlot });
+            return bySlot;
+        }
+
+        /// <summary>Weak on the LoadedModule, so a runtime-discovered DLL dropped from _modules on unload
+        /// takes its entry with it.</summary>
+        private readonly ConditionalWeakTable<LoadedModule, EmulatorImports> _emulatorImports
+            = new ConditionalWeakTable<LoadedModule, EmulatorImports>();
+
+        private sealed class EmulatorImports
+        {
+            internal uint LoadBase;
+            internal Dictionary<uint, string> BySlot;   // never mutated once built: emulators share it
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the shipped per-image import map. Touches no target; it
+        /// fills the same cache BuildEmulator reads, with the value BuildEmulator would compute.</summary>
+        internal Dictionary<uint, string> EmulatorImportsForTest(LoadedModule rt) { return EmulatorImportsFor(rt); }
 
         /// <summary>Read exactly <paramref name="n"/> bytes from the debuggee, or fewer at a guard page /
         /// unreadable boundary (the emulator throws NotSupported when short, surfacing as &lt;unavailable&gt;).</summary>
