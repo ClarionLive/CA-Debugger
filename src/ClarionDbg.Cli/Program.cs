@@ -33,6 +33,7 @@ namespace ClarionDbg.Cli
                     case "scanmissingnames": return ScanMissingNames(args);
                     case "surveymissingnames": return SurveyMissingNames(args);
                     case "protocolcheck": return ProtocolCheck(args);
+                    case "procs": return ProcsCommand.Run(args);
                     default: Usage(); return 1;
                 }
             }
