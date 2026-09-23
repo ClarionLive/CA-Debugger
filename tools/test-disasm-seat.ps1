@@ -371,8 +371,52 @@ Check 'the location clear is gated on EmptySeat, not on any empty reply' `
   ($arm -match 'if\s*\(\s*outcome\s*==\s*SeatState\.WindowOutcome\.EmptySeat\s*\)\s*\{\s*_curPath = _curModule = null') ''
 Check 'the banner is re-derived AFTER the listing is replaced' (($iBanner -ge 0) -and ($iBanner -gt $iCache)) "banner=$iBanner cache=$iCache"
 
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '4. stepping while viewing another thread says what it will do (375d463b)'
+# The step buttons stay ENABLED - stepping is defined on the stopped thread and is a legitimate thing to want
+# from anywhere - but the tooltip and the banner name the thread that will run and say the view returns to it.
+# The two pure helpers are compiled out of the shipped view; the wiring is pinned as statements.
+$isOther = Get-Method 'private static bool IsOtherThread(uint selTid, uint stoppedTid)' $viewSrc
+$stepTip = Get-Method 'private static string StepTip(string tip, string stoppedName)' $viewSrc
+Add-Type -TypeDefinition @"
+public static class DisasmStepProbe {
+$(($isOther, $stepTip -join "`n") -replace 'private static', 'public static')
+}
+"@ -Language CSharp | Out-Null
+Check 'another selected thread, both known: viewing another thread' ([DisasmStepProbe]::IsOtherThread($B, $A)) ''
+Check 'the stopped thread itself: not another thread' (-not [DisasmStepProbe]::IsOtherThread($A, $A)) ''
+Check 'selection unknown: says nothing' (-not [DisasmStepProbe]::IsOtherThread($Z, $A)) ''
+Check 'stopped thread unknown: says nothing' (-not [DisasmStepProbe]::IsOtherThread($B, $Z)) ''
+$plain = 'Step over one instruction'
+# [NullString]::Value, not $null: PowerShell hands a .NET string parameter "" for $null.
+Check 'on the stopped thread the tooltip is the plain one' ([DisasmStepProbe]::StepTip($plain, [NullString]::Value) -eq $plain) ''
+$tip = [DisasmStepProbe]::StepTip($plain, 'Thread 2')
+Check 'elsewhere the tooltip keeps the plain text first' ($tip.StartsWith($plain)) $tip
+Check '...names the thread that will run, as the stopped thread' ($tip -match 'on Thread 2, the stopped thread') $tip
+Check '...and says the view returns to it' ($tip -match 'returns to it') $tip
+
+$updTips = Get-CSharpCodeOnly (Get-Method 'private void UpdateStepTips()' $viewSrc)
+Check 'the tooltips name the STOPPED thread, never the viewed one' `
+  (($updTips -match 'ThreadName\(_stoppedTid\)') -and ($updTips -notmatch 'ThreadName\(_selTid\)')) ''
+Check 'the tooltips speak only when IsOtherThread says so' ($updTips -match 'IsOtherThread\(_selTid,\s*_stoppedTid\)') ''
+foreach ($pair in @(@('_bOver', 'TipOver'), @('_bInto', 'TipInto'), @('_bOut', 'TipOut'))) {
+  Check "$($pair[0]) gets its own tip through StepTip" `
+    ($updTips -match ([regex]::Escape($pair[0]) + '\.ToolTipText\s*=\s*StepTip\(' + $pair[1] + ',\s*stopped\)')) ''
+}
+$banner = Get-CSharpCodeOnly (Get-Method 'private void UpdateThreadBanner()' $viewSrc)
+# As a STATEMENT at the start of a line: `if (x) UpdateStepTips();` would disable it and still contain the text.
+Check 'every banner refresh re-words the step tooltips (an unconditional statement)' ($banner -match '(?m)^\s*UpdateStepTips\(\);') ''
+Check 'the visible banner says which thread Step runs' ($banner -match 'Step runs "\s*\+\s*ThreadName\(_stoppedTid\)') ''
+# THE DECISION ITSELF: the buttons are not disabled for viewing another thread. Enabled means paused, only.
+$updBtns = Get-CSharpCodeOnly (Get-Method 'private void UpdateButtons(DebugSessionState s)' $viewSrc)
+foreach ($btn in '_bOver', '_bInto', '_bOut') {
+  Check "$btn stays enabled whenever paused (explained, not taken away)" `
+    ($updBtns -match ('(?m)^\s*if \(' + $btn + '\s*!= null\) ' + $btn + '\.Enabled\s*=\s*paused;')) ''
+}
+
 # The count, asserted: "ALL CHECKS PASSED" is equally true of a run that silently skipped a section.
-$EXPECTED_CHECKS = 95
+$EXPECTED_CHECKS = 113
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

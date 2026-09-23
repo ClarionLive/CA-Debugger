@@ -196,6 +196,41 @@ namespace ClarionDebugger.Disassembly
 
         // ----- stepping toolbar -----
 
+        private const string TipOver = "Step over one instruction (run calls to completion)";
+        private const string TipInto = "Step one machine instruction (into calls)";
+        private const string TipOut  = "Step out of the procedure (source level)";
+
+        /// <summary>Is the view following a thread other than the one execution stopped on? Both must be
+        /// known: an unknown side is the ordinary single-thread case, where saying anything is noise. The
+        /// same rule as the pad's viewingOtherThread, so the two never disagree about when to speak.</summary>
+        private static bool IsOtherThread(uint selTid, uint stoppedTid)
+        {
+            return selTid != 0 && stoppedTid != 0 && selTid != stoppedTid;
+        }
+
+        /// <summary>A step button's tooltip. STEPPING IS DEFINED ON THE STOPPED THREAD (ticket 375d463b): while
+        /// the view follows another one, Over/Into/Out still run the stopped thread, and the next stop brings
+        /// the view back to it. That is correct engine behaviour and the buttons stay enabled — taking a
+        /// control away is worse than explaining it — but it must not be a surprise, so the tooltip names the
+        /// thread that will run and says the view will return to it. <paramref name="stoppedName"/> is null
+        /// when the view is on the stopped thread, and the tooltip is then the plain one.</summary>
+        private static string StepTip(string tip, string stoppedName)
+        {
+            if (stoppedName == null) return tip;
+            return tip + " — on " + stoppedName + ", the stopped thread: stepping always runs it, and the view"
+                 + " returns to it";
+        }
+
+        /// <summary>Re-word the step buttons for the thread the view is on. Called with the banner, which is
+        /// re-derived on every selection, inventory, stop and seat change.</summary>
+        private void UpdateStepTips()
+        {
+            string stopped = IsOtherThread(_selTid, _stoppedTid) ? ThreadName(_stoppedTid) : null;
+            if (_bOver != null) _bOver.ToolTipText = StepTip(TipOver, stopped);
+            if (_bInto != null) _bInto.ToolTipText = StepTip(TipInto, stopped);
+            if (_bOut  != null) _bOut.ToolTipText  = StepTip(TipOut,  stopped);
+        }
+
         private void BuildToolbar()
         {
             _bar.RenderMode = ToolStripRenderMode.Professional;
@@ -207,9 +242,9 @@ namespace ClarionDebugger.Disassembly
             // and stops at the next instruction; Into single-steps into calls. Out is source-level.
             _bContinue = AddButton("▶ Continue", "Resume until the next breakpoint or exception", () => _svc?.Continue());
             _bar.Items.Add(new ToolStripSeparator());
-            _bOver  = AddButton("⤼ Over",  "Step over one instruction (run calls to completion)", () => _svc?.StepInstrOver());
-            _bInto  = AddButton("⤷ Into",  "Step one machine instruction (into calls)",           () => _svc?.StepInstr());
-            _bOut   = AddButton("⤴ Out",   "Step out of the procedure (source level)",            () => _svc?.StepOut());
+            _bOver  = AddButton("⤼ Over",  TipOver, () => _svc?.StepInstrOver());
+            _bInto  = AddButton("⤷ Into",  TipInto, () => _svc?.StepInstr());
+            _bOut   = AddButton("⤴ Out",   TipOut,  () => _svc?.StepOut());
             _bar.Items.Add(new ToolStripSeparator());
             _bSrc   = AddButton("◧ Source", "Open the .clw source at the current line", ShowSource);
             _bar.Items.Add(new ToolStripSeparator());
@@ -550,10 +585,15 @@ namespace ClarionDebugger.Disassembly
             // SeatState.ForeignSeatedTid's, next to the only code that writes the painted thread: blank while
             // nothing is painted, or while what IS painted is not what we are now selecting.
             uint foreign = _seat.ForeignSeatedTid(_selTid, _stoppedTid);
+            // The second clause says the step buttons' consequence in the one place that is always visible
+            // (375d463b): pressing Step here runs the STOPPED thread and the view snaps back to it, and that
+            // snap-back is only readable if it was announced.
             if (foreign != 0)
-                text = "viewing " + ThreadName(foreign) + " — not the stopped thread";
+                text = "viewing " + ThreadName(foreign) + " — not the stopped thread · Step runs "
+                     + ThreadName(_stoppedTid);
             _thread.Text = text;
             _thread.Visible = text.Length > 0;
+            UpdateStepTips();
         }
 
         /// <summary>Name a thread the way the pad names it: its Clarion thread number when the RTL gave one,
