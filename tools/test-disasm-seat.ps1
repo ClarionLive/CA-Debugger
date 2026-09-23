@@ -168,6 +168,7 @@ function Test-Retires([string] $Name, [scriptblock] $Prepare, [scriptblock] $Act
 $painted = { param($x) $x.Stopped($A, $null); [void]$x.WindowLanded($A, $A, 3) }
 Test-Retires 'a stop'            { param($x) }       { param($x) $x.Stopped($A, $null) }
 Test-Retires 'a thread seat'     $painted            { param($x) [void]$x.TryBeginSeat($B) }
+Test-Retires 'a recentre'        $painted            { param($x) [void]$x.BeginRecentre($A) }
 Test-Retires 'a coarse seek'     $painted            { param($x) $x.Seek() }
 Test-Retires 'a rebind'          $painted            { param($x) $x.Rebound() }
 Test-Retires 'an exit'           $painted            { param($x) $x.Exited() }
@@ -276,6 +277,25 @@ Check 'a seek abandons the pending thread seat' (($s.SeatingTid -eq 0) -and (-no
 Check 'so the switch''s late registers cannot yank the view off the scroll' (-not $s.TakeRegs($B, $VA)) ''
 [void]$s.WindowLanded($B, $B, 20)
 Check 'the seek''s reply honestly paints the selected thread (its code, at the scrolled address)' ($s.SeatedTid -eq $B) "seated=$($s.SeatedTid)"
+
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '2g. recentre: the explicit way back to the current instruction (876ddf1d)'
+
+$s = New-Seat
+$s.Stopped($A, $null)
+[void]$s.WindowLanded($A, $A, 3)
+$s.Seek()
+[void]$s.WindowLanded($A, $A, 7)
+Check 'CONTROL: after a seek the ordinary seat refuses, because the thread IS painted' (-not $s.TryBeginSeat($A)) ''
+Check 'recentre seats anyway, on the selected thread, through its registers' `
+  ($s.BeginRecentre($A) -and ($s.SeatingTid -eq $A) -and $s.AwaitRegs) "seating=$($s.SeatingTid) await=$($s.AwaitRegs)"
+Check 'recentre leaves the painted thread alone until the new window lands' ($s.SeatedTid -eq $A) "seated=$($s.SeatedTid)"
+Check 'recentre on an unknown thread does nothing' (-not (New-Seat).BeginRecentre($Z)) ''
+$s = New-Seat
+$s.Stopped($B, $null)
+[void]$s.WindowLanded($B, $B, 0)
+Check 'recentre retries a thread that decoded to nothing (an explicit ask is worth one retry)' ($s.BeginRecentre($B)) ''
 
 # ------------------------------------------------------------------------------------------------------------
 Write-Host ''
@@ -415,8 +435,34 @@ foreach ($btn in '_bOver', '_bInto', '_bOut') {
     ($updBtns -match ('(?m)^\s*if \(' + $btn + '\s*!= null\) ' + $btn + '\.Enabled\s*=\s*paused;')) ''
 }
 
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '5. the way back to the current instruction, and the scroll that it makes harmless (876ddf1d)'
+# BeginRecentre's behaviour is section 2g. These pin the view's entry points to it, by statement.
+$recentre = Get-CSharpCodeOnly (Get-Method 'private void Recentre()' $viewSrc)
+Check 'recentre seats through SeatState and asks for the registers only if a seat began' `
+  ($recentre -match 'if \(_seat\.BeginRecentre\(_selTid\)\) _svc\.RequestRegs\(\);') ''
+# The SELECTED thread's registers, never the stopped thread's address: CurrentVa while another thread is
+# selected is the blind-seat defect SeatOnLateOpen documents.
+Check 'recentre never seats blind on an address' (($recentre -notmatch 'CurrentVa') -and ($recentre -notmatch 'RequestDisasmAt') -and ($recentre -notmatch '_stoppedTid')) ''
+Check 'recentre does nothing unless paused' ($recentre -match '_svc\.State != DebugSessionState\.Paused\) return;') ''
+Check 'the toolbar has a Current button wired to Recentre' ($viewCode -match '_bCur\s*=\s*AddButton\("[^"]*Current",\s*"[^"]*",\s*Recentre\);') ''
+$cmdKey = Get-CSharpCodeOnly (Get-Method 'protected override bool ProcessCmdKey(ref Message msg, Keys keyData)' $viewSrc)
+Check 'Alt+* recentres, and is consumed' ($cmdKey -match 'if \(keyData == \(Keys\.Alt \| Keys\.Multiply\)\) \{ Recentre\(\); return true; \}') ''
+$updRec = Get-CSharpCodeOnly (Get-Method 'private void UpdateRecentre()' $viewSrc)
+Check 'Current is enabled only while paused on a known thread' `
+  ($updRec -match '_bCur\.Enabled = _svc\?\.State == DebugSessionState\.Paused && _selTid != 0;') ''
+Check '...re-evaluated on every state change (an unconditional statement)' ($updBtns -match '(?m)^\s*UpdateRecentre\(\);') ''
+Check '...and on every selection change, with the banner' ($banner -match '(?m)^\s*UpdateRecentre\(\);') ''
+# THE SCROLL WINS (the PM's ruling on 876ddf1d): a seek retires the pending switch seat and nothing in it
+# re-asserts one. Re-seating here would yank the view off where the user just scrolled.
+$coarse = Get-CSharpCodeOnly (Get-Method 'private void OnCoarseScroll(object sender, ScrollEventArgs e)' $viewSrc)
+Check 'a coarse seek goes through SeatState.Seek' ($coarse -match '(?m)^\s*_seat\.Seek\(\);') ''
+Check 'a coarse seek never re-asserts a thread seat' `
+  ($coarse -notmatch 'BeginRecentre|TryBeginSeat|SeatOnSelectedThread|RequestRegs') ''
+
 # The count, asserted: "ALL CHECKS PASSED" is equally true of a run that silently skipped a section.
-$EXPECTED_CHECKS = 113
+$EXPECTED_CHECKS = 130
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

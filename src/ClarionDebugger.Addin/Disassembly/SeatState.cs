@@ -141,6 +141,21 @@ namespace ClarionDebugger.Disassembly
             return true;
         }
 
+        /// <summary>An EXPLICIT request to go back to <paramref name="selTid"/>'s current instruction (ticket
+        /// 876ddf1d). Unlike <see cref="TryBeginSeat"/> it skips the already-painted and already-empty guards
+        /// on purpose: "painted" is exactly the state a user who scrolled away is in, and an explicit ask is
+        /// worth one retry of an address that decoded to nothing. It still retires everything in flight and
+        /// seats through the registers, like any other seat. The painted thread is left alone: its listing
+        /// stays on screen until the new window replaces it.</summary>
+        public bool BeginRecentre(uint selTid)
+        {
+            if (selTid == 0) return false;
+            NewEpoch();
+            _seatingTid = selTid;
+            _awaitRegsSeat = true;
+            return true;
+        }
+
         /// <summary>A regs reply for <paramref name="tid"/> whose EIP parsed to <paramref name="eipVa"/> (0 when
         /// absent or unparsable). True - and the "we asked" flag is CONSUMED - only if this view asked for
         /// exactly that thread's registers and the reply says where to seat. The seat stays in flight: it
@@ -173,7 +188,7 @@ namespace ClarionDebugger.Disassembly
         ///
         /// THE SCROLL WINS, deliberately (the PM's ruling on 876ddf1d): the user's newest explicit action beats
         /// an older auto-centre, so nothing here or after re-asserts the abandoned seat. Re-asserting it would
-        /// yank the view away from where the user just scrolled.
+        /// yank the view away from where the user just scrolled. The way back is <see cref="BeginRecentre"/>.
         ///
         /// Any "no code to show for Thread B" claim is retired NOW rather than when the reply lands: from this
         /// moment the pane is an address seek and says nothing about a thread.</summary>

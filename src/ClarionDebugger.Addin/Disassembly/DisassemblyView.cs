@@ -36,7 +36,7 @@ namespace ClarionDebugger.Disassembly
         private readonly VScrollBar _coarse = new VScrollBar { Dock = DockStyle.Left };   // coarse address seek
         private readonly VScrollBar _scroll = new VScrollBar { Dock = DockStyle.Right };  // fine line scroll
         private readonly ToolStrip _bar = new ToolStrip { Dock = DockStyle.Top, GripStyle = ToolStripGripStyle.Hidden };
-        private ToolStripButton _bContinue, _bOver, _bInto, _bOut, _bStop, _bSrc;
+        private ToolStripButton _bContinue, _bOver, _bInto, _bOut, _bStop, _bSrc, _bCur;
         private ToolStripLabel _loc;
         private string _curPath, _curModule;   // source location of the current instruction (the stop's
                                                // symbol, its non-TSWD fallback, lives in _seat: SymbolFor)
@@ -246,6 +246,7 @@ namespace ClarionDebugger.Disassembly
             _bInto  = AddButton("⤷ Into",  TipInto, () => _svc?.StepInstr());
             _bOut   = AddButton("⤴ Out",   TipOut,  () => _svc?.StepOut());
             _bar.Items.Add(new ToolStripSeparator());
+            _bCur   = AddButton("⌖ Current", "Go back to the current instruction of the thread being viewed (Alt+*)", Recentre);
             _bSrc   = AddButton("◧ Source", "Open the .clw source at the current line", ShowSource);
             _bar.Items.Add(new ToolStripSeparator());
             _bStop  = AddButton("■ Stop",  "Terminate the debug session", () => _svc?.Stop());
@@ -304,7 +305,30 @@ namespace ClarionDebugger.Disassembly
             if (_bInto  != null) _bInto.Enabled  = paused;
             if (_bOut   != null) _bOut.Enabled   = paused;
             if (_bStop  != null) _bStop.Enabled  = paused || running;
+            UpdateRecentre();
             UpdateLocation();
+        }
+
+        /// <summary>GO BACK TO THE CURRENT INSTRUCTION (ticket 876ddf1d). The auto-centre can be lost — a
+        /// coarse seek during a thread switch deliberately abandons the switch's seat (the scroll wins; see
+        /// OnCoarseScroll), and any scroll moves the window off the current row — and without this there was
+        /// no way back short of stepping. It re-seats on the SELECTED thread's EIP exactly as a thread switch
+        /// does: a new epoch, then the registers, then the window. The selected thread, not the stopped one:
+        /// the engine decodes the SELECTED thread, so seating on the stopped thread's address while another is
+        /// selected would paint one thread's code under the other's banner (the blind-seat defect).
+        /// An explicit action, so it is not refused because the thread is already painted — that is exactly
+        /// the state of a user who scrolled away.</summary>
+        private void Recentre()
+        {
+            if (_svc == null || _svc.State != DebugSessionState.Paused) return;
+            if (_seat.BeginRecentre(_selTid)) _svc.RequestRegs();
+        }
+
+        /// <summary>Recentre needs a paused session and a thread to recentre ON: the seat goes through that
+        /// thread's registers, which are tid-stamped.</summary>
+        private void UpdateRecentre()
+        {
+            if (_bCur != null) _bCur.Enabled = _svc?.State == DebugSessionState.Paused && _selTid != 0;
         }
 
         // ----- engine session (events arrive on the reader thread → marshal to the UI thread) -----
@@ -594,6 +618,7 @@ namespace ClarionDebugger.Disassembly
             _thread.Text = text;
             _thread.Visible = text.Length > 0;
             UpdateStepTips();
+            UpdateRecentre();   // _selTid moves with the banner's inputs
         }
 
         /// <summary>Name a thread the way the pad names it: its Clarion thread number when the RTL gave one,
@@ -928,6 +953,15 @@ namespace ClarionDebugger.Disassembly
             return base.IsInputKey(keyData);
         }
 
+        /// <summary>Alt+* — Visual Studio's "Show Next Statement" — recentres on the current instruction.
+        /// Taken here rather than in OnKeyDown because an Alt chord arrives as a system key, which the
+        /// command-key pass sees first.</summary>
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Alt | Keys.Multiply)) { Recentre(); return true; }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
@@ -1003,7 +1037,7 @@ namespace ClarionDebugger.Disassembly
             // THE SEEK DELIBERATELY WINS OVER A PENDING SEAT (the PM's ruling on 876ddf1d): retiring the
             // replies abandons an in-flight thread-switch seat, and nothing re-asserts it — that would yank
             // the view away from where the user just scrolled. Do not "fix" this by re-seating after the
-            // seek.
+            // seek; the way back to the current instruction is the explicit Recentre action (Alt+*).
             _seat.Seek();
             _svc?.RequestDisasmAt("0x" + va.ToString("X"), WindowCount, MakeTag(WinTag));   // reseat the window there
         }
