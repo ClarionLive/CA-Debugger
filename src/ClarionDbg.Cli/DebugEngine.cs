@@ -607,6 +607,9 @@ namespace ClarionDbg.Cli
             uint pollMs = _interactive ? 200u : (uint)_waitMs;
             while (running)
             {
+                // Every pass, not only the timeout branch: a stream of debug events never reaches that branch,
+                // and its 200 ms is coarser than the hover's 150. PollHover throttles itself by timestamp.
+                if (_interactive) PollHover(false);
                 if (!Native.WaitForDebugEvent(buf, pollMs))
                 {
                     if (_interactive)
@@ -673,6 +676,7 @@ namespace ClarionDbg.Cli
                         // opening an episode — then a reused tid inheriting a dead thread's block is a live
                         // bug and this is the line that prevents it. Cheap; kept.
                         ClearThreadedBlockCache(tid);
+                        ForgetSetIpThread(tid);   // setip observations: a reused tid starts with none
                         break;
 
                     case Native.EXCEPTION_DEBUG_EVENT:
@@ -708,6 +712,7 @@ namespace ClarionDbg.Cli
                         {
                             // pass first-chance non-breakpoint exceptions back to the app
                             status = Native.DBG_EXCEPTION_NOT_HANDLED;
+                            SetIpOnExceptionPassed(tid);   // the app's handler may unwind a watched step: see DebugEngine.SetIp.cs
                         }
                         break;
 
@@ -802,6 +807,40 @@ namespace ClarionDbg.Cli
         // ------------------------------------------------------------------ pause + command loop
 
         /// <summary>
+        /// Resolve where the stopped thread is and announce it: the thread-stamped `paused` event and the
+        /// console line. Lifted out of <see cref="PausedWait"/> so it can run AGAIN within one stop: after
+        /// `setip` moves EIP, the pause loop re-runs this with reason "setip", so the host refreshes every
+        /// panel through its ordinary `paused` path and the step verbs get locals for the NEW line.
+        /// </summary>
+        private void AnnounceStop(uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason,
+                                  out LoadedModule m, out bool resolved, out int line, out int mi)
+        {
+            uint va = haveCtx ? ctx.Eip : 0;
+            m = haveCtx ? ModuleAt(va) : null;
+            uint rva = m != null ? va - m.LoadBase : va;
+            line = 0; mi = -1; uint recRva = 0;
+            resolved = haveCtx && m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            if (!resolved) { line = 0; mi = -1; recRva = 0; }
+            string mod = resolved ? m.Dbg.ModuleNameForIdx(mi) : null;
+            string proc = haveCtx ? ProcNameAt(m, rva) : null;
+            uint gap = resolved ? rva - recRva : 0;
+            // SPIKE: when stopped in non-TSWD code (the runtime), name the location from the live IAT
+            // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
+            string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
+
+            // Remember where this thread stood, for setip's observed-ESP path (DebugEngine.SetIp.cs).
+            ObserveStop(tid, ref ctx, haveCtx, m, rva, resolved, gap, reason);
+
+            // `paused` carries the STOPPED thread's tid. It describes one thread's location and registers,
+            // so it is thread-scoped like the rest; carrying the tid means the host knows which thread it
+            // stopped on even if its follow-up `threads` request fails or races. Additive: a host that does
+            // not read the field is unaffected.
+            EmitThreadEvent(tid, Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
+                haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch setip quit");
+        }
+
+        /// <summary>
         /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
         /// services stdin commands until a resume-type command arrives.
         /// </summary>
@@ -811,33 +850,19 @@ namespace ClarionDbg.Cli
             _instrStep = false;       // and consumes a pending instruction-step
             _selectedTid = tid;       // a new stop always starts on the stopped thread — a selection is
                                       // per-stop and is never carried across one
+            HoverNewStop();             // one fresh hover answer per stop, however long the step took
             ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
                                         // rather than trust bases cached while the target was last frozen
-            uint va = haveCtx ? ctx.Eip : 0;
-            var m = haveCtx ? ModuleAt(va) : null;
-            uint rva = m != null ? va - m.LoadBase : va;
-            int line = 0; int mi = -1; uint recRva = 0;
-            bool resolved = haveCtx && m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
-            if (!resolved) { line = 0; mi = -1; recRva = 0; }
-            string mod = resolved ? m.Dbg.ModuleNameForIdx(mi) : null;
-            string proc = haveCtx ? ProcNameAt(m, rva) : null;
-            uint gap = resolved ? rva - recRva : 0;
-            // SPIKE: when stopped in non-TSWD code (the runtime), name the location from the live IAT
-            // so the host can show "in ClaRUN.dll!Cla$PushLong+0x7" instead of "(unresolved)".
-            string sym = (haveCtx && !resolved) ? NearestImportSymbol(va) : null;
 
-            // `paused` carries the STOPPED thread's tid. It describes one thread's location and registers,
-            // so it is thread-scoped like the rest; carrying the tid means the host knows which thread it
-            // stopped on even if its follow-up `threads` request fails or races. Additive: a host that does
-            // not read the field is unaffected.
-            EmitThreadEvent(tid, Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
-                haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
+            // The stop's location. These four are what the step verbs hand BeginStep, so they must describe
+            // where EIP IS: `setip` moves it and re-runs AnnounceStop to recompute them (a77abd94 risk 6).
+            LoadedModule m; bool resolved; int line; int mi;
+            AnnounceStop(tid, ref ctx, haveCtx, reason, out m, out resolved, out line, out mi);
 
             while (true)
             {
                 string cmd;
-                if (!_cmds.TryDequeue(out cmd)) { Thread.Sleep(20); continue; }
+                if (!_cmds.TryDequeue(out cmd)) { PollHover(true); Thread.Sleep(20); continue; }
                 cmd = cmd.Trim();
                 if (cmd.Length == 0) continue;
                 var parts = cmd.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
@@ -935,12 +960,24 @@ namespace ClarionDbg.Cli
                         EmitError(verb + ": the target is already paused");
                         break;
 
+                    case "setip":   // set next statement: move the STOPPED thread's EIP (DebugEngine.SetIp.cs)
+                        if (HandleSetIpCommand(parts, tid, hThread, ref ctx, haveCtx))
+                        {
+                            AnnounceStop(tid, ref ctx, haveCtx, "setip", out m, out resolved, out line, out mi);
+                            HoverNewStop();   // a setip stop is a new stop for the hover tracker too (the page re-baselines on it)
+                        }
+                        break;
+
                     case "threads":
                         HandleThreadsCommand(tid);
                         break;
 
                     case "thread":
                         HandleThreadSelectCommand(parts, tid);
+                        break;
+
+                    case "hover":   // identify-thread-by-window mode (DebugEngine.Hover.cs)
+                        HandleHoverCommand(parts, true);
                         break;
 
                     case "expand":   // lazy expansion of a reference node (read-only; no target code runs)
@@ -1018,6 +1055,10 @@ namespace ClarionDbg.Cli
         /// <summary>Set TF on the paused thread when the resume needs a single-step (BP re-arm or stepping).</summary>
         private void ArmResume(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, bool stepping)
         {
+            // FIRST, before anything can return: every resume verb comes through here, so this is where setip's
+            // observations are cut back for the run that follows (DebugEngine.SetIp.cs). Position pinned by
+            // tools/test-engine-setip-sites.ps1.
+            SetIpOnResume(tid, stepping, haveCtx, haveCtx ? ctx.Esp : 0);
             if (!haveCtx) return;
             bool needTf = stepping || _rearm.ContainsKey(tid);
             if (!needTf) return;
@@ -1073,8 +1114,14 @@ namespace ClarionDbg.Cli
                                            false, "no thread selection while the target is running");
                         break;
                     }
+                    case "hover":   // identify-thread-by-window mode: report-only while running
+                        HandleHoverCommand(parts, false);
+                        break;
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
+                        break;
+                    case "setip":   // its own refusal event, so the pad can toast it like any other setip refusal
+                        EmitSetIpNotPaused(parts);
                         break;
                     // The resume verbs USED TO BE LISTED HERE, as a third hand-maintained copy of the set.
                     // They are now recognised by IsResumeVerb ahead of this switch — one owner, so adding a
@@ -1166,35 +1213,24 @@ namespace ClarionDbg.Cli
             Native.WriteProcessMemory(_hProcess, Ptr(va), BitConverter.GetBytes(value), 4, out wrote);
         }
 
-        /// <summary>mem 0xADDR LEN — read target memory while paused (for the watch pane).</summary>
+        /// <summary>mem 0xADDR LEN [reqId] — read target memory while paused (the Memory panel). READ-ONLY and
+        /// capped at <see cref="MemMaxLen"/> bytes; only the pause loop dispatches it, so it never runs
+        /// against a running target. The optional trailing reqId is echoed on the reply, and on a refusal as a
+        /// mem event with an "error" member, so the host can match a reply to the request that asked for it.
+        /// Without one a refusal is a plain error event, as before.</summary>
         private void HandleMemCommand(string[] parts)
         {
-            if (parts.Length < 3) { EmitError("mem expects: mem 0xADDR LEN"); return; }
-            uint addr; int len;
-            string a = parts[1].Trim();
-            try
+            uint addr; int len; string reqId; byte[] buf; int read;
+            string err = MemRead(parts, out addr, out len, out reqId, out buf, out read);
+            if (err != null)
             {
-                addr = a.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-                    ? Convert.ToUInt32(a.Substring(2), 16)
-                    : Convert.ToUInt32(a);
-            }
-            catch { EmitError("mem: bad address '" + a + "'"); return; }
-            if (!int.TryParse(parts[2], out len) || len <= 0 || len > 4096)
-            {
-                EmitError("mem: length must be 1..4096");
-                return;
-            }
-            var buf = new byte[len];
-            int read;
-            Native.ReadProcessMemory(_hProcess, Ptr(addr), buf, len, out read);
-            if (read <= 0)
-            {
-                EmitError($"mem: read failed at 0x{addr:X}");
+                if (reqId != null && EmitJson) Console.WriteLine("@JSON " + Json.MemError(addr, len, reqId, err));
+                else EmitError(err);
                 return;
             }
             // echo the REQUESTED len so the host can correlate the reply to its request even when
             // the read came back short; bytes carries only what was actually read
-            if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len));
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len, reqId));
             else
             {
                 // hex + ASCII sidebar, 16 bytes per row (a flat hex blob hides readable strings)
@@ -1212,6 +1248,62 @@ namespace ClarionDbg.Cli
                     Console.WriteLine($"  mem 0x{addr + (uint)row:X8}: {hex.ToString().PadRight(48)} {asc}");
                 }
             }
+        }
+
+        /// <summary>The largest mem read, in bytes. The Memory panel pages within it.</summary>
+        internal const int MemMaxLen = 4096;
+
+        /// <summary>Parse and perform one mem read. Returns null on success, else the refusal text. addr, len
+        /// and reqId are filled as far as parsing got, so a refusal can still be correlated.
+        /// <para>
+        /// The read goes through <see cref="ReadCleanBlock"/>, not a raw ReadProcessMemory. The raw call is
+        /// all-or-nothing, so a span running into an unreadable page failed outright instead of returning the
+        /// bytes before it, and it showed our own planted 0xCC wherever a breakpoint or call-skip temp sits.
+        /// ReadBlock reads page by page, and ReadCleanBlock puts the original bytes back.
+        /// </para></summary>
+        private string MemRead(string[] parts, out uint addr, out int len, out string reqId, out byte[] buf, out int read)
+        {
+            addr = 0; len = 0; buf = null; read = 0;
+            reqId = parts.Length > 3 ? parts[3] : null;
+            if (parts.Length < 3) return "mem expects: mem 0xADDR LEN [reqId]";
+            string a = parts[1].Trim();
+            try
+            {
+                addr = a.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    ? Convert.ToUInt32(a.Substring(2), 16)
+                    : Convert.ToUInt32(a);
+            }
+            catch { return "mem: bad address '" + a + "'"; }
+            if (!int.TryParse(parts[2], out len) || len <= 0 || len > MemMaxLen)
+            {
+                len = 0;
+                return "mem: length must be 1.." + MemMaxLen;
+            }
+            // ReadBlock steps va + total in uint arithmetic, so a span past 0xFFFFFFFF would wrap to page 0.
+            if ((ulong)addr + (ulong)len > 0x100000000UL)
+                return $"mem: 0x{addr:X} + {len} runs past the end of the address space";
+            buf = new byte[len];
+            read = ReadCleanBlock(addr, buf);
+            if (read <= 0) { read = 0; return $"mem: read failed at 0x{addr:X}"; }
+            return null;
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the REAL mem parse and read, against whatever process
+        /// handle the engine holds (see <see cref="SetProcessHandleForTest"/>).</summary>
+        internal string MemReadForTest(string[] parts, out uint addr, out int len, out string reqId, out byte[] buf, out int read)
+        {
+            return MemRead(parts, out addr, out len, out reqId, out buf, out read);
+        }
+
+        /// <summary>Test seam: point the engine's reads at <paramref name="h"/>. protocolcheck hands it its OWN
+        /// process, so a read meets real pages, a real unreadable page, and bytes the harness planted.</summary>
+        internal void SetProcessHandleForTest(IntPtr h) { _hProcess = h; }
+
+        /// <summary>Test seam: record a planted INT3 at <paramref name="va"/> whose original byte was
+        /// <paramref name="original"/>, as a user breakpoint or (temp) a call-skip temp would.</summary>
+        internal void PlantForTest(uint va, byte original, bool temp)
+        {
+            if (temp) _temp[va] = original; else _armed[va] = original;
         }
 
         private void EmitResumed(string mode)

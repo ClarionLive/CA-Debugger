@@ -281,16 +281,27 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>len = the REQUESTED read size (host correlates replies on it); read = bytes
-        /// actually read, which is how many hex pairs follow in bytes.</summary>
-        public static string Mem(uint addr, byte[] bytes, int read, int len)
+        /// actually read, which is how many hex pairs follow in bytes. reqId, when the request carried one,
+        /// is echoed as the LAST member so the host can match the reply to its request; null omits it.</summary>
+        public static string Mem(uint addr, byte[] bytes, int read, int len, string reqId = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"mem\",\"addr\":\"0x").Append(addr.ToString("X"))
               .Append("\",\"len\":").Append(len)
               .Append(",\"read\":").Append(read).Append(",\"bytes\":\"");
             for (int i = 0; i < read; i++) sb.Append(bytes[i].ToString("X2"));
-            sb.Append("\"}");
+            sb.Append('"');
+            if (reqId != null) sb.Append(",\"reqId\":").Append(Str(reqId));
+            sb.Append('}');
             return sb.ToString();
+        }
+
+        /// <summary>A refused mem read that carried a reqId: the same event, no bytes, and the reason. A plain
+        /// error event could not say WHICH request it answers, and the page would wait on it forever.</summary>
+        public static string MemError(uint addr, int len, string reqId, string error)
+        {
+            return "{\"event\":\"mem\",\"addr\":\"0x" + addr.ToString("X") + "\",\"len\":" + len
+                 + ",\"read\":0,\"bytes\":\"\",\"error\":" + Str(error) + ",\"reqId\":" + Str(reqId) + "}";
         }
 
         /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
@@ -458,6 +469,40 @@ namespace ClarionDbg.Cli
         public static string Error(string message)
         {
             return "{\"event\":\"error\",\"message\":" + Str(message) + "}";
+        }
+
+        /// <summary>`procs --json` (ProcsCommand.cs): the attach picker's process list, one line. The host parses
+        /// it, so the member names and order are a contract: event, procs[{pid,name,path,tswd}], skipped, and
+        /// with verbose a trailing skips[{pid,name,reason}].</summary>
+        public static string Procs(List<ProcEntry> procs, List<ProcSkip> skips, bool verbose)
+        {
+            var sb = new StringBuilder("{\"event\":\"procs\",\"procs\":[");
+            for (int i = 0; i < procs.Count; i++)
+            {
+                var p = procs[i];
+                if (i > 0) sb.Append(',');
+                sb.Append("{\"pid\":").Append(p.Pid)
+                  .Append(",\"name\":").Append(Str(p.Name))
+                  .Append(",\"path\":").Append(Str(p.Path))
+                  .Append(",\"tswd\":").Append(p.Tswd ? "true" : "false")
+                  .Append('}');
+            }
+            sb.Append("],\"skipped\":").Append(skips.Count);
+            if (verbose)
+            {
+                sb.Append(",\"skips\":[");
+                for (int i = 0; i < skips.Count; i++)
+                {
+                    var s = skips[i];
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"pid\":").Append(s.Pid)
+                      .Append(",\"name\":").Append(Str(s.Name))
+                      .Append(",\"reason\":").Append(Str(s.Reason))
+                      .Append('}');
+                }
+                sb.Append(']');
+            }
+            return sb.Append('}').ToString();
         }
     }
 }

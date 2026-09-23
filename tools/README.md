@@ -60,10 +60,13 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-engine-bpowner.ps1` | offline | breakpoint ownership across images (not yet total-pinned: ticket 6493d226) |
 | `test-engine-session.ps1` | offline | the shared engine-session lifecycle, and that harnesses use it |
 | `test-engine-tid-members.ps1` (plain and `-SelfTest`) | offline | no thread-id JSON member written by hand; thread ids to users go through TidText |
+| `test-engine-hover-sites.ps1` (plain and `-SelfTest`) | offline | PausedWait resets the hover tracker as an unconditional top-level statement before its command loop (position, not text) |
 | `test-pad-*.js` | offline (node) | the debugger pad page |
 | `test-bp-threaded.ps1` | **live** | a tracepoint over a THREADed name, hit repeatedly without pausing |
 | `test-watch-threaded.ps1` | **live** | a watch reads a THREADed name from its instance, not a HISTORY:: copy |
 | `test-interactive.ps1` | **live** | step / stepover / stepout from a startup breakpoint |
+| `test-engine-setip-sites.ps1` (plain and `-SelfTest`) | offline | every resume cuts setip's observations back as ArmResume's first statement, and every step trap records its ESP (position, not text) |
+| `test-setip.ps1` | **live** | set next statement on SplashScreen: back via `observed`, forward refused (stack-unproven), both breakpoints still fire around a setip, Step starts from the new line, nothing observed survives a continue or a step-out, and the ACCEPT-boundary, prologue, routine and Pause-stop refusals |
 
 **Live** suites launch `clbrws.exe` from the Clarion 11 examples
 (`C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses`) under the engine and

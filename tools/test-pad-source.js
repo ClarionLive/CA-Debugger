@@ -67,6 +67,7 @@ const wv = { postMessage: s => SENT.push(JSON.parse(s)) };
 function attachTip() { }
 function setAbout() { } function setTarget() { } function setRunState() { } function setPaused() { }
 function resetThreadState() { } function buildRegs() { } function refreshLibState() { }
+function memReread() { } function onMem() { }   // Memory panel: tools/test-pad-memory.js
 function renderLibState() { } function onLibState() { } function buildVarTree() { }
 function collectSyms() { return []; } function onThreads() { } function onThreadSelected() { }
 function onEngineError() { } function tidAccepted() { return true; } function buildStack() { }

@@ -296,12 +296,15 @@ namespace ClarionDebugger.Services
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
         public event Action<string, string, string, uint?> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON, tid)
+        public event Action<string, string, int, int, string, string> MemReceived; // Memory panel read (reqId, addr, len requested, bytes read, hex bytes, error-or-null)
         public event Action<Dictionary<string, string>, uint?> RegsReceived; // standalone regs reply (regs, tid)
         public event Action<DebugThreadList> ThreadsReceived;      // thread inventory for the current stop
         // 'thread <tid>' result. The tid is the thread that was ASKED FOR (null when the request was
         // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
         // the selection it had and asks 'threads' for the authoritative one.
         public event Action<uint?, bool, string> ThreadSelected;
+        // Hover mode (f6e547ce): (thread owning the window under the cursor, or null for none; on; paused).
+        public event Action<uint?, bool, bool> HoverChanged;
         // Disassembly listing (tag, instrs, tid). The tid is the thread the engine actually DECODED, and it
         // was the one thread-scoped reply whose invoke dropped it while the decoder below already parsed it
         // — so the view could only ever gate on its own bookkeeping, never on the engine's own answer.
@@ -311,6 +314,7 @@ namespace ClarionDebugger.Services
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
         public event Action<string> EngineError;                   // engine-reported error event
+        public event Action<bool, string, string, int, string> SetIpResult; // set next statement: ok, refusal code, module, line, user text
         public event Action<string> LogReceived;
         public event Action<int> Exited;
 
@@ -672,6 +676,14 @@ namespace ClarionDebugger.Services
                 && SendCommand("bp add " + module + ":" + line + (singleTarget ? "|one=1" : ""));
         }
 
+        /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line within
+        /// the procedure it is in. The engine decides whether that is safe and answers with a `setip` event
+        /// (<see cref="SetIpResult"/>); on success a `paused` event with reason "setip" follows.</summary>
+        public bool SetNextStatement(string module, int line)
+        {
+            return IsValidModuleName(module) && line > 0 && SendCommand("setip " + module + ":" + line);
+        }
+
         /// <summary>Remove a breakpoint by module:line (planted or requested line both match).</summary>
         public bool RemoveBreakpoint(string module, int line)
         {
@@ -707,6 +719,10 @@ namespace ClarionDebugger.Services
             return tid > 0 && SendCommand("thread " + tid.ToString(CultureInfo.InvariantCulture));
         }
 
+        /// <summary>Turn the engine's identify-thread-by-window mode on or off; answers via HoverChanged.
+        /// Valid running OR paused: the engine polls in both loops, and only reports while running.</summary>
+        public bool SetHover(bool on) { return SendCommand(on ? "hover on" : "hover off"); }
+
         /// <summary>Re-read the selected thread's registers (paused only); via RegsReceived. The 'paused'
         /// event carries the STOPPED thread's registers, so this is how the pane follows a thread switch.</summary>
         public bool RequestRegs() { return SendCommand("regs"); }
@@ -735,6 +751,37 @@ namespace ClarionDebugger.Services
             if (string.IsNullOrEmpty(vaHex) || !Regex.IsMatch(vaHex, "^0x[0-9A-Fa-f]+$")) return false;
             if (string.IsNullOrEmpty(ebpHex) || !Regex.IsMatch(ebpHex, "^0x[0-9A-Fa-f]+$")) return false;
             return SendCommand("framelocals " + reqId + " " + vaHex + " " + ebpHex);
+        }
+
+        /// <summary>Read <paramref name="len"/> bytes of the debuggee at <paramref name="addrHex"/> for the Memory
+        /// panel. Result arrives via MemReceived keyed by <paramref name="reqId"/>.
+        /// <para>
+        /// SECURITY. This is the one request that takes an address the page chose freely: the address box, and
+        /// "View memory" on any row. That freedom is the feature, so there is no table of issued addresses as
+        /// there is for edits and expands.
+        /// </para>
+        /// <para>
+        /// TRUST MODEL (Owner's decision, 2026-09-23, after the codex security gate raised "the page can drive
+        /// arbitrary mem reads" as a MEDIUM): our own packaged debugger.html is TRUSTED for memory reads. Typing
+        /// an address is the feature, and the user is debugging their own process.
+        ///  * WHO CAN ASK. OnWebMessage drops every message whose source is not our packaged page
+        ///    (IsExpectedSource, ClarionDebuggerWebView.cs), so the only in-page attacker left is an XSS in
+        ///    debugger.html itself.
+        ///  * WHAT THEY GET. READ-ONLY: `mem` has no write path, and a row's `addr` is a different member from
+        ///    the `va` the edit grants key on (EditGrants), so nothing read here can turn into a write.
+        ///    PAUSED-ONLY: the pad forwards it only while Paused, and the engine refuses it while running.
+        ///    CAPPED at 4096 bytes a request, here and again in the engine. VALIDATED here as
+        ///    ^0x[0-9A-Fa-f]{1,8}$ plus an integer len, so nothing can add a word or a second command to the
+        ///    engine's space-separated stdin.
+        ///  * RESIDUAL RISK: an XSS in debugger.html could read the paused debuggee's memory, 4 KB at a time.
+        ///    That is tracked on the XSS audit ticket e1dea0d9, not closed here.
+        /// </para></summary>
+        public bool RequestMem(int reqId, string addrHex, int len)
+        {
+            if (reqId < 0 || len < 1 || len > 4096) return false;
+            if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]{1,8}$")) return false;
+            return SendCommand("mem " + addrHex + " " + len.ToString(CultureInfo.InvariantCulture) + " "
+                               + reqId.ToString(CultureInfo.InvariantCulture));
         }
 
         /// <summary>EXPERIMENT: request a disassembly listing at the SELECTED thread's EIP (paused only);
@@ -1056,6 +1103,10 @@ namespace ClarionDebugger.Services
                     LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
                     break;
 
+                case "mem":
+                    MemReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "addr"), GetInt(json, "len"), GetInt(json, "read"), GetStr(json, "bytes"), GetStr(json, "error"));
+                    break;
+
                 case "threads":
                     var tl = ParseThreads(json);
                     if (tl != null) ThreadsReceived?.Invoke(tl);
@@ -1066,6 +1117,11 @@ namespace ClarionDebugger.Services
                     // — passed through as null rather than 0, because 0 would be a sentinel the pad reads
                     // as a real thread id. Absent is the only way to say "unknown".
                     ThreadSelected?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "ok"), GetStr(json, "error"));
+                    break;
+
+                case "hover":
+                    // The thread under the cursor. Absent means NONE and stays null, never 0.
+                    HoverChanged?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "on"), GetBool(json, "paused"));
                     break;
 
                 case "watch":
@@ -1090,6 +1146,11 @@ namespace ClarionDebugger.Services
 
                 case "error":
                     EngineError?.Invoke(GetStr(json, "message"));
+                    break;
+
+                case "setip":   // set next statement: a refusal, or the success that precedes `paused` reason setip
+                    SetIpResult?.Invoke(GetBool(json, "ok"), GetStr(json, "reason"), GetStr(json, "module"),
+                                        GetInt(json, "line"), GetStr(json, "error"));
                     break;
 
                 case "exited":

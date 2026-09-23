@@ -65,7 +65,7 @@ const FNS = ['WATCH_STORE', 'WATCH_MAX', 'WATCH_TARGETS', 'WATCH_IDLE_TEXT', 'WA
   'nameKey', 'watchedKey', 'targetKey', 'loadWatchStore', 'saveWatches', 'applyValue', 'cssEsc',
   'clearEditMeta', 'clearDtMeta', 'clearValueMeta', 'SRC_IDLE_TEXT', 'clearSrc',
   'restoreWatchesFor', 'addWatchSilent', 'addWatch', 'removeWatch', 'watchWaitingHtml',
-  'settleWaitingCells', 'setRunState'];
+  'settleWaitingCells', 'setRunState', 'childWatchPath'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
@@ -349,6 +349,71 @@ ok(storedNames(lastPath).length === 1, 'the target just written survived its own
   JSON.stringify(storedNames(lastPath)));
 ok(Object.keys(readStore().byTarget).length <= MAX_TARGETS, 'and the bound still holds',
   String(Object.keys(readStore().byTarget).length));
+
+section('16) a watch PATH (HEAD.MEMBER) round-trips like any other name (3a0c915d)');
+// A pinned group/queue member is watched by its dotted path, and the store keeps it as a plain string, so
+// it has to survive a restart spelled exactly as sent, and fold case over the WHOLE path: the head and the
+// member are both Clarion names.
+const QPATH = 'QUEUE:BROWSE:1.BRW1::JOB:JobID';
+reset();
+targetPath = APP; restoreWatchesFor(APP);
+addWatchSilent(QPATH); addWatchSilent('BrowseButtons.ListBox');
+restart(); targetPath = APP; restoreWatchesFor(APP);
+names = rowsOnScreen().map(r => r.name);
+ok(names.indexOf(QPATH) >= 0 && names.indexOf('BrowseButtons.ListBox') >= 0,
+  'both dotted names came back as they were spelled', JSON.stringify(names));
+ok(sent('watch').indexOf(QPATH) >= 0, 'and the restore asked the host for the whole path', JSON.stringify(sent('watch')));
+addWatch('queue:browse:1.brw1::job:jobid');
+ok(rowsOnScreen().length === 2 && TOASTS.some(t => /already watched/i.test(t)),
+  'the same path in another case is the same watch', JSON.stringify(rowsOnScreen().map(r => r.name)));
+addWatch('QUEUE:BROWSE:1.BRW1::JOB:Job_desc');
+ok(rowsOnScreen().length === 3, 'a sibling member under the same head is a different watch',
+  JSON.stringify(rowsOnScreen().map(r => r.name)));
+removeWatch('Queue:Browse:1.Brw1::Job:JobId');
+restart(); targetPath = APP; restoreWatchesFor(APP);
+names = rowsOnScreen().map(r => r.name);
+ok(names.indexOf(QPATH) < 0 && names.length === 2, 'removing it in another case removes it for good', JSON.stringify(names));
+
+section('17) which Variables-tree rows get a watch path');
+// childWatchPath is the page's whole decision; renderVarRow pins a LEAF exactly when it has one.
+const QREF = { name: 'QUEUE:BROWSE:1', type: '', ref: true, refKind: 'aggregate' };
+const GRP = { name: 'BROWSEBUTTONS', type: '', children: [] };
+const ARR = { name: 'BRW1::SORT1:KEYDISTRIBUTION', type: 'ARRAY[1..100]', children: [] };
+const LEAF = { name: 'BRW1::JOB:JOBID', type: 'SHORT' };
+ok(childWatchPath('BROWSEBUTTONS', GRP, 1, true, { name: 'LISTBOX' }) === 'BROWSEBUTTONS.LISTBOX',
+  'a member of a direct group is HEAD.MEMBER');
+ok(childWatchPath('G.SUB', GRP, 2, true, { name: 'X' }) === 'G.SUB.X', 'and a nested direct group extends the path');
+ok(childWatchPath('QUEUE:BROWSE:1', QREF, 1, true, LEAF) === 'QUEUE:BROWSE:1.BRW1::JOB:JOBID',
+  'a member under a LOCAL reference head gets HEAD.MEMBER');
+ok(childWatchPath('MODQ', QREF, 1, false, LEAF) === null, 'but not under a Module Data (global) reference head');
+// refKind, frozen with the engine's var-row emission (revised 2026-09-23): "aggregate" | "class" | "other".
+// Only an "aggregate" head (a QUEUE or GROUP) is walked through. A class reference looks like a queue's in
+// every other field, and an engine that predates refKind sends none.
+const kindPath = k => { const h = { name: 'H', type: '', ref: true }; if (k !== undefined) h.refKind = k;
+  return childWatchPath('H', h, 1, true, LEAF); };
+ok(kindPath('aggregate') === 'H.BRW1::JOB:JOBID', 'refKind "aggregate": the head is walked through');
+ok(kindPath('class') === null, 'refKind "class": no path, so no pin that could only answer an error');
+ok(kindPath('other') === null, 'refKind "other": no path');
+ok(kindPath(undefined) === null, 'no refKind at all (an older engine): no path - fail closed');
+ok(kindPath('queue') === null && kindPath('group') === null,
+  'the superseded "queue"/"group" spellings get no path either');
+ok(kindPath('Aggregate') === null, 'refKind is matched exactly as frozen, not case-folded');
+ok(childWatchPath('G.R', QREF, 2, true, LEAF) === null, 'nor under a reference BELOW the head');
+// a plain child name, so this is the ARRAY rule on its own and not the "[n]" one below
+ok(childWatchPath('BRW1::SORT1:KEYDISTRIBUTION', ARR, 1, true, { name: 'X', type: 'SHORT' }) === null,
+  'nor under an array');
+ok(childWatchPath('G', GRP, 1, true, { name: '[3]', ref: true }) === null, 'nor for an "[n]" element row');
+ok(childWatchPath(null, GRP, 2, true, LEAF) === null, 'and once a path is gone, nothing below gets one back');
+const rvr = pad.extract(html, 'renderVarRow');
+ok(/if\(!expandable && watchPath\)/.test(rvr) && rvr.indexOf('depth===1') < 0,
+  'renderVarRow pins a leaf by its watch path, with no depth gate left');
+ok(/addWatch\(watchPath\)/.test(rvr) && /dataset\.name=watchPath/.test(rvr),
+  'and the pin and the right-click selection both send that path, never the bare leaf name');
+ok(/childWatchPath\(watchPath, v, depth, refHeadOk, c\)/.test(rvr), 'children are given their path by childWatchPath');
+// Source text, like the three above: the Locals tree is the one whose top-level references are locals.
+ok(/lastLocals\|\|\[\], true\)/.test(pad.extract(html, 'renderLocals'))
+   && /lastModuleItems\|\|\[\], false\)/.test(pad.extract(html, 'renderModuleData')),
+  'Local Variables allows a reference head, Module Data does not');
 
 // ---- 87c66af6: setRunState lost its caption writes; the one real action in that block must remain ----
 // This suite extracts the REAL setRunState (test-pad-threads.js stubs it), so it is the only place the

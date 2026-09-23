@@ -96,10 +96,12 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived      += OnSvcExpanded;
             _svc.FrameLocalsReceived   += OnSvcFrameLocals;
             _svc.LibStateReceived      += OnSvcLibState;
+            _svc.MemReceived           += OnSvcMem;
             _svc.WatchReceived         += OnSvcWatch;
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
+            _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
             _svc.BreakpointRemoved     += OnSvcBreakpointRemoved;
@@ -107,6 +109,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError       += OnSvcBreakpointError;
             _svc.Traced                += OnSvcTraced;
             _svc.EngineError           += OnSvcEngineError;
+            _svc.SetIpResult           += OnSvcSetIpResult;
             _svc.ModuleLoaded          += OnSvcModuleLoaded;
             _svc.ModuleUnloaded        += OnSvcModuleUnloaded;
             _svc.LogReceived           += OnSvcLog;
@@ -243,10 +246,12 @@ namespace ClarionDebugger.Terminal
             _svc.ExpandedReceived       -= OnSvcExpanded;
             _svc.FrameLocalsReceived    -= OnSvcFrameLocals;
             _svc.LibStateReceived       -= OnSvcLibState;
+            _svc.MemReceived            -= OnSvcMem;
             _svc.WatchReceived          -= OnSvcWatch;
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
+            _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
             _svc.BreakpointRemoved      -= OnSvcBreakpointRemoved;
@@ -254,6 +259,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError        -= OnSvcBreakpointError;
             _svc.Traced                 -= OnSvcTraced;
             _svc.EngineError            -= OnSvcEngineError;
+            _svc.SetIpResult            -= OnSvcSetIpResult;
             _svc.ModuleLoaded           -= OnSvcModuleLoaded;
             _svc.ModuleUnloaded         -= OnSvcModuleUnloaded;
             _svc.LogReceived            -= OnSvcLog;
@@ -321,6 +327,11 @@ namespace ClarionDebugger.Terminal
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
+        // Memory panel. Grants nothing: a dump is display only (see RequestMem's security note).
+        private void OnSvcMem(string reqId, string addr, int len, int read, string bytes, string error) => UI(() =>
+            Post("{\"type\":\"mem\",\"reqId\":" + Str(reqId) + ",\"addr\":" + Str(addr)
+                 + ",\"len\":" + len.ToString(CultureInfo.InvariantCulture) + ",\"read\":" + read.ToString(CultureInfo.InvariantCulture)
+                 + ",\"bytes\":" + Str(bytes) + ",\"error\":" + Str(error) + "}"));
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
@@ -336,6 +347,13 @@ namespace ClarionDebugger.Terminal
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
                                   + ": " + (error ?? "could not select"));
+        });
+        // Hover mode (f6e547ce). Not thread-SCOPED: the tid names the thread under the cursor, so the page
+        // must not run it through tidAccepted. None is an absent tid, through TidJson like every tid.
+        private void OnSvcHover(uint? tid, bool on, bool paused) => UI(() =>
+        {
+            Post("{\"type\":\"hover\",\"on\":" + (on ? "true" : "false") + ",\"paused\":" + (paused ? "true" : "false")
+                + TidJson(tid) + "}");
         });
         private void OnSvcWatch(DebugWatch w) => UI(() => OnWatch(w));
         // The ENGINE's answer to a write the host sent: it re-issues the grant that write spent, so the row can
@@ -596,6 +614,13 @@ namespace ClarionDebugger.Terminal
                             if (fl != null) _svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp);
                         }
                         break;
+                    case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
+                        if (_svc.State == DebugSessionState.Paused)
+                        {
+                            var mr = MemRequest.Parse(data);
+                            if (mr != null) _svc.RequestMem(mr.ReqId, mr.Addr, mr.Len);
+                        }
+                        break;
                     case "libstate":   // per-thread Library State refresh: data = reqId
                         if (_svc.State == DebugSessionState.Paused && PageNumbers.TryInt(data, out int lrq))
                             _svc.RequestLibState(lrq);
@@ -609,6 +634,8 @@ namespace ClarionDebugger.Terminal
                         if (_svc.State == DebugSessionState.Paused && PageNumbers.TryUInt(data, out uint seltid))
                             _svc.SelectThread(seltid);
                         break;
+                    // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
+                    case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
                     case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
                     case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;
@@ -626,6 +653,7 @@ namespace ClarionDebugger.Terminal
                     case "bpremove": RemoveBp(data); break;
                     case "bpprops": SetBpProps(data); break;
                     case "runtocursor": CmdRunToCursor(data); break;   // transient one-shot bp at module:line, then resume
+                    case "setip": CmdSetNextStatement(data); break;    // move the stopped thread's IP to module:line
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
@@ -755,6 +783,29 @@ namespace ClarionDebugger.Terminal
         }
 
         private static string TransientKey(string module, int line) { return (module ?? "") + ":" + line; }
+
+        /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line. Paused
+        /// only, and an explicit module:line only (the pad's source-view menu); the engine decides whether the
+        /// move is safe. A refusal comes back through <see cref="OnSvcSetIpResult"/>; a success is followed by
+        /// an ordinary `paused` (reason "setip"), which <see cref="OnPaused"/> handles like any other stop.</summary>
+        public void CmdSetNextStatement(string spec)
+        {
+            if (CurrentState != DebugSessionState.Paused) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            if (!_svc.SetNextStatement(at.Module, at.Line))
+                Console("err", "set next statement: could not send the request for " + at.Module + ":" + at.Line + ".");
+        }
+
+        // The success line is logged here; the refresh itself rides on the `paused` that follows it. A refusal is
+        // logged and handed to the page, which shows the engine's sentence as is.
+        private void OnSvcSetIpResult(bool ok, string reason, string module, int line, string error) => UI(() =>
+        {
+            if (ok) Console("info", "set next statement: " + module + ":" + line);
+            else Console("err", "set next statement refused (" + reason + "): " + error);
+            Post("{\"type\":\"setip\",\"ok\":" + (ok ? "true" : "false") + ",\"reason\":" + Str(reason)
+                 + ",\"error\":" + Str(error) + ",\"module\":" + Str(module) + ",\"line\":" + line + "}");
+        });
 
         // ── Run to cursor sourced from the real Monaco editor ─────────────────────────────────────
         // "Wherever the developer's caret actually is right now", pulled from ClarionAssistant's live Monaco
@@ -1280,6 +1331,9 @@ namespace ClarionDebugger.Terminal
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
+                // A `paused` with reason "setip" (set next statement) lands here too and cancels a run-to-cursor
+                // still waiting for its bp-set. That is intended: the user moved the IP after asking to run, so
+                // the pending run is moot, and it is not resumed behind their back.
                 if (_transientBps.Count > 0)
                 {
                     foreach (var key in new List<string>(_transientBps))
