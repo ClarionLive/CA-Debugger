@@ -296,6 +296,7 @@ namespace ClarionDebugger.Services
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
         public event Action<string, string, string, uint?> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON, tid)
+        public event Action<string, string, int, int, string, string> MemReceived; // Memory panel read (reqId, addr, len requested, bytes read, hex bytes, error-or-null)
         public event Action<Dictionary<string, string>, uint?> RegsReceived; // standalone regs reply (regs, tid)
         public event Action<DebugThreadList> ThreadsReceived;      // thread inventory for the current stop
         // 'thread <tid>' result. The tid is the thread that was ASKED FOR (null when the request was
@@ -743,6 +744,30 @@ namespace ClarionDebugger.Services
             return SendCommand("framelocals " + reqId + " " + vaHex + " " + ebpHex);
         }
 
+        /// <summary>Read <paramref name="len"/> bytes of the debuggee at <paramref name="addrHex"/> for the Memory
+        /// panel. Result arrives via MemReceived keyed by <paramref name="reqId"/>.
+        /// <para>
+        /// SECURITY. This is the one request that takes an address the page chose freely: the address box, and
+        /// "View memory" on any row. That freedom is the feature, so there is no table of issued addresses as
+        /// there is for edits and expands. What bounds it:
+        ///  * READ-ONLY. `mem` has no write path. A row's `addr` is a different member from the `va` the edit
+        ///    grants key on (EditGrants), so nothing read here can turn into a write.
+        ///  * CAPPED at 4096 bytes a request, checked here and again by the engine.
+        ///  * PAUSED-ONLY. The pad forwards it only while Paused, and the engine refuses it while running.
+        ///  * VALIDATED here: ^0x[0-9A-Fa-f]{1,8}$ and an integer len, so the page cannot add a word or a
+        ///    second command to the engine's space-separated stdin.
+        /// The user can already read the debuggee's memory: they launched it under a debugger, and every
+        /// panel shows its data. What changes is what the page can be shown, not what anyone can do to the
+        /// target.
+        /// </para></summary>
+        public bool RequestMem(int reqId, string addrHex, int len)
+        {
+            if (reqId < 0 || len < 1 || len > 4096) return false;
+            if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]{1,8}$")) return false;
+            return SendCommand("mem " + addrHex + " " + len.ToString(CultureInfo.InvariantCulture) + " "
+                               + reqId.ToString(CultureInfo.InvariantCulture));
+        }
+
         /// <summary>EXPERIMENT: request a disassembly listing at the SELECTED thread's EIP (paused only);
         /// result arrives via DisasmReceived, stamped with the thread the engine decoded.</summary>
         public bool RequestDisasm() { return SendCommand("disasm"); }
@@ -1060,6 +1085,10 @@ namespace ClarionDebugger.Services
 
                 case "libstate":
                     LibStateReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "error"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
+                    break;
+
+                case "mem":
+                    MemReceived?.Invoke(GetStr(json, "reqId"), GetStr(json, "addr"), GetInt(json, "len"), GetInt(json, "read"), GetStr(json, "bytes"), GetStr(json, "error"));
                     break;
 
                 case "threads":

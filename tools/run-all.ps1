@@ -73,6 +73,7 @@ $Suites = @(
   @{ File = 'test-pad-bpstate.js' }
   @{ File = 'test-pad-contrast.js' }
   @{ File = 'test-pad-editmeta.js' }
+  @{ File = 'test-pad-memory.js' }
   @{ File = 'test-pad-parse.js'; Success = '^all \d+ inline script block\(s\) parse OK$' }
   @{ File = 'test-pad-source.js' }
   @{ File = 'test-pad-threads.js' }

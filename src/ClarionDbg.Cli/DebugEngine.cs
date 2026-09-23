@@ -1176,35 +1176,24 @@ namespace ClarionDbg.Cli
             Native.WriteProcessMemory(_hProcess, Ptr(va), BitConverter.GetBytes(value), 4, out wrote);
         }
 
-        /// <summary>mem 0xADDR LEN — read target memory while paused (for the watch pane).</summary>
+        /// <summary>mem 0xADDR LEN [reqId] — read target memory while paused (the Memory panel). READ-ONLY and
+        /// capped at <see cref="MemMaxLen"/> bytes; only the pause loop dispatches it, so it never runs
+        /// against a running target. The optional trailing reqId is echoed on the reply, and on a refusal as a
+        /// mem event with an "error" member, so the host can match a reply to the request that asked for it.
+        /// Without one a refusal is a plain error event, as before.</summary>
         private void HandleMemCommand(string[] parts)
         {
-            if (parts.Length < 3) { EmitError("mem expects: mem 0xADDR LEN"); return; }
-            uint addr; int len;
-            string a = parts[1].Trim();
-            try
+            uint addr; int len; string reqId; byte[] buf; int read;
+            string err = MemRead(parts, out addr, out len, out reqId, out buf, out read);
+            if (err != null)
             {
-                addr = a.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-                    ? Convert.ToUInt32(a.Substring(2), 16)
-                    : Convert.ToUInt32(a);
-            }
-            catch { EmitError("mem: bad address '" + a + "'"); return; }
-            if (!int.TryParse(parts[2], out len) || len <= 0 || len > 4096)
-            {
-                EmitError("mem: length must be 1..4096");
-                return;
-            }
-            var buf = new byte[len];
-            int read;
-            Native.ReadProcessMemory(_hProcess, Ptr(addr), buf, len, out read);
-            if (read <= 0)
-            {
-                EmitError($"mem: read failed at 0x{addr:X}");
+                if (reqId != null && EmitJson) Console.WriteLine("@JSON " + Json.MemError(addr, len, reqId, err));
+                else EmitError(err);
                 return;
             }
             // echo the REQUESTED len so the host can correlate the reply to its request even when
             // the read came back short; bytes carries only what was actually read
-            if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len));
+            if (EmitJson) Console.WriteLine("@JSON " + Json.Mem(addr, buf, read, len, reqId));
             else
             {
                 // hex + ASCII sidebar, 16 bytes per row (a flat hex blob hides readable strings)
@@ -1222,6 +1211,62 @@ namespace ClarionDbg.Cli
                     Console.WriteLine($"  mem 0x{addr + (uint)row:X8}: {hex.ToString().PadRight(48)} {asc}");
                 }
             }
+        }
+
+        /// <summary>The largest mem read, in bytes. The Memory panel pages within it.</summary>
+        internal const int MemMaxLen = 4096;
+
+        /// <summary>Parse and perform one mem read. Returns null on success, else the refusal text. addr, len
+        /// and reqId are filled as far as parsing got, so a refusal can still be correlated.
+        /// <para>
+        /// The read goes through <see cref="ReadCleanBlock"/>, not a raw ReadProcessMemory. The raw call is
+        /// all-or-nothing, so a span running into an unreadable page failed outright instead of returning the
+        /// bytes before it, and it showed our own planted 0xCC wherever a breakpoint or call-skip temp sits.
+        /// ReadBlock reads page by page, and ReadCleanBlock puts the original bytes back.
+        /// </para></summary>
+        private string MemRead(string[] parts, out uint addr, out int len, out string reqId, out byte[] buf, out int read)
+        {
+            addr = 0; len = 0; buf = null; read = 0;
+            reqId = parts.Length > 3 ? parts[3] : null;
+            if (parts.Length < 3) return "mem expects: mem 0xADDR LEN [reqId]";
+            string a = parts[1].Trim();
+            try
+            {
+                addr = a.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                    ? Convert.ToUInt32(a.Substring(2), 16)
+                    : Convert.ToUInt32(a);
+            }
+            catch { return "mem: bad address '" + a + "'"; }
+            if (!int.TryParse(parts[2], out len) || len <= 0 || len > MemMaxLen)
+            {
+                len = 0;
+                return "mem: length must be 1.." + MemMaxLen;
+            }
+            // ReadBlock steps va + total in uint arithmetic, so a span past 0xFFFFFFFF would wrap to page 0.
+            if ((ulong)addr + (ulong)len > 0x100000000UL)
+                return $"mem: 0x{addr:X} + {len} runs past the end of the address space";
+            buf = new byte[len];
+            read = ReadCleanBlock(addr, buf);
+            if (read <= 0) { read = 0; return $"mem: read failed at 0x{addr:X}"; }
+            return null;
+        }
+
+        /// <summary>Test seam for `protocolcheck`: the REAL mem parse and read, against whatever process
+        /// handle the engine holds (see <see cref="SetProcessHandleForTest"/>).</summary>
+        internal string MemReadForTest(string[] parts, out uint addr, out int len, out string reqId, out byte[] buf, out int read)
+        {
+            return MemRead(parts, out addr, out len, out reqId, out buf, out read);
+        }
+
+        /// <summary>Test seam: point the engine's reads at <paramref name="h"/>. protocolcheck hands it its OWN
+        /// process, so a read meets real pages, a real unreadable page, and bytes the harness planted.</summary>
+        internal void SetProcessHandleForTest(IntPtr h) { _hProcess = h; }
+
+        /// <summary>Test seam: record a planted INT3 at <paramref name="va"/> whose original byte was
+        /// <paramref name="original"/>, as a user breakpoint or (temp) a call-skip temp would.</summary>
+        internal void PlantForTest(uint va, byte original, bool temp)
+        {
+            if (temp) _temp[va] = original; else _armed[va] = original;
         }
 
         private void EmitResumed(string mode)

@@ -284,6 +284,14 @@
   .listctl input::placeholder { color:#6f6f6f; }
   .sortbtn { flex:none; cursor:pointer; background:var(--btnhover,#2d2d2d); border:1px solid var(--popup-border); color:var(--fg-dim); border-radius:3px; padding:3px 8px; font-size:11px; white-space:nowrap; }
   .sortbtn:hover { color:var(--fg); }
+  /* Memory panel: a 16-byte hex + ASCII dump. Dimmed while running - the bytes are from the last stop. */
+  .memctl select { flex:none; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; font-size:11px; }
+  .memctl input.bad { border-color:#c98a8a; }
+  #memBody { font-size:11px; padding:2px 10px 4px 14px; overflow-x:auto; }
+  #memBody .mrow { display:flex; gap:10px; white-space:pre; }
+  #memBody .madr { color:var(--fg-dim); } #memBody .mhex { color:var(--num); } #memBody .masc { color:var(--orange); }
+  #memBody .memnote { color:var(--fg-dim); font-style:italic; padding-top:2px; }
+  body:not(.paused) #memBody .mrow { opacity:.5; }
   .proc { display:flex; align-items:center; gap:8px; padding:2px 8px 2px 14px; font-size:13px; white-space:nowrap; }
   .proc:hover { background:var(--hover); }
   .proc .procname { color:var(--name); overflow:hidden; text-overflow:ellipsis; }
@@ -468,6 +476,13 @@
         <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Library State <span class="hint">per-thread RTL state</span><span class="sec-refresh" id="libRefresh" title="Refresh Library State">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
         <div class="body mono" id="libBody"><div class="empty">Expand while paused to read the thread's RTL state.</div></div>
       </details>
+      <details class="section" data-sec="memory">
+        <summary><span class="grip" draggable="true" title="Drag to reorder">⠿</span><span class="twisty">▶</span>Memory <span class="hint">hex · ASCII · right-click a variable</span><span class="sec-refresh" id="memRefresh" title="Re-read memory">↻</span><span class="sec-x" title="Hide section">✕</span></summary>
+        <div class="body">
+          <div class="listctl memctl"><button id="memPrev" class="sortbtn" title="Previous block">◀</button><input id="memAddr" placeholder="Address, e.g. 0x4A2F10 (Enter)" autocomplete="off" spellcheck="false" /><select id="memLen" title="Bytes per read"><option value="256">256</option><option value="1024">1 KB</option><option value="4096">4 KB</option></select><button id="memNext" class="sortbtn" title="Next block">▶</button></div>
+          <div class="mono" id="memBody"><div class="empty">Pause, then enter an address, or right-click a variable and choose View memory.</div></div>
+        </div>
+      </details>
     </div>
 
     <div class="splitter" id="splitter"></div>
@@ -490,7 +505,7 @@
     <span class="dn" id="dtName"></span><span class="dt" id="dtType"></span><span class="veq">=</span><span class="dv" id="dtVal"></span>
     <span class="dacts"><span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span><span class="dact copy" id="dtCopy" title="Copy Value">⧉</span></span>
   </div>
-  <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div></div>
+  <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div><div class="mi" id="tmMem">⌗ View memory</div></div>
   <div class="ctxmenu" id="srcMenu"><div class="mi" id="miRtc">▶ Run to cursor</div></div>
   <div class="ctxmenu" id="procMenu"><div class="mi" id="miBpEntry">⛔ Break on entry</div></div>
 
@@ -748,11 +763,11 @@
   // panels stay in the DOM (display:none) so they keep receiving host updates and restore instantly.
   const MAIN=document.querySelector('.main');
   const COL_LEFT=$('colLeft'), COL_RIGHT=$('colRight'), HBAR=$('hiddenBar'), SPLITTER=$('splitter');
-  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers','libstate'];
+  const DEFAULT_LEFT=['stack','variables','watch','breakpoints','procedures','registers','libstate','memory'];
   const DEFAULT_RIGHT=['source','console'];
   const ALL_IDS=DEFAULT_LEFT.concat(DEFAULT_RIGHT);
-  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', libstate:'Library State', source:'Source', console:'Debug Console'};
-  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true, libstate:true}; // only collapsible (<details>) panels; matches markup
+  const SEC_LABEL={variables:'Variables', watch:'Watch', stack:'Call Stack', breakpoints:'Breakpoints', procedures:'Procedures', registers:'Registers', libstate:'Library State', memory:'Memory', source:'Source', console:'Debug Console'};
+  const DEFAULT_COLLAPSED={variables:false, watch:false, stack:false, breakpoints:false, procedures:false, registers:true, libstate:true, memory:true}; // only collapsible (<details>) panels; matches markup
   let layoutLoaded=false, dragSec=null;
 
   function secEl(id){ return MAIN ? MAIN.querySelector('[data-sec="'+id+'"]') : null; }
@@ -1041,9 +1056,11 @@
     row.addEventListener('contextmenu',e=>{ e.preventDefault();
       if(!selSet.has(row)) selOne(row);
       const n=selSet.size; $('tmWatch').textContent='👁 Add to Watch'+(n>1?' ('+n+')':'');
+      memMenuFor(row.dataset.addr, true);   // the right-clicked row's own address, not the selection's
       const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
   }
   $('tmWatch').onclick=()=>{ addWatchMany(Array.from(selSet).map(r=>r.dataset.name).filter(Boolean)); $('treeMenu').classList.remove('show'); selSet.clear(); applySel(); };
+  $('tmMem').onclick=()=>{ $('treeMenu').classList.remove('show'); openMemoryAt(_memMenuAddr); };
   document.addEventListener('click',()=>{ $('treeMenu').classList.remove('show'); $('srcMenu').classList.remove('show'); $('procMenu').classList.remove('show'); });
 
   // ---- Source view: right-click "Run to cursor" (one-shot bp at the line, then resume). Only meaningful
@@ -1481,6 +1498,7 @@
       row.appendChild(pin);
       wireSel(row);
     }
+    wireMemMenu(row, v);   // "View memory" for any row with storage; after the gate, which decides selrow
 
     let box=null, open=false, loaded=false;
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
@@ -1558,6 +1576,93 @@
   function onLibState(reqId, error, items){
     if(+reqId!==_libReq) return;
     lastLibError=error||null; lastLibState=error?null:(items||[]); renderLibState();
+  }
+
+  // ---- Memory panel: a hex + ASCII dump of the debuggee at an address (ticket 633d8b2f) ----
+  // Read-only and paused-only: the host forwards `mem` only while paused and the engine caps a read at
+  // MEM_MAX bytes, so the panel pages in blocks of at most that. Like Library State it reads only while it
+  // is open, re-reads on each stop, and keeps the last dump on resume, dimmed (CSS keys on body.paused).
+  // Replies are matched on reqId and anything but the newest is dropped. They are NOT tid-gated: memory
+  // belongs to the process, not to a thread.
+  const MEM_MAX=4096, MEM_TOP=0x100000000;
+  let _memReq=0, memAddr=null, memLen=256, lastMem=null, memInFlight=null, _memMenuAddr=null;
+  // A typed address: hex, with or without 0x, at most 8 digits. null for anything else.
+  function memParseAddr(s){
+    const t=String(s==null?'':s).trim().replace(/^0x/i,'');
+    return /^[0-9a-f]{1,8}$/i.test(t) ? parseInt(t,16) : null;
+  }
+  function memHex(n){ return '0x'+n.toString(16).toUpperCase().padStart(8,'0'); }
+  // Where a block of `len` bytes may start: not below 0, and not so high it runs past 4 GB (the engine
+  // refuses that span rather than wrapping it).
+  function memClampStart(a, len){ return Math.max(0, Math.min(a, MEM_TOP-len)); }
+  // The reply's hex string as 16-byte rows: {addr, hex, ascii}. Printable ASCII only; everything else is '.'.
+  function memRows(base, hex, read){
+    const rows=[]; const n=Math.min(read|0, (hex||'').length>>1);
+    for(let r=0;r<n;r+=16){
+      const cells=[]; let asc='';
+      for(let i=r;i<Math.min(r+16,n);i++){
+        const b=parseInt(hex.substr(i*2,2),16);
+        cells.push(hex.substr(i*2,2).toUpperCase());
+        asc+=(b>=0x20 && b<0x7F) ? String.fromCharCode(b) : '.';
+      }
+      while(cells.length<16) cells.push('  ');
+      rows.push({addr:memHex(base+r), hex:cells.slice(0,8).join(' ')+'  '+cells.slice(8).join(' '), ascii:asc});
+    }
+    return rows;
+  }
+  function memIsOpen(){ const el=secEl('memory'); return !!(el && el.open && !isHidden(el)); }
+  function refreshMem(){
+    if(memAddr===null || !isPaused || !memIsOpen()){ renderMem(); return; }
+    const key=memAddr+'|'+memLen; if(memInFlight===key) return;   // the same read is already on its way
+    memInFlight=key; send('mem', (++_memReq)+'|'+memHex(memAddr)+'|'+memLen); renderMem();
+  }
+  function onMem(m){
+    if(+m.reqId!==_memReq) return;
+    memInFlight=null; lastMem=m; renderMem();
+  }
+  // A new stop, or ↻: re-read even if the last request was never answered (the host drops a `mem` it
+  // receives while running, so a reply is not guaranteed and the in-flight mark must not outlive the stop).
+  function memReread(){ memInFlight=null; refreshMem(); }
+  function renderMem(){
+    const box=$('memBody'); if(!box) return;
+    if(memAddr===null){ box.innerHTML='<div class="empty">Pause, then enter an address, or right-click a variable and choose View memory.</div>'; return; }
+    const m=lastMem;
+    if(!m || memParseAddr(m.addr)!==memAddr){ box.innerHTML='<div class="empty">'+(isPaused?'Reading…':'Pause to read memory.')+'</div>'; return; }
+    if(m.error){ box.innerHTML='<div class="empty">'+esc(m.error)+'</div>'; return; }
+    box.innerHTML=memRows(memAddr, m.bytes, m.read).map(r=>
+      '<div class="mrow"><span class="madr">'+r.addr+'</span><span class="mhex">'+r.hex+'</span><span class="masc">'+esc(r.ascii)+'</span></div>').join('')
+      +((m.read|0)<(m.len|0) ? '<div class="memnote">'+(m.read|0)+' of '+(m.len|0)+' bytes readable; the rest is not mapped</div>' : '');
+  }
+  function memGo(a){
+    if(a===null) return;
+    memAddr=memClampStart(a, memLen); lastMem=null;
+    const inp=$('memAddr'); if(inp){ inp.value=memHex(memAddr); inp.classList.remove('bad'); }
+    refreshMem();
+  }
+  // "View memory" on a variable row: open the panel (un-hiding it if needed) at that row's address.
+  function openMemoryAt(addr){
+    const a=memParseAddr(addr); if(a===null) return;
+    const el=secEl('memory'); if(!el) return;
+    if(isHidden(el)) showSection('memory');
+    if(!el.open) el.open=true;   // its 'toggle' fires later and finds this read already in flight
+    memGo(a);
+    if(el.scrollIntoView) el.scrollIntoView({block:'nearest'});
+  }
+  // The tree menu for one row: "View memory" only when the row has storage (`addr`, else an edit `va`),
+  // "Add to Watch" only when the row is a watchable top-level name (wireSel's rows).
+  function memMenuFor(addr, watchable){
+    _memMenuAddr=addr||null;
+    $('tmWatch').style.display=watchable?'':'none';
+    $('tmMem').style.display=_memMenuAddr?'':'none';
+  }
+  // Rows wireSel does not own (groups, arrays, references, nested members) still get "View memory".
+  function wireMemMenu(row, v){
+    const a=v.addr||v.va; if(!a) return;
+    row.dataset.addr=a;
+    if(row.classList.contains('selrow')) return;   // wireSel's handler shows the menu for these
+    row.addEventListener('contextmenu',e=>{ e.preventDefault(); e.stopPropagation();
+      memMenuFor(a, false);
+      const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
   }
 
   // ---- module-scope data (current module's DATA section, refreshed each pause) ----
@@ -2408,6 +2513,16 @@
   // Library State: ↻ forces a re-read; expanding the panel while paused fetches on demand.
   (function(){ const lr=$('libRefresh'); if(lr) lr.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); refreshLibState(); });
     const lp=secEl('libstate'); if(lp) lp.addEventListener('toggle',()=>refreshLibState()); })();
+  // Memory: an address typed + Enter, ◀ ▶ paging by the block size, ↻, and a read on expand.
+  (function(){ const inp=$('memAddr'), sel=$('memLen');
+    if(inp) inp.addEventListener('keydown',e=>{ if(e.key!=='Enter') return; e.preventDefault();
+      const a=memParseAddr(inp.value); if(a===null){ inp.classList.add('bad'); return; } memGo(a); });
+    if(sel) sel.addEventListener('change',()=>{ memLen=Math.min(MEM_MAX, +sel.value||256); if(memAddr!==null) memGo(memAddr); });
+    const pv=$('memPrev'), nx=$('memNext');
+    if(pv) pv.addEventListener('click',()=>{ if(memAddr!==null) memGo(Math.max(0, memAddr-memLen)); });
+    if(nx) nx.addEventListener('click',()=>{ if(memAddr!==null) memGo(memAddr+memLen); });
+    const mr=$('memRefresh'); if(mr) mr.addEventListener('click',e=>{ e.stopPropagation(); e.preventDefault(); memReread(); });
+    const mp=secEl('memory'); if(mp) mp.addEventListener('toggle',()=>refreshMem()); })();
 
   // ---- registers ----
   function buildRegs(regs){
@@ -2573,7 +2688,7 @@
         // is about to push — then adopt the thread this stop is ON, when the event names it. The host
         // asks for the inventory too, which fills in the picker and the readable labels.
         resetThreadState(m.tid);
-        buildRegs(m.regs); setPaused(true); refreshLibState(); break;
+        buildRegs(m.regs); setPaused(true); refreshLibState(); memReread(); break;
       // The target really is running again — THIS is where a step or a continue snaps the view back to
       // the stopped thread, because it is the engine saying the command took effect. Doing it when the
       // command was merely sent would relabel the panels for a command the host dropped (see send()).
@@ -2588,6 +2703,7 @@
       case 'stack': if(tidAccepted(m)) buildStack(m.frames||[]); break;
       case 'framelocals': { if(!tidAccepted(m)) break; const cb=_flCbs[m.reqId]; if(cb){ delete _flCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'libstate': if(tidAccepted(m)) onLibState(m.reqId, m.error, m.items||[]); break;
+      case 'mem': onMem(m); break;   // not tid-gated: memory is the process's, not a thread's
       case 'moduledata': if(tidAccepted(m)) buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { if(!tidAccepted(m)) break; const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;

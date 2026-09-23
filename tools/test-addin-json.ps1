@@ -1504,6 +1504,73 @@ Check 'module:line with no module, or no number, is dropped' `
   (($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse(':12')) -and ($null -eq [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('m.clw:x'))) ''
 $ob = [ClarionDebugger.Terminal.OpenBpRequest]::Parse("42`tC:\src\m.clw")
 Check 'openbp: line<TAB>path' (($null -ne $ob) -and $ob.Line -eq 42 -and $ob.Path -ceq 'C:\src\m.clw') ''
+
+# ---- the Memory panel's read (ticket 633d8b2f) --------------------------------------------------------
+# The one request whose ADDRESS the page chooses freely, so the gate is the shape: hex with its 0x, 32 bits,
+# 1..MaxLen bytes. RequestMem's doc comment carries the security reasoning; these hold it to its rules.
+$mr = [ClarionDebugger.Terminal.MemRequest]::Parse('4|0x401000|256')
+Check 'mem: reqId|0xADDR|len reads as three typed fields' `
+  (($null -ne $mr) -and $mr.ReqId -eq 4 -and $mr.Addr -ceq '0x401000' -and $mr.Len -eq 256) ''
+Check 'mem: CONTROL - the top of the cap and a full 8-digit address are accepted' `
+  ($null -ne [ClarionDebugger.Terminal.MemRequest]::Parse('4|0xFFFFF000|4096')) ''
+foreach ($bad in @('4|401000|256', '4|0x|16', '4|0x123456789|16', '4|0x40 1000|16', '4|0x40;1000|16', '4|0x401000|0',
+                   '4|0x401000|4097', '4|0x401000', '-1|0x10|16', '4|0x10|16|x', 'x|0x10|16', '4|0x10|1e3')) {
+  Check "mem: '$bad' is dropped" ($null -eq [ClarionDebugger.Terminal.MemRequest]::Parse($bad)) ''
+}
+# ONE cap on three sides of the bridge. A page that pages in bigger blocks than the host forwards would get
+# every read dropped; a host looser than the engine would forward reads the engine refuses.
+$engineCap = [regex]::Match($engineSrc, 'internal const int MemMaxLen = (\d+);')
+$pageCap = [regex]::Match((Get-Content -Raw -LiteralPath $PagePath), 'const MEM_MAX=(\d+)')
+Check 'mem: the host, the engine and the page share one cap' `
+  ($engineCap.Success -and $pageCap.Success -and [int]$engineCap.Groups[1].Value -eq [ClarionDebugger.Terminal.MemRequest]::MaxLen `
+   -and [int]$pageCap.Groups[1].Value -eq [ClarionDebugger.Terminal.MemRequest]::MaxLen) `
+  "engine=$($engineCap.Groups[1].Value) host=$([ClarionDebugger.Terminal.MemRequest]::MaxLen) page=$($pageCap.Groups[1].Value)"
+
+# RequestMem is the service-side gate, run for real over a recording SendCommand.
+$memProbeSrc = @"
+using System;
+using System.Globalization;
+using System.Text.RegularExpressions;
+public class MemRequestProbe {
+  public string Sent;
+  private bool SendCommand(string c) { Sent = c; return true; }
+  $(Get-Method 'public bool RequestMem(int reqId, string addrHex, int len)')
+}
+"@
+Add-Type -TypeDefinition $memProbeSrc -Language CSharp | Out-Null
+$mp = New-Object MemRequestProbe
+Check 'RequestMem sends mem ADDR LEN reqId (the reqId TRAILS, where the engine reads it)' `
+  ($mp.RequestMem(4, '0x401000', 256) -and $mp.Sent -ceq 'mem 0x401000 256 4') (ShowVal $mp.Sent)
+foreach ($c in @(@(4, '0x40 1000', 16), @(4, '401000', 16), @(4, '0x1234567890', 16), @(4, '0x10', 0), @(4, '0x10', 4097), @(-1, '0x10', 16), @(4, $null, 16))) {
+  # PowerShell stores $null into a C# string field as '', so "sent nothing" is IsNullOrEmpty, not -eq $null.
+  $mp.Sent = $null
+  Check "RequestMem refuses reqId=$($c[0]) addr=$(ShowVal $c[1]) len=$($c[2]) and sends nothing" `
+    ((-not $mp.RequestMem($c[0], $c[1], $c[2])) -and [string]::IsNullOrEmpty($mp.Sent)) (ShowVal $mp.Sent)
+}
+Check 'RequestMem carries its security reasoning (read-only, capped, paused-only, validated)' `
+  ($src -match 'SECURITY\. This is the one request' -and $src -match 'READ-ONLY' -and $src -match 'PAUSED-ONLY') ''
+
+# The dispatch: paused-gated BEFORE the parse, exactly like framelocals, and a reply grants nothing.
+$memCase = [regex]::Match($web, 'case "mem":[\s\S]*?break;')
+$memCaseCode = Get-CSharpCodeOnly $memCase.Value
+Check 'the bridge forwards mem only while Paused, through MemRequest.Parse and RequestMem' `
+  ($memCase.Success -and $memCaseCode -match 'case "mem":\s*if \(_svc\.State == DebugSessionState\.Paused\)\s*\{\s*var mr = MemRequest\.Parse\(data\);\s*if \(mr != null\) _svc\.RequestMem\(mr\.ReqId, mr\.Addr, mr\.Len\);\s*\}\s*break;') `
+  (ShowVal $memCase.Value)
+$onSvcMem = [regex]::Match($web, 'private void OnSvcMem\([\s\S]*?(?=private void OnSvcRegs)')
+Check 'the mem reply is posted and grants nothing (no _editGrants)' `
+  ($onSvcMem.Success -and $onSvcMem.Value -match '\\"type\\":\\"mem\\"' -and $onSvcMem.Value -notmatch '_editGrants') ''
+Check 'the bridge subscribes and unsubscribes the mem reply' `
+  ($web -match '_svc\.MemReceived\s*\+=\s*OnSvcMem;' -and $web -match '_svc\.MemReceived\s*-=\s*OnSvcMem;') ''
+Check 'the service raises MemReceived from a mem event' `
+  ($src -match 'case "mem":\s*MemReceived\?\.Invoke\(GetStr\(json, "reqId"\)') ''
+
+# A var row's read-only `addr` is NOT a grant. Only a ref:true row's addr is an EXPAND grant, and no addr is
+# ever an EDIT grant: that is what keeps "View memory" on a group from minting pencils.
+$ga = New-Object ClarionDebugger.Terminal.EditGrants
+$ga.GrantRows('{"name":"G","type":"","value":"{}","children":[{"name":"F","addr":"0x400004"}],"addr":"0x400000"},{"name":"S","type":"LONG","addr":"0x400010"}', 5)
+Check 'rows carrying only addr grant no edit and no expand' ($ga.Count -eq 0 -and $ga.ExpandableCount -eq 0) "$($ga.Count) edit, $($ga.ExpandableCount) expand"
+$ga.GrantRows('{"name":"R","ref":true,"addr":"0x12345678","module":"m.clw","typeRef":7}', 5)
+Check 'CONTROL: a ref:true row with addr is still an expand grant' ($ga.ExpandableCount -eq 1 -and $ga.Count -eq 0) "$($ga.ExpandableCount) expand"
 $u = [uint32] 0
 Check 'a thread id is a DWORD: a sign is not accepted' `
   (-not [ClarionDebugger.Terminal.PageNumbers]::TryUInt('-5', [ref] $u) -and [ClarionDebugger.Terminal.PageNumbers]::TryUInt('4294967295', [ref] $u)) ''
@@ -2209,7 +2276,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 337
+$EXPECTED_CHECKS = 367
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
