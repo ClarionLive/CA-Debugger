@@ -146,7 +146,7 @@ namespace ClarionDbg.Cli
         private RtlEmulator BuildEmulator(LoadedModule rt, uint tid, uint teb)
         {
             var imports = EmulatorImportsFor(rt);
-            uint stackBase = EmulatorStackWindow.Pick(_hProcess);
+            uint stackBase = EmulatorStackBase(_hProcess);
             if (stackBase == 0)
                 throw new InvalidOperationException(
                     "no free address-space window for the emulator's modeled stack — refusing rather than "
@@ -162,14 +162,36 @@ namespace ClarionDbg.Cli
                 stackBase: stackBase);
         }
 
+        /// <summary>Where the emulator's modeled stack goes: the window used last time if it is STILL free in
+        /// the target, otherwise a fresh <see cref="EmulatorStackWindow.Pick"/> (9b073cf9). This re-VALIDATES
+        /// the last window each time rather than reusing it on trust. The target ran since it was picked,
+        /// and a window it has since allocated into would make the emulator answer real reads from its own
+        /// zeroed buffer. Returns 0 when there is no free window at all.</summary>
+        private uint EmulatorStackBase(IntPtr hProcess)
+        {
+            if (_lastStackWindow != 0 && EmulatorStackWindow.StillFree(hProcess, _lastStackWindow))
+                return _lastStackWindow;
+            _lastStackWindow = EmulatorStackWindow.Pick(hProcess);
+            return _lastStackWindow;
+        }
+
+        /// <summary>The last window <see cref="EmulatorStackBase"/> handed out. Only ever a CANDIDATE: it is
+        /// re-checked against the live address space before every use, so nothing needs to clear it.</summary>
+        private uint _lastStackWindow;
+
+        /// <summary>Test seam for `protocolcheck`: the shipped window choice, against a process the harness
+        /// names. No refusal for an attached engine is needed: all it can leave behind is a candidate that
+        /// the next real call re-validates against the target before using.</summary>
+        internal uint EmulatorStackBaseForTest(IntPtr hProcess) { return EmulatorStackBase(hProcess); }
+
         /// <summary>The runtime image's IAT slot VA -> bare import name map ("dll!func" -> "func"), rebased to
         /// where the image is mapped. PER IMAGE, NOT PER EPISODE (9b073cf9): BuildEmulator runs on every
         /// breakpoint hit that reads a THREADed name, and rebuilding this map is work whose answer cannot
         /// change while the image stays mapped at one base. Measured 2026-09-22 on ClaRUN.dll (674 named
         /// imports): ~50-60 us per rebuild.
         ///
-        /// What is NOT cached here, deliberately: the modeled-stack window (free address space changes while
-        /// the target runs) and anything about a thread (the per-hit clear in ShouldPauseAtBp owns that).
+        /// What is NOT cached here, deliberately: anything about a thread (the per-hit clear in ShouldPauseAtBp
+        /// owns that). The modeled-stack window is only re-validated, not cached; see EmulatorStackBase.
         ///
         /// KEYED ON THE LoadedModule AND ITS BASE. A pre-loaded solution DLL keeps its LoadedModule across an
         /// unload and a reload (DebugEngine.Modules.cs sets LoadBase to 0, then to the new base), so the object

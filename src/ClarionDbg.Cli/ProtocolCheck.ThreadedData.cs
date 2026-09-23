@@ -263,6 +263,100 @@ namespace ClarionDbg.Cli
                 failures.Add("emulator imports: two modules were handed one map");
         }
 
+        /// <summary>
+        /// The emulator's modeled-stack window is REUSED only while it is still free (9b073cf9). BuildEmulator
+        /// used to walk the target's whole address space for a free window on every breakpoint hit. It now
+        /// keeps the last window and re-validates it with one query. The failure this design must prevent is
+        /// a window the target has since allocated into, because every emulated read there would then be
+        /// answered from the emulator's zeroed buffer. So this check OCCUPIES the window and requires a
+        /// fresh pick.
+        ///
+        /// Runs against THIS process's address space: the rule is about "is this range free in the process
+        /// being asked about", and a reservation made here is one the harness controls and releases.
+        ///
+        /// NOT COVERED: a real debuggee's allocation pattern between two hits.
+        /// </summary>
+        private static void CheckStackWindowRevalidated(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("the emulator's stack window is reused only while it is still free: once something is "
+                         + "mapped into it the next call picks a different, free window, and that window is then "
+                         + "KEPT while free even when a fresh walk would find a lower one - including when the whole window is one reserved region, "
+                         + "which only the region-state test rejects. Not covered: a real debuggee's allocations.");
+
+            IntPtr self = System.Diagnostics.Process.GetCurrentProcess().Handle;
+            var eng = NewEngine();
+            uint first = eng.EmulatorStackBaseForTest(self);
+            if (first == 0 || !EmulatorStackWindow.StillFree(self, first))
+            {
+                failures.Add("stack window control: no free window was picked in this process (0x" + first.ToString("X")
+                             + "), so nothing below is tested");
+                return;
+            }
+            // Occupy the modeled stack itself: the middle of the window, where every emulated push lands.
+            IntPtr taken = VirtualAlloc(new IntPtr((long)first), (UIntPtr)0x10000u, MemReserve, PageNoAccess);
+            if (taken == IntPtr.Zero)
+            {
+                failures.Add("stack window control: could not reserve 0x" + first.ToString("X") + " to occupy the window");
+                return;
+            }
+            uint next = 0;
+            try
+            {
+                if (EmulatorStackWindow.StillFree(self, first))
+                    failures.Add("stack window: StillFree said yes for a window with memory mapped into it");
+                next = eng.EmulatorStackBaseForTest(self);
+                if (next == first)
+                    failures.Add("stack window: the window at 0x" + first.ToString("X") + " was handed out AGAIN after "
+                                 + "memory was mapped into it - the emulator would answer real reads from its own buffer");
+                else if (next == 0 || !EmulatorStackWindow.StillFree(self, next))
+                    failures.Add("stack window: the replacement window 0x" + next.ToString("X") + " is not free");
+            }
+            finally { VirtualFree(taken, UIntPtr.Zero, MemRelease); }
+
+            // REUSE, made distinguishable from a re-pick. With the first window released, a fresh walk finds it
+            // again (it is the lowest free fit), while the window in hand is still free and must be kept.
+            // "Same answer twice" could not tell the two apart: the walk is deterministic.
+            if (next != 0 && next != first)
+            {
+                if (EmulatorStackWindow.Pick(self) != first)
+                    failures.Add("stack window control: a fresh walk no longer finds 0x" + first.ToString("X")
+                                 + ", so reuse cannot be told from a re-pick here");
+                else if (eng.EmulatorStackBaseForTest(self) != next)
+                    failures.Add("stack window: a window that was still free (0x" + next.ToString("X") + ") was not "
+                                 + "reused - the full walk still runs on every hit");
+            }
+
+            // The WHOLE window reserved as one region. Its size fits exactly, so only the region's STATE can
+            // reject it; the case above is also rejected by size, which would hide a missing state test.
+            var whole = NewEngine();
+            uint w = whole.EmulatorStackBaseForTest(self);
+            if (w == 0) { failures.Add("stack window control: no free window for the whole-window case"); return; }
+            IntPtr all = VirtualAlloc(new IntPtr((long)w - RtlEmulator.StackGuard), (UIntPtr)RtlEmulator.WindowBytes,
+                                      MemReserve, PageNoAccess);
+            if (all == IntPtr.Zero)
+            {
+                failures.Add("stack window control: could not reserve the whole window at 0x" + (w - RtlEmulator.StackGuard).ToString("X"));
+                return;
+            }
+            try
+            {
+                if (EmulatorStackWindow.StillFree(self, w))
+                    failures.Add("stack window: StillFree said yes for a window that is exactly one RESERVED region - "
+                                 + "the size fits, so only the region's state can say no, and it did not");
+                if (whole.EmulatorStackBaseForTest(self) == w)
+                    failures.Add("stack window: a window reserved end to end was handed out again");
+            }
+            finally { VirtualFree(all, UIntPtr.Zero, MemRelease); }
+        }
+
+        private const uint MemReserve = 0x2000, MemRelease = 0x8000, PageNoAccess = 0x01;
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr VirtualAlloc(IntPtr lpAddress, UIntPtr dwSize, uint flAllocationType, uint flProtect);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool VirtualFree(IntPtr lpAddress, UIntPtr dwSize, uint dwFreeType);
+
         /// <summary>One injected emulation's outcome, for <see cref="CheckEmulationFaultBranches"/>.</summary>
         private sealed class EmulationCase
         {

@@ -132,10 +132,10 @@ if ($null -ne $live) {
 }
 
 Write-Host ''
-Write-Host 'per-hit caching keeps the per-hit clear and the per-episode stack window (9b073cf9)'
+Write-Host 'per-hit caching keeps the per-hit clear and re-validates the stack window (9b073cf9)'
 # BuildEmulator's import map is cached per image. What must NOT be cached: a thread's instance block (the
 # .cwtls block cache is cleared at the single entrance to a hit, so a condition never reads a base from
-# before the resume), and the modeled-stack window (free address space changes while the target runs).
+# before the resume). The modeled-stack window is reused only after re-checking it is still free.
 # POSITION, not presence: a clear moved below the condition would still be in the method.
 $bpAdv = Get-Content -Raw -LiteralPath (Join-Path $EngineDir 'DebugEngine.BpAdvanced.cs')
 $gate = Get-CSharpBlock 'private bool ShouldPauseAtBp(' $bpAdv
@@ -151,8 +151,18 @@ $build = Get-CSharpBlock 'private RtlEmulator BuildEmulator(' $lib
 Check 'BuildEmulator exists' ($null -ne $build) ''
 if ($null -ne $build) {
   $buildCode = Get-CSharpCodeOnly $build
-  Check 'BuildEmulator picks a fresh stack window on every call' `
-    ($buildCode -match '(?m)^\s*uint stackBase = EmulatorStackWindow\.Pick\(_hProcess\);') ''
+  Check 'BuildEmulator takes its stack window from EmulatorStackBase' `
+    ($buildCode -match '(?m)^\s*uint stackBase = EmulatorStackBase\(_hProcess\);') ''
+}
+# ...and that reuses the last window ONLY when StillFree says so, else picks afresh. protocolcheck's
+# CheckStackWindowRevalidated proves the behaviour; this pins that the guard is the reuse's own condition.
+$choose = Get-CSharpBlock 'private uint EmulatorStackBase(' $lib
+Check 'EmulatorStackBase exists' ($null -ne $choose) ''
+if ($null -ne $choose) {
+  $chooseCode = Get-CSharpCodeOnly $choose
+  Check 'it reuses the last window only under StillFree, and otherwise calls Pick' `
+    (($chooseCode -match 'if \(_lastStackWindow != 0 && EmulatorStackWindow\.StillFree\(hProcess, _lastStackWindow\)\)\s*return _lastStackWindow;') `
+     -and ($chooseCode -match '_lastStackWindow = EmulatorStackWindow\.Pick\(hProcess\);')) ''
 }
 
 Write-Host ''
