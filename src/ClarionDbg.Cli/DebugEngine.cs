@@ -710,7 +710,7 @@ namespace ClarionDbg.Cli
                             else if (!_seenInitialBreak)
                             {
                                 _seenInitialBreak = true; // OS loader breakpoint (or the attach break) — swallow it
-                                if (IsAttach) ReseedThreadOrderAfterAttach();
+                                if (IsAttach) ReseedThreadOrderAfterAttach(tid);   // tid = the injected break thread
                                 status = Native.DBG_CONTINUE;
                             }
                             else if (_pauseRequested)

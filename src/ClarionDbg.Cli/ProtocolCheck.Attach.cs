@@ -104,10 +104,35 @@ namespace ClarionDbg.Cli
             if (json2 == null || json2.IndexOf("\"drained\":" + queue.Count, StringComparison.Ordinal) < 0)
                 failures.Add("detach drain: the detached event does not report drained " + queue.Count + ": " + (json2 ?? "(null)"));
 
+            // ---- the thread order after an attach ----
+            // 99 is the injected break thread and the OLDEST time here, so leaving it in puts it first. 20 and 30 tie,
+            // listed high tid first, so a sort that does not break the tie by tid (or breaks it the wrong way) moves
+            // them. 40's time is unreadable and must sort last.
+            var created = new List<KeyValuePair<uint, long>>
+            {
+                new KeyValuePair<uint, long>(30, 100), new KeyValuePair<uint, long>(10, 200),
+                new KeyValuePair<uint, long>(20, 100), new KeyValuePair<uint, long>(99, 50),
+                new KeyValuePair<uint, long>(40, long.MaxValue),
+            };
+            var tOrder = DebugEngine.OrderThreadsByCreation(created, 99);
+            if (string.Join(",", tOrder) != "20,30,10,40")
+                failures.Add("thread order: " + string.Join(",", tOrder) + " - expected 20,30,10,40 (oldest first, a tie "
+                             + "to the lower tid, an unreadable time last, and the injected break thread 99 left out)");
+            var eng3 = NewEngine();
+            eng3.ApplyThreadOrderForTest(tOrder);
+            if (eng3.MainTidForTest != 20)
+                failures.Add("thread order: _mainTid is " + eng3.MainTidForTest + " after the reseed - expected 20, the oldest");
+            if (eng3.SeqOfForTest(20) != 0 || eng3.SeqOfForTest(30) != 1 || eng3.SeqOfForTest(10) != 2 || eng3.SeqOfForTest(40) != 3
+                || eng3.SeqOfForTest(99) != int.MaxValue)
+                failures.Add("thread order: positions 20,30,10,40,99 = " + eng3.SeqOfForTest(20) + "," + eng3.SeqOfForTest(30) + ","
+                             + eng3.SeqOfForTest(10) + "," + eng3.SeqOfForTest(40) + "," + eng3.SeqOfForTest(99)
+                             + " - expected 0,1,2,3 and no position for the break thread");
+
             claims.Claim("detach: the loaded/detached/attach-error shapes are exact, `detach` is not a resume verb, the "
                          + "drain answers our INT3 (with an EIP rewind), a trap, the attach and pause breaks, and hands the "
                          + "app its own INT3 and faults; the teardown restores bytes and clears TF before continuing, and "
-                         + "drains a " + queue.Count + "-event queue before the stop.");
+                         + "drains a " + queue.Count + "-event queue before the stop. After an attach, threads are re-numbered "
+                         + "oldest first (a tie to the lower tid, the injected break thread left out) and the oldest is main.");
         }
 
         private static void ExpectEqual(List<string> failures, string what, string got, string want)

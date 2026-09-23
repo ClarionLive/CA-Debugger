@@ -102,12 +102,12 @@ namespace ClarionDbg.Cli
         /// Their CREATE_THREAD events came in the kernel's thread-list order, which nothing documents as creation
         /// order, and the CREATE_PROCESS thread is merely the first in that list. Re-number by creation time so
         /// "newest thread" (PickPauseThread) means what it means after a launch.</summary>
-        private void ReseedThreadOrderAfterAttach()
+        private void ReseedThreadOrderAfterAttach(uint breakTid)
         {
             var created = new List<KeyValuePair<uint, long>>();
             foreach (uint t in _threads)
             {
-                long when = long.MaxValue;
+                long when = long.MaxValue;   // unreadable: sorts after every thread whose time is known
                 IntPtr h = OpenThreadForContext(t);
                 if (h != IntPtr.Zero)
                 {
@@ -117,12 +117,41 @@ namespace ClarionDbg.Cli
                 }
                 created.Add(new KeyValuePair<uint, long>(t, when));
             }
-            created.Sort((a, b) => a.Value != b.Value ? a.Value.CompareTo(b.Value) : a.Key.CompareTo(b.Key));
+            ApplyThreadOrder(OrderThreadsByCreation(created, breakTid));
+        }
+
+        /// <summary>THE ORDER, pure: the tids oldest first by creation time, a tie broken by the lower tid so the
+        /// answer never depends on enumeration order, and <paramref name="breakTid"/> left out - the thread the
+        /// attach break ran on is injected by Windows, exits as soon as it is continued, and is neither the
+        /// program's main thread nor a thread a pause should pick.</summary>
+        internal static List<uint> OrderThreadsByCreation(IEnumerable<KeyValuePair<uint, long>> created, uint breakTid)
+        {
+            var list = new List<KeyValuePair<uint, long>>();
+            foreach (var kv in created) if (kv.Key != breakTid) list.Add(kv);
+            list.Sort((a, b) => a.Value != b.Value ? a.Value.CompareTo(b.Value) : a.Key.CompareTo(b.Key));
+            var order = new List<uint>(list.Count);
+            foreach (var kv in list) order.Add(kv.Key);
+            return order;
+        }
+
+        /// <summary>Re-number the threads 0.. in <paramref name="order"/>, and make the oldest the main thread.
+        /// A tid not in the order (the injected break thread) keeps no position, so SeqOf sorts it last.</summary>
+        private void ApplyThreadOrder(List<uint> order)
+        {
             _threadSeq.Clear();
             _nextThreadSeq = 0;
-            foreach (var kv in created) _threadSeq[kv.Key] = _nextThreadSeq++;
-            if (created.Count > 0) _mainTid = created[0].Key;
+            foreach (uint t in order) _threadSeq[t] = _nextThreadSeq++;
+            if (order.Count > 0) _mainTid = order[0];
         }
+
+        /// <summary>Test seam: the apply step on an engine with no target.</summary>
+        internal void ApplyThreadOrderForTest(List<uint> order)
+        {
+            RefuseSeamIfAttached("ApplyThreadOrderForTest");
+            ApplyThreadOrder(order);
+        }
+        internal uint MainTidForTest { get { return _mainTid; } }
+        internal int SeqOfForTest(uint tid) { return SeqOf(tid); }
 
         /// <summary>
         /// Detach on the event in <paramref name="held"/>. <paramref name="heldStatus"/> is the continue status

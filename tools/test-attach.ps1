@@ -46,7 +46,10 @@ if ($SelfTest) {
   # protocolcheck failure text that proves the RIGHT check caught it.
   $plants = @(
     @('the drain never runs', 'internal const int DetachDrainCapEvents = 200;', 'internal const int DetachDrainCapEvents = 0;', 'detach drain: continued'),
-    @('the drain does not rewind EIP on our INT3', 'if (rewind) DetachSetEip(Tid(ev), exAddr);', 'if (rewind) { }', 'detach drain: EIP rewinds none')
+    @('the drain does not rewind EIP on our INT3', 'if (rewind) DetachSetEip(Tid(ev), exAddr);', 'if (rewind) { }', 'detach drain: EIP rewinds none'),
+    @('the reseed keeps the injected break thread', 'foreach (var kv in created) if (kv.Key != breakTid) list.Add(kv);', 'foreach (var kv in created) list.Add(kv);', 'thread order: 99,'),
+    @('the reseed breaks a creation-time tie the wrong way', 'a.Value.CompareTo(b.Value) : a.Key.CompareTo(b.Key)', 'a.Value.CompareTo(b.Value) : b.Key.CompareTo(a.Key)', 'thread order: 30,20,'),
+    @('the reseed does not make the oldest thread main', 'if (order.Count > 0) _mainTid = order[0];', 'if (order.Count < 0) _mainTid = order[0];', 'thread order: _mainTid is')
   )
   try {
     $src = Join-Path $PSScriptRoot '..\src'
