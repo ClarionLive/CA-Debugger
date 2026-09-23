@@ -88,6 +88,9 @@ namespace ClarionDbg.Cli
                 CheckMemReadIsCleanAndPageSafe,
                 CheckVarRowAddrIsNotAnEditGrant,
                 CheckRefKindOnEveryRefNode,
+                CheckSetIpEventLoopRegions,
+                CheckSetIpDecision,
+                CheckSetIpWire,
             };
 
             foreach (var check in checks)
@@ -465,7 +468,8 @@ namespace ClarionDbg.Cli
             // "only valid while paused" case, not the hoisted one. Same error text today, but they are a
             // different set and must not be absorbed into this one.
             string[] pausedOnlyReads = { "mem", "regs", "stack", "watch", "locals", "moduledata", "disasm",
-                                         "setval", "threads", "threadscan", "framelocals", "libstate", "expand" };
+                                         "setval", "threads", "threadscan", "framelocals", "libstate", "expand",
+                                         "setip" };
             foreach (var v in pausedOnlyReads)
                 if (DebugEngine.IsResumeVerbForTest(v))
                     failures.Add("resume verbs: the read verb '" + v + "' is not a resume verb, but "

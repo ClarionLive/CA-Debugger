@@ -506,7 +506,7 @@
     <span class="dacts"><span class="dact" id="dtPin" title="Add to Watch"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M12 2l2.9 6.3 6.9.7-5.2 4.6 1.5 6.8L12 17.8 5.9 20.4l1.5-6.8L2.2 9l6.9-.7z"/></svg></span><span class="dact copy" id="dtCopy" title="Copy Value">⧉</span></span>
   </div>
   <div class="ctxmenu" id="treeMenu"><div class="mi" id="tmWatch">👁 Add to Watch</div><div class="mi" id="tmMem">⌗ View memory</div></div>
-  <div class="ctxmenu" id="srcMenu"><div class="mi" id="miRtc">▶ Run to cursor</div></div>
+  <div class="ctxmenu" id="srcMenu"><div class="mi" id="miRtc">▶ Run to cursor</div><div class="mi" id="miSetIp">➜ Set next statement</div></div>
   <div class="ctxmenu" id="procMenu"><div class="mi" id="miBpEntry">⛔ Break on entry</div></div>
 
   <div class="modal-backdrop" id="settingsBackdrop">
@@ -1071,11 +1071,31 @@
     e.preventDefault();
     rtcLine=parseInt(sl.dataset.line,10);
     $('miRtc').classList.toggle('disabled', !paused);
+    $('miSetIp').classList.toggle('disabled', !setIpAllowed());
     const m=$('srcMenu'); m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; m.style.top=e.clientY+'px'; m.classList.add('show');
   });
   $('miRtc').onclick=()=>{ $('srcMenu').classList.remove('show');
     if(!paused||rtcLine==null||isNaN(rtcLine)||!curFile) return;
     send('runtocursor', curFile+':'+rtcLine); };
+
+  // ---- Source view: right-click "Set next statement" (task a77abd94). Moves the STOPPED thread's instruction
+  // pointer to the clicked line; nothing runs. Only while paused AND viewing the stopped thread: the engine
+  // refuses another thread anyway, and a greyed item says so before the round trip. The engine decides what is
+  // safe (same procedure, not across an ACCEPT, ...) and its refusal sentence is shown as is. What it CANNOT
+  // decide is what skipping or repeating code means to the program, so the first use in a session says that
+  // once, in the console, where it stays readable. ----
+  let setIpWarned=false;
+  function setIpAllowed(){ return paused && !viewingOtherThread(); }
+  function setIpFromMenu(){ $('srcMenu').classList.remove('show');
+    if(!setIpAllowed()||rtcLine==null||isNaN(rtcLine)||!curFile) return;
+    if(!setIpWarned){ setIpWarned=true;
+      logLine('pause', 'Set next statement skips or repeats code without running anything in between. The debugger keeps the stack safe, '
+        + 'but not the program\'s own state: skipping an OPEN leaves a file or window closed, and repeating a line repeats its effects.'); }
+    send('setip', curFile+':'+rtcLine); }
+  $('miSetIp').onclick=setIpFromMenu;
+  // The host's relay of the engine's setip reply. Success needs nothing here: the `paused` that follows repaints
+  // the execution line and every panel.
+  function onSetIp(m){ if(!m.ok) toast(m.error || ('Set next statement refused (' + (m.reason||'?') + ')')); }
 
   // ---- Procedures pane: right-click "Break on entry" (persistent bp at the procedure's definition line).
   // Works in any state (idle stages it; running/paused plants it live). Delegated for buildProcs() rebuilds. ----
@@ -2709,6 +2729,7 @@
       case 'expanded': { if(!tidAccepted(m)) break; const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
       case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
       case 'varset': onVarSet(m); break;
+      case 'setip': onSetIp(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
       case 'procedures': buildProcs(m.procs||[]); break;
       case 'regs': if(tidAccepted(m)) buildRegs(m.regs); break;

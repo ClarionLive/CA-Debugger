@@ -314,6 +314,7 @@ namespace ClarionDebugger.Services
         public event Action<DebugModule> ModuleLoaded;             // image mapped (EXE or DLL)
         public event Action<DebugModule> ModuleUnloaded;           // image unmapped
         public event Action<string> EngineError;                   // engine-reported error event
+        public event Action<bool, string, string, int, string> SetIpResult; // set next statement: ok, refusal code, module, line, user text
         public event Action<string> LogReceived;
         public event Action<int> Exited;
 
@@ -673,6 +674,14 @@ namespace ClarionDebugger.Services
         {
             return IsValidModuleName(module)
                 && SendCommand("bp add " + module + ":" + line + (singleTarget ? "|one=1" : ""));
+        }
+
+        /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line within
+        /// the procedure it is in. The engine decides whether that is safe and answers with a `setip` event
+        /// (<see cref="SetIpResult"/>); on success a `paused` event with reason "setip" follows.</summary>
+        public bool SetNextStatement(string module, int line)
+        {
+            return IsValidModuleName(module) && line > 0 && SendCommand("setip " + module + ":" + line);
         }
 
         /// <summary>Remove a breakpoint by module:line (planted or requested line both match).</summary>
@@ -1130,6 +1139,11 @@ namespace ClarionDebugger.Services
 
                 case "error":
                     EngineError?.Invoke(GetStr(json, "message"));
+                    break;
+
+                case "setip":   // set next statement: a refusal, or the success that precedes `paused` reason setip
+                    SetIpResult?.Invoke(GetBool(json, "ok"), GetStr(json, "reason"), GetStr(json, "module"),
+                                        GetInt(json, "line"), GetStr(json, "error"));
                     break;
 
                 case "exited":

@@ -109,6 +109,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError       += OnSvcBreakpointError;
             _svc.Traced                += OnSvcTraced;
             _svc.EngineError           += OnSvcEngineError;
+            _svc.SetIpResult           += OnSvcSetIpResult;
             _svc.ModuleLoaded          += OnSvcModuleLoaded;
             _svc.ModuleUnloaded        += OnSvcModuleUnloaded;
             _svc.LogReceived           += OnSvcLog;
@@ -258,6 +259,7 @@ namespace ClarionDebugger.Terminal
             _svc.BreakpointError        -= OnSvcBreakpointError;
             _svc.Traced                 -= OnSvcTraced;
             _svc.EngineError            -= OnSvcEngineError;
+            _svc.SetIpResult            -= OnSvcSetIpResult;
             _svc.ModuleLoaded           -= OnSvcModuleLoaded;
             _svc.ModuleUnloaded         -= OnSvcModuleUnloaded;
             _svc.LogReceived            -= OnSvcLog;
@@ -651,6 +653,7 @@ namespace ClarionDebugger.Terminal
                     case "bpremove": RemoveBp(data); break;
                     case "bpprops": SetBpProps(data); break;
                     case "runtocursor": CmdRunToCursor(data); break;   // transient one-shot bp at module:line, then resume
+                    case "setip": CmdSetNextStatement(data); break;    // move the stopped thread's IP to module:line
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
@@ -780,6 +783,29 @@ namespace ClarionDebugger.Terminal
         }
 
         private static string TransientKey(string module, int line) { return (module ?? "") + ":" + line; }
+
+        /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line. Paused
+        /// only, and an explicit module:line only (the pad's source-view menu); the engine decides whether the
+        /// move is safe. A refusal comes back through <see cref="OnSvcSetIpResult"/>; a success is followed by
+        /// an ordinary `paused` (reason "setip"), which <see cref="OnPaused"/> handles like any other stop.</summary>
+        public void CmdSetNextStatement(string spec)
+        {
+            if (CurrentState != DebugSessionState.Paused) return;
+            var at = ModuleLineRequest.Parse(spec);
+            if (at == null) return;
+            if (!_svc.SetNextStatement(at.Module, at.Line))
+                Console("err", "set next statement: could not send the request for " + at.Module + ":" + at.Line + ".");
+        }
+
+        // The success line is logged here; the refresh itself rides on the `paused` that follows it. A refusal is
+        // logged and handed to the page, which shows the engine's sentence as is.
+        private void OnSvcSetIpResult(bool ok, string reason, string module, int line, string error) => UI(() =>
+        {
+            if (ok) Console("info", "set next statement: " + module + ":" + line);
+            else Console("err", "set next statement refused (" + reason + "): " + error);
+            Post("{\"type\":\"setip\",\"ok\":" + (ok ? "true" : "false") + ",\"reason\":" + Str(reason)
+                 + ",\"error\":" + Str(error) + ",\"module\":" + Str(module) + ",\"line\":" + line + "}");
+        });
 
         // ── Run to cursor sourced from the real Monaco editor ─────────────────────────────────────
         // "Wherever the developer's caret actually is right now", pulled from ClarionAssistant's live Monaco
@@ -1305,6 +1331,9 @@ namespace ClarionDebugger.Terminal
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
                 // Remove from the engine and clear the set; the bp-del echo refreshes the pane.
+                // A `paused` with reason "setip" (set next statement) lands here too and cancels a run-to-cursor
+                // still waiting for its bp-set. That is intended: the user moved the IP after asking to run, so
+                // the pending run is moot, and it is not resumed behind their back.
                 if (_transientBps.Count > 0)
                 {
                     foreach (var key in new List<string>(_transientBps))

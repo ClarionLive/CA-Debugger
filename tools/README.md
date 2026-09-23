@@ -64,6 +64,7 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-bp-threaded.ps1` | **live** | a tracepoint over a THREADed name, hit repeatedly without pausing |
 | `test-watch-threaded.ps1` | **live** | a watch reads a THREADed name from its instance, not a HISTORY:: copy |
 | `test-interactive.ps1` | **live** | step / stepover / stepout from a startup breakpoint |
+| `test-setip.ps1` | **live** | set next statement: a move re-announces the stop and Step starts from the new line, an origin breakpoint still fires after a setip onto another breakpoint, and the ACCEPT-boundary, prologue, routine and Pause-stop refusals |
 
 **Live** suites launch `clbrws.exe` from the Clarion 11 examples
 (`C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses`) under the engine and

@@ -805,22 +805,19 @@ namespace ClarionDbg.Cli
         // ------------------------------------------------------------------ pause + command loop
 
         /// <summary>
-        /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
-        /// services stdin commands until a resume-type command arrives.
+        /// Resolve where the stopped thread is and announce it: the thread-stamped `paused` event and the
+        /// console line. Lifted out of <see cref="PausedWait"/> so it can run AGAIN within one stop: after
+        /// `setip` moves EIP, the pause loop re-runs this with reason "setip", so the host refreshes every
+        /// panel through its ordinary `paused` path and the step verbs get locals for the NEW line.
         /// </summary>
-        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
+        private void AnnounceStop(uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason,
+                                  out LoadedModule m, out bool resolved, out int line, out int mi)
         {
-            _pauseRequested = false;  // any pause we reach consumes a pending pause request
-            _instrStep = false;       // and consumes a pending instruction-step
-            _selectedTid = tid;       // a new stop always starts on the stopped thread — a selection is
-                                      // per-stop and is never carried across one
-            ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
-                                        // rather than trust bases cached while the target was last frozen
             uint va = haveCtx ? ctx.Eip : 0;
-            var m = haveCtx ? ModuleAt(va) : null;
+            m = haveCtx ? ModuleAt(va) : null;
             uint rva = m != null ? va - m.LoadBase : va;
-            int line = 0; int mi = -1; uint recRva = 0;
-            bool resolved = haveCtx && m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
+            line = 0; mi = -1; uint recRva = 0;
+            resolved = haveCtx && m != null && m.Dbg != null && m.Dbg.ResolveAddr(rva, out line, out mi, out recRva);
             if (!resolved) { line = 0; mi = -1; recRva = 0; }
             string mod = resolved ? m.Dbg.ModuleNameForIdx(mi) : null;
             string proc = haveCtx ? ProcNameAt(m, rva) : null;
@@ -835,7 +832,26 @@ namespace ClarionDbg.Cli
             // not read the field is unaffected.
             EmitThreadEvent(tid, Json.Paused(reason, mod, proc, resolved ? line : 0, rva, va, gap, resolved, sym,
                 haveCtx ? Json.Regs(ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp, ctx.Eip, ctx.EFlags) : null));
-            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch quit");
+            Console.WriteLine($"  [paused: {reason}]{(resolved ? " " + mod + " line " + line : "")}{(proc != null ? " in " + proc : sym != null ? " in " + sym : "")} — commands: continue step stepover stepout bp mem regs stack disasm sym watch setip quit");
+        }
+
+        /// <summary>
+        /// Blocks the debug loop (target fully suspended — the debug event is not continued) and
+        /// services stdin commands until a resume-type command arrives.
+        /// </summary>
+        private void PausedWait(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx, string reason)
+        {
+            _pauseRequested = false;  // any pause we reach consumes a pending pause request
+            _instrStep = false;       // and consumes a pending instruction-step
+            _selectedTid = tid;       // a new stop always starts on the stopped thread — a selection is
+                                      // per-stop and is never carried across one
+            ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
+                                        // rather than trust bases cached while the target was last frozen
+
+            // The stop's location. These four are what the step verbs hand BeginStep, so they must describe
+            // where EIP IS: `setip` moves it and re-runs AnnounceStop to recompute them (a77abd94 risk 6).
+            LoadedModule m; bool resolved; int line; int mi;
+            AnnounceStop(tid, ref ctx, haveCtx, reason, out m, out resolved, out line, out mi);
 
             while (true)
             {
@@ -936,6 +952,11 @@ namespace ClarionDbg.Cli
                         // here keeps them out of IsResumeVerb, so they can no longer discard the user's
                         // thread selection on their way to "unknown command".
                         EmitError(verb + ": the target is already paused");
+                        break;
+
+                    case "setip":   // set next statement: move the STOPPED thread's EIP (DebugEngine.SetIp.cs)
+                        if (HandleSetIpCommand(parts, tid, hThread, ref ctx, haveCtx))
+                            AnnounceStop(tid, ref ctx, haveCtx, "setip", out m, out resolved, out line, out mi);
                         break;
 
                     case "threads":
@@ -1085,6 +1106,9 @@ namespace ClarionDbg.Cli
                         break;
                     case "quit": case "q": case "kill":
                         if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
+                        break;
+                    case "setip":   // its own refusal event, so the pad can toast it like any other setip refusal
+                        EmitSetIpNotPaused(parts);
                         break;
                     // The resume verbs USED TO BE LISTED HERE, as a third hand-maintained copy of the set.
                     // They are now recognised by IsResumeVerb ahead of this switch — one owner, so adding a

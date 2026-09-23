@@ -267,8 +267,9 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     Check 'exactly 1 script runs the engine only as the one-shot `procs`, so it launches no debuggee' `
         ($oneShot.Count -eq 1 -and $oneShot[0].Name -eq 'test-procs.ps1') (($oneShot.Name) -join ', ')
     $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and $oneShot.Name -notcontains $_.Name -and (Test-NamesEngineBinary $_.FullName) })
-    # A number, not "every": if a fourth harness appears this says so instead of quietly covering three.
-    Check 'exactly 3 scripts here launch the engine binary' ($harnesses.Count -eq 3) (($harnesses.Name) -join ', ')
+    # A number, not "every": if another harness appears this says so instead of quietly covering the old set.
+    # 4 since test-setip.ps1 (a77abd94, 2026-09-23).
+    Check 'exactly 4 scripts here launch the engine binary' ($harnesses.Count -eq 4) (($harnesses.Name) -join ', ')
 
     foreach ($h in $harnesses) {
         $text = Get-Content -Raw -LiteralPath $h.FullName
@@ -467,7 +468,7 @@ Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionNa
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 60
+$EXPECTED_CHECKS = 64   # 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94)
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean
