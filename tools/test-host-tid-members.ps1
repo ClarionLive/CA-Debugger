@@ -185,43 +185,54 @@ if (-not $sources.ContainsKey($ruleRel)) { Write-Host "  FAIL  $ruleRel not foun
 $ruleSrc = $sources[$ruleRel]
 $names = @(Get-DeclaredNames $ruleSrc)
 
+# Sections and an explicit total per mode (lib-check.ps1): a section that throws, returns early, terminates
+# the script or asserts nothing is a FAILURE, never a shorter "ALL N CHECKS PASSED". The scan runs once, up
+# front; the sections read it.
+function Copy-Sources { $m = @{}; foreach ($k in $sources.Keys) { $m[$k] = $sources[$k] }; $m }
+
 if ($SelfTest) {
   Write-Host 'test-host-tid-members -SelfTest: each planted violation must be caught, by the rule meant to catch it'
   Write-Host ''
-  $scan0 = Invoke-Scan $sources $names
-  Check 'CONTROL: the shipped source is clean, so every red below is the plant' ((Get-Violations $scan0).Count -eq 0) ((Get-Violations $scan0) -join ',')
-  $plants = @(
-    @('a row tid typed inline again', 'name',
-      '.Append(TidMember(TidMemberTid, t.Tid))', '.Append(",\"tid\":").Append(t.Tid)'),
-    @('a top-level stopped written as a bare number', 'name',
-      '.Append(TidMember(TidMemberStopped, list.StoppedTid))', '.Append(",\"stopped\":").Append(list.StoppedTid)'),
-    @('a NEW, undeclared name carrying a tid', 'value',
-      '.Append(TidMember(TidMemberTid, t.Tid))', '.Append(TidMember(TidMemberTid, t.Tid)).Append(",\"ownerThread\":").Append(t.Tid)'),
-    @('a tid concatenated rather than appended', 'value',
-      'Post("{\"type\":\"engineerror\",\"message\":" + Str(msg) + "}");', 'Post("{\"type\":\"engineerror\",\"lastTid\":" + _lastTid + "}");'),
-    @('a member assembled around a variable, outside the writer', 'shape',
-      '.Append(TidMember(TidMemberTid, t.Tid))', '.Append(",\"").Append(TidMemberTid).Append("\":").Append(t.Tid)')
-  )
-  foreach ($p in $plants) {
-    $n = ([regex]::Matches($ruleSrc, [regex]::Escape($p[2]))).Count
-    if ($n -ne 1) { Check "plant applies: $($p[0])" $false "anchor found $n time(s)"; continue }
-    $mut = @{}; foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
-    $mut[$ruleRel] = $ruleSrc.Replace($p[2], $p[3])
-    $v = Get-Violations (Invoke-Scan $mut $names)
-    Check "caught by the $($p[1]) rule: $($p[0])" ($v -contains $p[1]) "rules broken: $(if ($v.Count) { $v -join ',' } else { 'none' })"
+  Invoke-CheckSection 'the shipped source is the clean baseline' {
+    $scan0 = Invoke-Scan $sources $names
+    Check 'CONTROL: the shipped source is clean, so every red below is the plant' ((Get-Violations $scan0).Count -eq 0) ((Get-Violations $scan0) -join ',')
   }
-  # The scope reaches past the WebView: a violation in ANOTHER host file is caught too.
-  $other = @($sources.Keys | Where-Object { $_ -ne $ruleRel -and $_ -like 'Services\*' } | Select-Object -First 1)
-  if ($other.Count) {
-    $mut = @{}; foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
-    $mut[$other[0]] = $mut[$other[0]] + "`nclass Planted { string J(uint tid) { return `"{\`"tid\`":`" + tid + `"}`"; } }`n"
-    $v = Get-Violations (Invoke-Scan $mut $names)
-    Check "caught in another host file ($($other[0]))" (($v -contains 'name') -and ($v -contains 'value')) "rules broken: $($v -join ',')"
+  Invoke-CheckSection 'each planted violation is caught by its own rule' {
+    $plants = @(
+      @('a row tid typed inline again', 'name',
+        '.Append(TidMember(TidMemberTid, t.Tid))', '.Append(",\"tid\":").Append(t.Tid)'),
+      @('a top-level stopped written as a bare number', 'name',
+        '.Append(TidMember(TidMemberStopped, list.StoppedTid))', '.Append(",\"stopped\":").Append(list.StoppedTid)'),
+      @('a NEW, undeclared name carrying a tid', 'value',
+        '.Append(TidMember(TidMemberTid, t.Tid))', '.Append(TidMember(TidMemberTid, t.Tid)).Append(",\"ownerThread\":").Append(t.Tid)'),
+      @('a tid concatenated rather than appended', 'value',
+        'Post("{\"type\":\"engineerror\",\"message\":" + Str(msg) + "}");', 'Post("{\"type\":\"engineerror\",\"lastTid\":" + _lastTid + "}");'),
+      @('a member assembled around a variable, outside the writer', 'shape',
+        '.Append(TidMember(TidMemberTid, t.Tid))', '.Append(",\"").Append(TidMemberTid).Append("\":").Append(t.Tid)')
+    )
+    foreach ($p in $plants) {
+      $n = ([regex]::Matches($ruleSrc, [regex]::Escape($p[2]))).Count
+      if ($n -ne 1) { Check "plant applies: $($p[0])" $false "anchor found $n time(s)"; continue }
+      $mut = Copy-Sources
+      $mut[$ruleRel] = $ruleSrc.Replace($p[2], $p[3])
+      $v = Get-Violations (Invoke-Scan $mut $names)
+      Check "caught by the $($p[1]) rule: $($p[0])" ($v -contains $p[1]) "rules broken: $(if ($v.Count) { $v -join ',' } else { 'none' })"
+    }
   }
-  # A COMMENT naming the idiom is not an emit.
-  $mut = @{}; foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
-  $mut[$ruleRel] = $ruleSrc + "`n// never write .Append(`",\`"tid\`":`").Append(t.Tid) by hand`n"
-  Check 'CONTROL: the idiom inside a comment is not reported' ((Get-Violations (Invoke-Scan $mut $names)).Count -eq 0) ''
+  Invoke-CheckSection 'the scope reaches every host file, and not the comments' {
+    $other = @($sources.Keys | Where-Object { $_ -ne $ruleRel -and $_ -like 'Services\*' } | Select-Object -First 1)
+    if ($other.Count -eq 0) { Check 'a second host file exists to plant into' $false 'no Services\*.cs found' }
+    else {
+      $mut = Copy-Sources
+      $mut[$other[0]] = $mut[$other[0]] + "`nclass Planted { string J(uint tid) { return `"{\`"tid\`":`" + tid + `"}`"; } }`n"
+      $v = Get-Violations (Invoke-Scan $mut $names)
+      Check "caught in another host file ($($other[0]))" (($v -contains 'name') -and ($v -contains 'value')) "rules broken: $($v -join ',')"
+    }
+    $mut = Copy-Sources
+    $mut[$ruleRel] = $ruleSrc + "`n// never write .Append(`",\`"tid\`":`").Append(t.Tid) by hand`n"
+    Check 'CONTROL: the idiom inside a comment is not reported' ((Get-Violations (Invoke-Scan $mut $names)).Count -eq 0) ''
+  }
+  Assert-CheckTotal 8
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -231,39 +242,42 @@ if ($SelfTest) {
 Write-Host 'test-host-tid-members: no thread-id JSON member is written outside the host''s shared writer'
 Write-Host ''
 
-Check 'the WebView declares the thread-id member names in one array' ($names.Count -gt 0) $(if ($names.Count) { '' } else { 'TidValuedMemberNames was not found' })
-Check 'every declared name resolved through its TidMember* constant' (-not ($names | Where-Object { $_ -like '<unresolved:*' })) ($names -join ', ')
-Check 'the host declares 3 thread-id member names' ($names.Count -eq 3) "got $($names.Count): $($names -join ', ')"
+Invoke-CheckSection 'the declared name set, read off the WebView' {
+  Check 'the WebView declares the thread-id member names in one array' ($names.Count -gt 0) $(if ($names.Count) { '' } else { 'TidValuedMemberNames was not found' })
+  Check 'every declared name resolved through its TidMember* constant' (-not ($names | Where-Object { $_ -like '<unresolved:*' })) ($names -join ', ')
+  Check 'the host declares 3 thread-id member names' ($names.Count -eq 3) "got $($names.Count): $($names -join ', ')"
+}
 
-$writer = Get-CSharpBlock 'private static string TidMember(string name, uint? tid)' $ruleSrc
-Check 'the shared writer exists' ($null -ne $writer) $(if ($writer) { '' } else { 'TidMember was not found' })
-if ($writer) {
-  $typed = @($names | Where-Object { $writer.IndexOf("\`"$_\`":", [StringComparison]::Ordinal) -ge 0 })
+Invoke-CheckSection 'the shared writer' {
+  $writer = Get-CSharpBlock 'private static string TidMember(string name, uint? tid)' $ruleSrc
+  Check 'the shared writer exists' ($null -ne $writer) $(if ($writer) { '' } else { 'TidMember was not found' })
+  $typed = @(if ($writer) { $names | Where-Object { $writer.IndexOf("\`"$_\`":", [StringComparison]::Ordinal) -ge 0 } } else { '(no writer)' })
   Check 'the shared writer types no member name of its own' ($typed.Count -eq 0) ($typed -join ', ')
 }
 
 $scan = Invoke-Scan $sources $names
-Check "scanned $($sources.Count) host source file(s), the WebView among them" ($sources.Count -gt 1) ''
+Invoke-CheckSection 'the scan of every host source file' {
+  Check "scanned $($sources.Count) host source file(s), the WebView among them" ($sources.Count -gt 1) ''
+  Check 'no declared thread-id member name is written as JSON text outside the writer' (@($scan.ByName).Count -eq 0) `
+    (Show $scan.ByName { "$($_.File):$($_.Line) typed $($_.Name) as $($_.Literal)" })
+  # The per-row BOOLEANS that share these names. Exactly two, each named, so a third is a decision:
+  #   Terminal\ClarionDebuggerWebView.cs  OnThreads row "stopped"  (is this the thread execution halted on?)
+  #   Terminal\ClarionDebuggerWebView.cs  OnThreads row "selected" (is this the thread the reads point at?)
+  Check 'exactly 2 same-named members are per-row booleans' (@($scan.Booleans).Count -eq 2) `
+    (Show $scan.Booleans { "$($_.File):$($_.Line) $($_.Name)" })
+  Check 'no member of ANY name is handed a thread id outside the writer' (@($scan.ByValue).Count -eq 0) `
+    (Show $scan.ByValue { "$($_.File):$($_.Line) $($_.Name) <- $($_.Value)" })
+  $bad = @($scan.Nameless | Where-Object { -not $_.Allowed })
+  Check 'no member name is ASSEMBLED around a variable outside the writer and RegsJson' ($bad.Count -eq 0) `
+    (Show $bad { "$($_.File):$($_.Line) $($_.Text)" })
+  # CONTROL: the writer's own punctuation is still FOUND, or the check above passes because the walk sees
+  # nothing. THREE: TidMember's ,\" and \": and RegsJson's \":.
+  $ok = @($scan.Nameless | Where-Object { $_.Allowed })
+  Check 'and the two allowed blocks still assemble their own (3 delimiter literals)' ($ok.Count -eq 3) `
+    (Show $ok { "$($_.File):$($_.Line) $($_.Text)" })
+}
 
-Check 'no declared thread-id member name is written as JSON text outside the writer' (@($scan.ByName).Count -eq 0) `
-  (Show $scan.ByName { "$($_.File):$($_.Line) typed $($_.Name) as $($_.Literal)" })
-# The per-row BOOLEANS that share these names. Exactly two, each named, so a third is a decision:
-#   Terminal\ClarionDebuggerWebView.cs  OnThreads row "stopped"  (is this the thread execution halted on?)
-#   Terminal\ClarionDebuggerWebView.cs  OnThreads row "selected" (is this the thread the reads point at?)
-Check 'exactly 2 same-named members are per-row booleans' (@($scan.Booleans).Count -eq 2) `
-  (Show $scan.Booleans { "$($_.File):$($_.Line) $($_.Name)" })
-Check 'no member of ANY name is handed a thread id outside the writer' (@($scan.ByValue).Count -eq 0) `
-  (Show $scan.ByValue { "$($_.File):$($_.Line) $($_.Name) <- $($_.Value)" })
-
-$bad = @($scan.Nameless | Where-Object { -not $_.Allowed })
-Check 'no member name is ASSEMBLED around a variable outside the writer and RegsJson' ($bad.Count -eq 0) `
-  (Show $bad { "$($_.File):$($_.Line) $($_.Text)" })
-# CONTROL: the writer's own punctuation is still FOUND, or the check above passes because the walk sees
-# nothing. THREE: TidMember's ,\" and \": and RegsJson's \":.
-$ok = @($scan.Nameless | Where-Object { $_.Allowed })
-Check 'and the two allowed blocks still assemble their own (3 delimiter literals)' ($ok.Count -eq 3) `
-  (Show $ok { "$($_.File):$($_.Line) $($_.Text)" })
-
+Assert-CheckTotal 11
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"
