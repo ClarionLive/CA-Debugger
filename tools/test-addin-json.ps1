@@ -826,6 +826,67 @@ Check 'its doc comment no longer instructs new payloads to order their fields' `
 Check 'and says plainly that field order no longer matters' ($doc -match '(?i)no longer .*field order|field order.*no longer|order.*irrelevant') ''
 
 Write-Host ''
+Write-Host 'break on entry: a breakpoint the engine never took is SAID, not implied'
+# afbc68c7 item 1. CmdBreakOnProcEntry printed "break on entry: X" and then called AddBreakpoint and threw its
+# answer away, so a request that never reached the engine looked exactly like one that did. The idle branch
+# staged whatever module it was handed. The REAL method is compiled below against a fake service, so what is
+# asserted is what it does - which console lines it writes and what it stages - not what its text resembles.
+$boeProbeSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+namespace BoeProbe {
+$bpRecord
+public sealed class ClarionDebuggerService {
+  $(Get-Method 'public static bool IsValidModuleName(string module)')
+  $((Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)') -replace 'internal static', 'public static')
+}
+public sealed class FakeSvc {
+  public bool IsRunning; public bool Accept = true;
+  public List<string> Adds = new List<string>();
+  public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
+}
+$((Get-Method 'internal static class JsonMessageReader' $reader) -replace 'internal static class', 'public static class')
+public sealed class Pad {
+  public FakeSvc _svc = new FakeSvc();
+  public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public List<string> Lines = new List<string>();
+  public int BpPushes;
+  private void Console(string level, string text) { Lines.Add(level + "|" + text); }
+  private void SendBps() { BpPushes++; }
+  $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
+  $(Get-Method 'private static string JsonVal(string json, string key)' $web)
+  $(Get-Method 'public void CmdBreakOnProcEntry(string data)' $web)
+}
+}
+"@
+Add-Type -TypeDefinition $boeProbeSrc -Language CSharp | Out-Null
+function BoeErrs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
+
+$boe = New-Object BoeProbe.Pad
+$boe._svc.IsRunning = $true; $boe._svc.Accept = $false
+$boe.CmdBreakOnProcEntry('{"module":"MAIN.CLW","line":42,"name":"MAIN"}')
+Check 'CONTROL: the live branch really asked the engine' ($boe._svc.Adds.Count -eq 1) ($boe._svc.Adds -join ',')
+Check 'a refused live add writes an error line naming the breakpoint' `
+  (@(BoeErrs $boe).Count -eq 1 -and @(BoeErrs $boe)[0] -match 'MAIN\.CLW:42') ($boe.Lines -join ' / ')
+$boeOk = New-Object BoeProbe.Pad
+$boeOk._svc.IsRunning = $true; $boeOk._svc.Accept = $true
+$boeOk.CmdBreakOnProcEntry('{"module":"MAIN.CLW","line":42,"name":"MAIN"}')
+Check 'CONTROL: an accepted live add writes no error' (@(BoeErrs $boeOk).Count -eq 0) ($boeOk.Lines -join ' / ')
+
+# The idle branch: a module the engine would refuse is not staged into the pane as if it were a breakpoint.
+$boeIdle = New-Object BoeProbe.Pad
+$boeIdle.CmdBreakOnProcEntry('{"module":"..\\evil clw","line":42,"name":"X"}')
+Check 'an idle request with an unusable module stages nothing' ($boeIdle._pending.Count -eq 0) "$($boeIdle._pending.Count) staged"
+Check 'and says why' (@(BoeErrs $boeIdle).Count -eq 1) ($boeIdle.Lines -join ' / ')
+$boeIdleOk = New-Object BoeProbe.Pad
+$boeIdleOk.CmdBreakOnProcEntry('{"module":"MAIN.CLW","line":42,"name":"X"}')
+Check 'CONTROL: an idle request with a good module is staged once' `
+  ($boeIdleOk._pending.Count -eq 1 -and $boeIdleOk.BpPushes -eq 1 -and @(BoeErrs $boeIdleOk).Count -eq 0) "$($boeIdleOk._pending.Count) staged"
+
+Write-Host ''
 Write-Host 'breakpoint identity across TWO LOADED DLLS that each hold a same-named .clw'
 # A Check's DETAIL argument is evaluated BEFORE Check runs, so an index into a list that a broken build
 # left EMPTY throws and kills the suite mid-run - hiding every failure after it, in the one situation
@@ -1418,7 +1479,7 @@ Check 'RequestDisasmAt validates the tag it is handed' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 228
+$EXPECTED_CHECKS = 234
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

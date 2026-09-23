@@ -792,9 +792,28 @@ namespace ClarionDebugger.Terminal
             if (!int.TryParse(JsonVal(data, "line") ?? "", out line) || line <= 0) return;
             string name = JsonVal(data, "name");
 
+            // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
+            // the idle branch staged whatever module it was handed, so a name the engine would refuse sat
+            // in the pane as a breakpoint until the next Start silently dropped it (StartSession skips an
+            // invalid module).
+            if (!ClarionDebuggerService.IsValidModuleName(module))
+            {
+                Console("err", "break on entry: not a module name the debugger can use: " + module);
+                return;
+            }
+
             Console("info", "break on entry: " + (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line);
 
-            if (_svc.IsRunning) _svc.AddBreakpoint(module, line);   // engine echoes bp-set → pane refresh
+            if (_svc.IsRunning)
+            {
+                // The engine echoes bp-set and the pane refreshes from that. A false return means the
+                // command never reached the engine, so no echo will ever come - and this used to be
+                // ignored, leaving the info line above as the only word on a breakpoint that was never
+                // armed. Say so instead.
+                if (!_svc.AddBreakpoint(module, line))
+                    Console("err", "break on entry: could not set a breakpoint at " + module + ":" + line
+                        + " — the engine did not take the request.");
+            }
             else
             {
                 foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
