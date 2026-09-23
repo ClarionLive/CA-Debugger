@@ -283,6 +283,120 @@ namespace ClarionDbg.Cli
                 failures.Add("setip calls: CONTROL - line records on instruction boundaries were refused");
         }
 
+        /// <summary>
+        /// The OBSERVED path (Owner's rule, a77abd94 item 3): a move is allowed when this frame instance has
+        /// already stopped at the target with exactly the current ESP. The store is driven directly - the key
+        /// (tid, image, entry, EBP, return address), the ESP match, the prune of popped frames and of an exited
+        /// thread, the cap - and then the decision: observed rescues an unproven move, but every refusal that
+        /// binds both paths still refuses.
+        /// </summary>
+        private static void CheckSetIpObserved(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("setip's observed path allows a move only when THIS frame instance (tid, image, entry, EBP, "
+                         + "return address) stopped at the target with exactly the current ESP: an ESP mismatch, "
+                         + "another EBP/return/entry/image/tid, a popped frame (EBP below ESP) and an exited thread "
+                         + "all refuse; the store keeps at most " + DebugEngine.SetIpObservations.Cap + " entries, "
+                         + "oldest out, and a re-visit is not evicted by its own stale slot. In the decision, observed "
+                         + "rescues stack-unproven and accept-boundary, the proof path still works alone, and "
+                         + "other-thread, not-on-statement, other-proc, prologue and code-unreadable bind both paths.");
+
+            var k = new DebugEngine.SetIpFrameKey { Tid = 100, LoadBase = 0x400000, EntryRva = 0x75424, Ebp = 0x348FEB8, Ret = 0x42A0B1 };
+            const uint line34 = 0x754AF, esp = 0x348FE6C;
+            var obs = new DebugEngine.SetIpObservations();
+            obs.Record(k, line34, esp);
+
+            if (!obs.Matches(k, line34, esp)) failures.Add("setip observed: the recorded line, same frame, same ESP was not matched");
+            if (obs.Matches(k, line34, esp - 0x30)) failures.Add("setip observed: an ESP 0x30 lower (an ACCEPT's first pass) matched - ESP was ignored");
+            if (obs.Matches(k, 0x754B7, esp)) failures.Add("setip observed: a line never stopped on matched");
+            var other = k; other.Ebp = k.Ebp - 0x100;
+            if (obs.Matches(other, line34, esp)) failures.Add("setip observed: a DIFFERENT EBP matched");
+            other = k; other.Ret = k.Ret + 0x20;
+            if (obs.Matches(other, line34, esp)) failures.Add("setip observed: a different RETURN ADDRESS (another call site, same EBP) matched - EBP alone is not an identity");
+            other = k; other.EntryRva = 0x752FC;
+            if (obs.Matches(other, line34, esp)) failures.Add("setip observed: a different procedure entry matched");
+            other = k; other.LoadBase = 0x10000000;
+            if (obs.Matches(other, line34, esp)) failures.Add("setip observed: a different image matched");
+            other = k; other.Tid = 200;
+            if (obs.Matches(other, line34, esp)) failures.Add("setip observed: another THREAD's observation matched");
+
+            // THE KEY'S EQUALITY ITSELF. The lookups above go through a Dictionary, which compares hashes first,
+            // so an Equals that ignored a field could still look right by luck of the hash - and the mutation
+            // run showed exactly that ("key by EBP only" survived them). A hash collision would then match two
+            // frames. So each field is pinned on Equals directly, one at a time.
+            var fields = new List<KeyValuePair<string, DebugEngine.SetIpFrameKey>>();
+            other = k; other.Tid++; fields.Add(new KeyValuePair<string, DebugEngine.SetIpFrameKey>("tid", other));
+            other = k; other.LoadBase += 0x1000; fields.Add(new KeyValuePair<string, DebugEngine.SetIpFrameKey>("image", other));
+            other = k; other.EntryRva += 4; fields.Add(new KeyValuePair<string, DebugEngine.SetIpFrameKey>("entry", other));
+            other = k; other.Ebp -= 4; fields.Add(new KeyValuePair<string, DebugEngine.SetIpFrameKey>("EBP", other));
+            other = k; other.Ret += 4; fields.Add(new KeyValuePair<string, DebugEngine.SetIpFrameKey>("return address", other));
+            foreach (var kv in fields)
+                if (k.Equals(kv.Value)) failures.Add("setip observed: two frame keys differing only in " + kv.Key + " are Equal");
+            var twin = k;
+            if (!k.Equals(twin) || k.GetHashCode() != twin.GetHashCode()) failures.Add("setip observed: CONTROL - identical frame keys are not Equal");
+
+            // Prune: this thread's frame survives while ESP is below its EBP, and goes once ESP passes it.
+            var k2 = k; k2.Tid = 200;
+            obs.Record(k2, line34, esp);
+            obs.PrunePopped(100, esp);
+            if (!obs.Matches(k, line34, esp)) failures.Add("setip observed: a LIVE frame (ESP below its EBP) was pruned");
+            obs.PrunePopped(100, k.Ebp + 8);
+            if (obs.Matches(k, line34, esp)) failures.Add("setip observed: a POPPED frame (its EBP now below ESP) still matched");
+            if (!obs.Matches(k2, line34, esp)) failures.Add("setip observed: pruning thread 100 removed thread 200's frame - another thread's frames are not judged by this ESP");
+            obs.DropThread(200);
+            if (obs.Matches(k2, line34, esp) || obs.Count != 0) failures.Add("setip observed: EXIT_THREAD left the thread's observations behind (count " + obs.Count + ")");
+
+            // The cap: oldest out; and a line re-recorded many times is never evicted by its own stale slots.
+            var capObs = new DebugEngine.SetIpObservations();
+            int cap = DebugEngine.SetIpObservations.Cap;
+            for (int i = 0; i < cap + 10; i++) capObs.Record(k, (uint)(0x80000 + i), esp);
+            if (capObs.Count != cap) failures.Add("setip observed: " + (cap + 10) + " records left " + capObs.Count + " entries, expected the cap " + cap);
+            if (capObs.Matches(k, 0x80000, esp)) failures.Add("setip observed: the OLDEST entry survived past the cap");
+            if (!capObs.Matches(k, (uint)(0x80000 + cap + 9), esp)) failures.Add("setip observed: the NEWEST entry was evicted");
+            // A re-visit at the FRONT of the queue when the cap is hit: line A recorded first, the store filled,
+            // A re-recorded (its first slot is now stale and oldest), then one more record. The stale slot must
+            // be skipped, so A survives and the next-oldest real entry goes instead.
+            var reObs = new DebugEngine.SetIpObservations();
+            const uint lineA = 0x70000;
+            reObs.Record(k, lineA, esp);
+            for (int i = 1; i < cap; i++) reObs.Record(k, (uint)(0x80000 + i), esp);
+            reObs.Record(k, lineA, esp);
+            reObs.Record(k, 0x90000, esp);
+            if (!reObs.Matches(k, lineA, esp)) failures.Add("setip observed: a line re-visited just before the cap was evicted by its own STALE queue slot");
+            if (reObs.Matches(k, 0x80001, esp)) failures.Add("setip observed: after skipping the stale slot, the next-oldest entry was not the one evicted");
+            if (reObs.Count != cap) failures.Add("setip observed: the re-visit case left " + reObs.Count + " entries, expected " + cap);
+
+            var loopObs = new DebugEngine.SetIpObservations();
+            for (int i = 0; i < 5 * cap; i++) loopObs.Record(k, line34 + (uint)(i % 3), esp);
+            if (loopObs.Count != 3 || !loopObs.Matches(k, line34, esp)) failures.Add("setip observed: a loop re-visiting 3 lines left " + loopObs.Count + " entries or lost one");
+            if (loopObs.QueueLengthForTest > 4 * cap + 1) failures.Add("setip observed: stale slots grew the queue to " + loopObs.QueueLengthForTest + " - compaction did not bound it");
+
+            // The decision: which path, and what binds both.
+            Func<Action<DebugEngine.SetIpFacts>, string> via = move =>
+            {
+                var f = FxPassingFacts(); move(f);
+                string by; string code = DebugEngine.DecideSetIp(f, out by);
+                return code != null ? "refused:" + code : "via:" + by;
+            };
+            Action<string, Action<DebugEngine.SetIpFacts>, string> expect = (what, move, want) =>
+            {
+                string got = via(move);
+                if (got != want) failures.Add("setip observed: " + what + " -> " + got + ", expected " + want);
+            };
+            expect("a proven move", f => { }, "via:proof");
+            expect("a proven move that was also observed (proof reported first)", f => f.ObservedMatch = true, "via:proof");
+            expect("an unproven move", f => f.StackError = "Cla$BEEP not measured", "refused:stack-unproven");
+            expect("an unproven move to an OBSERVED line", f => { f.StackError = "Cla$BEEP not measured"; f.ObservedMatch = true; }, "via:observed");
+            expect("an unpaired-ACCEPT proc, observed line", f => { f.RegionError = "x"; f.ObservedMatch = true; }, "via:observed");
+            var loop = new DebugEngine.EventLoopRegion { StartCall = 0x4754F8, Lo = 0x4754FE, Hi = 0x4756AB };
+            expect("an ACCEPT-boundary move to an observed line (ESP equal is the property itself)",
+                   f => { f.Regions.Add(loop); f.StopRva = 0x75503; f.TargetRva = 0x756AB; f.ObservedMatch = true; }, "via:observed");
+            expect("observed, but another thread selected", f => { f.ObservedMatch = true; f.SelectedTid = 200; }, "refused:other-thread");
+            expect("observed, but the stop is mid-statement", f => { f.ObservedMatch = true; f.Gap = 3; }, "refused:not-on-statement");
+            expect("observed, but the target is another symbol", f => { f.ObservedMatch = true; f.TargetEntryRva = 0x752FC; }, "refused:other-proc");
+            expect("observed, but the target is the entry record", f => { f.ObservedMatch = true; f.TargetRva = 0x75424; }, "refused:prologue");
+            expect("observed, but the code could not be read", f => { f.ObservedMatch = true; f.CodeRead = false; }, "refused:code-unreadable");
+        }
+
         /// <summary>A SetIpFacts that passes: stopped and selected on one thread, exactly on a statement, the
         /// target one record in the same symbol, past the entry record, no ACCEPT in the procedure.</summary>
         private static DebugEngine.SetIpFacts FxPassingFacts()
@@ -401,8 +515,8 @@ namespace ClarionDbg.Cli
             if (unparsable.Contains("\"module\"") || unparsable.Contains("\"line\""))
                 failures.Add("setip wire: an unparsable request still wrote module/line: " + unparsable);
 
-            string ok = DebugEngine.SetIpOkJson("clbrws026.clw", 44, 88, 0x75503, 0x475503);
-            if (ok != "{\"event\":\"setip\",\"ok\":true,\"module\":\"clbrws026.clw\",\"line\":44,\"fromLine\":88,\"rva\":\"0x75503\",\"va\":\"0x475503\"}")
+            string ok = DebugEngine.SetIpOkJson("clbrws026.clw", 44, 88, 0x75503, 0x475503, DebugEngine.SetIpViaObserved);
+            if (ok != "{\"event\":\"setip\",\"ok\":true,\"module\":\"clbrws026.clw\",\"line\":44,\"fromLine\":88,\"rva\":\"0x75503\",\"va\":\"0x475503\",\"via\":\"observed\"}")
                 failures.Add("setip wire: success shape is " + ok);
             if (DebugEngine.WithTidForTest(ok, 0).Contains("\"tid\""))
                 failures.Add("setip wire: an unknown tid became a tid member on the success reply");

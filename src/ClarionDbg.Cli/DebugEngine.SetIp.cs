@@ -27,7 +27,13 @@ namespace ClarionDbg.Cli
     // The rule compares the INNERMOST region (by its Start call site), so a nested ACCEPT is covered without
     // having been measured, and a region that cannot be paired refuses the whole procedure (`accept-unpaired`).
     //
-    // NOT MEASURED, and so not claimed: LOOP i = 1 TO n, REPORT/PRINT, nested ACCEPT, BREAK out of an ACCEPT.
+    // NOT MEASURED, and so not claimed: REPORT/PRINT, nested ACCEPT, BREAK out of an ACCEPT. (LOOP i = 1 TO n
+    // was measured later the same day: ESP constant over 23 iterations of SetupStringStops.)
+    //
+    // That rule alone was not enough (pipeline run 1): "no ACCEPT crossing" is not "ESP equal at the stop
+    // and at the target". A move is now allowed by one of two paths - the PROOF (every call in the procedure
+    // has a known effect on ESP, plus the ACCEPT rule) or the OBSERVED path (this frame instance already
+    // stopped at the target with the current ESP). Both are below.
     internal sealed partial class DebugEngine
     {
         // ---- the frozen refusal codes. Wire: {"event":"setip","ok":false,"reason":<code>,"error":<text>,...}
@@ -78,7 +84,7 @@ namespace ClarionDbg.Cli
                 case SetIpPrologue:       return "Can't move to or from a procedure's entry line: its stack frame is set up there.";
                 case SetIpCodeUnreadable: return "Can't read the current procedure's code to check that the move is safe.";
                 case SetIpAcceptUnpaired: return "Can't work out this procedure's ACCEPT loops, so no move inside it can be checked as safe.";
-                case SetIpStackUnproven:  return "Can't prove the stack is the same at that line: this procedure calls code whose effect on the stack was never measured.";
+                case SetIpStackUnproven:  return "Can't prove the stack is the same at that line: this procedure calls code whose effect on the stack was never measured. Step to that line first; then you can return to it.";
                 case SetIpAcceptBoundary: return "Can't move across an ACCEPT loop boundary: the runtime keeps the loop's state on the stack.";
                 case SetIpWriteFailed:    return "Couldn't set the thread's instruction pointer.";
                 default:                  return null;
@@ -424,6 +430,169 @@ namespace ClarionDbg.Cli
             return null;
         }
 
+        // ------------------------------------------------------------------ OBSERVED ESP (the second path)
+        //
+        // The proof above covers 683 of clbrws's 2003 symbols (census, 2026-09-23): most procedures call some
+        // runtime entry nobody measured. The Owner's rule for them (a77abd94 item 3): a move is ALSO allowed
+        // when this thread has already STOPPED at the target's line record, in the SAME frame instance, and
+        // the ESP recorded then equals the current ESP exactly. That is the property setip needs, observed
+        // rather than proven - which is what makes "go back and run that again" work everywhere, while a
+        // move FORWARD to a line not yet reached still needs the proof.
+
+        /// <summary>
+        /// Which frame an observation belongs to: (tid, image, procedure entry, EBP, return address).
+        ///
+        /// EBP ALONE IS NOT AN IDENTITY (the pid-is-not-an-identity lesson again): a later call at the same
+        /// depth reuses it. The procedure entry and the return address at [EBP+4] narrow that to "the same
+        /// procedure, called from the same call site, with its frame at the same address".
+        ///
+        /// WHAT THIS STILL CANNOT TELL APART: a later invocation of the same procedure from the same call site
+        /// whose frame lands at the same EBP - a procedure called twice in a row from one loop, or a recursive
+        /// call that returns and is made again. The key is identical, so the old invocation's observations
+        /// match the new one. WHY THAT IS STILL SAFE: the same procedure entered from the same call site with
+        /// the same EBP has run the same prologue from the same starting point, so its frame has the same base
+        /// ESP. An observation says "at this line, ESP was E relative to that base", and E is a property of
+        /// the frame's layout at that line, not of which invocation measured it. The match additionally
+        /// requires ESP to be EQUAL NOW, so a stack that differs in depth (an ACCEPT's extra state, a
+        /// different iteration) still refuses. What neither key nor ESP can vouch for is PROGRAM state -
+        /// locals, files, windows - and that is the pad's hazard warning, as for every setip.
+        /// </summary>
+        internal struct SetIpFrameKey : IEquatable<SetIpFrameKey>
+        {
+            public uint Tid, LoadBase, EntryRva, Ebp, Ret;
+            public bool Equals(SetIpFrameKey o)
+            {
+                return Tid == o.Tid && LoadBase == o.LoadBase && EntryRva == o.EntryRva && Ebp == o.Ebp && Ret == o.Ret;
+            }
+            public override bool Equals(object o) { return o is SetIpFrameKey && Equals((SetIpFrameKey)o); }
+            public override int GetHashCode()
+            {
+                unchecked { return (int)(Tid * 31 + LoadBase * 17 + EntryRva * 13 + Ebp * 7 + Ret); }
+            }
+        }
+
+        /// <summary>
+        /// The observations: per frame instance, the ESP seen at each line record the thread stopped on.
+        /// PURE state (no process access), so protocolcheck drives it directly.
+        /// </summary>
+        internal sealed class SetIpObservations
+        {
+            /// <summary>Total entries kept; the oldest go first. Far more than a debugging session steps.</summary>
+            internal const int Cap = 4096;
+
+            private struct Obs { public uint Esp; public long Seq; }
+            private readonly Dictionary<SetIpFrameKey, Dictionary<uint, Obs>> _byFrame = new Dictionary<SetIpFrameKey, Dictionary<uint, Obs>>();
+            private struct Slot { public SetIpFrameKey Frame; public uint Rva; public long Seq; }
+            private readonly Queue<Slot> _order = new Queue<Slot>();
+            private long _seq;
+            private int _count;
+
+            internal int Count { get { return _count; } }
+
+            /// <summary>The thread stopped exactly on the record at <paramref name="rva"/> with this ESP.
+            /// A re-visit replaces the old ESP: the latest measurement is the one that describes the frame.</summary>
+            internal void Record(SetIpFrameKey frame, uint rva, uint esp)
+            {
+                Dictionary<uint, Obs> lines;
+                if (!_byFrame.TryGetValue(frame, out lines)) { lines = new Dictionary<uint, Obs>(); _byFrame[frame] = lines; }
+                if (!lines.ContainsKey(rva)) _count++;
+                long seq = ++_seq;
+                lines[rva] = new Obs { Esp = esp, Seq = seq };
+                _order.Enqueue(new Slot { Frame = frame, Rva = rva, Seq = seq });
+                while (_count > Cap && _order.Count > 0) EvictOldest();
+                if (_order.Count > 4 * Cap) Compact();   // stale slots from re-visits (a loop) must not grow forever
+            }
+
+            /// <summary>Rebuild the queue from the live entries only, oldest first.</summary>
+            private void Compact()
+            {
+                var live = new List<Slot>();
+                foreach (var f in _byFrame)
+                    foreach (var l in f.Value) live.Add(new Slot { Frame = f.Key, Rva = l.Key, Seq = l.Value.Seq });
+                live.Sort((a, b) => a.Seq.CompareTo(b.Seq));
+                _order.Clear();
+                foreach (var s in live) _order.Enqueue(s);
+            }
+
+            /// <summary>Test seam: the queue's length, so protocolcheck can see that compaction bounds it.</summary>
+            internal int QueueLengthForTest { get { return _order.Count; } }
+
+            /// <summary>Was the record at <paramref name="rva"/> seen in THIS frame, with exactly this ESP?</summary>
+            internal bool Matches(SetIpFrameKey frame, uint rva, uint currentEsp)
+            {
+                Dictionary<uint, Obs> lines;
+                Obs o;
+                return _byFrame.TryGetValue(frame, out lines) && lines.TryGetValue(rva, out o) && o.Esp == currentEsp;
+            }
+
+            /// <summary>At a stop of <paramref name="tid"/>: drop that thread's frames that have been popped,
+            /// i.e. whose EBP is now BELOW the current ESP (the stack grows down, so a live frame's EBP is at
+            /// or above ESP). Other threads' frames are not judged by this thread's ESP.</summary>
+            internal void PrunePopped(uint tid, uint currentEsp)
+            {
+                var dead = new List<SetIpFrameKey>();
+                foreach (var f in _byFrame.Keys) if (f.Tid == tid && f.Ebp < currentEsp) dead.Add(f);
+                foreach (var f in dead) Remove(f);
+            }
+
+            /// <summary>EXIT_THREAD: a reused tid must not inherit a dead thread's frames.</summary>
+            internal void DropThread(uint tid)
+            {
+                var dead = new List<SetIpFrameKey>();
+                foreach (var f in _byFrame.Keys) if (f.Tid == tid) dead.Add(f);
+                foreach (var f in dead) Remove(f);
+            }
+
+            private void Remove(SetIpFrameKey f)
+            {
+                Dictionary<uint, Obs> lines;
+                if (_byFrame.TryGetValue(f, out lines)) { _count -= lines.Count; _byFrame.Remove(f); }
+            }
+
+            /// <summary>The queue holds every Record in order, including ones since re-recorded or pruned. A
+            /// slot evicts its entry only if that entry is still the one it recorded (same Seq); a stale slot
+            /// is skipped, so a re-visit is never deleted by its own older queue slot.</summary>
+            private void EvictOldest()
+            {
+                var s = _order.Dequeue();
+                Dictionary<uint, Obs> lines;
+                Obs o;
+                if (!_byFrame.TryGetValue(s.Frame, out lines) || !lines.TryGetValue(s.Rva, out o) || o.Seq != s.Seq) return;
+                lines.Remove(s.Rva); _count--;
+                if (lines.Count == 0) _byFrame.Remove(s.Frame);
+            }
+        }
+
+        private readonly SetIpObservations _setIpObs = new SetIpObservations();
+
+        /// <summary>The frame instance the thread is in, or false when it cannot be identified (no
+        /// symbol, or [EBP+4] unreadable): then nothing is recorded and nothing matches.</summary>
+        private bool TryFrameKey(uint tid, ref Native.CONTEXT_X86 ctx, LoadedModule m, uint rva, out SetIpFrameKey key)
+        {
+            key = default(SetIpFrameKey);
+            if (m == null || m.Dbg == null) return false;
+            ProcSymbol sym;
+            if (!m.Dbg.ResolveSymbolVerified(rva, out sym)) return false;
+            var b = new byte[4];
+            if (ReadBlock(ctx.Ebp + 4, b) != 4) return false;
+            key = new SetIpFrameKey { Tid = tid, LoadBase = m.LoadBase, EntryRva = sym.EntryRva, Ebp = ctx.Ebp, Ret = BitConverter.ToUInt32(b, 0) };
+            return true;
+        }
+
+        /// <summary>At every stop (AnnounceStop, including setip's own re-announce): prune this thread's
+        /// popped frames, then record the stop if it sits exactly on a line record.</summary>
+        private void ObserveStop(uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, LoadedModule m, uint rva, bool resolved, uint gap)
+        {
+            if (!haveCtx) return;
+            _setIpObs.PrunePopped(tid, ctx.Esp);
+            if (!resolved || gap != 0) return;
+            SetIpFrameKey key;
+            if (TryFrameKey(tid, ref ctx, m, rva, out key)) _setIpObs.Record(key, rva, ctx.Esp);
+        }
+
+        /// <summary>EXIT_THREAD hook (one line in the debug loop).</summary>
+        private void ForgetSetIpThread(uint tid) { _setIpObs.DropThread(tid); }
+
         // ------------------------------------------------------------------ the decision (pure)
 
         /// <summary>Everything <see cref="DecideSetIp"/> needs, gathered by the handler. A plain bag so
@@ -447,6 +616,7 @@ namespace ClarionDbg.Cli
             public uint FirstRecordRva;    // the stop symbol's entry record (0 = none of its own)
             public string RegionError;     // FindEventLoopRegions' reason; null = regions are good
             public string StackError;      // ProveCallsBalanced's reason; null = every call has a known effect
+            public bool ObservedMatch;     // this frame instance was stopped at the target with the current ESP
             public bool CodeRead;          // the span's bytes were read
             public List<EventLoopRegion> Regions = new List<EventLoopRegion>();
             public uint LoadBase;          // regions are in VA; stop/target are RVAs
@@ -459,6 +629,20 @@ namespace ClarionDbg.Cli
         /// </summary>
         internal static string DecideSetIp(SetIpFacts f)
         {
+            string allowedBy;
+            return DecideSetIp(f, out allowedBy);
+        }
+
+        /// <summary>The path that allowed a move, on the success reply as "via".</summary>
+        internal const string SetIpViaProof = "proof";
+        internal const string SetIpViaObserved = "observed";
+
+        /// <summary><see cref="DecideSetIp(SetIpFacts)"/>, also saying WHICH path allowed the move:
+        /// <see cref="SetIpViaProof"/> when the call proof and the ACCEPT rule hold, else
+        /// <see cref="SetIpViaObserved"/> when the target was seen in this frame at this ESP. Null on a refusal.</summary>
+        internal static string DecideSetIp(SetIpFacts f, out string allowedBy)
+        {
+            allowedBy = null;
             if (f.SelectedTid != f.StoppedTid) return SetIpOtherThread;
             if (!f.HaveCtx) return SetIpNoContext;
             // Only a stop exactly on a statement boundary has nothing of the CURRENT statement on the stack.
@@ -475,6 +659,19 @@ namespace ClarionDbg.Cli
             // top of the first, and moving FROM it (a step-into lands there) leaves the frame unbuilt.
             if (IsPrologueRecord(f.TargetRva, f.FirstRecordRva) || IsPrologueRecord(f.StopRva, f.FirstRecordRva)) return SetIpPrologue;
             if (!f.CodeRead) return SetIpCodeUnreadable;
+
+            // Everything above binds BOTH paths. Below, the PROOF path is tried first; when it cannot prove
+            // the move, a matching observation still allows it. Its refusal code is the proof's, because that
+            // is what the user can act on ("step to that line first").
+            string proof = ProofRefusal(f);
+            if (proof == null) { allowedBy = SetIpViaProof; return null; }
+            if (f.ObservedMatch) { allowedBy = SetIpViaObserved; return null; }
+            return proof;
+        }
+
+        /// <summary>The proof path's own refusal, or null when it proves the move.</summary>
+        private static string ProofRefusal(SetIpFacts f)
+        {
             if (f.RegionError != null) return SetIpAcceptUnpaired;
             // Before the ACCEPT rule, because that rule is only a proof when the ACCEPT pair is the ONLY call
             // in the procedure that can move ESP. "No detected ACCEPT crossing" says nothing about a call
@@ -500,14 +697,15 @@ namespace ClarionDbg.Cli
 
         /// <summary>The success reply. No tid member here: EmitThreadEvent stamps it through WithTid, which
         /// is the one place an unknown tid becomes an ABSENT member.</summary>
-        internal static string SetIpOkJson(string module, int line, int fromLine, uint rva, uint va)
+        internal static string SetIpOkJson(string module, int line, int fromLine, uint rva, uint va, string via)
         {
             return "{\"event\":\"setip\",\"ok\":true"
                  + ",\"module\":" + Json.Str(module)
                  + ",\"line\":" + line
                  + ",\"fromLine\":" + fromLine
                  + ",\"rva\":\"0x" + rva.ToString("X") + "\""
-                 + ",\"va\":\"0x" + va.ToString("X") + "\"}";
+                 + ",\"va\":\"0x" + va.ToString("X") + "\""
+                 + ",\"via\":" + Json.Str(via) + "}";
         }
 
         /// <summary>A refusal. <paramref name="module"/> null / <paramref name="line"/> &lt;= 0 omit the
@@ -613,10 +811,16 @@ namespace ClarionDbg.Cli
                         f.FirstRecordRva = FirstRecordRvaInProc(m, stopSym.EntryRva);
                         ReadEventLoopRegions(m, f);
                     }
+
+                    // The observed path: has THIS frame instance stopped on the target with this very ESP?
+                    SetIpFrameKey frame;
+                    if (rvas.Count == 1 && TryFrameKey(tid, ref ctx, m, f.StopRva, out frame))
+                        f.ObservedMatch = _setIpObs.Matches(frame, f.TargetRva, ctx.Esp);
                 }
             }
 
-            string refusal = DecideSetIp(f);
+            string via;
+            string refusal = DecideSetIp(f, out via);
             if (refusal != null)
             {
                 EmitSetIpRefusal(tid, refusal, module, line, rvas != null ? rvas.Count : 0,
@@ -652,8 +856,8 @@ namespace ClarionDbg.Cli
             RestoreIfArmed(tid, newVa);
 
             string canon = m.Dbg.ModuleNameForIdx(targetMi) ?? module;
-            if (EmitJson) EmitThreadEvent(tid, SetIpOkJson(canon, line, fromLine, f.TargetRva, newVa));
-            Console.WriteLine($"  setip: {canon}:{line} (from line {fromLine}, EIP 0x{oldVa:X8} -> 0x{newVa:X8})");
+            if (EmitJson) EmitThreadEvent(tid, SetIpOkJson(canon, line, fromLine, f.TargetRva, newVa, via));
+            Console.WriteLine($"  setip: {canon}:{line} (from line {fromLine}, EIP 0x{oldVa:X8} -> 0x{newVa:X8}, via {via})");
             return true;
         }
 
