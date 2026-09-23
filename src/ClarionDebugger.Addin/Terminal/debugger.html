@@ -1395,7 +1395,9 @@
   // ---- one renderer for a collapsible name/value/type group (Locals, Module Data) ----
   // A row may be: a leaf; a DIRECT group (carries `children`, expanded eagerly); or a REFERENCE to another
   // structure (`ref`:true + addr/module/typeRef) which is expanded LAZILY on first open via the engine.
-  function renderVarGroup(el, label, extra, items){
+  // `localTree`: the rows are the paused frame's LOCALS, so a top-level &QUEUE/&GROUP's members are watchable
+  // through it (see childWatchPath). Module Data passes false.
+  function renderVarGroup(el, label, extra, items, localTree){
     if(!el) return;
     el.innerHTML='';
     if(!items.length) return;
@@ -1405,18 +1407,33 @@
       +(extra?'<span class="vtype">'+esc(extra)+'</span>':'')+'<span class="count">'+arr.length+'</span>';
     el.appendChild(hdr);
     const state={open:true};
-    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label); const hay=varHay(v);
+    const tops=arr.map(v=>{ const h=renderVarRow(el, v, 1, label, v.name||null, !!localTree); const hay=varHay(v);
       h.el._applyVis=()=>{ const m=(!varQ||hay.indexOf(varQ)>=0); h.setVisible((state.open||!!varQ) && m); }; return h; });
     function applyAll(){ tops.forEach(h=>h.el._applyVis()); }
     hdr.onclick=()=>{ state.open=!state.open; hdr.querySelector('.ar').textContent=state.open?'▾':'▸'; applyAll(); };
     applyAll();
   }
 
+  // The WATCH path of a child row (HEAD.MEMBER[.MEMBER], ticket 3a0c915d), or null when the engine has no
+  // way to resolve one. The engine walks direct GROUP/QUEUE members from the head, and follows ONE reference:
+  // a LOCAL &QUEUE/&GROUP at the head (QUEUE:BROWSE:1 is one). So the path stops (null, for the child and
+  // everything under it) at an array or one of its "[n]" elements, at a reference anywhere below the head,
+  // and at a reference head that is not a local (Module Data). A class reference head looks the same here
+  // as a queue's, so its members DO get a path; the engine answers those with an explicit error.
+  function childWatchPath(parentWatchPath, parent, parentDepth, refHeadOk, child){
+    if(parentWatchPath==null || !parent || !child || !child.name) return null;
+    if(/^\[/.test(child.name) || /^ARRAY/.test(parent.type||'')) return null;
+    if(parent.ref && !(parentDepth===1 && refHeadOk)) return null;
+    return parentWatchPath+'.'+child.name;
+  }
+
   // Render one variable row into `container`, with its descendants in a child box inserted right after it
   // (nested-container model: collapsing a node just hides its box, so lazy children slot in cleanly).
-  // `parentPath` is the dotted name-path of this row's ancestors — used only to persist expand-state (see
-  // openPaths above) across re-renders; it carries no other meaning.
-  function renderVarRow(container, v, depth, parentPath){
+  // `parentPath` is the '>'-joined name-path of this row's ancestors — used only to persist expand-state
+  // (see openPaths above) across re-renders; it is NOT a watch name. `watchPath` is this row's own watch
+  // name, or null when it has none (see childWatchPath); `refHeadOk` says a top-level reference in this
+  // tree is a LOCAL, whose members the engine can reach through it.
+  function renderVarRow(container, v, depth, parentPath, watchPath, refHeadOk){
     const path = (parentPath||'')+'>'+(v.name||'');
     const eager = v.children || null;            // DIRECT group: members already supplied
     const isRef = !!v.ref;                        // REFERENCE: expand lazily (deref on the engine)
@@ -1436,18 +1453,19 @@
     // for the SAME name at the SAME stop says otherwise.
     applyNote(row.querySelector('.vval'), v.note);
 
-    // TOP-LEVEL scalar leaf (a local or module-data item): make it watchable by name — pin star + right-click
-    // "Add to Watch", the same affordances a Global gets. Watches resolve against the current frame FIRST (a
-    // local shadows a global), so a local name added here tracks its live stack slot. Gated to depth===1:
-    // NESTED group/queue members (e.g. BRW1::JOB:JOBID inside QUEUE:BROWSE:1) have no standalone resolvable
-    // name — the engine reads them by address while walking the group, but the watch-by-name resolver only
-    // knows top-level local entries and globals, so watching a member would just show "(not found)". They
-    // stay visible with live values (and the edit pencil); they just don't get a misleading watch button.
-    if(!expandable && v.name && depth===1){
+    // A LEAF with a watch path is watchable — pin star + right-click "Add to Watch", the same affordances a
+    // Global gets. A top-level row's path is its own name; a member's is HEAD.MEMBER (e.g.
+    // QUEUE:BROWSE:1.BRW1::JOB:JOBID), which the engine re-resolves by name at every pause, so nothing
+    // address-bound is stored and a restored watch list still means the same variables. Watches resolve
+    // against the current frame FIRST (a local shadows a global). A nested row sends its FULL path, never
+    // the bare leaf name, which for a global could name some other container's field. Rows with no path
+    // (under an array, or through a reference the engine does not follow) keep their live values and the
+    // edit pencil; they just don't get a watch button that could only answer "(not found)".
+    if(!expandable && watchPath){
       row.classList.add('selrow');
-      row.dataset.name=v.name;
+      row.dataset.name=watchPath;
       const pin=document.createElement('span'); pin.className='pin'; pin.title='Add to Watch'; pin.innerHTML=STAR;
-      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(v.name); };
+      pin.onclick=e=>{ e.stopPropagation(); pin.classList.add('pinned'); addWatch(watchPath); };
       row.appendChild(pin);
       wireSel(row);
     }
@@ -1456,7 +1474,7 @@
     function ensureBox(){ if(!box){ box=document.createElement('div'); box.style.display='none';
       container.insertBefore(box, row.nextSibling); } return box; }
     function renderKids(items){ const b=ensureBox(); b.innerHTML='';
-      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path));
+      sortVars(items).forEach(c=>renderVarRow(b, c, depth+1, path, childWatchPath(watchPath, v, depth, refHeadOk, c), refHeadOk));
       if(!items || !items.length) b.innerHTML='<div class="row" style="padding-left:'+(14+(depth+1)*16)+'px;opacity:.55">(no members)</div>'; }
     if(eager && eager.length){ renderKids(eager); loaded=true; }
 
@@ -1534,7 +1552,7 @@
   // Raw data kept so the sort toggle can re-render without re-fetching.
   let lastModule='', lastModuleItems=null, lastSymbols=null;
   function buildModuleData(module, items){ lastModule=module; lastModuleItems=items||[]; renderModuleData(); }
-  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[]); applyVarFilter(); }
+  function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[], false); applyVarFilter(); }
 
   // ---- current-frame locals mirrored into the Variables pane ("Local Variables" section) ----
   // Same data the Call Stack shows for frame 0, surfaced in the Variables pane so locals sit alongside
@@ -1542,7 +1560,7 @@
   // buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop.
   let lastLocals=null, lastLocalsProc='';
   function buildLocals(proc, items){ lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
-  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[]); applyVarFilter(); }
+  function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[], true); applyVarFilter(); }
 
   function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
   function renderVarTree(){
@@ -1996,7 +2014,7 @@
             b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(thread changed — expand again to re-read)</div>';
             if(box) box.style.display=open?'':'none'; return; }
           if(!items.length){ b.innerHTML='<div class="row" style="padding-left:30px;opacity:.55">(no locals)</div>'; }
-          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx));
+          else sortVars(items).forEach(c=>renderVarRow(b, c, 1, 'stack:'+idx, c.name||null, true));
           if(box) box.style.display=open?'':'none'; }); }
       function toggle(){ if(!canLoc) return; open=!open; el._open=open; el.querySelector('.ar').textContent=open?'▾':'▸';
         if(open) load(); if(box) box.style.display=open?'':'none'; }
