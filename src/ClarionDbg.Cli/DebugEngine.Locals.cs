@@ -21,20 +21,6 @@ namespace ClarionDbg.Cli
         /// rows; reference locals (incl. by-ref GROUP/QUEUE) are lazy (expanded on demand). Shared by the
         /// method and host-procedure groups. <paramref name="module"/> tags ref rows so the host can request
         /// expansion against the right image's TSWD.</summary>
-///        private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp)
-///        {
-///            var rows = new List<string>();
-///            List<LocalSym> locals;
-///            if (m != null && m.Dbg != null && m.Dbg.ReadLocals().TryGetValue(entryRva, out locals))
-///                foreach (var l in locals)
-///                {
-///                    uint slotVa = (uint)((long)frameEbp + l.FrameOff);
-///                    rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places, slotVa, l.FrameOff, m.Name));
-///                }
-///            return rows;
-///        }
-
-
 		private List<string> LocalRowsFor(LoadedModule m, uint entryRva, uint frameEbp, bool suppressSelf)
 		{
 			var rows = new List<string>();
@@ -88,13 +74,6 @@ namespace ClarionDbg.Cli
 				bool inGap = sym.Kind == SymbolKind.Method
 							 && nextEntry != 0
 							 && queryRva >= nextEntry;
-				Console.WriteLine("@JSON {\"event\":\"console\",\"level\":\"warn\",\"text\":\"GAP CHECK:"
-					+ " sym=" + sym.Name
-					+ " kind=" + sym.Kind
-					+ " entryRva=0x" + sym.EntryRva.ToString("X")
-					+ " nextEntry=0x" + nextEntry.ToString("X")
-					+ " queryRva=0x" + queryRva.ToString("X")
-					+ " inGap=" + inGap + "\"}");
 				rows = LocalRowsFor(m, entry, ebp, inGap);
 			}
 			EmitThreadEvent(tid, "{\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
