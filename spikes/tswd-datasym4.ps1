@@ -1,4 +1,4 @@
-# Phase 3 item-4 spike part 4: systematic framing of the +0x2C symbol-record region.
+﻿# Phase 3 item-4 spike part 4: systematic framing of the +0x2C symbol-record region.
 # Find EVERY strictly-valid nameRef u32 in the region, then derive record framing from
 # the byte contexts (histogram of bytes at fixed offsets before the nameRef) and from
 # the deltas between consecutive hits inside one scope block.

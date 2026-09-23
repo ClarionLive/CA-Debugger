@@ -64,6 +64,13 @@ Invoke-CheckSection '3) Wait-EnginePaused reports the stop, the exit, and the ti
     Emit $s2 '@JSON {"event":"exited","code":0}'
     Check 'an exited event is not a stop' (-not (Wait-EnginePaused $s2 5))
 
+    # CASE IS PART OF THE TOKEN (09207c17). The pad switches on "paused" exactly, so a line the pad would
+    # not treat as a stop must not be one here either. Pins the -cmatch in Wait-EnginePaused: with -match
+    # this line is a stop, and every check above still passes.
+    $sCase = New-FakeSession
+    Emit $sCase '@JSON {"event":"Paused","ebp":"0x18FF00","va":"0x847A76"}'
+    Check 'a case-drifted "Paused" is not a stop' (-not (Wait-EnginePaused $sCase 1))
+
     $s3 = New-FakeSession
     $script:tickCount = 0
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -227,7 +234,24 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     Check 'every .ps1 here parses, so nothing is classified by failing to be read' `
         ($self.Length -gt 0 -and @($all | Where-Object { $null -ne (Get-Ast $_.FullName) }).Count -eq $all.Count) `
         "$($all.Count) file(s)"
-    $harnesses = @($all | Where-Object { $_.Name -ne $self -and (Test-NamesEngineBinary $_.FullName) })
+    # run-all.ps1 is the second exclusion, and it is EARNED rather than granted: it names the binary to run
+    # `protocolcheck`, which starts no debuggee, so there is no target to launch through New-EngineSession
+    # or to clean up. Asserted from its AST - every call of the binary passes exactly `protocolcheck` - so
+    # the day it grows a real launch, it stops being exempt and this fails.
+    $runAll = @($all | Where-Object { $_.Name -eq 'run-all.ps1' })
+    if ($runAll.Count) {
+        $exeCalls = @((Get-Ast $runAll[0].FullName).FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.CommandAst] -and
+            $n.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $n.CommandElements[0].VariablePath.UserPath -eq 'engineExe'
+        }, $true))
+        $notPc = @($exeCalls | Where-Object { $_.CommandElements.Count -ne 2 -or $_.CommandElements[1].Extent.Text -cne 'protocolcheck' })
+        Check 'run-all.ps1 runs the engine only as `protocolcheck`, so it launches no debuggee' `
+            ($exeCalls.Count -ge 1 -and $notPc.Count -eq 0) "$($exeCalls.Count) call(s); not protocolcheck: $(($notPc | ForEach-Object { $_.Extent.Text }) -join ' | ')"
+    }
+    else { Check 'run-all.ps1 exists, so its exemption below is about a real file' $false '' }
+    $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and (Test-NamesEngineBinary $_.FullName) })
     # A number, not "every": if a fourth harness appears this says so instead of quietly covering three.
     Check 'exactly 3 scripts here launch the engine binary' ($harnesses.Count -eq 3) (($harnesses.Name) -join ', ')
 
@@ -406,6 +430,20 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
     } finally { Remove-Item -LiteralPath $banned -Force -ErrorAction SilentlyContinue }
 }
 
+# THE SECTION RUNNER MUST NOT SHADOW ITS CALLER. PowerShell scoping is dynamic, so a section body sees
+# Invoke-CheckSection's own locals ahead of the script's variables of the same name - found 2026-09-22 when
+# test-bp-threaded.ps1's -Name read as the section's heading. Every name the runner uses internally is set
+# here at SCRIPT scope, and the section must read the script's values back.
+$script:Name = 'caller Name'; $script:Body = 'caller Body'; $script:before = 'caller before'
+$script:returned = 'caller returned'; $script:err = 'caller err'
+$script:sectionName = 'caller sectionName'; $script:sectionBody = 'caller sectionBody'
+Invoke-CheckSection '7) a section reads its CALLER''s variables, never the section runner''s own' {
+    $seen = "$Name|$Body|$before|$returned|$err|$sectionName|$sectionBody"
+    Check 'every runner-internal name reads the script''s value inside a section' `
+        ($seen -ceq 'caller Name|caller Body|caller before|caller returned|caller err|caller sectionName|caller sectionBody') $seen
+}
+Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionName, sectionBody
+
 # (b) THE BACKSTOP, in lib-check.ps1's terms. (a) - Invoke-CheckSection turning a thrown section into a
 # failed check - is what actually closes ticket cb9324f2 and needs nothing maintained. This catches the
 # remaining case (a) cannot: a section that returns EARLY without throwing raises nothing to catch, and
@@ -414,7 +452,7 @@ Invoke-CheckSection '6) a POKE is a signal too, so it goes through the same iden
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 56
+$EXPECTED_CHECKS = 59
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean
