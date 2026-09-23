@@ -231,6 +231,110 @@ namespace ClarionDbg.Cli
             finally { Marshal.FreeHGlobal(slot); }
         }
 
+        /// <summary>
+        /// `refKind` on every ref:true row (contract frozen by the PM, 2026-09-23): "aggregate" | "class" |
+        /// "other", never omitted, never on a row that is not a ref.
+        ///
+        /// The rule itself, over fixtures: "other" for a null referent, null Members and an empty member list,
+        /// all three of which LooksLikeClassLayout calls a class, so these pin that "other" is decided FIRST.
+        /// Over the fixtures that DO have members, RefKindOf says "class" exactly when LooksLikeClassLayout
+        /// does, including one whose FIRST-listed member is at +4 with another at +0, the fixture that tells
+        /// the shared predicate apart from a copy that looks at Members[0] only.
+        /// Then both writers, through the real builders: NodeJson's by-ref row (over a slot in this process
+        /// holding a pointer) and ArrayChildrenJson's array-of-group elements.
+        ///
+        /// NOT COVERED: whether the +4 heuristic is right on real images beyond the clbrws measurement it
+        /// came from; the page's use of the field.
+        /// </summary>
+        private static void CheckRefKindOnEveryRefNode(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("every ref:true row carries exactly one refKind, one of aggregate/class/other, and no other "
+                         + "row carries one; a null or member-less referent is 'other' although LooksLikeClassLayout "
+                         + "calls it a class, and otherwise refKind is 'class' exactly when LooksLikeClassLayout says "
+                         + "so - through NodeJson's by-ref row and the array-of-group element alike. Not covered: the "
+                         + "+4 heuristic beyond clbrws, the page.");
+
+            var lng = new ClarionType { Kind = TypeKind.Int, Size = 4 };
+            Func<int[], ClarionType> grp = offs =>
+            {
+                var t = new ClarionType { Kind = TypeKind.Group, Size = 16, TypeRef = 0x55, Members = new List<TypeMember>() };
+                foreach (int o in offs) t.Members.Add(new TypeMember { Name = "M" + o, Offset = o, Type = lng });
+                return t;
+            };
+            var agg = grp(new[] { 0, 4 });
+            var cls = grp(new[] { 4, 8 });
+            var late0 = grp(new[] { 4, 0 });       // first listed at +4, but a member at +0: an aggregate
+
+            // ---- the rule, and its ORDER.
+            var none = new[]
+            {
+                new KeyValuePair<string, ClarionType>("a null referent", null),
+                new KeyValuePair<string, ClarionType>("a group with null Members", new ClarionType { Kind = TypeKind.Group, Size = 4 }),
+                new KeyValuePair<string, ClarionType>("a group with no members", grp(new int[0])),
+            };
+            foreach (var kv in none)
+            {
+                if (!DebugEngine.LooksLikeClassLayout(kv.Value))
+                    failures.Add("refKind control: LooksLikeClassLayout no longer calls " + kv.Key + " a class, so this "
+                                 + "fixture no longer pins that 'other' is decided first");
+                string k = DebugEngine.RefKindOf(kv.Value);
+                if (k != "other") failures.Add("refKind: " + kv.Key + " is '" + k + "', expected 'other'");
+            }
+            foreach (var t in new[] { agg, cls, late0 })
+            {
+                string k = DebugEngine.RefKindOf(t);
+                bool isClass = DebugEngine.LooksLikeClassLayout(t);
+                if ((k == "class") != isClass || (k != "class" && k != "aggregate"))
+                    failures.Add("refKind: members at " + string.Join(",", t.Members.ConvertAll(m => "+" + m.Offset))
+                                 + " gave '" + k + "' while LooksLikeClassLayout says " + (isClass ? "class" : "not a class"));
+            }
+            if (DebugEngine.RefKindOf(agg) != "aggregate" || DebugEngine.RefKindOf(cls) != "class" || DebugEngine.RefKindOf(late0) != "aggregate")
+                failures.Add("refKind control: the fixtures no longer produce aggregate/class/aggregate, so the iff above is not "
+                             + "being tested on both sides");
+
+            // ---- the writers.
+            var self = System.Diagnostics.Process.GetCurrentProcess();
+            IntPtr slot = Marshal.AllocHGlobal(4);
+            try
+            {
+                Marshal.WriteInt32(slot, 0x12345678);
+                var live = NewEngine();
+                live.SetProcessHandleForTest(self.Handle);
+                uint slotVa = unchecked((uint)slot.ToInt32());
+                var rows = new List<KeyValuePair<string, string>>();
+                foreach (var kv in new[] { new KeyValuePair<string, ClarionType>("aggregate", agg), new KeyValuePair<string, ClarionType>("class", cls) })
+                {
+                    string r = live.NodeJsonForTest("R", new ClarionType { Kind = TypeKind.Reference, Size = 4, Referent = kv.Value },
+                                                    0x16, 0, 4, 0, slotVa, "m.clw", null, true);
+                    rows.Add(new KeyValuePair<string, string>("by-ref " + kv.Key, r));
+                    if (r.IndexOf("\"refKind\":\"" + kv.Key + "\"", StringComparison.Ordinal) < 0)
+                        failures.Add("refKind: NodeJson's by-ref row over a " + kv.Key + " layout does not say so: " + r);
+                }
+                var arrCls = new ClarionType { Kind = TypeKind.Array, Size = 32, Length = 2, LoBound = 1, ElemSize = 16, ElemType = cls };
+                string a = live.NodeJsonForTest("A", arrCls, 0x18, 0, 32, 0, 0x400000, "m.clw", null, true);
+                rows.Add(new KeyValuePair<string, string>("array of class-layout groups", a));
+                if (Occurrences(a, "\"refKind\":\"class\"") != 2)
+                    failures.Add("refKind: the array-of-group elements over a class layout do not each say 'class': " + a);
+                string plain = live.NodeJsonForTest("G", agg, 0x08, 0, 16, 0, 0x400000, "m.clw", null, true);
+                rows.Add(new KeyValuePair<string, string>("direct group", plain));
+
+                // Every ref:true row carries one, every refKind sits on a ref:true row, and each value is legal.
+                foreach (var kv in rows)
+                {
+                    int refs = Occurrences(kv.Value, "\"ref\":true"), kinds = Occurrences(kv.Value, "\"refKind\":");
+                    if (refs != kinds)
+                        failures.Add("refKind: the " + kv.Key + " output has " + refs + " ref:true row(s) and " + kinds + " refKind(s)");
+                    foreach (System.Text.RegularExpressions.Match m in
+                             System.Text.RegularExpressions.Regex.Matches(kv.Value, "\"refKind\":\"([^\"]*)\""))
+                        if (m.Groups[1].Value != "aggregate" && m.Groups[1].Value != "class" && m.Groups[1].Value != "other")
+                            failures.Add("refKind: the " + kv.Key + " output carries an illegal refKind '" + m.Groups[1].Value + "'");
+                }
+                if (Occurrences(plain, "\"refKind\":") != 0)
+                    failures.Add("refKind: a direct (non-ref) group row carries a refKind: " + plain);
+            }
+            finally { Marshal.FreeHGlobal(slot); }
+        }
+
         private const uint MemCommitFlag = 0x1000, PageReadWriteFlag = 0x04;
 
         private static string[] Parts(params string[] args)

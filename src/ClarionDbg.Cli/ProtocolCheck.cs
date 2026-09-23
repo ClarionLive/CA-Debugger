@@ -87,6 +87,7 @@ namespace ClarionDbg.Cli
                 CheckHoverHitTest,
                 CheckMemReadIsCleanAndPageSafe,
                 CheckVarRowAddrIsNotAnEditGrant,
+                CheckRefKindOnEveryRefNode,
             };
 
             foreach (var check in checks)

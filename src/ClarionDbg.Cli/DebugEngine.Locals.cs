@@ -171,6 +171,18 @@ namespace ClarionDbg.Cli
         ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
         ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
         /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
+        /// <summary>The `refKind` every ref:true row carries (contract frozen by the PM, 2026-09-23): "other" when
+        /// the referent is unknown or declares no members, else "class" or "aggregate" by
+        /// <see cref="LooksLikeClassLayout"/>, the SAME predicate the watch path walker refuses class heads with.
+        /// Aggregate, not group/queue: the TSWD record cannot tell a GROUP from a QUEUE (both are tag 0x08, first
+        /// member at +0), so that split would be a guess. "other" is tested FIRST because the predicate answers
+        /// true for a layout with no members, which is not evidence of a class.</summary>
+        internal static string RefKindOf(ClarionType referent)
+        {
+            if (referent == null || referent.Members == null || referent.Members.Count == 0) return "other";
+            return LooksLikeClassLayout(referent) ? "class" : "aggregate";
+        }
+
         /// <summary>Test seam for `protocolcheck`: build a row through the REAL <see cref="NodeJson"/>, so
         /// the edit-metadata veto is asserted against the shipped builder rather than a copy of its rules.
         /// Needs no live process — whether a row carries a `va` never depends on the value read.</summary>
@@ -213,6 +225,7 @@ namespace ClarionDbg.Cli
                 else
                     sb.Append(",\"value\":").Append(Json.Str("0x" + ptr.ToString("X")))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(ptr.ToString("X")).Append('"')
+                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(g)))
                       .Append(",\"module\":").Append(Json.Str(module))
                       .Append(",\"typeRef\":").Append(g.TypeRef);
             }
@@ -373,6 +386,7 @@ namespace ClarionDbg.Cli
                     sb.Append("{\"name\":").Append(Json.Str(idx))
                       .Append(",\"type\":\"GROUP\",\"value\":").Append(Json.Str("{…}"))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(eva.ToString("X")).Append('"')
+                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(elem)))
                       .Append(",\"module\":").Append(Json.Str(module))
                       .Append(",\"typeRef\":").Append(elem.TypeRef);
                     // Carries no `va`, so it is not editable regardless — but it should still say why it is
