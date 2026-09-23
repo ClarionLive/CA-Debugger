@@ -247,6 +247,12 @@ namespace ClarionDbg.Cli
                       .Append(",\"size\":").Append(size)
                       .Append(",\"places\":").Append(places);
             }
+            // Memory panel ("View memory"): where this row's bytes live, READ-ONLY. A separate member from `va`
+            // on purpose: `va` is the edit grant and the host keys editability on its presence, so it cannot
+            // widen to groups, arrays or vetoed rows. A by-ref group row already carries `addr` (its target,
+            // for `expand`), which is also the useful thing to dump; a null reference has nothing to show.
+            if (!(byRef && g != null) && va != 0)
+                sb.Append(",\"addr\":\"0x").Append(va.ToString("X")).Append('"');
             if (note != null) sb.Append(",\"note\":").Append(Json.Str(note));
             if (frameOff.HasValue) sb.Append(",\"frameOff\":").Append(frameOff.Value);
             sb.Append('}');
