@@ -26,7 +26,7 @@ const pagePath = argv.find(a => !a.startsWith('--'));
 const html = pad.readPage(pagePath);
 const El = pad.El;
 
-const TWISTY_CLOSED = '\u25b8', TWISTY_OPEN = '\u25be', DASH = '\u2014';
+const TWISTY_CLOSED = '\u25b8', TWISTY_OPEN = '\u25be';
 
 // ---- scope the page's functions run in -------------------------------------------------------------
 // pad-dom does not parse innerHTML. renderStack writes a frame row's twisty as `<span class="ar">..</span>`
@@ -136,8 +136,10 @@ console.log('\n1) Pause: frame 0 is an OS call (no proc, real ebp) -- the Clario
   const id = lastFlId(), cb = id != null ? _flCbs[id] : null;
   check('1h (setup) the mirror request has a stored reply callback', typeof cb === 'function', 'id ' + id);
   if (typeof cb === 'function') cb([{ name: 'LOC:X', value: '1' }]);
-  check('1i the mirror reply names the frame: lastLocalsProc is "SPLASHSCREEN ' + DASH + ' frame 2"',
-        lastLocalsProc === 'SPLASHSCREEN ' + DASH + ' frame 2', JSON.stringify(lastLocalsProc));
+  // The first Clarion frame IS the stopped frame (Owner's rule, 2026-09-24): its proc name alone, no frame
+  // number, the way a watch read in it carries no frameIdx (49538b78 wave 5 run 2).
+  check('1i the mirror reply names the stopped procedure with no frame suffix: lastLocalsProc is "SPLASHSCREEN"',
+        lastLocalsProc === 'SPLASHSCREEN', JSON.stringify(lastLocalsProc));
   check('1j the mirror reply delivered its items to the Local Variables section',
         Array.isArray(lastLocals) && lastLocals.length === 1 && lastLocals[0].name === 'LOC:X');
 }

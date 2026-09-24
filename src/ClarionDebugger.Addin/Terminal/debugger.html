@@ -1842,8 +1842,11 @@
   // pause via buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop. When that
   // frame is not frame 0 (a Pause lands in an OS call), the header says which frame the locals belong to.
   let lastLocals=null, lastLocalsProc='';
-  function buildLocals(proc, items, frameIdx){
-    lastLocalsProc=(proc||'')+(proc && frameIdx>0 ? ' — frame '+frameIdx : ''); lastLocals=items||[]; renderLocals(); }
+  // The header names the procedure only. What it mirrors is the STOPPED frame, which after a Pause sits below the
+  // runtime frames the event loop idles in; by the Owner's rule (2026-09-24) that first Clarion frame IS frame 0,
+  // so no frame number is shown for it, exactly as a watch read there carries none (49538b78 wave 5 run 2).
+  function buildLocals(proc, items){
+    lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
   function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[], true); applyVarFilter(); }
 
   function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
@@ -2361,7 +2364,7 @@
     // under it is the one to show (70b58a1a). renderStack owns the "has locals" test and returns that
     // frame's index. requestFrameLocals guards a missing frame and calls back [] (clearing the section).
     const li=renderStack(), fl=li>=0?lastFrames[li]:null;
-    requestFrameLocals(fl, items=>buildLocals(fl?fl.proc:'', items, li)); }
+    requestFrameLocals(fl, items=>buildLocals(fl?fl.proc:'', items)); }
   function applyStackFilter(){ const list=$('stackList'); if(!list) return;
     list.querySelectorAll('.frame').forEach(el=>{ const show=(!stackQ || (el._hay||'').indexOf(stackQ)>=0);
       el.style.display=show?'':'none'; if(el._box) el._box.style.display=(show && el._open)?'':'none'; }); }

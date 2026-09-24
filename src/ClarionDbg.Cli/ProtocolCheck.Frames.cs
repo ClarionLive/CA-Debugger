@@ -116,7 +116,9 @@ namespace ClarionDbg.Cli
         {
             claims.Claim("a watched name resolves in Clarion's scope order: the stopped frame's local (after a Pause, "
                          + "the first Clarion frame), then a global, and only then the INNERMOST caller frame that "
-                         + "declares it, so a caller's local never shadows a global the stopped code reads; a frame "
+                         + "declares it, so a caller's local never shadows a global the stopped code reads, and a name "
+                         + "found in the first Clarion frame is labelled as the current frame (frameIdx 0) while a "
+                         + "caller keeps its stack index; a frame "
                          + "with no procedure or no frame base is never asked, and a recursive procedure answers from "
                          + "its innermost activation; the watch event carries frameIdx/frameProc flat only for a frame other than 0; "
                          + "the per-stop frame cache is reused for the same registers and re-walked after a clear or "
@@ -183,6 +185,19 @@ namespace ClarionDbg.Cli
             if (got != -1)
                 failures.Add("watch scope: after a Pause a caller of the first Clarion frame still comes after the "
                              + "global (-1); got " + got);
+
+            // The label: the first Clarion frame IS the stopped frame, so it reports 0 (no frame fields) even
+            // after a Pause, where it sits at 1; a caller beyond it keeps its own stack index.
+            int rep = DebugEngine.ReportedFrameIdx(paused, 1);
+            if (rep != 0)
+                failures.Add("watch label: after a Pause a name in the first Clarion frame (1) must report frameIdx 0, "
+                             + "not \"frame " + rep + ", not the current procedure\"");
+            rep = DebugEngine.ReportedFrameIdx(paused, 2);
+            if (rep != 2)
+                failures.Add("watch label: a caller beyond the first Clarion frame keeps its stack index 2; got " + rep);
+            rep = DebugEngine.ReportedFrameIdx(stop, 0);
+            if (rep != 0)
+                failures.Add("watch label: an ordinary stop's frame 0 reports 0; got " + rep);
 
             // The contract: flat, only for a frame other than 0.
             var bytes = new byte[4];

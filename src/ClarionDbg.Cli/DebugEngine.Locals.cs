@@ -206,7 +206,7 @@ namespace ClarionDbg.Cli
                                                               out va, out l, out m),
                                   globalExists);
             if (i < 0) return false;
-            slotVa = va; found = l; owner = m; frameIdx = i; frameProc = frames[i].Proc;
+            slotVa = va; found = l; owner = m; frameIdx = ReportedFrameIdx(frames, i); frameProc = frames[i].Proc;
             return true;
         }
 
@@ -224,6 +224,15 @@ namespace ClarionDbg.Cli
             if (declares(frames[first])) return first;
             if (globalExists) return -1;
             return InnermostFrameWith(frames, declares, first + 1);
+        }
+
+        /// <summary>The frameIdx a watch reports for a name resolved in frame <paramref name="i"/>: 0 for the
+        /// first Clarion frame, which IS the stopped frame (the Owner's rule, 2026-09-24: after a Pause, frame 0
+        /// is the OS call and the stopped Clarion frame sits at 1 or more), so the reply carries no frame fields
+        /// and the page shows it as the current procedure; its own stack index for any caller beyond it.</summary>
+        internal static int ReportedFrameIdx(IList<StackFrame> frames, int i)
+        {
+            return i == FirstClarionFrameIndex(frames) ? 0 : i;
         }
 
         /// <summary>The index of the innermost frame from <paramref name="start"/> up that can answer
