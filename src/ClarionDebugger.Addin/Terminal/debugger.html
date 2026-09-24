@@ -1807,11 +1807,13 @@
   function renderModuleData(){ renderVarGroup($('moduleTree'), 'Module Data', lastModule, lastModuleItems||[], false); applyVarFilter(); }
 
   // ---- current-frame locals mirrored into the Variables pane ("Local Variables" section) ----
-  // Same data the Call Stack shows for frame 0, surfaced in the Variables pane so locals sit alongside
-  // Global Variables and get the pin / right-click "Add to Watch" affordances. Refreshed every pause via
-  // buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop.
+  // Same data the Call Stack shows for its first frame with locals, surfaced in the Variables pane so locals
+  // sit alongside Global Variables and get the pin / right-click "Add to Watch" affordances. Refreshed every
+  // pause via buildStack(); cleared (empty items → renderVarGroup renders nothing) on resume/stop. When that
+  // frame is not frame 0 (a Pause lands in an OS call), the header says which frame the locals belong to.
   let lastLocals=null, lastLocalsProc='';
-  function buildLocals(proc, items){ lastLocalsProc=proc||''; lastLocals=items||[]; renderLocals(); }
+  function buildLocals(proc, items, frameIdx){
+    lastLocalsProc=(proc||'')+(proc && frameIdx>0 ? ' — frame '+frameIdx : ''); lastLocals=items||[]; renderLocals(); }
   function renderLocals(){ renderVarGroup($('localsTree'), 'Local Variables', lastLocalsProc, lastLocals||[], true); applyVarFilter(); }
 
   function buildVarTree(symbols){ lastSymbols=symbols||null; renderVarTree(); }
@@ -2308,23 +2310,24 @@
   })();
 
   // ---- call stack ----
-  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. The CURRENT
-  // frame (index 0) auto-expands. Frames always render in CALL ORDER; the sort button sorts the variables
+  // Each frame expands (lazily) to its OWN locals — the Call-Stack-driven Variables model. The first frame
+  // with locals (frame 0, or the Clarion frame under a Pause) auto-expands. Frames always render in CALL ORDER; the sort button sorts the variables
   // INSIDE a frame (shared varSortAlpha). The filter matches procedure/module. The twisty toggles locals;
   // clicking the frame name jumps the editor.
   let stackQ='', lastFrames=null;
   function buildStack(frames){ lastFrames=frames||[];
     // A stack reply (or the deliberate clear that starts a switch) is the answer the panel was waiting for.
     if(lastFrames.length) stackPendingTid=null;
-    renderStack();
-    // Mirror the CURRENT frame's locals into the Variables pane. requestFrameLocals guards a missing/bad
-    // frame and calls back [] (clearing the section). Watch resolves against the top frame, so frame 0 is
-    // the right one to surface here.
-    const f0=lastFrames[0];
-    requestFrameLocals(f0, items=>buildLocals(f0?f0.proc:'', items)); }
+    // Mirror the first frame that HAS locals into the Variables pane: frame 0 after an ordinary stop, but
+    // after a Pause frame 0 is the OS call the event loop idles in (no procedure), and the Clarion frame
+    // under it is the one to show (70b58a1a). renderStack owns the "has locals" test and returns that
+    // frame's index. requestFrameLocals guards a missing frame and calls back [] (clearing the section).
+    const li=renderStack(), fl=li>=0?lastFrames[li]:null;
+    requestFrameLocals(fl, items=>buildLocals(fl?fl.proc:'', items, li)); }
   function applyStackFilter(){ const list=$('stackList'); if(!list) return;
     list.querySelectorAll('.frame').forEach(el=>{ const show=(!stackQ || (el._hay||'').indexOf(stackQ)>=0);
       el.style.display=show?'':'none'; if(el._box) el._box.style.display=(show && el._open)?'':'none'; }); }
+  // Returns the index of the first frame with locals (the one buildStack mirrors), or -1.
   function renderStack(){
     const list=$('stackList'); list.innerHTML=''; const frames=lastFrames||[]; $('stackCount').textContent=frames.length;
     if(!frames.length){
@@ -2335,18 +2338,21 @@
       list.innerHTML='<div class="empty">'+(stackPendingTid!=null
         ? 'Reading '+esc(threadName(t,stackPendingTid))+'…'
         : 'Paused frames appear here.')+'</div>';
-      return;
+      return -1;
     }
+    // A frame has locals when it has a procedure AND a frame base. The engine keys a frame's locals on its
+    // procedure symbol, so a frame without one answers "(no locals)" whatever its ebp: after a Pause that
+    // is frame 0, the OS call, which carries the thread's EBP but is no Clarion procedure.
+    const hasLocals=f=>!!(f && f.proc && f.ebp && f.ebp!=='0x0');
+    const locIdx=frames.findIndex(hasLocals);
     // Frames stay in CALL ORDER (frame 0 = current → callers); only the variables inside sort.
     frames.forEach((f,idx)=>{
-      // Locals availability hinges on having a frame base (ebp), NOT on a resolved proc name: a frame may
-      // resolve to real locals even when its symbol name is unknown, so don't hide them behind a name.
-      const canLoc = !!(f.ebp && f.ebp!=='0x0');
+      const canLoc = hasLocals(f);
       const el=document.createElement('div'); el.className='frame'+(idx===0?' cur':'')+(f.proc?'':' unknown')+(f.uncertain?' uncertain':'');
       el._hay=((f.proc||'')+' '+(f.module||'')).toLowerCase(); el._open=false;
       const loc = f.module ? '<span class="floc"><span class="file">'+esc(f.module)+'</span>:<span class="ln">'+f.line+'</span></span>' : '';
       el.innerHTML='<span class="ar">'+(canLoc?'▸':'')+'</span>'
-        +(f.uncertain?'<span class="unc" title="Gjenfunnet ved rå stack-skanning, ikke via EBP-kjeden — kan være en foreldet, allerede returnert kall-adresse.">⚠</span>':'')
+        +(f.uncertain?'<span class="unc" title="Recovered by a raw stack scan, not the EBP chain — it may be a stale return address from a call that already returned.">⚠</span>':'')
         +'<span class="fn">'+esc(f.proc||'(unknown)')+'</span>'+loc
         +(f.kind?'<span class="kind">'+esc(f.kind)+'</span>':'');
       list.appendChild(el);
@@ -2369,9 +2375,10 @@
       if(canLoc){ const ar=el.querySelector('.ar'); ar.onclick=(e)=>{ e.stopPropagation(); toggle(); }; }
       if(f.module) el.onclick=()=>send('jump',f.module+':'+f.line);   // name click jumps the editor
 
-      if(idx===0 && canLoc){ open=true; el._open=true; el.querySelector('.ar').textContent='▾'; load(); }
+      if(idx===locIdx){ open=true; el._open=true; el.querySelector('.ar').textContent='▾'; load(); }
     });
     applyStackFilter();
+    return locIdx;
   }
 
   // ---- breakpoints ----

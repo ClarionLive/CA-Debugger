@@ -306,12 +306,14 @@ namespace ClarionDbg.Cli
             if (parts.Length < 2) { EmitError("watch expects: watch NAME"); return; }
             string name = parts[1];
 
-            // A procedure-local shadows a same-named global while we are paused inside its frame, so resolve the
-            // CURRENT frame's locals FIRST. Locals live on the stack (never .cwtls), so this is a direct read.
-            uint slotVa; LocalSym lsym; LoadedModule lowner;
-            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, name, out slotVa, out lsym, out lowner))
+            // A procedure-local shadows a same-named global while its procedure is on the stack, so resolve the
+            // stack's locals FIRST, innermost frame first. Locals live on the stack (never .cwtls), so this is a
+            // direct read. A local found in a caller's frame says which one (bae5f46d).
+            uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
+            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
-                EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places);
+                EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places,
+                               frameIdx: fIdx, frameProc: fProc);
                 return;
             }
 
@@ -330,13 +332,13 @@ namespace ClarionDbg.Cli
             {
                 // A watch PATH (GROUP.MEMBER) is tried only here, after both lookups above missed, so no
                 // name that resolves today changes meaning (a restored watch list reads as it did).
-                var path = TryWatchPath(name, tid, ref ctx, haveCtx, out owner, out templateVa, out typeCode, out target,
+                var path = TryWatchPath(name, tid, ref ctx, haveCtx, hThread, out owner, out templateVa, out typeCode, out target,
                                         out size, out places, out spanSize);
                 if (path == PathResolve.Answered) return;
                 if (path == PathResolve.NoHead)
                 {
-                    // Not a current-frame local and not a global. If it IS a local of some other procedure, it is
-                    // merely out of scope right now (we are paused elsewhere) — flag that so the Watch row reads
+                    // Not a local of any procedure on the stack and not a global. If it IS a local of some other procedure, it
+                    // is merely out of scope right now (that procedure is not on the stack) — flag that so the Watch row reads
                     // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
                     bool outOfScope = haveCtx && IsKnownLocalName(name);
                     EmitThreadEvent(tid, Json.WatchMiss(name, outOfScope));
@@ -509,7 +511,7 @@ namespace ClarionDbg.Cli
         /// <summary>What <see cref="TryWatchPath"/> left for its caller.</summary>
         private enum PathResolve
         {
-            /// <summary>The head is neither a current-frame local nor a global: the caller's ordinary miss
+            /// <summary>The head is neither a local on the stack nor a global: the caller's ordinary miss
             /// decides "(out of scope)" by the head's name.</summary>
             NoHead,
             /// <summary>A reply was emitted here (a local-headed value, a miss or an error).</summary>
@@ -519,12 +521,12 @@ namespace ClarionDbg.Cli
             GlobalMember,
         }
 
-        /// <summary>watch HEAD.MEMBER[.MEMBER]: resolve the head as a current-frame local, then as a global
+        /// <summary>watch HEAD.MEMBER[.MEMBER]: resolve the head as a local on the stack (innermost frame first), then as a global
         /// data symbol, and walk to the leaf (see <see cref="WalkWatchPath"/>). A local-headed leaf is
         /// answered here: a local lives on the stack, and a reference head's buffer on the heap, never in
         /// .cwtls. A global-headed leaf goes back to HandleWatchCommand, so the span classification and the
         /// instance mapping stay the one copy every global goes through.</summary>
-        private PathResolve TryWatchPath(string name, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx,
+        private PathResolve TryWatchPath(string name, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, IntPtr hThread,
                                          out LoadedModule owner, out uint templateVa, out byte code, out byte target,
                                          out uint size, out int places, out uint spanSize)
         {
@@ -544,14 +546,15 @@ namespace ClarionDbg.Cli
             uint leafVa; ClarionType leafType; string error;
             WatchPathOutcome outcome;
 
-            uint slotVa; LocalSym lsym; LoadedModule lowner;
-            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, head, out slotVa, out lsym, out lowner))
+            uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
+            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, head, out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
                 outcome = WalkWatchPath(lsym.Type, lsym.TypeCode, true, slotVa, members, readPointer,
                                         out leafVa, out leafType, out error);
                 if (outcome != WatchPathOutcome.Ok) { EmitPathFailure(tid, name, outcome, error); return PathResolve.Answered; }
                 CodeForType(leafType, out code, out target, out size, out places);
-                EmitWatchValue(tid, name, leafVa, leafVa, false, code, size, target, places);
+                EmitWatchValue(tid, name, leafVa, leafVa, false, code, size, target, places,
+                               frameIdx: fIdx, frameProc: fProc);
                 return PathResolve.Answered;
             }
 
@@ -594,9 +597,11 @@ namespace ClarionDbg.Cli
         /// &amp;STRING locals deref correctly and DECIMAL locals render/edit at the right scale; both default to 0
         /// for global/static data (whose DataLocation does not carry them). <paramref name="note"/> annotates a
         /// value that is real but qualified (an unallocated thread instance), and <paramref name="editable"/>
-        /// can veto the edit pencil for a value that must not be written back.</summary>
+        /// can veto the edit pencil for a value that must not be written back. <paramref name="frameIdx"/> and
+        /// <paramref name="frameProc"/> name the stack frame a local came from; -1/null for anything else.</summary>
         private void EmitWatchValue(uint tid, string name, uint templateVa, uint instanceVa, bool threaded, byte typeCode, uint size,
-                                    byte target = 0, int places = 0, string note = null, bool editable = true)
+                                    byte target = 0, int places = 0, string note = null, bool editable = true,
+                                    int frameIdx = -1, string frameProc = null)
         {
             int len = (int)Math.Min(Math.Max(size, 1), 4096);
             var buf = new byte[len];
@@ -607,7 +612,8 @@ namespace ClarionDbg.Cli
             string value = FormatValueAt(typeCode, target, size, places, instanceVa);
             bool isNullRef = typeCode == 0x16 && value == "(null)";
             string tn = ClarionTypeLabel(typeCode, target, size, places, isNullRef);
-            EmitThreadEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note));
+            EmitThreadEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note,
+                                            frameIdx: frameIdx, frameProc: frameProc));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}{(note != null ? " — " + note : "")}");
             for (int row = 0; row < read; row += 16)
             {

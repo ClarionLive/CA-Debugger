@@ -427,7 +427,7 @@ namespace ClarionDbg.Cli
         /// <see cref="WatchMiss"/>.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
                                    byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable,
-                                   string note = null)
+                                   string note = null, int frameIdx = -1, string frameProc = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
@@ -440,6 +440,10 @@ namespace ClarionDbg.Cli
               .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read);
             if (note != null) sb.Append(",\"note\":").Append(Str(note));
+            // A local read in a CALLER's frame (bae5f46d, contract frozen 2026-09-24): which frame, flat, and only
+            // when it is not frame 0 - a current-frame local or a global carries neither.
+            if (frameIdx > 0)
+                sb.Append(",\"frameIdx\":").Append(frameIdx).Append(",\"frameProc\":").Append(Str(frameProc));
             if (editable)
                 sb.Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
                   .Append(",\"places\":").Append(places);

@@ -891,6 +891,7 @@ namespace ClarionDbg.Cli
             HoverNewStop();             // one fresh hover answer per stop, however long the step took
             ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
                                         // rather than trust bases cached while the target was last frozen
+            ClearFrameCache();          // and re-walk the stack: frames cached at the last stop are history
 
             // The stop's location. These four are what the step verbs hand BeginStep, so they must describe
             // where EIP IS: `setip` moves it and re-runs AnnounceStop to recompute them (a77abd94 risk 6).
@@ -982,7 +983,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "stack": case "bt": case "where":
-                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
+                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid, view.HThread);
                         break;
 
                     case "moduledata": case "moddata":
