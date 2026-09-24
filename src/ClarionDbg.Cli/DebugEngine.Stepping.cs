@@ -97,6 +97,10 @@ namespace ClarionDbg.Cli
                         if (covered)
                         {
                             _skipEntryEsp = ctx.Esp;
+                            _skipEntryEbp = ctx.Ebp;   // at the callee's entry, still the caller's frame
+                            _skipEventLoopKind = EventLoopCallKindAt(_prevVa, ret);
+                            _skipRetVa = ret;
+                            _skipLoopHeadVa = _skipEventLoopKind == 2 ? PlantLoopHeadTemp(ret) : 0;
                             _skipRunning = true;
                             _prevVa = va;
                             return; // TF stays clear → full speed until the temp BP (or a user BP)
@@ -270,6 +274,76 @@ namespace ClarionDbg.Cli
             return (nextEntryRva == 0 || rec < nextEntryRva) ? rec : 0;
         }
 
+        // ------------------------------------------------------------------ the ACCEPT loop's two calls (0f16e12c)
+        //
+        // ACCEPT compiles to `call [Cla$StartEventLoop]` at its head and `call [Cla$EndEventLoop]; cmp al,0;
+        // je <Start's return address>` at its back-edge, and ClaRUN keeps the loop's state ON THE PROCEDURE'S
+        // OWN STACK (DebugEngine.SetIp.cs, measured on clbrws 2026-09-23): the body runs about 0xFC below the
+        // frame's statement depth, and deeper on the first passes. Both calls are skipped like any other, and
+        // two ESP tests then refused them. OnTempBp's recursion guard read Start's LOW return as a deeper frame
+        // and re-armed for ever, so Step Over on an ACCEPT line never stopped. And had it been accepted, the
+        // Over ESP gate, measured on the ACCEPT line, refused every statement of the body.
+        //
+        // So for these two calls only:
+        //   - "has it returned" is asked of the FRAME: EBP back at the caller's. Clarion code is EBP-relative,
+        //     ClaRUN preserves EBP, and a deeper activation of the same procedure through the same return
+        //     address has an EBP of its own, so the recursion guard still holds;
+        //   - on return, the step's ESP baseline moves to where the call left ESP. That is the frame's
+        //     statement depth from here on: the body's after Start, and after End either the next pass's or,
+        //     when the loop exits, the frame's own again.
+        //   - End has a SECOND way back. When the loop goes round it does not return to its call site at all:
+        //     it resumes at the loop head, Start's return address. So skipping End also plants a temp there,
+        //     and whichever of the two the frame reaches first ends the skip and takes the other one out.
+        private int _skipEventLoopKind;   // the call being skipped: 1 = StartEventLoop, 2 = EndEventLoop, 0 = other
+        private uint _skipEntryEbp;       // EBP at the callee's entry (the caller's frame)
+        private uint _skipRetVa;          // the skipped call's return address (its temp INT3)
+        private uint _skipLoopHeadVa;     // End only: the loop-head temp THIS skip planted, or 0
+
+        /// <summary>Plant a temp INT3 at the loop head of the back-edge that follows a `call [End]` returning
+        /// to <paramref name="endRet"/>, and return its VA; 0 when there is no back-edge there, or the head
+        /// already carries an INT3 (a user breakpoint pauses there anyway; an existing temp is not ours to
+        /// remove).</summary>
+        private uint PlantLoopHeadTemp(uint endRet)
+        {
+            uint head = EventLoopBackEdgeTargetAt(endRet);
+            byte orig;
+            if (head == 0 || head == endRet || _armed.ContainsKey(head) || _temp.ContainsKey(head)
+                || !ReadByte(head, out orig))
+                return 0;
+            WriteByte(head, 0xCC);
+            _temp[head] = orig;
+            NotePlanted(head, orig);   // a queued hit on it outlives CancelStep (Attach.cs)
+            return head;
+        }
+
+        /// <summary>Has the skipped call returned to the stepping frame? For an ordinary call, ESP is back above
+        /// the callee's entry. For an event-loop call, whose return ESP is not its call site's, EBP is back at
+        /// the caller's frame.</summary>
+        private static bool SkipHasReturned(int eventLoopKind, uint esp, uint ebp, uint entryEsp, uint entryEbp)
+        {
+            return eventLoopKind != 0 ? ebp == entryEbp : esp >= entryEsp + 4;
+        }
+
+        /// <summary>The skipped call has returned: an event-loop call moves the step's ESP baseline to the ESP
+        /// it returned with. Every mode, not only Over: Out's `esp &gt; _startEsp` would otherwise read the
+        /// loop's exit, which puts ESP back at the frame's depth, as having left the procedure.
+        /// <para>The skip is over whichever of its temps the frame reached (<paramref name="va"/>), so an End skip's
+        /// other temp is restored and dropped here: left planted, it would fire later in the step as a skip
+        /// return with no skip behind it.</para></summary>
+        private void EndSkip(uint va, uint esp, bool haveEsp)
+        {
+            if (_skipEventLoopKind != 0 && haveEsp) _startEsp = esp;
+            uint other = va == _skipLoopHeadVa ? _skipRetVa : _skipLoopHeadVa;
+            byte orig;
+            if (_skipLoopHeadVa != 0 && other != va && _temp.TryGetValue(other, out orig))
+            {
+                WriteByte(other, orig);
+                _temp.Remove(other);
+            }
+            _skipEventLoopKind = 0;
+            _skipLoopHeadVa = 0;
+        }
+
         private void StopStepAndPause(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, string reason)
         {
             CancelStep();
@@ -281,6 +355,8 @@ namespace ClarionDbg.Cli
         {
             _mode = StepMode.None;
             _skipRunning = false;
+            _skipEventLoopKind = 0;
+            _skipLoopHeadVa = 0;   // its byte is in _temp, which the loop below restores
             // The prologue bypass is step-session state. It was set once in BeginStep and never cleared,
             // so it survived into the NEXT step session and disabled that session's ESP gate too until
             // BeginStep happened to recompute it. Clearing it here means a cancelled step leaves nothing
@@ -308,6 +384,8 @@ namespace ClarionDbg.Cli
             _stepStartVa = _prevVa;
             _stepCount = 0;
             _skipRunning = false;
+            _skipEventLoopKind = 0;
+            _skipLoopHeadVa = 0;
 
             // "Am I starting inside the prologue?" measured with the right instrument.
             //
@@ -394,6 +472,34 @@ namespace ClarionDbg.Cli
             _prevVa = prevVa;
             _temp[tempVa] = 0x90;
         }
+
+        /// <summary>Put an armed Step Over session into its run-to-return state, as StepMachine leaves it after
+        /// planting a call-skip temp INT3: the step's ESP baseline, the callee-entry ESP and EBP, which call is
+        /// being skipped (<see cref="EventLoopCallKind"/>'s 1/2/0), and the thread running at full speed.
+        /// <paramref name="retVa"/> must already be a recorded temp (ArmStepOverSessionForTest); a non-zero
+        /// <paramref name="loopHeadVa"/> is recorded as the End skip's loop-head temp.</summary>
+        internal void ArmCallSkipForTest(uint retVa, uint loopHeadVa, uint startEsp, uint entryEsp, uint entryEbp,
+                                         int eventLoopKind)
+        {
+            RefuseSeamIfAttached("ArmCallSkipForTest");
+            if (!_temp.ContainsKey(retVa))
+                throw new InvalidOperationException("ArmCallSkipForTest: 0x" + retVa.ToString("X8")
+                                                    + " is not a recorded temp INT3");
+            _skipRetVa = retVa;
+            _skipLoopHeadVa = loopHeadVa;
+            if (loopHeadVa != 0) _temp[loopHeadVa] = 0x90;
+            _startEsp = startEsp;
+            _skipEntryEsp = entryEsp;
+            _skipEntryEbp = entryEbp;
+            _skipEventLoopKind = eventLoopKind;
+            _skipRunning = true;
+        }
+
+        /// <summary>The step's ESP baseline (<c>_startEsp</c>), which the Over and OverInstr gates and Out read.</summary>
+        internal uint StartEspForTest { get { return _startEsp; } }
+
+        /// <summary>Is the stepping thread still running at full speed to a call-skip return?</summary>
+        internal bool SkipRunningForTest { get { return _skipRunning; } }
 
         /// <summary>Is a step session still in flight? This is the exact condition OnSingleStep's step-2
         /// guard tests (<c>_mode != StepMode.None</c>) before it runs StepMachine, so a false here means

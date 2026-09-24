@@ -282,5 +282,92 @@ namespace ClarionDbg.Cli
             }
             return b;
         }
+
+        /// <summary>
+        /// A call-skip temp INT3 belongs to the STEPPING thread's skip (65931ddd).
+        ///
+        /// The temp sits at a return address in shared code, so another thread can execute it while thread A's
+        /// Step Over runs to that return. OnTempBp used to decide on the hitting thread's ESP against A's
+        /// <c>_skipEntryEsp</c>, so thread B arriving high ended A's skip: the temp was removed,
+        /// <c>_skipRunning</c> cleared, and A's anchor and TF went to B. A's step then had nothing to stop it.
+        ///
+        /// THREE CASES. Case 1 is the bug. Case 2 (A's own return still ends the skip) is what stops a guard
+        /// that swallows EVERY hit from passing case 1. Case 3 (A's own deeper, recursive hit still re-arms)
+        /// pins that the old `returned` test still runs for the stepping thread.
+        /// </summary>
+        private static void CheckTempBpBelongsToSteppingThread(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("a call-skip temp INT3 hit by a thread OTHER than the stepping one leaves the step session "
+                         + "untouched (temp still recorded, skip still running, anchor unmoved) and schedules only "
+                         + "that thread's temp re-plant; the stepping thread's own return still ends the skip, and "
+                         + "its own deeper hit still re-arms. The two seams refuse an attached engine. Not "
+                         + "covered: the race while thread B steps off the restored byte.");
+
+            // Not multiples of 4, so Windows never assigns them (see CheckStepAnchorBelongsToSteppingThread).
+            const uint stepTid = 0xFFFFFFF1;
+            const uint otherTid = 0xFFFFFFF5;
+            const uint prevVa = 0x00401000;
+            const uint tempVa = 0x00402000;      // thread A's call-skip return address
+            const uint entryEsp = 0x0012F000;    // ESP at the callee's entry; returned = ESP >= this + 4
+            const uint highEsp = entryEsp + 4;   // exactly back at the caller's depth
+            const uint lowEsp = entryEsp - 0x40; // a deeper (recursive) frame
+            const uint frameEbp = 0x0012F100;    // the stepping frame's EBP
+
+            Func<DebugEngine> armed = () =>
+            {
+                var e = NewEngine();
+                e.ArmStepOverSessionForTest(stepTid, prevVa, tempVa);
+                e.ArmCallSkipForTest(tempVa, 0, entryEsp + 4, entryEsp, frameEbp, 0);   // an ordinary call
+                return e;
+            };
+
+            // ---- case 1: THE BUG. Thread B passes A's return address at an ESP that reads as "returned".
+            var b = armed();
+            string outcome = SeamOutcome(() => b.OnTempBpForTest(otherTid, tempVa, highEsp, frameEbp));
+            if (outcome != "returned without refusing")
+                failures.Add("temp-bp control: OnTempBpForTest " + (outcome ?? "refused") + " on an engine with no target");
+            if (b.TempBpCountForTest != 1)
+                failures.Add("temp-bp: a thread-B hit removed thread A's call-skip temp INT3 - A runs to its "
+                             + "return with nothing planted there, and its Step Over becomes a Continue");
+            if (!b.SkipRunningForTest)
+                failures.Add("temp-bp: a thread-B hit cleared thread A's run-to-return (_skipRunning) - B's ESP "
+                             + "was compared with A's callee-entry ESP");
+            if (!b.StepInFlightForTest)
+                failures.Add("temp-bp: a thread-B hit ended thread A's step session");
+            if (b.PrevVaForTest != prevVa)
+                failures.Add("temp-bp: a thread-B hit moved thread A's call-entry anchor from 0x" + prevVa.ToString("X")
+                             + " to 0x" + b.PrevVaForTest.ToString("X"));
+            if (!b.HasTempRearmForTest(otherTid, tempVa))
+                failures.Add("temp-bp: a thread-B hit scheduled no temp re-plant for thread B - the INT3 stays "
+                             + "restored after B steps off it, so A's return is no longer caught");
+
+            // ---- case 2: the stepping thread's own return still ends the skip. No line table, so IsStepStop
+            // is false and the handler takes the resume-stepping route, which re-anchors on the return address.
+            var a = armed();
+            SeamOutcome(() => a.OnTempBpForTest(stepTid, tempVa, highEsp, frameEbp));
+            if (a.TempBpCountForTest != 0 || a.SkipRunningForTest || a.PrevVaForTest != tempVa)
+                failures.Add("temp-bp: the STEPPING thread's own return did not end its skip (temps "
+                             + a.TempBpCountForTest + ", skipRunning " + a.SkipRunningForTest + ", anchor 0x"
+                             + a.PrevVaForTest.ToString("X") + ") - the thread guard is swallowing the hit it "
+                             + "exists to pass through");
+
+            // ---- case 3: the stepping thread's own DEEPER hit (recursion through the same return address).
+            var r = armed();
+            SeamOutcome(() => r.OnTempBpForTest(stepTid, tempVa, lowEsp, frameEbp));
+            if (r.TempBpCountForTest != 1 || !r.SkipRunningForTest || !r.HasTempRearmForTest(stepTid, tempVa))
+                failures.Add("temp-bp: a deeper hit on the stepping thread did not re-arm and run on - the "
+                             + "recursion guard no longer applies to the stepping thread");
+
+            // ---- the two new seams refuse an attached engine (CheckSeamsRefuseLiveTarget's six predate them).
+            var hProcField = typeof(DebugEngine).GetField("_hProcess",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (hProcField == null) { failures.Add("temp-bp control: DebugEngine._hProcess not found"); return; }
+            var att = armed();
+            hProcField.SetValue(att, new IntPtr(0x1234));
+            string o1 = SeamOutcome(() => att.OnTempBpForTest(otherTid, tempVa, highEsp, frameEbp));
+            string o2 = SeamOutcome(() => att.ArmCallSkipForTest(tempVa, 0, entryEsp + 4, entryEsp, frameEbp, 0));
+            if (o1 != null) failures.Add("temp-bp seam-guard: OnTempBpForTest " + o1 + " against an ATTACHED engine");
+            if (o2 != null) failures.Add("temp-bp seam-guard: ArmCallSkipForTest " + o2 + " against an ATTACHED engine");
+        }
     }
 }
