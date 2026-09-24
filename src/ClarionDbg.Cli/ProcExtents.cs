@@ -87,7 +87,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>A symbol that gets an extent: the host's candidates.</summary>
-        private static bool IsExtentKind(ProcSymbol s)
+        internal static bool IsExtentKind(ProcSymbol s)
         {
             return s.Kind == SymbolKind.Procedure || s.Kind == SymbolKind.Method;
         }

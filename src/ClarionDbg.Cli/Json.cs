@@ -70,8 +70,9 @@ namespace ClarionDbg.Cli
 
         /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module, and for a
         /// procedure or method with a known extent, its last source line (<c>endLine</c>, 6fa242ae). An
-        /// unknown extent OMITS the member rather than writing 0; see <see cref="ProcExtents"/> for what
-        /// unknown means and why routines never carry one.</summary>
+        /// unknown extent OMITS the member rather than writing 0, and a procedure or method says so with
+        /// <c>"extent":"unknown"</c> instead (f1a98318); see <see cref="ProcExtents"/> for what unknown means
+        /// and why routines carry neither.</summary>
         public static string Symbols(List<ProcSymbol> syms, TswdDebugInfo dbg)
         {
             var extents = new ProcExtents(dbg);   // indexed from dbg's WHOLE table, not the (maybe filtered) syms
@@ -91,6 +92,9 @@ namespace ClarionDbg.Cli
                   .Append(",\"line\":").Append(line);
                 int endLine = extents.EndLine(s);
                 if (endLine > 0) sb.Append(",\"endLine\":").Append(endLine);
+                // Said, not just omitted (f1a98318): the host must tell "this engine could not bound it" from an
+                // engine too old to send extents at all. Only a procedure or method has an extent to be unknown.
+                else if (ProcExtents.IsExtentKind(s)) sb.Append(",\"extent\":\"unknown\"");
                 sb.Append(",\"moduleIdx\":").Append(s.ModuleIdx)
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append('}');

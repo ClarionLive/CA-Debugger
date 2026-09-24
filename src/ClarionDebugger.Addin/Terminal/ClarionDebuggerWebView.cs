@@ -1231,7 +1231,8 @@ namespace ClarionDebugger.Terminal
                     {
                         var p = procs[i];
                         string id = ProcedureIds.IdFor(gen, i);
-                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine };
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine,
+                                                 ExtentUnknown = p.ExtentUnknown };
                         if (i > 0) sb.Append(',');
                         sb.Append("{\"id\":").Append(Str(id))
                           .Append(",\"name\":").Append(Str(p.Name))

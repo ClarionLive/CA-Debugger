@@ -985,6 +985,11 @@ $(Get-Method 'public sealed class DebugProcedure')
 public sealed class ClarionDebuggerService {
   public static List<DebugProcedure> Listed = new List<DebugProcedure>();
   public static List<DebugProcedure> GetProcedures(string exe) { return new List<DebugProcedure>(Listed); }
+  $((Get-Method 'internal static DebugProcedure ProcedureFromSymbol(string obj)') -replace '^internal static', 'public static')
+  $(Get-Method 'private static string GetStr(string json, string key)')
+  $(Get-Method 'private static int GetInt(string json, string key)')
+  $(Get-Method 'private static int? GetIntOrNull(string json, string key)')
+  $(Get-Method 'private static string ScanNumberToken(string json, string key)')
   $(Get-Method 'public static bool IsValidModuleName(string module)')
   $((Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)') -replace 'internal static', 'public static')
 }
@@ -1045,8 +1050,9 @@ public sealed class BridgePad {
 Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
 function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
-function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0)
-  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine; $p
+function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0, [switch] $ExtentUnknown)
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine
+  $p.ExtentUnknown = [bool] $ExtentUnknown; $p
 }
 
 # ---- host writers, run --------------------------------------------------------------------------------
@@ -1273,10 +1279,12 @@ Check 'CONTROL: an idle request for a good module is staged once' `
 # ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
 # list, and it must be CONTAINED by a procedure (PM ruling, codex adversary gate) - never "the nearest one
 # above". Containment needs the procedure's END, which the bundled engine sends as endLine since e049e07; a
-# procedure with no end is refused as an engine/host version mismatch (pipeline run 2), never bounded by the
-# next procedure's start. clbrws011.clw: MAIN 42..70 with a routine inside it at 45, OTHER 80..120.
-# clbrws003.clw: LAST 20, no end. clbrws004.clw: BOUNDED 10..30, AFTERDATA 60. clbrws005.clw: the adversary's
-# case, A 10 with NO end and B 50..70.
+# procedure with no end is refused (pipeline run 2), never bounded by the next procedure's start. WHY it is
+# refused depends on what the engine sent (f1a98318): no extent member at all is an engine/host version
+# mismatch, while "extent":"unknown" is a same-build engine that could not bound it from the debug info.
+# clbrws011.clw: MAIN 42..70 with a routine inside it at 45, OTHER 80..120. clbrws003.clw: LAST 20, no end.
+# clbrws004.clw: BOUNDED 10..30, AFTERDATA 60. clbrws005.clw: the adversary's case, A 10 with NO end and
+# B 50..70. clbrws006.clw: UNBOUNDED 10, extent unknown, and NEXTP 50..70.
 $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42 'procedure' 70))
@@ -1288,6 +1296,8 @@ $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'AFTERDATA' 'clbrws004.clw' 60))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'A' 'clbrws005.clw' 10))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'B' 'clbrws005.clw' 50 'procedure' 70))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'UNBOUNDED' 'clbrws006.clw' 10 -ExtentUnknown))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'NEXTP' 'clbrws006.clw' 50 'procedure' 70))
 $posPad.RunPushProcedures('C:\App\app.exe')
 function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
 function PosRefused { param($path, $line, $reason)
@@ -1315,9 +1325,35 @@ Check 'CONTROL: a procedure WITH an end still resolves in the same module (B 50.
 Check 'with an end of 30, cursor 20 resolves (BOUNDED 10..30)' ((PosAdd 'C:\Src\clbrws004.clw' 20) -ceq 'clbrws004.clw:10') ($posPad._svc.Adds -join ',')
 Check 'and cursor 40, past that end, is refused' (PosRefused 'C:\Src\clbrws004.clw' 40 'past the end of BOUNDED') ($posPad.Lines -join ' / ')
 Check 'REFUSED: a file the list does not cover' (PosRefused 'C:\Src\unlisted.clw' 50 'no listed procedure is in') ($posPad.Lines -join ' / ')
+# f1a98318: the SAME refusal, worded by its cause. A procedure the engine said it could not bound is not a
+# broken install, so its message names the debug info and never the version mismatch.
+Check 'REFUSED: UNBOUNDED(10, extent unknown), cursor 20 - the debug info does not bound it' `
+  (PosRefused 'C:\Src\clbrws006.clw' 20 'the debug info does not say where UNBOUNDED ends') ($posPad.Lines -join ' / ')
+Check 'and that refusal does not blame an engine/host version mismatch' `
+  (($posPad.Lines -join ' / ') -notmatch 'mismatch|reinstall') ($posPad.Lines -join ' / ')
+Check 'CONTROL: NEXTP, bounded, still resolves beside it (50..70, cursor 60)' `
+  ((PosAdd 'C:\Src\clbrws006.clw' 60) -ceq 'clbrws006.clw:50') ($posPad._svc.Adds -join ',')
+Check 'and the version-mismatch refusal (A, no extent member at all) does not claim the debug info is at fault' `
+  ((PosRefused 'C:\Src\clbrws005.clw' 40 'engine/host version mismatch') -and (($posPad.Lines -join ' / ') -notmatch 'debug info')) ($posPad.Lines -join ' / ')
+# The service's reading of an engine row, RUN on rows in the engine's shape (Json.Symbols): the three cases
+# the host tells apart.
+$symRow = { param($extra) '{"name":"P","raw":"P","kind":"procedure","rva":"0x1000","line":10' + $extra + ',"moduleIdx":1,"module":"m.clw"}' }
+$withEnd = [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol((& $symRow ',"endLine":20'))
+$unknownEnd = [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol((& $symRow ',"extent":"unknown"'))
+$oldEngine = [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol((& $symRow ''))
+Check 'a row WITH endLine reads as bounded, not unknown' (($withEnd.EndLine -eq 20) -and -not $withEnd.ExtentUnknown) "end=$($withEnd.EndLine) unknown=$($withEnd.ExtentUnknown)"
+Check 'a row with "extent":"unknown" reads as unbounded BY THE ENGINE' (($unknownEnd.EndLine -eq 0) -and $unknownEnd.ExtentUnknown) "end=$($unknownEnd.EndLine) unknown=$($unknownEnd.ExtentUnknown)"
+Check 'a row with neither reads as an old engine (no end, not said unknown)' (($oldEngine.EndLine -eq 0) -and -not $oldEngine.ExtentUnknown) "end=$($oldEngine.EndLine) unknown=$($oldEngine.ExtentUnknown)"
+Check 'CONTROL: a routine row is read, a data row is skipped' `
+  (($null -ne [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol('{"name":"R","kind":"routine","line":12,"module":"m.clw"}')) -and `
+   ($null -eq [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol('{"name":"D","kind":"other","line":12,"module":"m.clw"}'))) ''
+Check 'the list hands the engine''s "unknown" through to the id table (PushProcedures copies ExtentUnknown)' `
+  ((Get-Method 'private void PushProcedures(string exe)' $web) -match 'ExtentUnknown = p\.ExtentUnknown') ''
 Check 'the service reads an engine endLine when there is one, and treats one before the start as unknown' `
-  (((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
-   ((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'end\.HasValue && end\.Value >= line\) \? end\.Value : 0')) ''
+  (((Get-Method 'internal static DebugProcedure ProcedureFromSymbol(string obj)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
+   ((Get-Method 'internal static DebugProcedure ProcedureFromSymbol(string obj)') -match 'end\.HasValue && end\.Value >= line\) \? end\.Value : 0')) ''
+Check 'GetProcedures reads each row through ProcedureFromSymbol, the reader run above' `
+  ((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'ProcedureFromSymbol\(m\.Value\)') ''
 
 # ---- edits, through the real page ---------------------------------------------------------------------
 function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
@@ -2284,7 +2320,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 370
+$EXPECTED_CHECKS = 380
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

@@ -265,9 +265,14 @@ namespace ClarionDebugger.Services
         /// (a routine is not independently navigable the way a procedure is).</summary>
         public string Kind;
         /// <summary>The procedure's LAST source line when the engine reports one (an <c>endLine</c> member), else
-        /// 0 = unknown. The bundled engine sends it for every procedure since e049e07 (6fa242ae); a position
-        /// lookup on a procedure without one is refused as an engine/host version mismatch.</summary>
+        /// 0 = unknown. The bundled engine sends it for every procedure it can bound since e049e07 (6fa242ae); a
+        /// position lookup on a procedure without one is refused either way.</summary>
         public int EndLine;
+        /// <summary>True when the engine said it could NOT bound this procedure (<c>"extent":"unknown"</c> in
+        /// place of <c>endLine</c>, f1a98318): the debug info gave no end, which a same-build engine does for some
+        /// real procedures. False with no EndLine means the engine sent neither member, so it predates this.
+        /// The two refusals word the cause differently; both still refuse.</summary>
+        public bool ExtentUnknown;
     }
 
     /// <summary>
@@ -1795,24 +1800,32 @@ namespace ClarionDebugger.Services
                 foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
                 {
                     if (list.Count >= MaxProcedures) break;
-                    string obj = m.Value;
-                    string kind = GetStr(obj, "kind");
-                    // Routines come through as well as procedures/methods: they are what lets a breakpoint
-                    // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
-                    // them together with their parent by definition line, so containment falls out of the
-                    // line order — no extra symbol work. The Procedures panel filters routines back out on
-                    // the client, so this does not change what that list shows.
-                    if (kind != "procedure" && kind != "method" && kind != "routine") continue;
-                    int line = GetInt(obj, "line");
-                    if (line <= 0) continue;
-                    int? end = GetIntOrNull(obj, "endLine");
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
-                                                  EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0 });
+                    var p = ProcedureFromSymbol(m.Value);
+                    if (p != null) list.Add(p);
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }
             catch { }
             return list;
+        }
+
+        /// <summary>One <c>@SYMBOLS</c> row as a listed procedure, or null for a row the list skips (another kind,
+        /// or no definition line).</summary>
+        internal static DebugProcedure ProcedureFromSymbol(string obj)
+        {
+            string kind = GetStr(obj, "kind");
+            // Routines come through as well as procedures/methods: they are what lets a breakpoint
+            // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
+            // them together with their parent by definition line, so containment falls out of the
+            // line order — no extra symbol work. The Procedures panel filters routines back out on
+            // the client, so this does not change what that list shows.
+            if (kind != "procedure" && kind != "method" && kind != "routine") return null;
+            int line = GetInt(obj, "line");
+            if (line <= 0) return null;
+            int? end = GetIntOrNull(obj, "endLine");
+            return new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
+                                        EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0,
+                                        ExtentUnknown = GetStr(obj, "extent") == "unknown" };
         }
 
         private static List<DebugBreakpoint> ParseBpList(string json)

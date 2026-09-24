@@ -445,14 +445,18 @@ namespace ClarionDebugger.Terminal
                                    : module + ":" + line + " is above the first listed procedure";
                 return null;
             }
-            // FAIL CLOSED on an unknown end (PM ruling, codex adversary, pipeline run 2). The bundled engine sends
-            // endLine for every procedure since e049e07, and it ships in this addin with the host, so a
-            // procedure WITHOUT one means the two have come apart. Bounding it by the next procedure's start
-            // instead - the fallback this replaced - attributed module data between A's end and B's start to A.
+            // FAIL CLOSED on an unknown end (PM ruling, codex adversary, pipeline run 2). Bounding it by the next
+            // procedure's start instead - the fallback this replaced - attributed module data between A's end and
+            // B's start to A. The CAUSE is worded by what the engine sent (f1a98318): "extent":"unknown" is a
+            // same-build engine that could not bound this procedure from the debug info, while neither member is
+            // an engine too old to send extents, the only case a reinstall fixes.
             if (at.EndLine <= 0)
             {
-                why = "the debugger does not know where " + at.Name + " ends (the engine sent no endLine: an engine/host"
-                    + " version mismatch - reinstall the CA Debugger so both come from one build)";
+                why = at.ExtentUnknown
+                    ? "the debug info does not say where " + at.Name + " ends, so the debugger cannot tell whether line "
+                      + line + " is inside it - break on its entry from the Procedures list instead"
+                    : "the debugger does not know where " + at.Name + " ends (the engine sent no extent at all: an"
+                      + " engine/host version mismatch - reinstall the CA Debugger so both come from one build)";
                 return null;
             }
             if (line <= at.EndLine) return at;
@@ -468,6 +472,7 @@ namespace ClarionDebugger.Terminal
         public int Line;
         public string Kind;   // procedure | method | routine
         public int EndLine;   // last source line when the engine reported one, else 0 = unknown
+        public bool ExtentUnknown;   // the engine sent "extent":"unknown": it could not bound this one (f1a98318)
     }
 
     /// <summary>The edit tuples the host has ISSUED for the rows currently on screen.
