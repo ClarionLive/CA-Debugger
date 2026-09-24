@@ -77,6 +77,8 @@ $Suites = @(
   @{ File = 'test-engine-tid-members.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-engine-hover-sites.ps1' }
   @{ File = 'test-engine-hover-sites.ps1'; Args = @('-SelfTest') }
+  @{ File = 'test-engine-framecache-sites.ps1' }
+  @{ File = 'test-engine-framecache-sites.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-pad-bpstate.js' }
   @{ File = 'test-pad-contrast.js' }
   @{ File = 'test-pad-editmeta.js' }
@@ -86,6 +88,7 @@ $Suites = @(
   @{ File = 'test-pad-source.js' }
   @{ File = 'test-pad-setip.js' }
   @{ File = 'test-pad-threads.js' }
+  @{ File = 'test-pad-frames.js' }
   @{ File = 'test-pad-watch-persist.js' }
   @{ File = 'test-bp-threaded.ps1'; Live = $true }
   @{ File = 'test-watch-threaded.ps1'; Live = $true }

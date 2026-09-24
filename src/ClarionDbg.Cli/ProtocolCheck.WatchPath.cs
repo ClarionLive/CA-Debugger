@@ -16,8 +16,8 @@ namespace ClarionDbg.Cli
         /// ignores member offsets (every member reads the group's first bytes), and one that walks a reference
         /// head from its frame SLOT instead of the pointer the slot holds (the members read stack bytes).
         ///
-        /// NOT COVERED: how HandleWatchCommand picks the head (current-frame local first, then a global data
-        /// symbol), what it emits for each outcome, and the THREADed-member mapping. Those need a paused
+        /// NOT COVERED: how HandleWatchCommand picks the head (a local in the innermost frame that declares it,
+        /// then a global data symbol; the frame choice is pinned in ProtocolCheck.Frames.cs), what it emits for each outcome, and the THREADed-member mapping. Those need a paused
         /// target with parsed TSWD; the live acceptance is pinning BRW1::JOB:JobID on clbrws.
         /// </summary>
         private static void CheckWatchPathWalker(List<string> failures, ClaimLog claims)
