@@ -589,6 +589,18 @@ namespace ClarionDbg.Cli
             Console.WriteLine($"  watch {name}: {reason}");
         }
 
+        /// <summary>The watch reply's <c>addr</c>: the address of this thread's OWN storage for the name, or null
+        /// when the bytes came from the shared THREAD template. Every template read passes instanceVa ==
+        /// templateVa with threaded set (Unallocated, Template, Straddling); a thread's own instance (Ok) is a
+        /// different block, and non-threaded data (Outside, a frame local, a local-headed path) is its own
+        /// storage by definition. Decided from the arguments rather than per arm, so an arm added later
+        /// cannot forget it.</summary>
+        internal static string OwnStorageAddr(bool threaded, uint templateVa, uint instanceVa)
+        {
+            if (threaded && instanceVa == templateVa) return null;
+            return "0x" + instanceVa.ToString("X");
+        }
+
         /// <summary>Read and report a watch value (instanceVa = templateVa for non-threaded data). <paramref
         /// name="target"/>/<paramref name="places"/> carry a frame local's referent-type and DECIMAL scale so
         /// &amp;STRING locals deref correctly and DECIMAL locals render/edit at the right scale; both default to 0
@@ -607,7 +619,8 @@ namespace ClarionDbg.Cli
             string value = FormatValueAt(typeCode, target, size, places, instanceVa);
             bool isNullRef = typeCode == 0x16 && value == "(null)";
             string tn = ClarionTypeLabel(typeCode, target, size, places, isNullRef);
-            EmitThreadEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note));
+            EmitThreadEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note,
+                                            addr: OwnStorageAddr(threaded, templateVa, instanceVa)));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}{(note != null ? " — " + note : "")}");
             for (int row = 0; row < read; row += 16)
             {

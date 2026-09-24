@@ -248,6 +248,9 @@ namespace ClarionDebugger.Services
         public bool OutOfScope;     // a known frame local, but execution is paused outside its procedure
         public string Error;        // resolved by name but unreadable (e.g. a THREADed instance the RTL wouldn't yield)
         public string Note;         // a real but qualified value (e.g. a THREADed variable this thread hasn't used yet)
+        public string Addr;         // this thread's OWN storage (hex) for "View memory"; null for a template read
+        public int? FrameIdx;       // the frame a local head resolved in, when not frame 0; null otherwise
+        public string FrameProc;    // that frame's procedure name (with FrameIdx)
         /// <summary>The thread this value was read on, or null from an engine that doesn't stamp replies.
         /// The pad drops a reply whose Tid isn't the thread it is currently showing.</summary>
         public uint? Tid;
@@ -1599,6 +1602,11 @@ namespace ClarionDebugger.Services
                 w.TypeCode = GetStr(json, "type");   // raw code as hex ("0x11") for edit-variable-value
                 w.Size = GetInt(json, "size");
                 w.Places = GetInt(json, "places");   // 0 when absent (watch doesn't carry DECIMAL scale)
+                // Absent, not zero/empty, when the engine does not send them: addr only for own storage,
+                // frameIdx/frameProc only for a local resolved outside frame 0 (04b9679e).
+                w.Addr = GetStr(json, "addr");
+                w.FrameIdx = GetIntOrNull(json, "frameIdx");
+                w.FrameProc = GetStr(json, "frameProc");
                 // Value is now formatted engine-side by the shared Clarion value renderer (same one the
                 // Locals panel uses) and shipped ready-to-display — no separate client-side formatting.
                 w.Value = GetStr(json, "value");

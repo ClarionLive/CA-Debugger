@@ -8,7 +8,9 @@
 //   - only the NEWEST reply paints, and a reply is not tid-gated (memory is the process's);
 //   - the dump escapes the ASCII gutter, and says so when the read came back short;
 //   - "View memory" appears for any row with storage (`addr`, or an edit `va`), including the rows the
-//     watch gate does not wire, and never for a row without one.
+//     watch gate does not wire, and never for a row without one;
+//   - a Globals/Tables row and group header take that address from each watch reply's `addr` and lose it
+//     with the reply, without touching a Variables-tree row of the same name (04b9679e).
 //
 //   node tools/test-pad-memory.js [path/to/debugger.html]
 // Exit code 0 = all checks passed.
@@ -198,6 +200,117 @@ check('memClampStart does not go below 0', memClampStart(-16, 256) === 0);
   check('the tree menu carries a View memory item', /id="treeMenu"[^\n]*id="tmMem"/.test(html));
   check('the memory panel is in the layout lists, collapsed by default',
         /DEFAULT_LEFT=\[[^\]]*'memory'/.test(html) && /DEFAULT_COLLAPSED=\{[^}]*memory:true/.test(html) && /data-sec="memory"/.test(html));
+}
+
+// ---- 9. "View memory" on Global/Tables rows, from the watch reply's addr (04b9679e) -----------------
+// The REAL renderSymRow, applyValue, clearValueMeta and invalidateThreadScopedState, with the value
+// formatting around them stubbed. What it holds the page to: a Globals/Tables row (value row AND group
+// header) takes its address from each watch reply's `addr`, loses it on a reply without one, on a miss
+// and on a thread switch; a Variables-tree row of the same name keeps the engine address it was built
+// with; and a local read in a caller's frame is labelled with that frame.
+const FNS9 = ['cssEsc', 'clearEditMeta', 'clearDtMeta', 'clearValueMeta', 'applyValue', 'renderSymRow',
+  'invalidateThreadScopedState'];
+const missing9 = [];
+const src9 = FNS9.map(n => { try { return pad.extract(html, n); } catch (e) { missing9.push(n); return ''; } }).join('\n');
+if (missing9.length) {
+  console.log('  FAIL  page function(s) not found in ' + pad.resolvePage(pagePath) + ': ' + missing9.join(', '));
+  process.exit(1);
+}
+const values = new Map();
+const nameKey = n => (n == null ? '' : String(n)).toLowerCase();
+function setEditMeta() { } function wireEdit() { } function dtApply() { } function applyNote() { }
+function watchWaitingHtml() { return ''; } function wireSel() { } function addWatch() { }
+function sortVars(a) { return a || []; }
+const STAR = '*';
+const WATCHED = [];
+function syncRowWatch(name, visible) { if (visible) WATCHED.push(name); return true; }
+eval(src9);
+// Rows built by the page are LEls here, so their context-menu listeners can be fired. renderSymRow wires
+// the pin and arrow it wrote as innerHTML, which pad-dom does not parse, so those two answer with a stand-in.
+class RowEl extends LEl {
+  querySelector(sel) { return super.querySelector(sel) || ((sel === '.pin' || sel === '.ar') ? new El('span') : null); }
+}
+doc.createElement = t => new RowEl(t);
+
+function ctx(row) {
+  let prevented = false; _memMenuAddr = null; $('treeMenu').classList.remove('show');
+  row.fire('contextmenu', { preventDefault() { prevented = true; }, stopPropagation() { }, clientX: 5, clientY: 5 });
+  return prevented;
+}
+function valueRow(name) {
+  const r = new LEl('div'); r.className = 'row'; r.dataset.name = name;
+  const v = new LEl('span'); v.className = 'vval'; r.appendChild(v); doc.body.appendChild(r); return { r, v };
+}
+const frames = r => r.children.filter(c => c.classList.contains('vframe'));
+{
+  const tree = new LEl('div'); doc.body.appendChild(tree);
+  const vrow = renderSymRow(tree, { name: 'GLO:Count', typeName: 'LONG' }, 1).el;
+  check('a Globals value row starts with no address', vrow.dataset.addr === undefined);
+  applyValue('GLO:Count', true, '5', 'LONG', false, { addr: '0x4A2F10' });
+  check('...and takes the reply\'s addr', vrow.dataset.addr === '0x4A2F10', String(vrow.dataset.addr));
+  applyValue('GLO:Count', true, '0', 'LONG', true, { note: 'not yet used on this thread' });
+  check('a reply with no addr (a template read) drops it', vrow.dataset.addr === undefined, String(vrow.dataset.addr));
+  applyValue('GLO:Count', true, '5', 'LONG', false, { addr: '0x4A2F10' });
+  applyValue('GLO:Count', false, null, null, false, { error: 'unreadable' });
+  check('a miss drops it', vrow.dataset.addr === undefined, String(vrow.dataset.addr));
+
+  const h = renderSymRow(tree, { name: 'CUS:Record', typeName: 'GROUP', fields: [{ name: 'CUS:Name', typeName: 'STRING' }] }, 1);
+  const hdr = h.el;
+  check('a Tables/group header is keyed by its name, so a reply can reach it', hdr.dataset.name === 'CUS:Record');
+  WATCHED.length = 0; h.setVisible(true);
+  check('...and is watched while visible (for its address)', WATCHED.indexOf('CUS:Record') >= 0, JSON.stringify(WATCHED));
+  check('with no address yet, its right-click offers nothing', ctx(hdr) === false && !$('treeMenu').classList.contains('show'));
+  applyValue('CUS:Record', true, '', 'GROUP', true, { addr: '0x2A31010' });
+  check('a reply gives the header its address', hdr.dataset.addr === '0x2A31010', String(hdr.dataset.addr));
+  check('...and its right-click offers View memory at it',
+        ctx(hdr) === true && _memMenuAddr === '0x2A31010' && $('tmMem').style.display === '', String(_memMenuAddr));
+  applyValue('CUS:Record', true, '', 'GROUP', true, { note: 'template' });
+  check('a template reply takes it away again', hdr.dataset.addr === undefined && ctx(hdr) === false, String(hdr.dataset.addr));
+
+  // THE TRAP: a Variables-tree row with the same name, whose addr is the engine's own (wireMemMenu).
+  const tr = new LEl('div'); tr.className = 'row'; tr.dataset.name = 'GLO:Count'; doc.body.appendChild(tr);
+  wireMemMenu(tr, { name: 'GLO:Count', addr: '0x19FE40' });
+  applyValue('GLO:Count', true, '5', 'LONG', false, { addr: '0x4A2F10' });
+  check('a reply does not overwrite a Variables-tree row\'s engine addr', tr.dataset.addr === '0x19FE40', String(tr.dataset.addr));
+  applyValue('GLO:Count', false, null, null, false, {});
+  check('...and a miss does not clear it', tr.dataset.addr === '0x19FE40', String(tr.dataset.addr));
+
+  // A thread switch: the address was the OLD thread's instance.
+  applyValue('CUS:Record', true, '', 'GROUP', true, { addr: '0x2A31010' });
+  applyValue('GLO:Count', true, '5', 'LONG', false, { addr: '0x4A2F10' });
+  invalidateThreadScopedState(1);
+  check('a thread switch drops a Globals row\'s and a header\'s address',
+        hdr.dataset.addr === undefined && vrow.dataset.addr === undefined, hdr.dataset.addr + ' ' + vrow.dataset.addr);
+  check('...but not a Variables-tree row\'s', tr.dataset.addr === '0x19FE40', String(tr.dataset.addr));
+
+  // The frame label.
+  const w = valueRow('LOC:N');
+  applyValue('LOC:N', true, '7', 'LONG', false, { frameIdx: 2, frameProc: 'BROWSE' });
+  let f = frames(w.r);
+  check('a local read in frame 2 is labelled with the frame and procedure',
+        f.length === 1 && f[0].textContent === 'frame 2 · BROWSE', f.map(x => x.textContent).join('|'));
+  check('...placed before the value', f.length === 1 && w.r.children.indexOf(f[0]) === w.r.children.indexOf(w.v) - 1);
+  applyValue('LOC:N', true, '7', 'LONG', false, { frameIdx: 2, frameProc: 'BROWSE' });
+  check('a second reply does not stack a second label', frames(w.r).length === 1, frames(w.r).length + '');
+  applyValue('LOC:N', true, '8', 'LONG', false, {});
+  check('a reply with no frame removes it', frames(w.r).length === 0);
+  applyValue('LOC:N', true, '8', 'LONG', false, { frameIdx: 0, frameProc: 'MAIN' });
+  check('frame 0 is not labelled', frames(w.r).length === 0);
+  applyValue('LOC:N', true, '7', 'LONG', false, { frameIdx: 3, frameProc: '<img src=x onerror=alert(1)>' });
+  f = frames(w.r);
+  check('a hostile procedure name is text', f.length === 1 && f[0].textContent === 'frame 3 · <img src=x onerror=alert(1)>' && f[0].innerHTML === '');
+  applyValue('LOC:N', false, null, null, false, { outOfScope: true });
+  check('a miss removes the label', frames(w.r).length === 0);
+  applyValue('LOC:N', true, '7', 'LONG', false, { frameIdx: 2, frameProc: 'BROWSE' });
+  invalidateThreadScopedState(2);
+  check('a thread switch removes the label', frames(w.r).length === 0);
+
+  // The page never works an address out for itself. Comments stripped: the note above saying so would match.
+  const code = ['renderSymRow', 'applyValue', 'wireMemMenu'].map(n => pad.extract(html, n)).join('\n').replace(/\/\/[^\n]*/g, '');
+  check('no base+rva arithmetic in the row, reply or menu code', !/\brva\b|loadBase|LoadBase/.test(code));
+  const onMsg = pad.extract(html, 'onMessage');
+  check("the 'watch' case hands applyValue addr, frameIdx and frameProc",
+        /case 'watch':[^\n]*addr:m\.addr[^\n]*frameIdx:m\.frameIdx[^\n]*frameProc:m\.frameProc/.test(onMsg));
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');

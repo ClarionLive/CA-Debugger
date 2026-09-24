@@ -170,6 +170,7 @@
   .vas.active { opacity:.85; color:var(--green); }
   .vas:hover { opacity:1; color:var(--fg); }
   .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
+  .vframe { color:var(--fg-dim); font-size:10px; margin-right:6px; border:1px solid var(--popup-border); border-radius:3px; padding:0 4px; white-space:nowrap; }
   .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .pin svg, .dact svg { display:block; }
   .row:hover .pin { opacity:1; } .pin:hover { color:var(--warn); } .pin.pinned { opacity:1; color:var(--warn); }
@@ -1330,6 +1331,8 @@
   //   clearEditMeta  — the write path only          (selectThread: close it, disturb nothing on screen)
   //   clearDtMeta    — the view-as tag only         (dtApply: this cell holds no number to view)
   //   clearValueMeta — both, for a reused cell      (everyone else)
+  // clearValueMeta also drops the reply's frame label (_vframe, see applyValue): it is per-reply state of
+  // the same cell, and a row reused on another thread or at another stop must not keep naming a frame.
   function clearDtMeta(cell){
     if(!cell) return;
     if(cell._vas){ cell._vas.remove(); cell._vas=null; }
@@ -1339,6 +1342,7 @@
     if(!cell) return;
     clearEditMeta(cell);
     clearDtMeta(cell);
+    if(cell._vframe){ cell._vframe.remove(); cell._vframe=null; }
   }
   // A REAL value that carries a caveat — a THREADed name with no instance on the thread being read, or one
   // this thread hasn't used yet. ONE function for it, because the Watch panel and the Variables tree are
@@ -1368,6 +1372,11 @@
     // The trailing `i` is the whole fix for the reported symptom: a reply for one spelling resolves the
     // rows keyed in another, instead of leaving them on "…" for the rest of the session.
     document.querySelectorAll('[data-name="'+cssEsc(name)+'" i]').forEach(row=>{
+      // "View memory" on a Globals/Tables row follows THIS reply's own-storage address (04b9679e): the
+      // engine sends addr only for the thread's own data, never for the shared THREAD template, and the
+      // page never computes one. Only rows renderSymRow built carry _addrFromWatch: a Variables-tree row
+      // with the same name holds the engine's addr from its own row data, which a reply must not touch.
+      if(row._addrFromWatch){ if(found && meta && meta.addr) row.dataset.addr=meta.addr; else delete row.dataset.addr; }
       const v=row.querySelector('.vval'); if(!v) return;
       // 'idle' belongs in this list as much as 'pending': a restored row is answered at the first pause
       // WITHOUT being re-rendered, so leaving the class on would show a real value in the grey-italic
@@ -1401,6 +1410,14 @@
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
       applyNote(v, meta && meta.note);   // …then the caveat, which must win the tooltip back off dtApply
+      // A local that resolved in a CALLER's frame says which one, so it is not read as the current
+      // procedure's. clearValueMeta above removed the previous reply's label.
+      if(meta && Number.isInteger(meta.frameIdx) && meta.frameIdx>0){
+        const ft=document.createElement('span'); ft.className='vframe';
+        ft.textContent='frame '+meta.frameIdx+(meta.frameProc?' · '+meta.frameProc:'');
+        ft.title='Read from frame '+meta.frameIdx+' of the call stack'+(meta.frameProc?' ('+meta.frameProc+')':'')+', not the current procedure.';
+        v.insertAdjacentElement('beforebegin', ft); v._vframe=ft;
+      }
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -1800,12 +1817,16 @@
     $('tmMem').style.display=_memMenuAddr?'':'none';
   }
   // Rows wireSel does not own (groups, arrays, references, nested members) still get "View memory".
+  // A Globals/Tables row (_addrFromWatch) is wired with no address yet: its address arrives, and goes, with
+  // each watch reply (applyValue), so the handler reads it at the click and offers nothing while it has none.
   function wireMemMenu(row, v){
-    const a=v.addr||v.va; if(!a) return;
-    row.dataset.addr=a;
+    const a=v.addr||v.va;
+    if(a) row.dataset.addr=a;
+    else if(!row._addrFromWatch) return;           // no storage, and no reply will ever give it one
     if(row.classList.contains('selrow')) return;   // wireSel's handler shows the menu for these
-    row.addEventListener('contextmenu',e=>{ e.preventDefault(); e.stopPropagation();
-      memMenuFor(a, false);
+    row.addEventListener('contextmenu',e=>{ const cur=row.dataset.addr; if(!cur) return;
+      e.preventDefault(); e.stopPropagation();
+      memMenuFor(cur, false);
       const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
   }
 
@@ -1877,6 +1898,7 @@
     const name = s.name;
     const row=document.createElement('div'); row.className='row'+(isGroup?'':' selrow');
     row.style.paddingLeft=(14+depth*16)+'px';
+    row._addrFromWatch=true;   // "View memory" follows the watch reply's addr (applyValue), never base+rva
     row.innerHTML='<span class="ar">'+(isGroup?'▸':'')+'</span>'
       +'<span class="vname'+(depth>1?' field':'')+'">'+esc(name)+'</span>'
       +'<span class="vtype">'+esc(s.typeName||(s.size!=null?'size '+s.size:''))+'</span>';
@@ -1888,6 +1910,11 @@
       row.innerHTML+='<span class="veq">=</span>'+watchWaitingHtml()+'<span class="pin">'+STAR+'</span>';
       row.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(name); };
       wireSel(row);
+    } else {
+      // A header is watched by name too, for its address alone: it has no value cell, so applyValue sets
+      // its addr and returns. `globals` carries only rva/module, and a THREADed record's address is per thread.
+      row.dataset.name=name;
+      wireMemMenu(row, {});
     }
     tree.appendChild(row);
 
@@ -1901,7 +1928,8 @@
     }
     return { el: row, setVisible(b){
       row.style.display=b?'':'none';
-      if(!isGroup){ syncRowWatch(name, b); return; }
+      syncRowWatch(name, b);
+      if(!isGroup) return;
       if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
       else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; row.querySelector('.ar').textContent='▸'; }
     } };
@@ -2131,6 +2159,7 @@
   function invalidateThreadScopedState(gen){
     values.clear();                                                                     // (5)
     document.querySelectorAll('[data-name]').forEach(row=>{
+      if(row._addrFromWatch) delete row.dataset.addr;   // another thread's instance, until the new reply
       const v=row.querySelector('.vval'); if(!v) return;
       // Rows that HAD an answer on the old thread are expecting a fresh one; rows still on "…" (a
       // collapsed tree row nobody is watching) are not, and must not be swept later as unanswered.
@@ -2873,7 +2902,7 @@
       case 'mem': onMem(m); break;   // not tid-gated: memory is the process's, not a thread's
       case 'moduledata': if(tidAccepted(m)) buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { if(!tidAccepted(m)) break; const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
+      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note, addr:m.addr, frameIdx:m.frameIdx, frameProc:m.frameProc}); break;
       case 'varset': onVarSet(m); break;
       case 'setip': onSetIp(m); break;
       case 'bplist': buildBps(m.bps||[]); break;

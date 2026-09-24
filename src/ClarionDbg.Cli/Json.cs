@@ -423,11 +423,14 @@ namespace ClarionDbg.Cli
         /// local) address the bytes were read from; templateVa is the link-time template address. <paramref
         /// name="editable"/> gates the edit-variable-value metadata (va + places): the host keys "is this cell
         /// editable" purely on the presence of "va", so a non-writable type (ref / group / unknown) emits no va
-        /// and therefore shows no edit pencil instead of erroring on commit. A miss goes through
-        /// <see cref="WatchMiss"/>.</summary>
+        /// and therefore shows no edit pencil instead of erroring on commit. <paramref name="addr"/> ("0x..."),
+        /// when given, is the address of THIS thread's own storage for the name and is what the pad's "View
+        /// memory" opens; null for a value read from the shared THREAD template (Unallocated, Template,
+        /// Straddling), so the memory view never shows the template as the thread's data. It is independent of
+        /// <paramref name="editable"/>. A miss goes through <see cref="WatchMiss"/>.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
                                    byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable,
-                                   string note = null)
+                                   string note = null, string addr = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
@@ -440,6 +443,7 @@ namespace ClarionDbg.Cli
               .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read);
             if (note != null) sb.Append(",\"note\":").Append(Str(note));
+            if (addr != null) sb.Append(",\"addr\":").Append(Str(addr));
             if (editable)
                 sb.Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
                   .Append(",\"places\":").Append(places);

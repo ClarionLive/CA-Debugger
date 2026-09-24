@@ -96,6 +96,7 @@ namespace ClarionDbg.Cli
                 CheckDetach,
                 CheckCommandsNeverStarved,
                 CheckDetachHardening,
+                CheckWatchAddrIsOwnStorage,
             };
 
             foreach (var check in checks)
