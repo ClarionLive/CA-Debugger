@@ -55,7 +55,10 @@ function parseSel(sel) {
     if (m[1]) out.classes.push(m[1]);
     else out.attrs.push({
       name: m[2],
-      value: m[3] === undefined ? null : m[3].replace(/\\(.)/g, '$1'),
+      // Both CSS escape forms: `\"` and the hex `\a ` the page's cssEsc uses for control characters (one
+      // optional trailing space is part of a hex escape, as in CSS).
+      value: m[3] === undefined ? null
+           : m[3].replace(/\\([0-9a-fA-F]{1,6}) ?|\\(.)/g, (_, h, c) => h ? String.fromCodePoint(parseInt(h, 16)) : c),
       ci: !!m[4],
     });
   }

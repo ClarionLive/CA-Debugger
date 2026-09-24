@@ -1760,7 +1760,11 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"size\":").Append(w.Size)
                   .Append(",\"places\":").Append(w.Places)
                   // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
-                  .Append(",\"note\":").Append(Str(w.Note));
+                  .Append(",\"note\":").Append(Str(w.Note))
+                  // "View memory" address (own storage only) and the caller frame a local resolved in
+                  .Append(",\"addr\":").Append(Str(w.Addr))
+                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null")
+                  .Append(",\"frameProc\":").Append(Str(w.FrameProc));
             else
                 // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and
                 // a name that resolved but could not be read (error) — all three must clear the row's pending state

@@ -78,11 +78,14 @@ function send() { }
 // page state the extracted functions close over
 let curFile = null, curLine = 0;
 let allSyms = [], bps = [];
+// the thread selection buildSource labels the header from (section 6); null = no selection, as at startup
+let selTid = null, stopTid = null, threadRows = [];
 let lastLibState = null, lastLibError = null;
 const _flCbs = {}, _expandCbs = {};
 
 // ---- the page's own code ---------------------------------------------------------------------------
-const FNS = ['esc', 'reEsc', 'setSrcLocation', 'clearSrc', 'buildSource', 'renderBpDots', 'onMessage'];
+const FNS = ['esc', 'reEsc', 'setSrcLocation', 'clearSrc', 'buildSource', 'renderBpDots', 'onMessage',
+             'viewingOtherThread', 'threadName', 'threadRowFor'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
@@ -237,6 +240,34 @@ console.log('\n5) buildSource is the ONE writer of the listing and of curFile/cu
         !!markup && !!idleConst && markup[1] === idleConst[1],
         markup && idleConst ? JSON.stringify(markup[1]) + ' vs ' + JSON.stringify(idleConst[1])
                             : 'markup span or constant not found');
+}
+
+console.log('\n6) after a thread switch the header names the thread the source belongs to (0955b29f)');
+// The host sends the SELECTED thread's source after a switch and adds no tid to the message, so the page
+// says which thread it is, from the two tids it already holds. The label is the page's own threadName.
+{
+  const empty = () => { const c = $('src').children[0]; return c ? c.textContent : ''; };
+  function at(sel, stop, rows) { selTid = sel; stopTid = stop; threadRows = rows || []; }
+
+  at(100, 100); hostSource('withSource');
+  check('the stopped thread selected: the header carries no thread label', !/\(Thread |\(tid /.test(headerText()), headerText());
+  at(null, 100); hostSource('withSource');
+  check('no selection (unscoped): no thread label either', !/\(Thread |\(tid /.test(headerText()), headerText());
+
+  at(200, 100, [{ tid: 200, clarionThread: 2 }]); hostSource('withSource');
+  check('another thread selected: the header ends with its name, in the threads list\'s words',
+        /\(Thread 2\)<\/span>$/.test(headerText()), headerText());
+  check('...after the location, which is still written', headerText().indexOf(A_FILE) >= 0 && headerText().indexOf(A_FILE) < headerText().indexOf('(Thread 2)'));
+  at(200, 100, []); hostSource('withSource');
+  check('a thread with no Clarion number is named by its tid, as the threads list does', /\(tid 200\)<\/span>$/.test(headerText()), headerText());
+
+  at(200, 100, [{ tid: 200, clarionThread: 2 }]); hostSource('noSource');
+  check("no source on another thread: \"No source for this thread's location\"",
+        /^No source for this thread's location( \(.*\))?\.$/.test(empty()), empty());
+  check('...and the header still names the thread', /\(Thread 2\)<\/span>$/.test(headerText()), headerText());
+  at(100, 100); hostSource('noSource');
+  check('no source on the stopped thread keeps "No source for this stop"',
+        /^No source for this stop( \(.*\))?\.$/.test(empty()), empty());
 }
 
 console.log('');

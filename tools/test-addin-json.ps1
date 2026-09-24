@@ -1205,6 +1205,7 @@ $pageJs = @(
   (Get-Method 'function buildProcs(procs){' $page),
   ((Get-Method "`$('procList').addEventListener('contextmenu'," $page) + ');'),
   ((Get-Method "`$('miBpEntry').onclick=" $page) + ';'),
+  (Get-Method 'function esc(s){' $page),
   (Get-Method 'function editAttrs(v){' $page),
   (Get-Method 'function setEditMeta(cell, meta){' $page),
   (Get-Method 'function stripEditQuotes(s){' $page),

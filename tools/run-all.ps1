@@ -56,6 +56,7 @@ $Suites = @(
   @{ File = 'test-addin-bpremove.ps1' }
   @{ File = 'test-addin-hooks.ps1' }
   @{ File = 'test-addin-json.ps1' }
+  @{ File = 'test-addin-watch-fields.ps1' }
   @{ File = 'test-addin-lifecycle.ps1' }
   @{ File = 'test-addin-attach.ps1' }
   @{ File = 'test-addin-attach.ps1'; Args = @('-SelfTest') }
@@ -89,6 +90,7 @@ $Suites = @(
   @{ File = 'test-pad-setip.js' }
   @{ File = 'test-pad-threads.js' }
   @{ File = 'test-pad-frames.js' }
+  @{ File = 'test-pad-xss.js' }
   @{ File = 'test-pad-watch-persist.js' }
   @{ File = 'test-bp-threaded.ps1'; Live = $true }
   @{ File = 'test-watch-threaded.ps1'; Live = $true }

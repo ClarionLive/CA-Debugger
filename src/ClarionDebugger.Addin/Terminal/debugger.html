@@ -170,6 +170,7 @@
   .vas.active { opacity:.85; color:var(--green); }
   .vas:hover { opacity:1; color:var(--fg); }
   .thread-tag { color:var(--purple); font-size:10px; margin-left:7px; border:1px solid #c586c055; border-radius:3px; padding:0 4px; }
+  .vframe { color:var(--fg-dim); font-size:10px; margin-right:6px; border:1px solid var(--popup-border); border-radius:3px; padding:0 4px; white-space:nowrap; }
   .pin { margin-left:auto; width:20px; display:inline-flex; align-items:center; justify-content:center; color:#6f6f6f; opacity:0; cursor:pointer; }
   .pin svg, .dact svg { display:block; }
   .row:hover .pin { opacity:1; } .pin:hover { color:var(--warn); } .pin.pinned { opacity:1; color:var(--warn); }
@@ -568,7 +569,12 @@
   // here. Relabelling the panels on dispatch left them holding one thread's values under another
   // thread's name whenever a command was dropped, which is the exact failure this ticket exists to stop.
   function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
-  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  // Escapes quotes as well as & < >: esc() output lands inside quoted attributes (data-n, data-name,
+  // data-va), and before 2026-09-24 a `"` in a debuggee symbol name broke out of them (e1dea0d9).
+  // \x22 and \x27 rather than literal quotes: tools/lib-extract.ps1 brace-matches this out with a C#
+  // string scanner, and a bare quote inside a regex literal reads to it as an unterminated string.
+  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                                                .replace(/\x22/g,'&quot;').replace(/\x27/g,'&#39;'); }
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
   let paused=false;
@@ -1284,8 +1290,9 @@
   }
 
   // edit-variable-value: build the inline data-attrs for an editable scalar cell (engine-controlled
-  // hex/number metadata — safe in attributes); empty string for non-editable rows.
-  function editAttrs(v){ return v.va ? (' data-va="'+v.va+'" data-tc="'+v.typeCode+'" data-sz="'+(v.size||0)+'" data-pl="'+(v.places||0)+'"') : ''; }
+  // hex/number metadata); empty string for non-editable rows. Escaped anyway, so the attributes stay
+  // well-formed whatever the reply carries rather than by where the values came from.
+  function editAttrs(v){ return v.va ? (' data-va="'+esc(v.va)+'" data-tc="'+esc(v.typeCode)+'" data-sz="'+esc(v.size||0)+'" data-pl="'+esc(v.places||0)+'"') : ''; }
   // Drop a cell's edit affordance and the instance address it was bound to. The pencil is a SIBLING of the
   // cell (wireEdit inserts it after), so it has to go too — a live pencil over a cleared va is exactly the
   // stale-write hazard this prevents. setEditMeta/wireEdit re-add both when the new reply carries a va.
@@ -1324,6 +1331,8 @@
   //   clearEditMeta  — the write path only          (selectThread: close it, disturb nothing on screen)
   //   clearDtMeta    — the view-as tag only         (dtApply: this cell holds no number to view)
   //   clearValueMeta — both, for a reused cell      (everyone else)
+  // clearValueMeta also drops the reply's frame label (_vframe, see applyValue): it is per-reply state of
+  // the same cell, and a row reused on another thread or at another stop must not keep naming a frame.
   function clearDtMeta(cell){
     if(!cell) return;
     if(cell._vas){ cell._vas.remove(); cell._vas=null; }
@@ -1333,6 +1342,7 @@
     if(!cell) return;
     clearEditMeta(cell);
     clearDtMeta(cell);
+    if(cell._vframe){ cell._vframe.remove(); cell._vframe=null; }
   }
   // A REAL value that carries a caveat — a THREADed name with no instance on the thread being read, or one
   // this thread hasn't used yet. ONE function for it, because the Watch panel and the Variables tree are
@@ -1362,6 +1372,11 @@
     // The trailing `i` is the whole fix for the reported symptom: a reply for one spelling resolves the
     // rows keyed in another, instead of leaving them on "…" for the rest of the session.
     document.querySelectorAll('[data-name="'+cssEsc(name)+'" i]').forEach(row=>{
+      // "View memory" on a Globals/Tables row follows THIS reply's own-storage address (04b9679e): the
+      // engine sends addr only for the thread's own data, never for the shared THREAD template, and the
+      // page never computes one. Only rows renderSymRow built carry _addrFromWatch: a Variables-tree row
+      // with the same name holds the engine's addr from its own row data, which a reply must not touch.
+      if(row._addrFromWatch){ if(found && meta && meta.addr) row.dataset.addr=meta.addr; else delete row.dataset.addr; }
       const v=row.querySelector('.vval'); if(!v) return;
       // 'idle' belongs in this list as much as 'pending': a restored row is answered at the first pause
       // WITHOUT being re-rendered, so leaving the class on would show a real value in the grey-italic
@@ -1395,6 +1410,14 @@
       wireEdit(row);   // add the ✎ edit-value pencil to editable Watch rows
       dtApply(v, name, value);   // DATE/TIME view-as (raw kept in tooltip)
       applyNote(v, meta && meta.note);   // …then the caveat, which must win the tooltip back off dtApply
+      // A local that resolved in a CALLER's frame says which one, so it is not read as the current
+      // procedure's. clearValueMeta above removed the previous reply's label.
+      if(meta && Number.isInteger(meta.frameIdx) && meta.frameIdx>0){
+        const ft=document.createElement('span'); ft.className='vframe';
+        ft.textContent='frame '+meta.frameIdx+(meta.frameProc?' · '+meta.frameProc:'');
+        ft.title='Read from frame '+meta.frameIdx+' of the call stack'+(meta.frameProc?' ('+meta.frameProc+')':'')+', not the current procedure.';
+        v.insertAdjacentElement('beforebegin', ft); v._vframe=ft;
+      }
       const numeric = typeName==='SHORT'||typeName==='BYTE'||typeName==='LONG';
       v.classList.toggle('num',!!numeric);
       const t=row.querySelector('.vtype'); if(t && typeName && !t.textContent) t.textContent=typeName;
@@ -1410,7 +1433,10 @@
       }
     });
   }
-  function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
+  // A CSS string body: quote and backslash escaped, and control characters as hex escapes, since a raw
+  // newline in a selector string makes querySelectorAll THROW (and applyValue with it). U+0000 cannot be
+  // expressed in CSS at all (it parses as U+FFFD), so a name containing one simply matches no row.
+  function cssEsc(s){ return String(s).replace(/["\\]/g,'\\$&').replace(/[\x00-\x1f\x7f]/g,c=>'\\'+c.charCodeAt(0).toString(16)+' '); }
 
   // ---- edit-variable-value: double-click a value cell to write a new value into the live process ----
   let isPaused=false;
@@ -1791,12 +1817,16 @@
     $('tmMem').style.display=_memMenuAddr?'':'none';
   }
   // Rows wireSel does not own (groups, arrays, references, nested members) still get "View memory".
+  // A Globals/Tables row (_addrFromWatch) is wired with no address yet: its address arrives, and goes, with
+  // each watch reply (applyValue), so the handler reads it at the click and offers nothing while it has none.
   function wireMemMenu(row, v){
-    const a=v.addr||v.va; if(!a) return;
-    row.dataset.addr=a;
+    const a=v.addr||v.va;
+    if(a) row.dataset.addr=a;
+    else if(!row._addrFromWatch) return;           // no storage, and no reply will ever give it one
     if(row.classList.contains('selrow')) return;   // wireSel's handler shows the menu for these
-    row.addEventListener('contextmenu',e=>{ e.preventDefault(); e.stopPropagation();
-      memMenuFor(a, false);
+    row.addEventListener('contextmenu',e=>{ const cur=row.dataset.addr; if(!cur) return;
+      e.preventDefault(); e.stopPropagation();
+      memMenuFor(cur, false);
       const tm=$('treeMenu'); tm.style.left=Math.min(e.clientX,window.innerWidth-200)+'px'; tm.style.top=e.clientY+'px'; tm.classList.add('show'); });
   }
 
@@ -1870,6 +1900,7 @@
     const name = s.name;
     const row=document.createElement('div'); row.className='row'+(isGroup?'':' selrow');
     row.style.paddingLeft=(14+depth*16)+'px';
+    row._addrFromWatch=true;   // "View memory" follows the watch reply's addr (applyValue), never base+rva
     row.innerHTML='<span class="ar">'+(isGroup?'▸':'')+'</span>'
       +'<span class="vname'+(depth>1?' field':'')+'">'+esc(name)+'</span>'
       +'<span class="vtype">'+esc(s.typeName||(s.size!=null?'size '+s.size:''))+'</span>';
@@ -1881,6 +1912,11 @@
       row.innerHTML+='<span class="veq">=</span>'+watchWaitingHtml()+'<span class="pin">'+STAR+'</span>';
       row.querySelector('.pin').onclick=e=>{ e.stopPropagation(); e.currentTarget.classList.add('pinned'); addWatch(name); };
       wireSel(row);
+    } else {
+      // A header is watched by name too, for its address alone: it has no value cell, so applyValue sets
+      // its addr and returns. `globals` carries only rva/module, and a THREADed record's address is per thread.
+      row.dataset.name=name;
+      wireMemMenu(row, {});
     }
     tree.appendChild(row);
 
@@ -1894,7 +1930,8 @@
     }
     return { el: row, setVisible(b){
       row.style.display=b?'':'none';
-      if(!isGroup){ syncRowWatch(name, b); return; }
+      syncRowWatch(name, b);
+      if(!isGroup) return;
       if(b){ kids.forEach(k=>k.setVisible(kidOpen)); }
       else { kids.forEach(k=>k.setVisible(false)); kidOpen=false; row.querySelector('.ar').textContent='▸'; }
     } };
@@ -1961,8 +1998,8 @@
       box.appendChild(e); return;
     }
     threadRows.forEach(t=>{
-      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols and esc() does not
-      // escape quotes, so interpolating them (especially into the title attribute) would be an injection sink.
+      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols, and building with DOM
+      // APIs keeps them out of HTML parsing entirely rather than relying on esc() for every attribute.
       const r=document.createElement('div');
       r.className='throw'+(t.tid===selTid?' sel':'')+(t.tid===stopTid?' stopped':'');
       const mark=document.createElement('span'); mark.className='thmark'; mark.textContent=(t.tid===selTid?'●':'○');
@@ -2124,6 +2161,7 @@
   function invalidateThreadScopedState(gen){
     values.clear();                                                                     // (5)
     document.querySelectorAll('[data-name]').forEach(row=>{
+      if(row._addrFromWatch) delete row.dataset.addr;   // another thread's instance, until the new reply
       const v=row.querySelector('.vval'); if(!v) return;
       // Rows that HAD an answer on the old thread are expecting a fresh one; rows still on "…" (a
       // collapsed tree row nobody is watching) are not, and must not be swept later as unanswered.
@@ -2475,7 +2513,7 @@
           // withheld the path to avoid, and would open an arbitrary one of the candidate files — the
           // plausible wrong answer this whole contract exists to stop. Declining is the honest action.
           // Title set as a PROPERTY, never interpolated into innerHTML: b.module comes from the debuggee's
-          // TSWD info and is untrusted, and esc() does not escape quotes.
+          // TSWD info and is untrusted.
           lk.classList.add('ambig');
           // SAME behaviour for both, DIFFERENT sentence. Claiming "more than one file claims it" when the
           // host merely sent something unreadable would state a fact about the user's program that we do
@@ -2495,7 +2533,7 @@
       }
       // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
       // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
-      // be an injection sink, since esc() doesn't escape quotes. Absent before symbols load: the row then
+      // make its safety depend on esc() at every site. Absent before symbols load: the row then
       // stays exactly as it was, rather than showing "unknown".
       const own=bpOwner(b.module, b.line);
       if(own){
@@ -2589,8 +2627,8 @@
     el.innerHTML='';
     const frag=document.createDocumentFragment();
     // Build rows with DOM APIs (textContent + .title), never innerHTML — name/module come from the
-    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE (esc() doesn't escape quotes,
-    // so interpolating them into an HTML attribute would be an injection sink).
+    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE, and DOM APIs keep them out
+    // of HTML parsing altogether.
     listed.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
       // The host's id for this row is what the right-click "Break on entry" sends back; the host looks up
@@ -2712,13 +2750,18 @@
   // a file the user was no longer stopped in.
   function buildSource(file, proc, startLine, lines, current){
     setSrcLocation(file, proc, current);
+    // After a thread switch the host sends the SELECTED thread's source (0955b29f) and says nothing about
+    // which thread that is, so the header says it here: the page knows both tids. Here and not in
+    // setSrcLocation, whose other caller (the 'paused' arm) runs before this stop's tids are adopted.
+    const otherThread=viewingOtherThread();
+    if(otherThread) $('srchdrText').innerHTML+=' <span class="srcthread">('+esc(threadName(threadRowFor(selTid), selTid))+')</span>';
     const src=$('src'); src.innerHTML='';
     if(!lines || !lines.length){
       // No listing => no file to act on. Everything keyed off curFile (run-to-cursor, the source
       // right-click, the breakpoint dots) reads null and does nothing, rather than acting on the last stop.
       curFile=null; curLine=0;
       const none=document.createElement('div'); none.className='empty';
-      none.textContent='No source for this stop'+(file?' ('+file+')':'')+'.';
+      none.textContent=(otherThread ? "No source for this thread's location" : 'No source for this stop')+(file?' ('+file+')':'')+'.';
       src.appendChild(none);
       return;
     }
@@ -2729,8 +2772,14 @@
     if(names.length){ try{ re=new RegExp('(?<![A-Za-z0-9_])('+names.map(reEsc).join('|')+')(?![A-Za-z0-9_:])','g'); }catch(e){ re=null; } }
     lines.forEach((txt,i)=>{ const ln=startLine+i; const d=document.createElement('div');
       d.className='sline'+(ln===current?' cur':''); d.dataset.line=ln;
-      let body=esc(txt);
-      if(re) body=body.replace(re,'<span class="srcid id" data-name="$1">$1</span>');
+      // Match on the RAW line and escape each piece as it is emitted. Running the regex over esc(txt)
+      // matched inside entities (a symbol named LT split `&lt;`) and wrote the match into data-name unescaped.
+      let body='';
+      if(re){ let last=0, mm; re.lastIndex=0;
+        while((mm=re.exec(txt))){ body+=esc(txt.slice(last,mm.index))
+            +'<span class="srcid id" data-name="'+esc(mm[1])+'">'+esc(mm[1])+'</span>'; last=re.lastIndex; }
+        body+=esc(txt.slice(last));
+      } else body=esc(txt);
       d.innerHTML='<span class="gut">'+ln+'</span><span>'+body+'</span>'; src.appendChild(d); });
     src.querySelectorAll('.srcid').forEach(attachTip);
     renderBpDots();
@@ -2805,9 +2854,18 @@
   function renderTA(q){
     const m=allSyms.filter(s=>s.name.toLowerCase().includes(q.toLowerCase())).slice(0,8);
     if(!q||!m.length){ ta.classList.remove('show'); return; }
-    ta.innerHTML=m.map(s=>'<div class="ta-item" data-n="'+esc(s.name)+'"><span class="tn">'+esc(s.name)+'</span><span class="tt">'+esc(s.type||'')+'</span></div>').join('');
+    // DOM APIs, not innerHTML: s.name comes from the debuggee's debug info, and the click handler reads it
+    // back from dataset, so it has to arrive there byte for byte rather than via HTML attribute parsing.
+    ta.innerHTML='';
+    m.forEach(s=>{
+      const it=document.createElement('div'); it.className='ta-item'; it.dataset.n=s.name;
+      const tn=document.createElement('span'); tn.className='tn'; tn.textContent=s.name;
+      const tt=document.createElement('span'); tt.className='tt'; tt.textContent=s.type||'';
+      it.appendChild(tn); it.appendChild(tt);
+      it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); };
+      ta.appendChild(it);
+    });
     ta.classList.add('show');
-    ta.querySelectorAll('.ta-item').forEach(it=>it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); });
   }
   inp.addEventListener('input',()=>renderTA(inp.value));
   inp.addEventListener('keydown',e=>{ if(e.key==='Enter'&&inp.value.trim()){ addWatch(inp.value.trim()); inp.value=''; ta.classList.remove('show'); } if(e.key==='Escape') ta.classList.remove('show'); });
@@ -2856,7 +2914,7 @@
       case 'mem': onMem(m); break;   // not tid-gated: memory is the process's, not a thread's
       case 'moduledata': if(tidAccepted(m)) buildModuleData(m.module, m.items||[]); break;
       case 'expanded': { if(!tidAccepted(m)) break; const cb=_expandCbs[m.reqId]; if(cb){ delete _expandCbs[m.reqId]; cb(m.items||[]); } break; }
-      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note}); break;
+      case 'watch': if(tidAccepted(m)) applyValue(m.name, m.found, m.value, m.typeName, m.threaded, {va:m.va, typeCode:m.typeCode, size:m.size, places:m.places, outOfScope:m.outOfScope, error:m.error, note:m.note, addr:m.addr, frameIdx:m.frameIdx, frameProc:m.frameProc}); break;
       case 'varset': onVarSet(m); break;
       case 'setip': onSetIp(m); break;
       case 'bplist': buildBps(m.bps||[]); break;
