@@ -1068,6 +1068,7 @@ using System.IO;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using ClarionDebugger.Wire;
 $readerBody
 $pageMsgsBody
 namespace ClarionDebugger.Terminal {
@@ -1663,7 +1664,9 @@ Check 'mem: the host, the engine and the page share one cap' `
    -and [int]$pageCap.Groups[1].Value -eq [ClarionDebugger.Terminal.MemRequest]::MaxLen) `
   "engine=$($engineCap.Groups[1].Value) host=$([ClarionDebugger.Terminal.MemRequest]::MaxLen) page=$($pageCap.Groups[1].Value)"
 
-# RequestMem is the service-side gate, run for real over a recording SendCommand.
+# RequestMem is the service-side gate, run for real over a recording SendCommand. It and MemRequest.Parse
+# share WireRules (70860d6b D2); the regex RequestMem had before let "0x10<newline>" through, since .NET's
+# $ matches before a trailing newline - a second command on the engine's stdin. That case is first below.
 $memProbeSrc = @"
 using System;
 using System.Globalization;
@@ -1672,16 +1675,18 @@ public class MemRequestProbe {
   public string Sent;
   private bool SendCommand(string c) { Sent = c; return true; }
   $(Get-Method 'public bool RequestMem(int reqId, string addrHex, int len)')
+  $(Get-Method 'internal static class WireRules' $reader)
 }
 "@
 Add-Type -TypeDefinition $memProbeSrc -Language CSharp | Out-Null
 $mp = New-Object MemRequestProbe
 Check 'RequestMem sends mem ADDR LEN reqId (the reqId TRAILS, where the engine reads it)' `
   ($mp.RequestMem(4, '0x401000', 256) -and $mp.Sent -ceq 'mem 0x401000 256 4') (ShowVal $mp.Sent)
-foreach ($c in @(@(4, '0x40 1000', 16), @(4, '401000', 16), @(4, '0x1234567890', 16), @(4, '0x10', 0), @(4, '0x10', 4097), @(-1, '0x10', 16), @(4, $null, 16))) {
+foreach ($c in @(@(4, "0x10`n", 16), @(4, '0x40 1000', 16), @(4, '401000', 16), @(4, '0x1234567890', 16), @(4, '0x10', 0), @(4, '0x10', 4097), @(-1, '0x10', 16), @(4, $null, 16))) {
   # PowerShell stores $null into a C# string field as '', so "sent nothing" is IsNullOrEmpty, not -eq $null.
   $mp.Sent = $null
-  Check "RequestMem refuses reqId=$($c[0]) addr=$(ShowVal $c[1]) len=$($c[2]) and sends nothing" `
+  Check "RequestMem refuses reqId=$($c[0]) addr=$((ShowVal $c[1]) -replace "`n", '
+') len=$($c[2]) and sends nothing" `
     ((-not $mp.RequestMem($c[0], $c[1], $c[2])) -and [string]::IsNullOrEmpty($mp.Sent)) (ShowVal $mp.Sent)
 }
 Check 'RequestMem carries its security reasoning (read-only, capped, paused-only, validated)' `
@@ -2413,7 +2418,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 393
+$EXPECTED_CHECKS = 394
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

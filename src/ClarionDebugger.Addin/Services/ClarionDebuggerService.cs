@@ -5,7 +5,8 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using ClarionDebugger.Terminal;
+using ClarionDebugger.Terminal;   // AttachableProcess (PageMessages.cs), the one Terminal type left here
+using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Services
 {
@@ -903,15 +904,15 @@ namespace ClarionDebugger.Services
         ///    the `va` the edit grants key on (EditGrants), so nothing read here can turn into a write.
         ///    PAUSED-ONLY: the pad forwards it only while Paused, and the engine refuses it while running.
         ///    CAPPED at 4096 bytes a request, here and again in the engine. VALIDATED here as
-        ///    ^0x[0-9A-Fa-f]{1,8}$ plus an integer len, so nothing can add a word or a second command to the
-        ///    engine's space-separated stdin.
+        ///    ^0x[0-9A-Fa-f]{1,8}$ (WireRules.IsHexAddr, the same check MemRequest.Parse makes) plus an integer
+        ///    len, so nothing can add a word or a second command to the engine's space-separated stdin.
         ///  * RESIDUAL RISK: an XSS in debugger.html could read the paused debuggee's memory, 4 KB at a time.
         ///    That is tracked on the XSS audit ticket e1dea0d9, not closed here.
         /// </para></summary>
         public bool RequestMem(int reqId, string addrHex, int len)
         {
-            if (reqId < 0 || len < 1 || len > 4096) return false;
-            if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]{1,8}$")) return false;
+            if (reqId < 0 || len < 1 || len > WireRules.MemMaxLen) return false;
+            if (!WireRules.IsHexAddr(addrHex)) return false;
             return SendCommand("mem " + addrHex + " " + len.ToString(CultureInfo.InvariantCulture) + " "
                                + reqId.ToString(CultureInfo.InvariantCulture));
         }
