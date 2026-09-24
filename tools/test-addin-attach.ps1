@@ -215,7 +215,7 @@ $xList = (Get-Method 'private void CmdListProcs()') -replace '^private', 'public
   -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow(' -replace 'ClarionDebuggerService\.ListProcesses\(', 'FakeLists.ListProcesses('
 $xProcsJson = Public (Get-Method 'private static string ProcsJson(List<AttachableProcess> procs, string error)')
 $xAttach = Get-Method 'public void CmdAttach(string data)'
-$xAttachSession = (Get-Method 'private void AttachSession(AttachableProcess target)') -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
+$xAttachSession = ((Get-Method 'private void AttachSession(AttachableProcess target)'), (Get-Method 'private void LoadStaticSymbols(string exe)'), (Get-Method 'private string SessionCounts(List<string> solutionDlls)') -join "`n") -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
 $xCtx = Get-Method 'private sealed class AttachContext'
 $xExited = Public (Get-ArrowHandler 'private void OnSvcExited(int code)')
 $xDetached = Public (Get-ArrowHandler 'private void OnSvcDetached(DebugDetach d)')
