@@ -58,7 +58,7 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-addin-hooks.ps1` | offline | the reflection hooks into ClarionAssistant, one child process per scenario |
 | `test-addin-json.ps1` | offline | the add-in's JSON reader and writer |
 | `test-addin-attach.ps1` (plain and `-SelfTest`) | offline | attach host side (3f2d747f): only a host-listed pid is attached, Stop sends `detach` (not `quit`) and waits 8 s, the `detached` event resets the pad, a closing pad still warns durably (log, with a %TEMP% fallback, + a dialog that survives a dead UI context) on an unsafe detach, and an attach carries `--expect-start`; `-SelfTest` breaks each guard (31 mutations) and requires red |
-| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images (not yet total-pinned: ticket 6493d226) |
+| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images: the spec grammar, the image-matching rule and the identity predicates (not that a breakpoint fires in both images) |
 | `test-engine-session.ps1` | offline | the shared engine-session lifecycle, and that harnesses use it |
 | `test-engine-tid-members.ps1` (plain and `-SelfTest`) | offline | no thread-id JSON member written by hand; thread ids to users go through TidText |
 | `test-engine-hover-sites.ps1` (plain and `-SelfTest`) | offline | PausedWait resets the hover tracker as an unconditional top-level statement before its command loop (position, not text) |
