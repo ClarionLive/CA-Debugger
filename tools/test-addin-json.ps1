@@ -1575,13 +1575,26 @@ Check 'and a write that never left keeps its grant, so a retry goes through' ($p
 # UI lambdas with live-editor side effects), so they are pinned by POSITION: the clear must come before the
 # re-reads that re-grant, or the fresh grants are wiped along with the stale ones.
 $onPaused = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $web)
-$iClearP = $onPaused.IndexOf('_editGrants.Clear()'); $iReq = $onPaused.IndexOf('_svc.RequestStack()')
+$iClearP = $onPaused.IndexOf('_editGrants.Clear()'); $iReq = $onPaused.IndexOf('RequestStack();')
+$iSelP = $onPaused.IndexOf('_editGrants.SelectThread(p.Tid);')
 Check 'a new stop clears the grants BEFORE requesting the replies that re-grant' `
   (($iClearP -ge 0) -and ($iReq -gt $iClearP)) "clear=$iClearP request=$iReq"
+# 49538b78 wave 5 run 2: the stopped thread is the selected one, set after the clear and before the stack
+# request, so the stop's own stack reply is the one that may offer frames.
+Check 'a new stop selects the stopped thread after the clear and before the stack request' `
+  (($iSelP -gt $iClearP) -and ($iReq -gt $iSelP)) "clear=$iClearP select=$iSelP request=$iReq"
+$tsel = Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcThreadSelected(')
+Check 'an accepted thread switch clears, then selects the new thread' `
+  ($tsel -match 'if \(ok\) \{ _editGrants\.Clear\(\); _editGrants\.SelectThread\(tid\); \}') ''
+$webCode = Get-CSharpCodeOnly $web
+Check 'every stack request is counted: the page''s and the stop''s go through RequestStack, the only _svc.RequestStack call' `
+  (($webCode -match 'case "stack": if \(_svc\.State == DebugSessionState\.Paused\) RequestStack\(\); break;') -and `
+   ([regex]::Matches($webCode, '_svc\.RequestStack\(').Count -eq 1) -and `
+   ((Get-CSharpCodeOnly (Get-Method 'private void RequestStack()' $web)) -match 'if \(_svc\.RequestStack\(\)\) _editGrants\.StackRequested\(\);')) ''
 Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
 Check 'the frame-locals and expand replies grant their rows only for a request the host verified' `
-  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'if \(_editGrants\.FrameLocalsVerified\(reqId\)\) _editGrants\.GrantRows\(itemsJson, tid\)') -and `
+  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'if \(_editGrants\.FrameLocalsVerified\(reqId, tid\)\) _editGrants\.GrantRows\(itemsJson, tid\)') -and `
    ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExpanded(')) -match 'if \(_editGrants\.ExpandVerified\(reqId\)\) _editGrants\.GrantRows\(itemsJson, null\)')) ''
 
 # ---- one write per address at a time (codex security, pipeline run 2) ---------------------------------
@@ -1662,9 +1675,12 @@ Check 'OnStack offers every frame it posts, with that reply''s thread' `
   ("tid=$($flProbe._editGrants.Tid) " + ($flProbe._editGrants.Frames -join ','))
 $flData = if ($pageOut) { DataOf $pageOut.framelocals } else { '' }
 Check 'the page asks for the caller frame''s locals exactly as the host posted it' ($flData -ceq '1|0x402000|0x19FF40') $flData
-function Offer { param($grants, $offers, $tid)
+# A stack reply for $tid carrying $offers, answering a stack request the host sent (and counted) just before.
+# It offers only when $tid is the selected thread: callers select it. Returns whether it offered.
+function Offer { param($grants, $offers, $tid, [switch] $Unrequested)
   $kv = New-Object 'System.Collections.Generic.List[System.Collections.Generic.KeyValuePair[string,string]]'
   foreach ($o in $offers) { $p = $o -split '\|'; $kv.Add((New-Object 'System.Collections.Generic.KeyValuePair[string,string]' $p[0], $p[1])) }
+  if (-not $Unrequested) { $grants.StackRequested() }
   $grants.OfferFrames($tid, $kv)
 }
 # One local of CALLER at its real EBP (0x19FF40 - 8), and the same local at forged EBPs. Each check below
@@ -1675,7 +1691,8 @@ function EditAt  { param($va) '{"va":"' + $va + '","typeCode":"0x03","size":4,"p
 $realLocal = LocalAt '0x19FF38'; $editReal = EditAt '0x19FF38'
 
 $fp = New-Object ClarionDebugger.Terminal.BridgePad
-Offer $fp._editGrants $flProbe._editGrants.Frames 4812
+$fp._editGrants.SelectThread(4812)   # the stop's thread (OnPaused)
+[void](Offer $fp._editGrants $flProbe._editGrants.Frames 4812)
 $fp.FrameLocals($flData)
 Check 'an offered frame''s locals are requested' `
   (($fp._svc.FrameLocalsSent.Count -eq 1) -and ($fp._svc.FrameLocalsSent[0] -ceq '1|0x402000|0x19FF40')) ($fp._svc.FrameLocalsSent -join ',')
@@ -1724,7 +1741,7 @@ Check 'and a reply under its reqId creates no edit grant' ($fp._svc.Sets.Count -
 # CURRENT, as for edits and expands. A thread's NEXT stack reply replaces its offer: a frame that has left
 # the stack cannot be asked about.
 $fp._svc.FrameLocalsSent.Clear()
-Offer $fp._editGrants @('0x401000|0x19FF00') 4812
+[void](Offer $fp._editGrants @('0x401000|0x19FF00') 4812)
 $fp.FrameLocals('9|0x402000|0x19FF40')
 Check 'a thread''s next stack reply replaces its offer: a frame no longer on it is refused' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
 # A request forwarded before a thread switch is answered AFTER it: the clear retired that request, so its
@@ -1742,13 +1759,72 @@ $fp.FrameLocals('11|0x401000|0x19FF00')
 Check 'after the switch a frame from the previous offer is refused' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
 # EditGrants on its own: Clear retires offers and forwarded requests, whoever calls it (a stop, a resume).
 $gf = New-Object ClarionDebugger.Terminal.EditGrants
-Offer $gf @('0x401000|0x19FF00') 7
+$gf.SelectThread(7)
+[void](Offer $gf @('0x401000|0x19FF00') 7)
 $gf.FrameLocalsForwarded(1)
 $gf.Clear()
 Check 'EditGrants.Clear retires the offered frames and the forwarded framelocals' `
-  ((-not $gf.IsFrameOffered('0x401000', '0x19FF00')) -and (-not $gf.FrameLocalsVerified('1'))) ''
-Offer $gf @('0x40100A|0x19FF0B') 7
+  ((-not $gf.IsFrameOffered('0x401000', '0x19FF00')) -and (-not $gf.FrameLocalsVerified('1', 7))) ''
+[void](Offer $gf @('0x40100A|0x19FF0B') 7)
 Check 'CONTROL: an offered frame matches without regard to hex case' ($gf.IsFrameOffered('0x40100a', '0x19ff0b')) ''
+
+# ---- an offer belongs to the SELECTED thread and the current epoch (49538b78 wave 5 run 2) --------------
+# framelocals names no thread. Every stack reply used to offer its frames whatever thread it was for, so a
+# late reply for thread A, landing after a switch to B, re-offered A's (va, ebp): the page's request for it
+# was forwarded, and the engine rendered A's locals at A's EBP in a reply stamped and granted for B - stale
+# cross-thread stack addresses, editable. Every path real: OnSvcThreadSelected, EditGrants, FrameLocals,
+# OnSvcFrameLocals and EditVar.
+$rp = New-Object ClarionDebugger.Terminal.BridgePad
+$rp._editGrants.SelectThread(4812)                     # stopped on A (4812)
+$rp._editGrants.StackRequested()                       # the page asks for A's stack...
+$rp.OnSvcThreadSelected(9001, $true, $null)            # ...switches to B (9001) before it is answered...
+$rp._editGrants.StackRequested()                       # ...and asks for B's
+$aLate = Offer $rp._editGrants @('0x402000|0x19FF40') 4812 -Unrequested   # A's reply lands after the switch
+Check 'a stale stack reply for the OLD thread, after the switch, offers nothing' (-not $aLate) ''
+$rp.FrameLocals('20|0x402000|0x19FF40')
+Check 'and a framelocals for its frame is refused, not forwarded' `
+  (($rp._svc.FrameLocalsSent.Count -eq 0) -and ($rp.Posts.Count -ge 1) -and ($rp.Posts[$rp.Posts.Count - 1] -cmatch '"reqId":"20","items":\[\],"refused":true')) `
+  (($rp._svc.FrameLocalsSent -join ',') + ' / ' + ($rp.Posts -join ' / '))
+$rp.OnSvcFrameLocals('20', (LocalAt '0x19FF30'), 9001)
+$rp.EditVar('{"va":"0x19FF30","typeCode":"0x03","size":4,"places":0,"tid":9001,"value":"9"}')
+Check 'and a reply under its reqId, stamped for the new thread, creates no edit grant' ($rp._svc.Sets.Count -eq 0) ($rp._svc.Sets -join ' ; ')
+# CONTROL, the genuine flow on the new thread: B's own reply to the counted request offers, is forwarded,
+# and its verified reply's locals are editable.
+$bOwn = Offer $rp._editGrants @('0x405000|0x2AFF40') 9001 -Unrequested
+$rp.FrameLocals('21|0x405000|0x2AFF40')
+$rp.OnSvcFrameLocals('21', (LocalAt '0x2AFF38'), 9001)
+$rp.EditVar('{"va":"0x2AFF38","typeCode":"0x03","size":4,"places":0,"tid":9001,"value":"9"}')
+Check 'CONTROL: the new thread''s own stack reply offers, and its frame''s locals are forwarded and editable' `
+  ($bOwn -and ($rp._svc.FrameLocalsSent.Count -eq 1) -and ($rp._svc.Sets.Count -eq 1)) `
+  ("offered=$bOwn sent=" + ($rp._svc.FrameLocalsSent -join ',') + " sets=" + ($rp._svc.Sets -join ' ; '))
+
+# THE EPOCH: a stack reply to a request sent before a clear (a stop, a resume, a switch) offers nothing, even
+# for the same thread; only a request counted after the clear can be answered with an offer.
+$ep = New-Object ClarionDebugger.Terminal.EditGrants
+$ep.SelectThread(4812)
+$ep.StackRequested()
+$ep.Clear()
+$preBump = Offer $ep @('0x402000|0x19FF40') 4812 -Unrequested
+Check 'a stack reply requested before the epoch bump offers nothing, even for the selected thread' `
+  ((-not $preBump) -and (-not $ep.IsFrameOffered('0x402000', '0x19FF40'))) "offered=$preBump"
+$postBump = Offer $ep @('0x402000|0x19FF40') 4812
+Check 'CONTROL: a reply to a request counted after the bump offers' ($postBump -and $ep.IsFrameOffered('0x402000', '0x19FF40')) "offered=$postBump"
+# Each reply spends ONE request: a second reply to one request is not an answer to anything.
+$second = Offer $ep @('0x403000|0x19FF80') 4812 -Unrequested
+Check 'a second stack reply to one request offers nothing' ((-not $second) -and $ep.IsFrameOffered('0x402000', '0x19FF40')) "offered=$second"
+
+# THE REPLY'S THREAD: a forwarded request grants only a reply stamped for the thread of the offer it was
+# checked against; any other thread's stamp grants nothing.
+$tp = New-Object ClarionDebugger.Terminal.BridgePad
+$tp._editGrants.SelectThread(4812)
+[void](Offer $tp._editGrants @('0x402000|0x19FF40') 4812)
+$tp.FrameLocals('30|0x402000|0x19FF40')
+$tp.OnSvcFrameLocals('30', (LocalAt '0x19FF2C'), 9001)
+$tp.EditVar('{"va":"0x19FF2C","typeCode":"0x03","size":4,"places":0,"tid":9001,"value":"9"}')
+$tp.EditVar((EditAt '0x19FF2C'))
+Check 'a framelocals reply stamped for another thread than its offer''s creates no edit grant' `
+  (($tp._svc.FrameLocalsSent.Count -eq 1) -and ($tp._svc.Sets.Count -eq 0)) (($tp._svc.FrameLocalsSent -join ',') + ' / ' + ($tp._svc.Sets -join ' ; '))
+
 Check 'the bridge routes framelocals through the checked FrameLocals, not straight to the service' `
   (((Get-CSharpCodeOnly $web) -match 'case "framelocals": FrameLocals\(data\); break;') -and `
    ([regex]::Matches((Get-CSharpCodeOnly $web), '_svc\.RequestFrameLocals\(').Count -eq 1)) ''
@@ -2592,7 +2668,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 422
+$EXPECTED_CHECKS = 433
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

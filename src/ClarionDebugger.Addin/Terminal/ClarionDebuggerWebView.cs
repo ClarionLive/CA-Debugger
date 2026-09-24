@@ -339,7 +339,7 @@ namespace ClarionDebugger.Terminal
             // Only a reply to a framelocals the host VERIFIED and forwarded may grant (49538b78 wave 5): its rows
             // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
             // posted for display, and grants nothing.
-            if (_editGrants.FrameLocalsVerified(reqId)) _editGrants.GrantRows(itemsJson, tid);
+            if (_editGrants.FrameLocalsVerified(reqId, tid)) _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
@@ -359,7 +359,8 @@ namespace ClarionDebugger.Terminal
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
             // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
-            if (ok) _editGrants.Clear();
+            // Only the new thread's stack replies may offer frames from here on.
+            if (ok) { _editGrants.Clear(); _editGrants.SelectThread(tid); }
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
@@ -703,7 +704,7 @@ namespace ClarionDebugger.Terminal
                         break;
                     // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
                     case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
-                    case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
+                    case "stack": if (_svc.State == DebugSessionState.Paused) RequestStack(); break;
                     case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;
                     case "rewatch":
@@ -1519,8 +1520,10 @@ namespace ClarionDebugger.Terminal
             UI(() =>
             {
                 // A new stop: nothing on screen is current any more, and the replies requested below re-grant
-                // the rows that are.
+                // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
+                // the selected one.
                 _editGrants.Clear();
+                _editGrants.SelectThread(p.Tid);
 
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
@@ -1561,7 +1564,7 @@ namespace ClarionDebugger.Terminal
                 // listing instead of leaving it on screen.
                 NoteStopSource(p);
                 SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
-                _svc.RequestStack();          // per-frame locals now load lazily from the Call Stack (frame 0 auto)
+                RequestStack();               // per-frame locals now load lazily from the Call Stack (frame 0 auto)
                 _svc.RequestModuleData();
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
                 // so this also tells the page which thread the panels it is about to receive belong to.
@@ -1720,6 +1723,13 @@ namespace ClarionDebugger.Terminal
                 + Str(why) + "}");
         }
 
+        /// <summary>Ask the engine for the selected thread's stack, and count the request in the current epoch:
+        /// only a reply to a counted request may offer frames (EditGrants.OfferFrames).</summary>
+        private void RequestStack()
+        {
+            if (_svc.RequestStack()) _editGrants.StackRequested();
+        }
+
         private void OnStack(List<DebugStackFrame> frames, uint? tid)
         {
             var sb = new StringBuilder("{\"type\":\"stack\",\"frames\":[");
@@ -1737,7 +1747,8 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"uncertain\":").Append(f.Uncertain ? "true" : "false").Append('}');
             }
             sb.Append(']').Append(TidJson(tid)).Append('}');
-            // The frames just offered are the only ones whose locals the page may ask for (see FrameLocals).
+            // The frames just offered are the only ones whose locals the page may ask for (see FrameLocals), and
+            // only when this reply is for the selected thread and answers a request of this epoch (OfferFrames).
             var offered = new List<KeyValuePair<string, string>>();
             foreach (var f in frames) offered.Add(new KeyValuePair<string, string>(f.Va, f.Ebp));
             _editGrants.OfferFrames(tid, offered);

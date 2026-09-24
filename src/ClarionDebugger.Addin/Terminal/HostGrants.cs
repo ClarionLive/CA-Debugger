@@ -179,11 +179,25 @@ namespace ClarionDebugger.Terminal
         // FRAME LOCALS are issued the same way (49538b78 wave 5, codex adversary). A framelocals request names
         // a procedure VA and an EBP, and the engine renders that procedure's locals at EBP + each local's
         // offset - edit metadata included. Forwarded unchecked, a real VA with a made-up EBP minted grants at
-        // addresses the page chose. So the (va, ebp) of every frame a stack reply offered is recorded, per
-        // thread, and a framelocals reply grants only when the host forwarded that request for one of them.
-        private readonly Dictionary<string, HashSet<string>> _framesByTid =
-            new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
-        private readonly HashSet<string> _frameLocalsInFlight = new HashSet<string>(StringComparer.Ordinal);
+        // addresses the page chose. So the (va, ebp) of every frame a stack reply offered is recorded, and a
+        // framelocals reply grants only when the host forwarded that request for one of them.
+        //
+        // BOUND TO THE SELECTED THREAD AND THE EPOCH (49538b78 wave 5 run 2, codex security + adversary). The
+        // request names no thread, and every stack reply used to offer its frames whatever thread it was for:
+        // a late reply for thread A, landing after a switch to B, re-offered A's (va, ebp); the page's request
+        // for it was forwarded, and the engine rendered A's locals at A's EBP in a reply stamped and granted
+        // for B. Now a stack reply offers only when it answers a stack request made in the CURRENT epoch (a
+        // clear - stop, resume, thread switch - starts a new one) and is for the thread the host last
+        // selected. A forwarded request remembers the thread of the offer it was checked against, and its
+        // reply grants only when stamped for that thread; the clear that ends an epoch retires every
+        // forwarded request, so a reply after it grants nothing (the epoch is not stored with the request as
+        // well: with the clear in front of it, that comparison could never fail).
+        private readonly HashSet<string> _framesOffered = new HashSet<string>(StringComparer.Ordinal);
+        private uint? _framesTid;          // the thread the current offer came from
+        private uint? _selectedTid;        // the thread the host last selected (a stop's thread, or a switch)
+        private int _stacksRequested;      // stack requests sent in this epoch (since the last clear), unanswered
+        private readonly Dictionary<string, uint?> _frameLocalsInFlight =
+            new Dictionary<string, uint?>(StringComparer.Ordinal);
 
         /// <summary>The number of EDIT tuples granted.</summary>
         public int Count { get { return _keys.Count; } }
@@ -191,13 +205,22 @@ namespace ClarionDebugger.Terminal
         /// <summary>The number of EXPANDABLE tuples issued.</summary>
         public int ExpandableCount { get { return _expandable.Count; } }
 
-        /// <summary>Retire everything: edit grants, expandable rows, offered frames and forwarded requests. One
-        /// clear, so no clear site can retire one family and leave another live.</summary>
+        /// <summary>Retire everything: edit grants, expandable rows, offered frames and forwarded requests, and
+        /// start a new EPOCH, so a stack reply to a request sent before now offers nothing. One clear, so no
+        /// clear site can retire one family and leave another live.</summary>
         public void Clear()
         {
             _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); _writesInFlight.Clear();
-            _framesByTid.Clear(); _frameLocalsInFlight.Clear();
+            _framesOffered.Clear(); _framesTid = null; _frameLocalsInFlight.Clear();
+            _stacksRequested = 0;
         }
+
+        /// <summary>The host selected <paramref name="tid"/>: a stop's thread, or a thread switch the engine
+        /// accepted. Only a stack reply for this thread offers frames.</summary>
+        public void SelectThread(uint? tid) { _selectedTid = tid; }
+
+        /// <summary>The host sent a stack request in the current epoch.</summary>
+        public void StackRequested() { _stacksRequested++; }
 
         // A grant is CONSUMED by the write it authorises (afbc68c7, codex security gate): otherwise one grant
         // let the same write be replayed for the rest of the pause. The consumed key waits here, by address,
@@ -271,36 +294,53 @@ namespace ClarionDebugger.Terminal
         /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
         public bool ExpandVerified(string reqId) { return reqId != null && _expandsInFlight.Remove(reqId); }
 
-        /// <summary>A stack reply for <paramref name="tid"/> offered exactly these frames, each a (va, ebp) pair:
-        /// they replace whatever that thread's previous stack reply offered. A frame with no VA, or with the
-        /// engine's "unknown" EBP (0x0), offers nothing: the page never asks about one.</summary>
-        public void OfferFrames(uint? tid, IEnumerable<KeyValuePair<string, string>> vaEbp)
+        /// <summary>A stack reply for <paramref name="tid"/> carried exactly these frames, each a (va, ebp) pair.
+        /// They are OFFERED, replacing the previous offer, only when <paramref name="tid"/> is the selected
+        /// thread and the reply answers a stack request made in this epoch (each such reply spends one); otherwise
+        /// nothing is offered and false is returned. A frame with no VA, or with the engine's "unknown" EBP
+        /// (0x0), offers nothing: the page never asks about one.</summary>
+        public bool OfferFrames(uint? tid, IEnumerable<KeyValuePair<string, string>> vaEbp)
         {
-            var set = new HashSet<string>(StringComparer.Ordinal);
+            // Another thread's reply answers none of this epoch's requests, which are all for the selected
+            // thread, so it spends none: that would leave the selected thread's own reply unanswered.
+            if (!WireRules.TidIsKnown(tid) || tid != _selectedTid) return false;
+            if (_stacksRequested <= 0) return false;   // requested before the last clear, or never
+            _stacksRequested--;
+            _framesOffered.Clear();
+            _framesTid = tid;
             if (vaEbp != null)
                 foreach (var f in vaEbp)
                     if (!string.IsNullOrEmpty(f.Key) && !string.IsNullOrEmpty(f.Value) && f.Value != "0x0")
-                        set.Add(FrameKey(f.Key, f.Value));
-            _framesByTid[TidKey(tid)] = set;
+                        _framesOffered.Add(FrameKey(f.Key, f.Value));
+            return true;
         }
 
-        /// <summary>True when this exact (va, ebp) is a frame a stack reply offered since the last clear. The
-        /// request names no thread, and a clear follows every thread switch, so any thread's offer counts.</summary>
+        /// <summary>True when this exact (va, ebp) is a frame the current offer holds. The offer is the selected
+        /// thread's: only its replies offer, and the clear in front of every selection change empties it.</summary>
         public bool IsFrameOffered(string va, string ebp)
         {
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(ebp)) return false;
-            string key = FrameKey(va, ebp);
-            foreach (var set in _framesByTid.Values)
-                if (set.Contains(key)) return true;
-            return false;
+            return _framesOffered.Contains(FrameKey(va, ebp));
         }
 
-        /// <summary>The host forwarded framelocals <paramref name="reqId"/> to the engine after verifying it.</summary>
-        public void FrameLocalsForwarded(int reqId) { _frameLocalsInFlight.Add(reqId.ToString(CultureInfo.InvariantCulture)); }
+        /// <summary>The host forwarded framelocals <paramref name="reqId"/> to the engine after checking it
+        /// against the current offer: the offer's thread goes with it.</summary>
+        public void FrameLocalsForwarded(int reqId)
+        {
+            _frameLocalsInFlight[reqId.ToString(CultureInfo.InvariantCulture)] = _framesTid;
+        }
 
-        /// <summary>Consume the record that <paramref name="reqId"/> was a verified, forwarded framelocals. False
-        /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
-        public bool FrameLocalsVerified(string reqId) { return reqId != null && _frameLocalsInFlight.Remove(reqId); }
+        /// <summary>Consume the record that <paramref name="reqId"/> was a verified, forwarded framelocals, and
+        /// say whether its reply may grant: only when it is stamped with the thread whose offer the request was
+        /// checked against. False for a reply the host never asked for, one from before the last clear, or one
+        /// for another thread; its rows grant nothing.</summary>
+        public bool FrameLocalsVerified(string reqId, uint? replyTid)
+        {
+            uint? sentTid;
+            if (reqId == null || !_frameLocalsInFlight.TryGetValue(reqId, out sentTid)) return false;
+            _frameLocalsInFlight.Remove(reqId);
+            return WireRules.TidIsKnown(replyTid) && replyTid == sentTid;
+        }
 
         private static string FrameKey(string va, string ebp)
         {
