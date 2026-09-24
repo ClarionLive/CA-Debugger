@@ -24,6 +24,10 @@
 #   3. BY SHAPE. A literal that is nothing but member punctuation (,\" {\" \":) is a member being ASSEMBLED
 #      around a variable - which is how TidMember itself works, so it is how a copy of it would look. Allowed
 #      only inside TidMember (2) and RegsJson (1, register names out of a fixed list).
+#   4. BY PREDICATE (6ac29815 #1). The absent-tid TEST - present and not 0 - is stated once, in
+#      WireRules.TidIsKnown (Terminal\JsonMessageReader.cs). A nullable's .Value (or GetValueOrDefault())
+#      compared with 0 anywhere else in CODE is an inline copy of it; there were four, in the WebView, the
+#      service, EditGrants and DisassemblyView, and one had already drifted to a different spelling.
 #
 # ASCII ONLY, for Windows PowerShell 5.1 (see memory: ps51-emdash-parse-trap).
 
@@ -156,7 +160,34 @@ function Invoke-Scan([hashtable] $Sources, [string[]] $Names) {
     }
   }
   $r.ByName = $byName.ToArray(); $r.Booleans = $bools.ToArray(); $r.ByValue = $byValue.ToArray(); $r.Nameless = $nameless.ToArray()
+  $p = Invoke-PredicateScan $Sources
+  $r | Add-Member -NotePropertyName Predicate -NotePropertyValue $p.Inline
+  $r | Add-Member -NotePropertyName PredicateDefs -NotePropertyValue $p.Definitions
+  $r | Add-Member -NotePropertyName PredicateInWriter -NotePropertyValue $p.InsideWriter
   return $r
+}
+
+# Rule 4. Comments are stripped first (Get-CSharpCodeOnly), so a comment explaining the rule is not a copy.
+$predicateRel = 'Terminal\JsonMessageReader.cs'
+$predicateSig = 'internal static bool TidIsKnown(uint? tid)'
+$predicateRx = '\.(Value|GetValueOrDefault\(\))\s*(?:[!=]=|>)\s*0u?\b'
+function Invoke-PredicateScan([hashtable] $Sources) {
+  $inline = New-Object System.Collections.ArrayList
+  $defs = 0; $inWriter = 0
+  foreach ($f in ($Sources.Keys | Sort-Object)) {
+    $code = Get-CSharpCodeOnly $Sources[$f]
+    $defs += [regex]::Matches($code, 'static\s+bool\s+TidIsKnown\s*\(').Count
+    $bs = -1; $be = -1
+    if ($f -eq $predicateRel) {
+      $body = Get-CSharpBlock $predicateSig $code
+      if ($null -ne $body) { $bs = $code.IndexOf($body, [StringComparison]::Ordinal); $be = $bs + $body.Length }
+    }
+    foreach ($m in [regex]::Matches($code, $predicateRx)) {
+      if ($bs -ge 0 -and $m.Index -ge $bs -and $m.Index -lt $be) { $inWriter++; continue }
+      [void] $inline.Add([pscustomobject] @{ File = $f; Line = (Get-LineOf $code $m.Index); Text = $m.Value })
+    }
+  }
+  [pscustomobject] @{ Inline = $inline.ToArray(); Definitions = $defs; InsideWriter = $inWriter }
 }
 
 function Read-Sources {
@@ -177,6 +208,7 @@ function Get-Violations($Scan) {
   if (@($Scan.Booleans).Count -ne 2) { $v += 'booleans' }
   if (@($Scan.ByValue).Count -gt 0) { $v += 'value' }
   if (@($Scan.Nameless | Where-Object { -not $_.Allowed }).Count -gt 0) { $v += 'shape' }
+  if (@($Scan.Predicate).Count -gt 0 -or $Scan.PredicateDefs -ne 1 -or $Scan.PredicateInWriter -ne 1) { $v += 'predicate' }
   return ,$v
 }
 
@@ -219,6 +251,28 @@ if ($SelfTest) {
       Check "caught by the $($p[1]) rule: $($p[0])" ($v -contains $p[1]) "rules broken: $(if ($v.Count) { $v -join ',' } else { 'none' })"
     }
   }
+  Invoke-CheckSection 'an inline copy of the absent-tid test is caught in any host file (6ac29815 #1)' {
+    $plants = @(
+      @('a fifth inline copy, in the service', 'Services\ClarionDebuggerService.cs',
+        'if (!WireRules.TidIsKnown(rowTid)) continue;', 'if (!rowTid.HasValue || rowTid.Value == 0) continue;'),
+      @('the view''s old TidOf, in its != spelling', 'Disassembly\DisassemblyView.cs',
+        'WireRules.TidIsKnown(t) ? t.Value : 0u', '(t != null && t.Value != 0) ? t.Value : 0u'),
+      @('a second definition of the test', $ruleRel,
+        'private static string TidMember(string name, uint? tid)', 'private static bool TidIsKnown(uint? t) { return WireRules.TidIsKnown(t); } private static string TidMember(string name, uint? tid)')
+    )
+    foreach ($p in $plants) {
+      if (-not $sources.ContainsKey($p[1])) { Check "plant applies: $($p[0])" $false "no $($p[1])"; continue }
+      $n = ([regex]::Matches($sources[$p[1]], [regex]::Escape($p[2]))).Count
+      if ($n -ne 1) { Check "plant applies: $($p[0])" $false "anchor found $n time(s) in $($p[1])"; continue }
+      $mut = Copy-Sources
+      $mut[$p[1]] = $sources[$p[1]].Replace($p[2], $p[3])
+      $v = Get-Violations (Invoke-Scan $mut $names)
+      Check "caught by the predicate rule: $($p[0])" ($v -contains 'predicate') "rules broken: $(if ($v.Count) { $v -join ',' } else { 'none' })"
+    }
+    $mut = Copy-Sources
+    $mut[$ruleRel] = $ruleSrc + "`n// never write if (!tid.HasValue || tid.Value == 0) by hand`n"
+    Check 'CONTROL: the test inside a comment is not reported' ((Get-Violations (Invoke-Scan $mut $names)).Count -eq 0) ''
+  }
   Invoke-CheckSection 'the scope reaches every host file, and not the comments' {
     $other = @($sources.Keys | Where-Object { $_ -ne $ruleRel -and $_ -like 'Services\*' } | Select-Object -First 1)
     if ($other.Count -eq 0) { Check 'a second host file exists to plant into' $false 'no Services\*.cs found' }
@@ -232,7 +286,7 @@ if ($SelfTest) {
     $mut[$ruleRel] = $ruleSrc + "`n// never write .Append(`",\`"tid\`":`").Append(t.Tid) by hand`n"
     Check 'CONTROL: the idiom inside a comment is not reported' ((Get-Violations (Invoke-Scan $mut $names)).Count -eq 0) ''
   }
-  Assert-CheckTotal 8
+  Assert-CheckTotal 12
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -277,7 +331,15 @@ Invoke-CheckSection 'the scan of every host source file' {
     (Show $ok { "$($_.File):$($_.Line) $($_.Text)" })
 }
 
-Assert-CheckTotal 11
+Invoke-CheckSection 'the absent-tid test is stated once (6ac29815 #1)' {
+  Check 'the host defines TidIsKnown exactly once (WireRules, Terminal\JsonMessageReader.cs)' ($scan.PredicateDefs -eq 1) "$($scan.PredicateDefs) definition(s)"
+  Check 'no host file compares a nullable''s Value with 0 outside it (an inline copy of the test)' (@($scan.Predicate).Count -eq 0) `
+    (Show $scan.Predicate { "$($_.File):$($_.Line) $($_.Text)" })
+  # CONTROL: the scan still FINDS the test where it is allowed, or the check above passes because it sees nothing.
+  Check 'CONTROL: and the scan finds the one allowed statement of it, inside TidIsKnown' ($scan.PredicateInWriter -eq 1) "$($scan.PredicateInWriter) inside"
+}
+
+Assert-CheckTotal 14
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

@@ -67,6 +67,9 @@ $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 # GetStr reads through the bridge's JsonMessageReader since 079ff431, so every probe that compiles it needs the
 # real reader beside it.
 $readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
+# The host's absent-tid rule lives in WireRules.TidIsKnown since 6ac29815, so every probe compiling a tid
+# reader or writer (TidMember, TidOf) carries the real class beside it.
+$wireRules = (Get-Method 'internal static class WireRules' $readerEarly) -replace 'internal static class', 'public static class'
 
 # Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
 # lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
@@ -87,6 +90,7 @@ $methods = @(
   (Get-Method 'private static uint? GetUIntOrNull(string json, string key)'),
   (Get-Method 'private static string TidJson(uint? tid)' $web),
   (Get-Method 'private static string TidMember(string name, uint? tid)' $web),
+  $wireRules,
   # the declared names the writer checks against (c299aced), lifted rather than retyped
   $tidNameDecls
 ) -join "`n"
@@ -593,6 +597,7 @@ $followParts = @(
   Get-Method 'private static string Str(string s)' $web
   Get-Method 'private static string TidJson(uint? tid)' $web
   Get-Method 'private static string TidMember(string name, uint? tid)' $web
+  $wireRules
   $tidNameDecls
 ) -join "`n"
 $followTypes = (Get-Method 'public sealed class DebugStackFrame') + "`n" + (Get-Method 'public sealed class DebugPause')
@@ -2113,6 +2118,7 @@ public static class DisasmTagProbe {
   public const string FwdTag = "winf";
   public const string BwdTag = "winb";
 $(($fmtTag, $parseTag, $tidMatch, $tidOf -join "`n") -replace 'private static', 'public static')
+$wireRules
 }
 "@
 Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
@@ -2364,6 +2370,7 @@ $($tidNameDecls)
   private void UI(Action a) { a(); }
 $(Get-Method 'private static string TidJson(uint? tid)' $web)
 $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+$wireRules
 $onSvcHoverSrc
   // the service's `case "hover"` hop, making the calls pinned below
   public void Deliver(string engineJson) {

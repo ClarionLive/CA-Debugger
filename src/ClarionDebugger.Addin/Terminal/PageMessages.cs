@@ -628,7 +628,7 @@ namespace ClarionDebugger.Terminal
         // 0 is not a thread (the absent-tid rule), so it scopes nothing.
         private static string TidKey(uint? tid)
         {
-            return tid.HasValue && tid.Value != 0 ? tid.Value.ToString(CultureInfo.InvariantCulture) : Unscoped;
+            return WireRules.TidIsKnown(tid) ? tid.Value.ToString(CultureInfo.InvariantCulture) : Unscoped;
         }
 
         // Hex is compared without regard to case: both come from the engine's own formatting, but the page

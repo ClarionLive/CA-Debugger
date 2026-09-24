@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
+using ClarionDebugger.Wire;
 using ICSharpCode.SharpDevelop.Project;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -1657,7 +1658,7 @@ namespace ClarionDebugger.Terminal
         {
             System.Diagnostics.Debug.Assert(Array.IndexOf(TidValuedMemberNames, name) >= 0,
                 "TidMember was handed an undeclared name; add it to TidValuedMemberNames");
-            if (!tid.HasValue || tid.Value == 0) return string.Empty;
+            if (!WireRules.TidIsKnown(tid)) return string.Empty;
             return ",\"" + name + "\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
 

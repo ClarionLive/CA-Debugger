@@ -316,6 +316,15 @@ namespace ClarionDebugger.Wire
     /// (ClarionDebuggerService).</summary>
     internal static class WireRules
     {
+        /// <summary>The absent-tid rule, stated once for the host (6ac29815 #1; the engine's is TidIsKnown in
+        /// DebugEngine.cs): a thread id is a real one only when it is present and not 0. Absent means the sender
+        /// did not say, and 0 is a sentinel that must never be read as a thread. Every host reader and writer of
+        /// a <c>uint?</c> tid asks here; tools/test-host-tid-members.ps1 fails an inline copy of the test.</summary>
+        internal static bool TidIsKnown(uint? tid)
+        {
+            return tid.HasValue && tid.Value != 0;
+        }
+
         /// <summary>The most bytes one Memory-panel read may ask for: the engine's cap (MemMaxLen in
         /// DebugEngine.cs), and the page's MEM_MAX.</summary>
         internal const int MemMaxLen = 4096;

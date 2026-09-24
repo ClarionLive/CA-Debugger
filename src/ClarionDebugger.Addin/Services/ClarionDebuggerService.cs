@@ -1482,7 +1482,7 @@ namespace ClarionDebugger.Services
                     // read the number with `?? 0u`, so a row whose tid did not parse became thread 0 - the
                     // sentinel the absent-tid rule exists to keep off the wire (c299aced).
                     uint? rowTid = GetUIntOrNull(t, "tid");
-                    if (!rowTid.HasValue || rowTid.Value == 0) continue;
+                    if (!WireRules.TidIsKnown(rowTid)) continue;
                     list.Threads.Add(new DebugThread
                     {
                         Tid = rowTid.Value,
