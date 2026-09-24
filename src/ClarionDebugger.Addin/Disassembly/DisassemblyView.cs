@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
+using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Disassembly
 {
@@ -467,7 +468,7 @@ namespace ClarionDebugger.Disassembly
         /// This is here as a FUNCTION rather than a sentence because the sentence was already written, in
         /// the comment on OnThreads, and four authors eroded it without anyone deciding to. A claim a grep
         /// can check outlives a claim a reader has to honour.</summary>
-        private static uint TidOf(uint? t) { return (t == null || t.Value == 0) ? 0u : t.Value; }
+        private static uint TidOf(uint? t) { return WireRules.TidIsKnown(t) ? t.Value : 0u; }
 
         private bool TidMatchesView(uint? tid) { return TidMatches(tid, _selTid); }
 

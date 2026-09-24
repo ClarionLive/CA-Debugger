@@ -47,11 +47,12 @@ namespace ClarionDbg.Cli
 
 
         /// <summary>framelocals reqId va ebp — the locals of ONE call-stack frame (the Call-Stack-driven
-        /// Variables model). Reads the frame's symbol locals at the supplied EBP. A ROUTINE has no frame of
-        /// its own (it runs on its procedure's frame via DO), so a routine frame surfaces its enclosing
-        /// procedure's locals read at the same EBP; a METHOD's enclosing procedure is a SEPARATE stack frame,
-        /// so methods show only their own. Emits a `framelocals` event keyed by reqId. Read-only.</summary>
-		private void HandleFrameLocalsCommand(string[] parts, uint tid)
+        /// Variables model). Reads the frame's symbol locals at the supplied EBP. A ROUTINE frame surfaces its
+        /// owning procedure's locals, read at THAT procedure's frame base (see <see cref="TryRoutineOwner"/>);
+        /// a METHOD's enclosing procedure is a SEPARATE stack frame, so methods show only their own. Emits a
+        /// `framelocals` event keyed by reqId. Read-only. <paramref name="ctx"/> is the selected thread's: a
+        /// routine stopped at its entry is only ever frame 0, and its owner is found from ESP.</summary>
+		private void HandleFrameLocalsCommand(string[] parts, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx)
 		{
 			if (parts.Length < 4) { EmitError("framelocals expects: framelocals reqId va ebp"); return; }
 			string reqId = parts[1];
@@ -63,10 +64,11 @@ namespace ClarionDbg.Cli
 			if (m != null && m.Dbg != null && ebp != 0 && m.Dbg.ResolveSymbolVerified(va - m.LoadBase, out sym))
 			{
 				uint entry = sym.EntryRva;
+				bool readable = true;
 				if (sym.Kind == SymbolKind.Routine)
 				{
-					uint pe = EnclosingProcedureEntry(m, va - m.LoadBase);
-					if (pe != 0) entry = pe;
+					uint entrySlot = haveCtx && va == ctx.Eip && ebp == ctx.Ebp ? ctx.Esp : 0;
+					readable = TryRoutineOwner(m, va, ebp, entrySlot, out entry, out ebp);
 				}
 
 				uint queryRva = va - m.LoadBase;
@@ -74,54 +76,201 @@ namespace ClarionDbg.Cli
 				bool inGap = sym.Kind == SymbolKind.Method
 							 && nextEntry != 0
 							 && queryRva >= nextEntry;
-				rows = LocalRowsFor(m, entry, ebp, inGap);
+				if (readable) rows = LocalRowsFor(m, entry, ebp, inGap);
 			}
 			EmitThreadEvent(tid, "{\"event\":\"framelocals\",\"reqId\":" + Json.Str(reqId)
 				+ ",\"items\":[" + string.Join(",", rows) + "]}");
 		}
 
-        /// <summary>The entry RVA of the procedure that lexically contains <paramref name="rva"/> — the
-        /// greatest Procedure-kind symbol entry at or below it. Used to map a routine frame to its host
-        /// procedure (they share a stack frame). 0 when none precedes.</summary>
-        private static uint EnclosingProcedureEntry(LoadedModule m, uint rva)
+        private const int ROUTINE_NEST_MAX = 64;   // DO-nesting walked before giving up on a routine's owner
+
+        /// <summary>
+        /// The procedure (or method) a ROUTINE frame belongs to, and THAT frame's base — where the routine's
+        /// visible locals live. Measured on clbrws 2026-09-24 (a stop in GRP4.Series1_TakeNextValue): a routine
+        /// sets up its OWN EBP frame (REFRESHWINDOW 0x48BFC18 -> INITIALIZEWINDOW 0x48BFC2C -> BROWSEJOBSGRAPHS
+        /// 0x48BFEB8), so the procedure's locals read at the routine's EBP were garbage. The owner was ALSO
+        /// wrong: it was taken as the greatest procedure entry at or below the routine, but routines compile
+        /// BELOW their procedure, so that named the PREVIOUS procedure in the image, whose template locals
+        /// share names (LocalRequest, WindowOpened) at other offsets.
+        ///
+        /// The chain answers both. A routine is only ever DOne from its owner's body or from another of its
+        /// routines, so follow saved-EBP links while each return lands in a routine; the first return that
+        /// lands in anything else is the owner, and that link's saved EBP is the owner's frame base. Every hop
+        /// must stay in the routine's own image and +0x1C compiland, and climb. False when the walk cannot
+        /// finish: no locals rather than another procedure's.
+        ///
+        /// A routine stopped at its ENTRY (a breakpoint on the ROUTINE label, or a Step Into that lands there)
+        /// has not run its push ebp/mov ebp,esp: <paramref name="routineEbp"/> is still its DOer's, and the
+        /// return into the DOer is at ESP, which the caller passes as <paramref name="entrySlot"/> (0 when it
+        /// does not know it, which fails). Walked from EBP instead, the first return would be the OWNER's into
+        /// ITS caller, a procedure of the same compiland whose locals would then be shown under the routine.
+        /// </summary>
+        private bool TryRoutineOwner(LoadedModule m, uint routineVa, uint routineEbp, uint entrySlot,
+                                     out uint ownerEntry, out uint ownerEbp)
         {
-            uint best = 0;
-            if (m == null || m.Dbg == null || m.Dbg.Symbols == null) return 0;
-            foreach (var s in m.Dbg.Symbols)   // sorted ascending by EntryRva
-                if (s.Kind == SymbolKind.Procedure && s.EntryRva <= rva && s.EntryRva >= best)
-                    best = s.EntryRva;
-            return best;
+            ownerEntry = 0; ownerEbp = 0;
+            int line, mi; uint recRva;
+            if (m == null || m.Dbg == null || !m.Dbg.ResolveAddr(routineVa - m.LoadBase, out line, out mi, out recRva))
+                return false;
+            bool atEntry = AtProcEntry(m, routineVa);
+            if (atEntry && entrySlot == 0) return false;
+            return FindRoutineOwner(routineEbp, mi, atEntry ? entrySlot : 0, ReadStackU32, ret => ReturnSite(m, ret),
+                                    out ownerEntry, out ownerEbp);
         }
 
-        /// <summary>Resolve a named local of the CURRENTLY-EXECUTING frame (frame 0): map the paused EIP to its
-        /// procedure (a ROUTINE shares its host procedure's frame, so route to the enclosing proc), then find a
-        /// local of that name (case-insensitive) in the proc's <see cref="LocalSym"/> set and compute its live
-        /// slot at [EBP + FrameOff]. Locals always live on the stack — never .cwtls — so the read is a direct,
-        /// synchronous one (no THR$GetInstance func-eval). Returns false when not paused-with-context, the owning
-        /// image has no debug info, or this frame declares no local of that name. Used by `watch NAME` so a
-        /// procedure-local shadows a same-named global while we are paused inside its frame.</summary>
-        private bool TryResolveLocalInCurrentFrame(ref Native.CONTEXT_X86 ctx, bool haveCtx, string name,
-            out uint slotVa, out LocalSym found, out LoadedModule owner)
+        /// <summary>What a return address lands in, for <see cref="FindRoutineOwner"/>: null outside
+        /// <paramref name="m"/> or in code with no verified symbol.</summary>
+        internal sealed class ReturnSiteInfo
+        {
+            public SymbolKind Kind;
+            public uint EntryRva;
+            public int ModuleIdx;   // the +0x1C compiland index
+        }
+
+        private ReturnSiteInfo ReturnSite(LoadedModule m, uint ret)
+        {
+            if (ModuleAt(ret) != m) return null;
+            uint rva = ret - m.LoadBase;
+            ProcSymbol rs; int line, mi; uint recRva;
+            if (!m.Dbg.ResolveSymbolVerified(rva, out rs) || !m.Dbg.ResolveAddr(rva, out line, out mi, out recRva))
+                return null;
+            return new ReturnSiteInfo { Kind = rs.Kind, EntryRva = rs.EntryRva, ModuleIdx = mi };
+        }
+
+        /// <summary>The walk behind <see cref="TryRoutineOwner"/>, static and fed through delegates so
+        /// `protocolcheck` can drive it over synthetic stacks. <paramref name="entrySlot"/> is non-zero only for
+        /// a routine at its entry: the slot holding its return into the DOer, whose frame base is still
+        /// <paramref name="routineEbp"/>.</summary>
+        internal static bool FindRoutineOwner(uint routineEbp, int routineMi, uint entrySlot, Func<uint, uint?> read32,
+                                              Func<uint, ReturnSiteInfo> siteOf, out uint ownerEntry, out uint ownerEbp)
+        {
+            ownerEntry = 0; ownerEbp = 0;
+            if (entrySlot != 0)
+            {
+                uint? ret0 = read32(entrySlot);
+                if (ret0 == null) return false;
+                var doer = siteOf(ret0.Value);
+                if (doer == null || doer.ModuleIdx != routineMi) return false;
+                if (doer.Kind != SymbolKind.Routine)
+                {
+                    ownerEntry = doer.EntryRva; ownerEbp = routineEbp;
+                    return true;
+                }
+                // DOne from another routine, whose own frame IS routineEbp: its owner is found from there.
+            }
+            uint cur = routineEbp;
+            for (int n = 0; n < ROUTINE_NEST_MAX; n++)
+            {
+                uint? ret = read32(cur + 4), saved = read32(cur);
+                if (ret == null || saved == null) return false;
+                var site = siteOf(ret.Value);
+                if (site == null || site.ModuleIdx != routineMi) return false;
+                if (saved.Value <= cur) return false;
+                if (site.Kind != SymbolKind.Routine)
+                {
+                    ownerEntry = site.EntryRva; ownerEbp = saved.Value;
+                    return true;
+                }
+                cur = saved.Value;
+            }
+            return false;
+        }
+
+        /// <summary>Resolve a named local against the stack in Clarion's scope order (bae5f46d; the order is the
+        /// Owner's, 2026-09-24, see <see cref="WatchFrameFor"/>): the stopped frame's locals, then global and
+        /// module data, then caller frames innermost first. <paramref name="globalExists"/> says whether a
+        /// global has the name; the caller has already looked, and answers the name itself when this returns
+        /// false. Frames are walked once per stop (<see cref="FramesForStop"/>), and only a frame with a
+        /// procedure and a frame base can answer. A ROUTINE runs in its own EBP frame, but its visible locals
+        /// are its owning procedure's, read at the OWNER's frame base (<see cref="TryRoutineOwner"/>). The slot
+        /// is [that base + FrameOff]. Locals always live on the stack — never .cwtls — so the read is a direct,
+        /// synchronous one (no THR$GetInstance func-eval).
+        ///
+        /// So a watch on a local of the procedure that CALLED the ABC method we are stopped in reads that
+        /// caller's value, unless a global has the name, and <paramref name="frameIdx"/>/<paramref
+        /// name="frameProc"/> say which frame it came from. A recursive or re-entered procedure answers from its
+        /// innermost activation, the one closest to the stop. Returns false when not paused-with-context, when
+        /// the global comes first, or when no frame on the stack declares the name. Used by `watch NAME` and a
+        /// watch path's head.</summary>
+        private bool TryResolveLocalOnStack(ref Native.CONTEXT_X86 ctx, bool haveCtx, IntPtr hThread, string name,
+            bool globalExists,
+            out uint slotVa, out LocalSym found, out LoadedModule owner, out int frameIdx, out string frameProc)
+        {
+            slotVa = 0; found = null; owner = null; frameIdx = -1; frameProc = null;
+            if (!haveCtx) return false;
+            var frames = FramesForStop(ref ctx, hThread);
+            uint va = 0; LocalSym l = null; LoadedModule m = null;
+            // Only frame 0 can be a routine at its entry, whose DOer's return is at ESP.
+            uint esp = ctx.Esp;
+            int i = WatchFrameFor(frames, f => TryLocalInFrame(f, ReferenceEquals(f, frames[0]) ? esp : 0, name,
+                                                              out va, out l, out m),
+                                  globalExists);
+            if (i < 0) return false;
+            slotVa = va; found = l; owner = m; frameIdx = ReportedFrameIdx(frames, i); frameProc = frames[i].Proc;
+            return true;
+        }
+
+        /// <summary>The frame a watched name resolves in, or -1 for "not a local here" (the global, when
+        /// <paramref name="globalExists"/>, or nothing at all). Clarion's own scope order, the Owner's decision of
+        /// 2026-09-24: (1) the stopped frame's locals, which after a Pause means the first Clarion frame
+        /// (<see cref="FirstClarionFrameIndex"/>); (2) global and module data; (3) only then caller frames,
+        /// innermost first. Code in the stopped procedure reads the GLOBAL when it has no local of that name, so
+        /// a caller's same-named local must not shadow it: that showed the caller's value, and an edit wrote into
+        /// the caller's stack. Static so `protocolcheck` can drive the order without a stack.</summary>
+        internal static int WatchFrameFor(IList<StackFrame> frames, Func<StackFrame, bool> declares, bool globalExists)
+        {
+            int first = FirstClarionFrameIndex(frames);
+            if (first < 0) return -1;
+            if (declares(frames[first])) return first;
+            if (globalExists) return -1;
+            return InnermostFrameWith(frames, declares, first + 1);
+        }
+
+        /// <summary>The frameIdx a watch reports for a name resolved in frame <paramref name="i"/>: 0 for the
+        /// first Clarion frame, which IS the stopped frame (the Owner's rule, 2026-09-24: after a Pause, frame 0
+        /// is the OS call and the stopped Clarion frame sits at 1 or more), so the reply carries no frame fields
+        /// and the page shows it as the current procedure; its own stack index for any caller beyond it.</summary>
+        internal static int ReportedFrameIdx(IList<StackFrame> frames, int i)
+        {
+            return i == FirstClarionFrameIndex(frames) ? 0 : i;
+        }
+
+        /// <summary>The index of the innermost frame from <paramref name="start"/> up that can answer
+        /// (<see cref="CanReadLocals"/>) and for which <paramref name="answers"/> is true; -1 when none. A frame
+        /// that cannot read locals is never asked. Static so `protocolcheck` can drive the choice without a
+        /// stack.</summary>
+        internal static int InnermostFrameWith(IList<StackFrame> frames, Func<StackFrame, bool> answers, int start = 0)
+        {
+            for (int i = start; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                if (!CanReadLocals(f)) continue;
+                if (answers(f)) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>A named local of ONE stack frame, read at that frame's own base. <paramref name="entrySlot"/>
+        /// is ESP for frame 0 and 0 for every other frame (see <see cref="TryRoutineOwner"/>).</summary>
+        private bool TryLocalInFrame(StackFrame f, uint entrySlot, string name, out uint slotVa, out LocalSym found,
+                                     out LoadedModule owner)
         {
             slotVa = 0; found = null; owner = null;
-            if (!haveCtx || ctx.Ebp == 0) return false;
-            var m = ModuleAt(ctx.Eip);
+            if (f == null || f.Ebp == 0) return false;
+            var m = ModuleAt(f.Va);
             if (m == null || m.Dbg == null) return false;
             ProcSymbol sym;
-            if (!m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym)) return false;
-            uint entry = sym.EntryRva;
-            if (sym.Kind == SymbolKind.Routine)
-            {
-                uint pe = EnclosingProcedureEntry(m, ctx.Eip - m.LoadBase);
-                if (pe != 0) entry = pe;
-            }
+            if (!m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym)) return false;
+            uint entry = sym.EntryRva, ebp = f.Ebp;
+            if (sym.Kind == SymbolKind.Routine && !TryRoutineOwner(m, f.Va, f.Ebp, entrySlot, out entry, out ebp))
+                return false;
             List<LocalSym> locals;
             if (!m.Dbg.ReadLocals().TryGetValue(entry, out locals) || locals == null) return false;
             foreach (var l in locals)
                 if (string.Equals(l.Name, name, StringComparison.OrdinalIgnoreCase))
                 {
                     found = l; owner = m;
-                    slotVa = (uint)((long)ctx.Ebp + l.FrameOff);
+                    slotVa = (uint)((long)ebp + l.FrameOff);
                     return true;
                 }
             return false;
@@ -165,12 +314,6 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>The single composite value renderer. Three shapes:
-        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
-        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
-        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
-        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
-        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
         /// <summary>The `refKind` every ref:true row carries (contract frozen by the PM, 2026-09-23): "other" when
         /// the referent is unknown or declares no members, else "class" or "aggregate" by
         /// <see cref="LooksLikeClassLayout"/>, the SAME predicate the watch path walker refuses class heads with.
@@ -192,6 +335,12 @@ namespace ClarionDbg.Cli
             return NodeJson(name, type, code, target, size, places, va, null, module, note, editable);
         }
 
+        /// <summary>The single composite value renderer. Three shapes:
+        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
+        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
+        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
+        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
+        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
         /// <remarks>`note` and `editable` are REQUIRED, like the two child builders this delegates to.
         /// They were fenced there first, which left the fence one level ABOVE the thing it was fencing:
         /// THIS is the function that actually writes `editable` into the payload, so a caller that said
@@ -578,14 +727,21 @@ namespace ClarionDbg.Cli
             var rows = new List<string>();
             string module = null;
 
-            if (haveCtx)
+            // Keyed on the first Clarion frame, not on EIP: after a Pause EIP is in win32u under ClaRUN's event
+            // loop, which has no module data of its own (70b58a1a).
+            var f = haveCtx ? FirstClarionFrame(ref ctx, hThread) : null;
+            if (f != null)
             {
-                var m = ModuleAt(ctx.Eip);
+                var m = ModuleAt(f.Va);
                 ProcSymbol sym;
-                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym))
+                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym))
                 {
                     int mi = sym.ModuleIdx;
-                    module = m.Dbg.ModuleNameForIdx(mi);
+                    // The LABEL comes from the +0x1C line table (FrameAt's moduleIdx), the index space
+                    // ModuleNameForIdx takes. sym.ModuleIdx is the +0x28 backref's, a different space, so
+                    // naming the module by it could print another compiland's name (52458d89). The filter
+                    // below still uses it: DataSymbol.ModuleIdx is a backref index too.
+                    module = f.Module;
                     var syms = m.Dbg.DataSymbols;
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
@@ -653,7 +809,7 @@ namespace ClarionDbg.Cli
             EmitThreadEvent(tid, "{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
                 + ",\"items\":[" + string.Join(",", rows) + "]}");
             if (!EmitJson)
-                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {tid}");
+                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {TidText(tid)}");
         }
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by

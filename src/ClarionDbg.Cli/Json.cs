@@ -70,8 +70,9 @@ namespace ClarionDbg.Cli
 
         /// <summary>Decoded symbol definitions (Phase 3): name + kind + entry RVA + owning module, and for a
         /// procedure or method with a known extent, its last source line (<c>endLine</c>, 6fa242ae). An
-        /// unknown extent OMITS the member rather than writing 0; see <see cref="ProcExtents"/> for what
-        /// unknown means and why routines never carry one.</summary>
+        /// unknown extent OMITS the member rather than writing 0, and a procedure or method says so with
+        /// <c>"extent":"unknown"</c> instead (f1a98318); see <see cref="ProcExtents"/> for what unknown means
+        /// and why routines carry neither.</summary>
         public static string Symbols(List<ProcSymbol> syms, TswdDebugInfo dbg)
         {
             var extents = new ProcExtents(dbg);   // indexed from dbg's WHOLE table, not the (maybe filtered) syms
@@ -91,6 +92,9 @@ namespace ClarionDbg.Cli
                   .Append(",\"line\":").Append(line);
                 int endLine = extents.EndLine(s);
                 if (endLine > 0) sb.Append(",\"endLine\":").Append(endLine);
+                // Said, not just omitted (f1a98318): the host must tell "this engine could not bound it" from an
+                // engine too old to send extents at all. Only a procedure or method has an extent to be unknown.
+                else if (ProcExtents.IsExtentKind(s)) sb.Append(",\"extent\":\"unknown\"");
                 sb.Append(",\"moduleIdx\":").Append(s.ModuleIdx)
                   .Append(",\"module\":").Append(Str(dbg.ModuleNameForIdx(s.ModuleIdx)))
                   .Append('}');
@@ -305,10 +309,14 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
-        public static string Stack(List<StackFrame> frames)
+        /// <summary>The stack reply. <paramref name="reqId"/>, when the request carried one, is echoed as
+        /// "reqId" ahead of the frames; with none, the member is absent.</summary>
+        public static string Stack(List<StackFrame> frames, string reqId = null)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"stack\",\"frames\":[");
+            sb.Append("{\"event\":\"stack\"");
+            if (reqId != null) sb.Append(",\"reqId\":").Append(Str(reqId));
+            sb.Append(",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
             {
                 var f = frames[i];
@@ -423,11 +431,14 @@ namespace ClarionDbg.Cli
         /// local) address the bytes were read from; templateVa is the link-time template address. <paramref
         /// name="editable"/> gates the edit-variable-value metadata (va + places): the host keys "is this cell
         /// editable" purely on the presence of "va", so a non-writable type (ref / group / unknown) emits no va
-        /// and therefore shows no edit pencil instead of erroring on commit. A miss goes through
-        /// <see cref="WatchMiss"/>.</summary>
+        /// and therefore shows no edit pencil instead of erroring on commit. <paramref name="addr"/> ("0x..."),
+        /// when given, is the address of THIS thread's own storage for the name and is what the pad's "View
+        /// memory" opens; null for a value read from the shared THREAD template (Unallocated, Template,
+        /// Straddling), so the memory view never shows the template as the thread's data. It is independent of
+        /// <paramref name="editable"/>. A miss goes through <see cref="WatchMiss"/>.</summary>
         public static string Watch(string name, bool found, uint templateVa, uint instanceVa, bool threaded,
                                    byte typeCode, string typeName, uint size, int places, string value, byte[] bytes, int read, bool editable,
-                                   string note = null)
+                                   string note = null, string addr = null, int frameIdx = -1, string frameProc = null)
         {
             var sb = new StringBuilder();
             sb.Append("{\"event\":\"watch\",\"name\":").Append(Str(name))
@@ -440,6 +451,11 @@ namespace ClarionDbg.Cli
               .Append(",\"value\":").Append(Str(value))   // engine-formatted (shared with the Locals panel)
               .Append(",\"read\":").Append(read);
             if (note != null) sb.Append(",\"note\":").Append(Str(note));
+            if (addr != null) sb.Append(",\"addr\":").Append(Str(addr));
+            // A local read in a CALLER's frame (bae5f46d, contract frozen 2026-09-24): which frame, flat, and only
+            // when it is not frame 0 - a current-frame local or a global carries neither.
+            if (frameIdx > 0)
+                sb.Append(",\"frameIdx\":").Append(frameIdx).Append(",\"frameProc\":").Append(Str(frameProc));
             if (editable)
                 sb.Append(",\"va\":\"0x").Append(instanceVa.ToString("X")).Append('"')
                   .Append(",\"places\":").Append(places);
@@ -510,8 +526,8 @@ namespace ClarionDbg.Cli
         /// "attached":true, so a host that does not read it is unaffected.</summary>
         public static string Loaded(uint pid, uint loadBase, bool attached)
         {
-            string s = Loaded(pid, loadBase);
-            return attached ? s.Substring(0, s.Length - 1) + ",\"attached\":true}" : s;
+            return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\""
+                 + (attached ? ",\"attached\":true" : "") + "}";
         }
 
         /// <summary>The engine let go of the target and it keeps running. drained = debug events that were

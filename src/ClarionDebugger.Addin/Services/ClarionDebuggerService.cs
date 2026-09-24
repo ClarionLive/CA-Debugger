@@ -5,7 +5,8 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using ClarionDebugger.Terminal;
+using ClarionDebugger.Terminal;   // AttachableProcess (PageMessages.cs), the one Terminal type left here
+using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Services
 {
@@ -248,6 +249,9 @@ namespace ClarionDebugger.Services
         public bool OutOfScope;     // a known frame local, but execution is paused outside its procedure
         public string Error;        // resolved by name but unreadable (e.g. a THREADed instance the RTL wouldn't yield)
         public string Note;         // a real but qualified value (e.g. a THREADed variable this thread hasn't used yet)
+        public string Addr;         // this thread's OWN storage (hex) for "View memory"; null for a template read
+        public int? FrameIdx;       // the frame a local head resolved in, when not frame 0; null otherwise
+        public string FrameProc;    // that frame's procedure name (with FrameIdx)
         /// <summary>The thread this value was read on, or null from an engine that doesn't stamp replies.
         /// The pad drops a reply whose Tid isn't the thread it is currently showing.</summary>
         public uint? Tid;
@@ -265,9 +269,14 @@ namespace ClarionDebugger.Services
         /// (a routine is not independently navigable the way a procedure is).</summary>
         public string Kind;
         /// <summary>The procedure's LAST source line when the engine reports one (an <c>endLine</c> member), else
-        /// 0 = unknown. The bundled engine sends it for every procedure since e049e07 (6fa242ae); a position
-        /// lookup on a procedure without one is refused as an engine/host version mismatch.</summary>
+        /// 0 = unknown. The bundled engine sends it for every procedure it can bound since e049e07 (6fa242ae); a
+        /// position lookup on a procedure without one is refused either way.</summary>
         public int EndLine;
+        /// <summary>True when the engine said it could NOT bound this procedure (<c>"extent":"unknown"</c> in
+        /// place of <c>endLine</c>, f1a98318): the debug info gave no end, which a same-build engine does for some
+        /// real procedures. False with no EndLine means the engine sent neither member, so it predates this.
+        /// The two refusals word the cause differently; both still refuse.</summary>
+        public bool ExtentUnknown;
     }
 
     /// <summary>
@@ -313,7 +322,7 @@ namespace ClarionDebugger.Services
         // per-event stamp). The pad uses it to DROP a reply for a thread it is no longer showing: a thread
         // switch leaves the previous thread's replies in flight, and painting one into the new thread's
         // panels would show one thread's values under another thread's name.
-        public event Action<List<DebugStackFrame>, uint?> StackReceived;  // resolved call stack (frames, tid)
+        public event Action<List<DebugStackFrame>, uint?, string> StackReceived;  // resolved call stack (frames, tid, reqId)
         public event Action<string, string, uint?> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
@@ -828,8 +837,13 @@ namespace ClarionDebugger.Services
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
 
-        /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
-        public bool RequestStack() { return SendCommand("stack"); }
+        /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived. A
+        /// <paramref name="reqId"/> (digits only) is sent as <c>reqid=N</c> and echoed on the reply, so the
+        /// host can tell which request a reply answers (49538b78 wave 5 run 3).</summary>
+        public bool RequestStack(string reqId = null)
+        {
+            return SendCommand(reqId == null ? "stack" : "stack reqid=" + reqId);
+        }
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
@@ -898,15 +912,15 @@ namespace ClarionDebugger.Services
         ///    the `va` the edit grants key on (EditGrants), so nothing read here can turn into a write.
         ///    PAUSED-ONLY: the pad forwards it only while Paused, and the engine refuses it while running.
         ///    CAPPED at 4096 bytes a request, here and again in the engine. VALIDATED here as
-        ///    ^0x[0-9A-Fa-f]{1,8}$ plus an integer len, so nothing can add a word or a second command to the
-        ///    engine's space-separated stdin.
+        ///    ^0x[0-9A-Fa-f]{1,8}$ (WireRules.IsHexAddr, the same check MemRequest.Parse makes) plus an integer
+        ///    len, so nothing can add a word or a second command to the engine's space-separated stdin.
         ///  * RESIDUAL RISK: an XSS in debugger.html could read the paused debuggee's memory, 4 KB at a time.
         ///    That is tracked on the XSS audit ticket e1dea0d9, not closed here.
         /// </para></summary>
         public bool RequestMem(int reqId, string addrHex, int len)
         {
-            if (reqId < 0 || len < 1 || len > 4096) return false;
-            if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]{1,8}$")) return false;
+            if (reqId < 0 || len < 1 || len > WireRules.MemMaxLen) return false;
+            if (!WireRules.IsHexAddr(addrHex)) return false;
             return SendCommand("mem " + addrHex + " " + len.ToString(CultureInfo.InvariantCulture) + " "
                                + reqId.ToString(CultureInfo.InvariantCulture));
         }
@@ -1211,7 +1225,7 @@ namespace ClarionDebugger.Services
                 case "stack":
                     var frames = ParseStack(json);
                     foreach (var f in frames) f.ResolvedPath = ResolveModulePath(f.Module);
-                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"));
+                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"), GetStr(json, "reqId"));
                     break;
 
                 case "moduledata":
@@ -1476,7 +1490,7 @@ namespace ClarionDebugger.Services
                     // read the number with `?? 0u`, so a row whose tid did not parse became thread 0 - the
                     // sentinel the absent-tid rule exists to keep off the wire (c299aced).
                     uint? rowTid = GetUIntOrNull(t, "tid");
-                    if (!rowTid.HasValue || rowTid.Value == 0) continue;
+                    if (!WireRules.TidIsKnown(rowTid)) continue;
                     list.Threads.Add(new DebugThread
                     {
                         Tid = rowTid.Value,
@@ -1599,6 +1613,11 @@ namespace ClarionDebugger.Services
                 w.TypeCode = GetStr(json, "type");   // raw code as hex ("0x11") for edit-variable-value
                 w.Size = GetInt(json, "size");
                 w.Places = GetInt(json, "places");   // 0 when absent (watch doesn't carry DECIMAL scale)
+                // Absent, not zero/empty, when the engine does not send them: addr only for own storage,
+                // frameIdx/frameProc only for a local resolved outside frame 0 (04b9679e).
+                w.Addr = GetStr(json, "addr");
+                w.FrameIdx = GetIntOrNull(json, "frameIdx");
+                w.FrameProc = GetStr(json, "frameProc");
                 // Value is now formatted engine-side by the shared Clarion value renderer (same one the
                 // Locals panel uses) and shipped ready-to-display — no separate client-side formatting.
                 w.Value = GetStr(json, "value");
@@ -1795,24 +1814,32 @@ namespace ClarionDebugger.Services
                 foreach (Match m in Regex.Matches(json, "\\{[^{}]*\\}"))
                 {
                     if (list.Count >= MaxProcedures) break;
-                    string obj = m.Value;
-                    string kind = GetStr(obj, "kind");
-                    // Routines come through as well as procedures/methods: they are what lets a breakpoint
-                    // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
-                    // them together with their parent by definition line, so containment falls out of the
-                    // line order — no extra symbol work. The Procedures panel filters routines back out on
-                    // the client, so this does not change what that list shows.
-                    if (kind != "procedure" && kind != "method" && kind != "routine") continue;
-                    int line = GetInt(obj, "line");
-                    if (line <= 0) continue;
-                    int? end = GetIntOrNull(obj, "endLine");
-                    list.Add(new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
-                                                  EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0 });
+                    var p = ProcedureFromSymbol(m.Value);
+                    if (p != null) list.Add(p);
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             }
             catch { }
             return list;
+        }
+
+        /// <summary>One <c>@SYMBOLS</c> row as a listed procedure, or null for a row the list skips (another kind,
+        /// or no definition line).</summary>
+        internal static DebugProcedure ProcedureFromSymbol(string obj)
+        {
+            string kind = GetStr(obj, "kind");
+            // Routines come through as well as procedures/methods: they are what lets a breakpoint
+            // inside a ROUTINE name both it and its enclosing procedure. The engine already orders
+            // them together with their parent by definition line, so containment falls out of the
+            // line order — no extra symbol work. The Procedures panel filters routines back out on
+            // the client, so this does not change what that list shows.
+            if (kind != "procedure" && kind != "method" && kind != "routine") return null;
+            int line = GetInt(obj, "line");
+            if (line <= 0) return null;
+            int? end = GetIntOrNull(obj, "endLine");
+            return new DebugProcedure { Name = GetStr(obj, "name"), Module = GetStr(obj, "module"), Line = line, Kind = kind,
+                                        EndLine = (end.HasValue && end.Value >= line) ? end.Value : 0,
+                                        ExtentUnknown = GetStr(obj, "extent") == "unknown" };
         }
 
         private static List<DebugBreakpoint> ParseBpList(string json)

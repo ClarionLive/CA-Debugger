@@ -16,29 +16,78 @@ namespace ClarionDbg.Cli
         private const int STACK_FRAMES_DEFAULT = 32;
         private const int STACK_FRAMES_MAX = 256;
 
-        /// <summary>stack [maxFrames] — resolved call stack while paused (frame 0 = current EIP). Walks the
-        /// SELECTED thread's registers, which is usually but not always the stopped thread's; the reply is
-        /// stamped with that tid so the host can drop it if it has since switched threads.</summary>
-        private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid)
+        /// <summary>stack [maxFrames] [reqid=N] — resolved call stack while paused (frame 0 = current EIP). Walks
+        /// the SELECTED thread's registers, which is usually but not always the stopped thread's; the reply is
+        /// stamped with that tid so the host can drop it if it has since switched threads. A reqid is echoed on
+        /// the reply as "reqId", so the host can tell WHICH request a reply answers (49538b78 wave 5 run 3): a
+        /// stale reply for the same thread carries the same tid, and only its id tells it apart.</summary>
+        private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
+                                        IntPtr hThread)
         {
-            if (!haveCtx) { EmitError("stack: no context for thread " + tid); return; }
-            int max = STACK_FRAMES_DEFAULT;
-            if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX))
-            {
-                EmitError($"stack: max frames must be 1..{STACK_FRAMES_MAX}");
-                return;
-            }
-            var frames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, max);
-            EmitThreadEvent(tid, Json.Stack(frames));
-            Console.WriteLine($"  stack of thread {tid} ({frames.Count} frame(s)):");
+            if (!haveCtx) { EmitError("stack: no context for thread " + TidText(tid)); return; }
+            int max; string reqId, error;
+            if (!TryParseStackArgs(parts, out max, out reqId, out error)) { EmitError(error); return; }
+            var frames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, max, hThread);
+            EmitThreadEvent(tid, Json.Stack(frames, reqId));
+            Console.WriteLine($"  stack of thread {TidText(tid)} ({frames.Count} frame(s)):");
             for (int i = 0; i < frames.Count; i++)
             {
                 var f = frames[i];
                 string name = f.Proc ?? "(unknown)";
                 string loc = f.Module != null ? $"  {f.Module}:{f.Line}" : "";
-                string unc = f.Uncertain ? "  (usikker — mulig foreldet stackrest)" : "";
+                string unc = f.Uncertain ? "  (uncertain — possibly a stale return address)" : "";
                 Console.WriteLine($"    #{i,-2} {name}{loc}  RVA 0x{f.Rva:X}{(f.Kind != null ? "  [" + f.Kind + "]" : "")}{unc}");
             }
+        }
+
+        private const string STACK_REQID = "reqid=";   // a token no frame count can be
+        private const int STACK_REQID_MAX_DIGITS = 10;
+
+        /// <summary>The arguments of `stack` (and `bt`/`where`): an optional frame count, then an optional
+        /// <c>reqid=N</c> (1 to 10 digits), in that order. Anything else is refused with the reason in
+        /// <paramref name="error"/>. <paramref name="reqId"/> is null when none was given.</summary>
+        internal static bool TryParseStackArgs(string[] parts, out int max, out string reqId, out string error)
+        {
+            max = STACK_FRAMES_DEFAULT; reqId = null; error = null;
+            int i = 1;
+            if (parts.Length > i && !parts[i].StartsWith(STACK_REQID, StringComparison.Ordinal))
+            {
+                if (!int.TryParse(parts[i], out max) || max < 1 || max > STACK_FRAMES_MAX)
+                {
+                    error = $"stack: max frames must be 1..{STACK_FRAMES_MAX}";
+                    return false;
+                }
+                i++;
+            }
+            if (parts.Length > i)
+            {
+                string id = parts[i].StartsWith(STACK_REQID, StringComparison.Ordinal) ? parts[i].Substring(STACK_REQID.Length) : null;
+                if (id == null || id.Length == 0 || id.Length > STACK_REQID_MAX_DIGITS || !IsAllDigits(id))
+                {
+                    error = "stack: expected [maxFrames] [reqid=N], N 1.." + STACK_REQID_MAX_DIGITS + " digits";
+                    return false;
+                }
+                reqId = id;
+                i++;
+            }
+            if (parts.Length > i) { error = "stack: expected [maxFrames] [reqid=N]"; return false; }
+            return true;
+        }
+
+        private static bool IsAllDigits(string s)
+        {
+            foreach (char c in s) if (c < '0' || c > '9') return false;
+            return true;
+        }
+
+        /// <summary>Test seam: the REAL HandleStackCommand for <paramref name="line"/>, with an invented context
+        /// and no target (every walk is frame 0 alone), so `protocolcheck` can read the reply it emits.</summary>
+        internal void HandleStackCommandForTest(string line, uint tid)
+        {
+            RefuseSeamIfAttached("HandleStackCommandForTest");
+            var c = NewContext();
+            c.Eip = 0x401000; c.Esp = 0x19F000; c.Ebp = 0x19F100;
+            HandleStackCommand(line.Split(' '), ref c, true, tid, IntPtr.Zero);
         }
 
         /// <summary>
@@ -57,19 +106,45 @@ namespace ClarionDbg.Cli
         /// </summary>
         private List<StackFrame> BuildStack(uint eip, uint esp, uint ebp, int maxFrames)
         {
+            return BuildStack(eip, esp, ebp, maxFrames, IntPtr.Zero);
+        }
+
+        /// <param name="hThread">the walked thread, for its TEB stack bounds. Without it a foreign top
+        /// cannot be chain-walked safely and falls back to the stack scan, as it always did.</param>
+        private List<StackFrame> BuildStack(uint eip, uint esp, uint ebp, int maxFrames, IntPtr hThread)
+        {
             var m0 = ModuleAt(eip);
             var frames = new List<StackFrame> { FrameAt(m0, eip, 0) };
             frames[0].Ebp = ebp;   // frame 0's locals are read at the current EBP
 
-            // External / frameless top frame — a DebugBreak() int3 (which executes in ntdll), or a
-            // thread paused inside an OS call. EBP here still belongs to the Clarion CALLER (the
-            // frameless callee never pushed its own EBP), so the EBP walk below would read [ebp+4] =
-            // the caller's return and jump a level too far, dropping the frame the user actually cares
-            // about (the line that called DebugBreak / the line we paused at). Reconstruct the Clarion
-            // frames by scanning the stack instead, which recovers that immediate caller.
+            // Foreign top frame: a Pause (the thread idles in win32u/user32 under ClaRUN's event loop), a
+            // DebugBreak() int3, or any stop inside an OS/runtime call. Walk the EBP chain up through the
+            // foreign links until one returns into Clarion code; that link's saved EBP is the Clarion
+            // frame's base, so its locals and module data are readable (70b58a1a). A frameless callee
+            // (DebugBreak) never pushed EBP, so ctx.Ebp is already the Clarion caller's own: that caller is
+            // the return at ESP itself, and it reads its locals at ctx.Ebp. A Clarion return found higher in
+            // [ESP, EBP) is ambiguous: it may be a stale slot inside a FRAMED foreign function called directly
+            // from Clarion, whose EBP is not the Clarion frame's, so it is shown Uncertain with no EBP.
+            // Only when the chain proves nothing (FPO in the runtime, no stack bounds) do we scan, and a
+            // scanned frame is Uncertain with no EBP: no locals rather than a guessed frame base.
             bool topIsClarion = m0 != null && m0.Dbg != null;
             if (!topIsClarion)
             {
+                uint lo, hi, link, framelessSlot; bool framelessUncertain;
+                if (TryStackBounds(hThread, esp, out lo, out hi)
+                    && FindForeignTopLink(ebp, lo, hi, ReadStackU32, IsClarionReturnSlot,
+                                          out link, out framelessSlot, out framelessUncertain))
+                {
+                    StackFrame fc;
+                    if (framelessSlot != 0 && TryFrameForReturn(ReadU32(framelessSlot), framelessSlot, out fc))
+                    {
+                        fc.Ebp = framelessUncertain ? 0 : ebp;
+                        fc.Uncertain = framelessUncertain;
+                        frames.Add(fc);
+                    }
+                    WalkEbpChain(frames, link, esp, maxFrames);
+                    if (frames.Count > 1) return frames;
+                }
                 ScanStack(frames, esp, maxFrames);
                 return frames;
             }
@@ -84,8 +159,17 @@ namespace ClarionDbg.Cli
                 if (TryFrameForReturn(ReadU32(esp), esp, out f0)) { f0.Ebp = ebp; frames.Add(f0); }
             }
 
-            uint cur = ebp;
-            uint floor = esp;        // frame bases sit at/above ESP and strictly increase up the stack
+            WalkEbpChain(frames, ebp, esp, maxFrames);
+
+            if (frames.Count < 2) ScanStack(frames, esp, maxFrames);
+            return frames;
+        }
+
+        /// <summary>Follow the EBP chain from <paramref name="cur"/>, adding one frame per link whose return
+        /// address is validated Clarion code, and stop at the first link that is not.</summary>
+        private void WalkEbpChain(List<StackFrame> frames, uint cur, uint floor, int maxFrames)
+        {
+            // frame bases sit at/above ESP and strictly increase up the stack
             bool first = true;
             while (frames.Count < maxFrames && cur != 0 && (first ? cur >= floor : cur > floor))
             {
@@ -98,10 +182,154 @@ namespace ClarionDbg.Cli
                 cur = callerEbp;
                 first = false;
             }
-
-            if (frames.Count < 2) ScanStack(frames, esp, maxFrames);
-            return frames;
         }
+
+        private const int FOREIGN_LINKS_MAX = 256;   // EBP links walked through runtime/OS code before giving up
+        private const uint FRAMELESS_SCAN_BYTES = 0x4000;   // how far above ESP to look for a frameless callee's return
+
+        /// <summary>
+        /// The EBP-chain walk above a foreign (non-Clarion) top frame. Starting at <paramref name="ebp"/>,
+        /// follow saved-EBP links through code that is not Clarion until the return slot of a link
+        /// (<c>cur + 4</c>) validates as a return into Clarion code; that link is <paramref name="link"/>, and
+        /// the caller walks the ordinary chain from it. Every link must lie inside the live stack
+        /// [<paramref name="lo"/>, <paramref name="hi"/>) — lo is ESP, hi the TEB's StackBase — be 4-aligned,
+        /// and strictly increase: a link that breaks any of these is FPO code using EBP as a general register
+        /// (or garbage), and the walk FAILS rather than guesses. Returns false when no link validates.
+        ///
+        /// <paramref name="framelessSlot"/> is set only when the first validated link is <paramref name="ebp"/>
+        /// ITSELF: then EBP was never pushed below it, so a frameless callee (DebugBreak's int3) sits on top of a
+        /// Clarion frame whose base IS <paramref name="ebp"/>, and its return is at ESP (<paramref name="lo"/>).
+        /// A FRAMED foreign function called straight from Clarion has the same shape, with perhaps a stale
+        /// Clarion return among its locals, so only a return AT lo is taken as the caller. Failing that, the
+        /// lowest validated return in [lo, ebp), searched at most FRAMELESS_SCAN_BYTES up, is reported with
+        /// <paramref name="framelessUncertain"/> set: an Uncertain frame with no base. In any other shape a
+        /// return below the first link lies inside a foreign frame, and is not a caller.
+        ///
+        /// Static and fed through delegates so `protocolcheck` can drive it over synthetic stacks.
+        /// </summary>
+        internal static bool FindForeignTopLink(uint ebp, uint lo, uint hi,
+                                                Func<uint, uint?> read32, Func<uint, bool> isClarionReturnSlot,
+                                                out uint link, out uint framelessSlot, out bool framelessUncertain)
+        {
+            link = 0; framelessSlot = 0; framelessUncertain = false;
+            if (hi < 8) return false;                 // hi - 8 below must not wrap
+            uint cur = ebp, prev = 0;                 // prev = 0 also refuses a null EBP on the first link
+            for (int n = 0; n < FOREIGN_LINKS_MAX; n++)
+            {
+                if ((cur & 3) != 0) return false;
+                if (cur < lo || cur > hi - 8) return false;
+                if (cur <= prev) return false;        // a link that does not climb is not a frame chain
+                if (isClarionReturnSlot(cur + 4))
+                {
+                    link = cur;
+                    if (n == 0)
+                    {
+                        uint first = (lo + 3) & ~3u;
+                        uint end = cur - first > FRAMELESS_SCAN_BYTES ? first + FRAMELESS_SCAN_BYTES : cur;
+                        for (uint s = first; s < end; s += 4)
+                            if (isClarionReturnSlot(s))
+                            {
+                                framelessSlot = s;
+                                framelessUncertain = s != lo;
+                                break;
+                            }
+                    }
+                    return true;
+                }
+                uint? next = read32(cur);
+                if (next == null) return false;
+                prev = cur;
+                cur = next.Value;
+            }
+            return false;
+        }
+
+        /// <summary>The walked thread's stack as [lo, hi): the TEB's StackLimit (+8) and StackBase (+4), with
+        /// lo raised to ESP. False without a thread handle or a readable TEB — the caller then scans.</summary>
+        private bool TryStackBounds(IntPtr hThread, uint esp, out uint lo, out uint hi)
+        {
+            lo = 0; hi = 0;
+            if (hThread == IntPtr.Zero) return false;
+            uint teb = GetTebBase(hThread);
+            if (teb == 0) return false;
+            hi = ReadU32(teb + 4);
+            lo = ReadU32(teb + 8);
+            if (hi == 0 || lo >= hi || esp < lo || esp >= hi) return false;
+            lo = esp;
+            return true;
+        }
+
+        private uint? ReadStackU32(uint va)
+        {
+            var b = new byte[4];
+            return ReadBlock(va, b) == 4 ? BitConverter.ToUInt32(b, 0) : (uint?)null;
+        }
+
+        private bool IsClarionReturnSlot(uint slot)
+        {
+            StackFrame f;
+            uint? ret = ReadStackU32(slot);
+            return ret != null && TryFrameForReturn(ret.Value, slot, out f);
+        }
+
+        /// <summary>The first frame whose locals can be read: a resolved procedure with a known frame base.
+        /// Frame 0 after an ordinary stop; after a Pause, the Clarion frame under the runtime's event loop.
+        /// Null when the stack has none (a scanned stack, or no context). Module data and local watches key
+        /// on it, so after a Pause they describe the Clarion code, not the OS call it idles in.</summary>
+        private StackFrame FirstClarionFrame(ref Native.CONTEXT_X86 ctx, IntPtr hThread)
+        {
+            var frames = FramesForStop(ref ctx, hThread);
+            int i = FirstClarionFrameIndex(frames);
+            return i < 0 ? null : frames[i];
+        }
+
+        /// <summary>Where <see cref="FirstClarionFrame"/> sits in <paramref name="frames"/>; -1 when none can
+        /// read locals.</summary>
+        internal static int FirstClarionFrameIndex(IList<StackFrame> frames)
+        {
+            for (int i = 0; i < frames.Count; i++)
+                if (CanReadLocals(frames[i])) return i;
+            return -1;
+        }
+
+        /// <summary>Can this frame's locals be read? It needs a procedure (a local set to look in) and a frame
+        /// base (somewhere to read one); a scanned, Uncertain frame has no base.</summary>
+        internal static bool CanReadLocals(StackFrame f)
+        {
+            return f.Proc != null && f.Ebp != 0;
+        }
+
+        // One stack walk per stop and register set, shared by every watch, module-data and local read at that
+        // stop: a walk per watch per stop is dozens of reads each, times every watch the host re-sends. Cleared
+        // on EVERY stop (PausedWait), which covers each resume. Keyed on EIP/ESP/EBP as well, so a setip or a
+        // thread switch inside one stop re-walks rather than reads another register set's frames.
+        private List<StackFrame> _stopFrames;
+        private uint _stopFramesEip, _stopFramesEsp, _stopFramesEbp;
+
+        private void ClearFrameCache() { _stopFrames = null; }
+
+        /// <summary>The walked frames for these registers at this stop (see <see cref="_stopFrames"/>).</summary>
+        private List<StackFrame> FramesForStop(ref Native.CONTEXT_X86 ctx, IntPtr hThread)
+        {
+            if (_stopFrames == null || _stopFramesEip != ctx.Eip || _stopFramesEsp != ctx.Esp || _stopFramesEbp != ctx.Ebp)
+            {
+                _stopFrames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, STACK_FRAMES_MAX, hThread);
+                _stopFramesEip = ctx.Eip; _stopFramesEsp = ctx.Esp; _stopFramesEbp = ctx.Ebp;
+            }
+            return _stopFrames;
+        }
+
+        /// <summary>Test seams for `protocolcheck`: the per-stop frame cache through the REAL FramesForStop and
+        /// ClearFrameCache. With no target every walk is frame 0 alone, which is enough: the check asserts
+        /// WHICH list instance comes back, not what is in it. Changes nothing but the cache itself.</summary>
+        internal List<StackFrame> FramesForStopForTest(uint eip, uint esp, uint ebp)
+        {
+            var c = NewContext();
+            c.Eip = eip; c.Esp = esp; c.Ebp = ebp;
+            return FramesForStop(ref c, IntPtr.Zero);
+        }
+
+        internal void ClearFrameCacheForTest() { ClearFrameCache(); }
 
         /// <summary>True when <paramref name="va"/> is exactly the entry of its containing procedure
         /// (prologue not yet run, so the frame's EBP is still the caller's).</summary>

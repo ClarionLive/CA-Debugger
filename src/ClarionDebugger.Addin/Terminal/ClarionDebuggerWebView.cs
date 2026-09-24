@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Text;
 using System.Windows.Forms;
 using ClarionDebugger.Services;
+using ClarionDebugger.Wire;
 using ICSharpCode.SharpDevelop.Project;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -309,9 +310,9 @@ namespace ClarionDebugger.Terminal
         // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
         // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
         // emit 'resumed', so they leave the marker alone.
-        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
-        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid) => UI(() => OnStack(frames, tid));
+        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid, string reqId) => UI(() => OnStack(frames, tid, reqId));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
         // fields); forward its array bodies verbatim so the structure survives intact.
 
@@ -335,7 +336,10 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcFrameLocals(string reqId, string itemsJson, uint? tid) => UI(() =>
         {
-            _editGrants.GrantRows(itemsJson, tid);
+            // Only a reply to a framelocals the host VERIFIED and forwarded may grant (49538b78 wave 5): its rows
+            // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
+            // posted for display, and grants nothing.
+            if (_editGrants.FrameLocalsVerified(reqId, tid)) _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
@@ -355,7 +359,8 @@ namespace ClarionDebugger.Terminal
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
             // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
-            if (ok) _editGrants.Clear();
+            // Only the new thread's stack replies may offer frames from here on.
+            if (ok) { _editGrants.Clear(); _editGrants.SelectThread(tid); }
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
@@ -676,13 +681,7 @@ namespace ClarionDebugger.Terminal
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
                     case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
-                    case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
-                        if (_svc.State == DebugSessionState.Paused)
-                        {
-                            var fl = FrameLocalsRequest.Parse(data);
-                            if (fl != null) _svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp);
-                        }
-                        break;
+                    case "framelocals": FrameLocals(data); break;   // call-stack frame locals: data = "reqId|va|ebp"
                     case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
                         if (_svc.State == DebugSessionState.Paused)
                         {
@@ -705,7 +704,7 @@ namespace ClarionDebugger.Terminal
                         break;
                     // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
                     case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
-                    case "stack": if (_svc.State == DebugSessionState.Paused) _svc.RequestStack(); break;
+                    case "stack": if (_svc.State == DebugSessionState.Paused) RequestStack(); break;
                     case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;
                     case "rewatch":
@@ -856,8 +855,7 @@ namespace ClarionDebugger.Terminal
                 Post("{\"type\":\"clear\"}");
                 var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
                 string label = (target.Name ?? "process") + " (pid " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
-                Console("info", "attaching to " + label + "  (" + _pending.Count + " breakpoint(s)"
-                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                Console("info", "attaching to " + label + SessionCounts(solutionDlls));
                 _attach = new AttachContext { Name = target.Name };
                 _lastAttachName = target.Name;
                 try { _svc.AttachSession(target, _pending.ToArray(), solutionDlls); }
@@ -867,16 +865,7 @@ namespace ClarionDebugger.Terminal
 
                 // Symbols come from the image on disk, as for a launch, when the listed path still resolves.
                 string exe = target.Path;
-                if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
-                {
-                    System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                    {
-                        string g = ClarionDebuggerService.GetGlobalsJson(exe);
-                        if (!string.IsNullOrEmpty(g))
-                            UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
-                    });
-                    PushProcedures(exe);
-                }
+                if (!string.IsNullOrEmpty(exe) && File.Exists(exe)) LoadStaticSymbols(exe);
             }
             catch (Exception ex) { Console("err", "attach failed: " + ex.Message); }
         }
@@ -1175,21 +1164,33 @@ namespace ClarionDebugger.Terminal
                 // Pre-load the solution's output DLLs so breakpoints set in DLL source bind before
                 // launch (multi-DLL apps); other DLLs are still picked up automatically as they load.
                 var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
-                Console("info", "starting: " + Path.GetFileName(_exe) + "  (" + _pending.Count + " breakpoint(s)"
-                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                Console("info", "starting: " + Path.GetFileName(_exe) + SessionCounts(solutionDlls));
                 _svc.StartSession(_exe, _pending.ToArray(), solutionDlls);
 
-                // load static data symbols (file buffers) for the Variables tree, off the UI thread
-                string exe = _exe;
-                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    string g = ClarionDebuggerService.GetGlobalsJson(exe);
-                    if (!string.IsNullOrEmpty(g))
-                        UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
-                });
-                PushProcedures(exe);   // refresh the Procedures list against the just-resolved target
+                LoadStaticSymbols(_exe);
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
+        }
+
+        /// <summary>A session's static symbols, read from the image on disk for a launch and an attach alike
+        /// (70860d6b C7): the data symbols (file buffers) for the Variables tree, off the UI thread, and the
+        /// Procedures list against this target.</summary>
+        private void LoadStaticSymbols(string exe)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string g = ClarionDebuggerService.GetGlobalsJson(exe);
+                if (!string.IsNullOrEmpty(g))
+                    UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
+            });
+            PushProcedures(exe);
+        }
+
+        /// <summary>The "  (N breakpoint(s), M solution DLL(s))" a session's start line ends with.</summary>
+        private string SessionCounts(List<string> solutionDlls)
+        {
+            return "  (" + _pending.Count + " breakpoint(s)"
+                + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")";
         }
 
         /// <summary>Merge the gutter's (red-dot) breakpoints, set before the session, into _pending.</summary>
@@ -1231,7 +1232,8 @@ namespace ClarionDebugger.Terminal
                     {
                         var p = procs[i];
                         string id = ProcedureIds.IdFor(gen, i);
-                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine };
+                        ids[id] = new ProcRef { Name = p.Name, Module = p.Module, Line = p.Line, Kind = p.Kind, EndLine = p.EndLine,
+                                                 ExtentUnknown = p.ExtentUnknown };
                         if (i > 0) sb.Append(',');
                         sb.Append("{\"id\":").Append(Str(id))
                           .Append(",\"name\":").Append(Str(p.Name))
@@ -1518,8 +1520,10 @@ namespace ClarionDebugger.Terminal
             UI(() =>
             {
                 // A new stop: nothing on screen is current any more, and the replies requested below re-grant
-                // the rows that are.
+                // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
+                // the selected one.
                 _editGrants.Clear();
+                _editGrants.SelectThread(p.Tid);
 
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
@@ -1558,8 +1562,9 @@ namespace ClarionDebugger.Terminal
                 // The module goes in as well as the path: when the path does not resolve there is still a
                 // source message, carrying the module so the page can name the stop and clear the last one's
                 // listing instead of leaving it on screen.
+                NoteStopSource(p);
                 SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
-                _svc.RequestStack();          // per-frame locals now load lazily from the Call Stack (frame 0 auto)
+                RequestStack();               // per-frame locals now load lazily from the Call Stack (frame 0 auto)
                 _svc.RequestModuleData();
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
                 // so this also tells the page which thread the panels it is about to receive belong to.
@@ -1655,7 +1660,7 @@ namespace ClarionDebugger.Terminal
         {
             System.Diagnostics.Debug.Assert(Array.IndexOf(TidValuedMemberNames, name) >= 0,
                 "TidMember was handed an undeclared name; add it to TidValuedMemberNames");
-            if (!tid.HasValue || tid.Value == 0) return string.Empty;
+            if (!WireRules.TidIsKnown(tid)) return string.Empty;
             return ",\"" + name + "\":" + tid.Value.ToString(CultureInfo.InvariantCulture);
         }
 
@@ -1718,7 +1723,15 @@ namespace ClarionDebugger.Terminal
                 + Str(why) + "}");
         }
 
-        private void OnStack(List<DebugStackFrame> frames, uint? tid)
+        /// <summary>Ask the engine for the selected thread's stack under a fresh request id, recorded for the
+        /// current epoch once sent: only a reply echoing a recorded id may offer frames (EditGrants.OfferFrames).</summary>
+        private void RequestStack()
+        {
+            string id = _editGrants.NewStackRequestId();
+            if (_svc.RequestStack(id)) _editGrants.StackRequested(id);
+        }
+
+        private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)
         {
             var sb = new StringBuilder("{\"type\":\"stack\",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
@@ -1735,7 +1748,13 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"uncertain\":").Append(f.Uncertain ? "true" : "false").Append('}');
             }
             sb.Append(']').Append(TidJson(tid)).Append('}');
+            // The frames just offered are the only ones whose locals the page may ask for (see FrameLocals), and
+            // only when this reply is for the selected thread and echoes a request id of this epoch (OfferFrames).
+            var offered = new List<KeyValuePair<string, string>>();
+            foreach (var f in frames) offered.Add(new KeyValuePair<string, string>(f.Va, f.Ebp));
+            _editGrants.OfferFrames(tid, reqId, offered);
             Post(sb.ToString());
+            FollowSelectedThread(frames, tid);
         }
 
         private void OnWatch(DebugWatch w)
@@ -1754,7 +1773,11 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"size\":").Append(w.Size)
                   .Append(",\"places\":").Append(w.Places)
                   // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
-                  .Append(",\"note\":").Append(Str(w.Note));
+                  .Append(",\"note\":").Append(Str(w.Note))
+                  // "View memory" address (own storage only) and the caller frame a local resolved in
+                  .Append(",\"addr\":").Append(Str(w.Addr))
+                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null")
+                  .Append(",\"frameProc\":").Append(Str(w.FrameProc));
             else
                 // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and
                 // a name that resolved but could not be read (error) — all three must clear the row's pending state
@@ -1825,6 +1848,46 @@ namespace ClarionDebugger.Terminal
                 return;
             }
             _editGrants.ExpandForwarded(x.ReqId);
+        }
+
+        /// <summary>A call-stack frame's locals: data is <c>reqId|va|ebp</c>, and it is forwarded ONLY when that
+        /// exact (va, ebp) is a frame the host's own stack reply offered since the last stop, resume or thread
+        /// switch (49538b78 wave 5, codex adversary). The engine renders the locals of the procedure at va at
+        /// EBP + each local's offset, edit metadata included, so a real va with a made-up EBP would mint edit
+        /// grants at addresses the page chose - and the page is trusted to READ memory, never to write it.
+        /// <para>
+        /// A frame that was not offered is REFUSED, not forwarded for display only. The page asks only about
+        /// frames it was shown, so a refusal costs a genuine page nothing but a lost race with the next stack
+        /// reply, which re-offers the frames that are current; a display-only forward would keep a second,
+        /// unverified path to the engine that no user needs. Like an expand refusal it is ANSWERED with an
+        /// empty reply for that reqId, so the frame the page is opening does not wait forever - and so is a
+        /// request the service would not send.
+        /// </para></summary>
+        private void FrameLocals(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var fl = FrameLocalsRequest.Parse(data);
+            if (fl == null) return;
+            if (!_editGrants.IsFrameOffered(fl.Va, fl.Ebp))
+            {
+                RefuseFrameLocals(fl.ReqId, "that frame is no longer current (or was never offered) — let the call stack refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp))
+            {
+                RefuseFrameLocals(fl.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.FrameLocalsForwarded(fl.ReqId);
+        }
+
+        // No tid: this answer is not from any thread, and an unstamped reply is one the page accepts whatever
+        // thread it is showing.
+        private void RefuseFrameLocals(int reqId, string why)
+        {
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "frame locals refused: " + why);
         }
 
         private void RefuseExpand(int reqId, string why)
@@ -2047,6 +2110,53 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append("]}");
             Post(sb.ToString());
+        }
+
+        // ------------------------------------------------------------------ the source pane follows the selected thread
+        // (0955b29f, Owner decision 2026-09-24). SendSource used to run only at a stop, so after a thread switch
+        // the pane and its header still showed the STOPPED thread's location. The page re-reads the stack on a
+        // switch, and that reply is stamped with the thread it describes, so it is the switch's source.
+
+        private DebugPause _stopSource;   // the stop's own location; null = not paused (cleared on resume)
+        private uint? _stopTid;           // the stopped thread; null = unknown, and then the pane never follows
+        private uint? _sourceTid;         // the thread whose location the source pane shows now
+
+        private void NoteStopSource(DebugPause p)
+        {
+            _stopSource = p;
+            _stopTid = p.Tid;
+            _sourceTid = p.Tid;
+        }
+
+        /// <summary>Re-points the source pane when a stack reply is for a thread other than the one it shows.
+        /// Back on the stopped thread it restores the stop's OWN source (its location may be a line no frame
+        /// carries, e.g. a step inside runtime code). Repeated replies for the thread on screen send nothing,
+        /// and neither does any reply when the stop named no thread: there is then no way to tell a switch from
+        /// the stop's own stack.</summary>
+        private void FollowSelectedThread(List<DebugStackFrame> frames, uint? tid)
+        {
+            if (_stopSource == null || !_stopTid.HasValue || !tid.HasValue || tid == _sourceTid) return;
+            _sourceTid = tid;
+            if (tid == _stopTid) { SendSource(_stopSource.Module, _stopSource.ResolvedPath, _stopSource.Proc, _stopSource.Line); return; }
+            var f = SourceFrameOf(frames);
+            // No frame with a line: still a source message, so the pane stops showing the other thread's code.
+            if (f == null) SendSource(null, null, null, 0);
+            else SendSource(f.Module, f.ResolvedPath, f.Proc, f.Line);
+        }
+
+        /// <summary>The frame whose line is a thread's location: frame 0 when it has a line, else the first frame
+        /// that is a real Clarion frame (a proc, and an ebp other than "0x0") with a line. A thread stopped inside
+        /// the runtime has no line in frame 0; the engine gives frames above a runtime frame a real ebp.</summary>
+        internal static DebugStackFrame SourceFrameOf(List<DebugStackFrame> frames)
+        {
+            if (frames == null) return null;
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                if (f == null || f.Line <= 0 || string.IsNullOrEmpty(f.Module)) continue;
+                if (i == 0 || (f.Proc != null && f.Ebp != "0x0")) return f;
+            }
+            return null;
         }
 
         // ------------------------------------------------------------------ gutter breakpoints

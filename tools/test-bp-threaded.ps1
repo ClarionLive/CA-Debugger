@@ -32,7 +32,14 @@ param(
     [string]$BpSite    = "clbrws001.clw:561",
     [string]$Name      = "AUT:AU_LNAME",
     [string]$MenuItem  = "2/5",            # Browse > Filtered Locator (Authors)
-    [int]$OpenWaitSec  = 5,                # settle time after each browse open
+    # WAIT FOR THE HITS, DO NOT SLEEP FOR THEM (b3e1ade8). Each open used to be followed by a fixed 5 s and
+    # the leg then asserted ">= 8 hits"; on 2026-09-22 leg 1 once came in under 8, because a slow open
+    # simply had not filled by the time the clock ran out. Now each open is followed by a poll of the
+    # observed trace count: it waits for the first hit, then for the count to stop moving for $QuietMs,
+    # and gives up only after $OpenHitTimeoutSec with no hit at all. A tracepoint that never fires is
+    # therefore still a red B/F - it just takes the timeout to say so.
+    [int]$OpenHitTimeoutSec = 30,
+    [int]$QuietMs      = 1500,
     # Each open fills the browse once (one BRW1::FillQueue per row) AND runs it on a NEW Clarion thread,
     # so repeating the open is what turns "a few hits" into "hit many times without pausing" across
     # SEVERAL threads -- which is the case a single-hit, single-thread test cannot tell from the bug.
@@ -167,10 +174,32 @@ function Poke-Menu([string]$path) {
     else { Write-Host "!! menu $path never posted ($verified verified attempt(s))" }
 }
 
+function TraceCount { return @($script:events | Where-Object { $_.Kind -eq 'trace' }).Count }
+
+# One open's hits, waited for rather than slept for: returns when the count has moved and then held still
+# for $QuietMs, or when $OpenHitTimeoutSec passes with no hit. The per-open line is the timing record.
+function Wait-OpenHits([string]$what) {
+    $from = TraceCount
+    $last = $from; $lastMoveMs = $null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $OpenHitTimeoutSec) {
+        Drain
+        if ($proc.HasExited) { break }
+        $n = TraceCount
+        if ($n -ne $last) { $last = $n; $lastMoveMs = $sw.ElapsedMilliseconds }
+        elseif ($null -ne $lastMoveMs -and ($sw.ElapsedMilliseconds - $lastMoveMs) -ge $QuietMs) { break }
+        Start-Sleep -Milliseconds 150
+    }
+    Drain
+    $got = (TraceCount) - $from
+    Write-Host ("--- {0}: {1} hit(s), {2:0.0} s{3} ---" -f $what, $got, $sw.Elapsed.TotalSeconds,
+                $(if ($got -eq 0) { " (NONE within $OpenHitTimeoutSec s)" } else { '' }))
+}
+
 function Run-Leg([string]$label) {
     for ($k = 1; $k -le $OpensPerLeg; $k++) {
         Poke-Menu $MenuItem
-        Run-For $OpenWaitSec ("{0}: open {1}/{2}" -f $label, $k, $OpensPerLeg)
+        Wait-OpenHits ("{0}: open {1}/{2}" -f $label, $k, $OpensPerLeg)
     }
 }
 

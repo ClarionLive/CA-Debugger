@@ -38,7 +38,11 @@ $session = New-EngineSession -Engine $Engine -Target $Target `
 # The next paused / setip event, in arrival order. Read-EngineLines hands over EVERYTHING that has arrived, and
 # a successful setip writes its reply and the re-announced `paused` back to back, so the events are queued:
 # returning on the first one and dropping the rest of the batch loses the `paused` (measured 2026-09-23).
-$script:pending = New-Object System.Collections.Queue
+# A wait TAKES the first pending event of its kind and LEAVES the others, in order, for the next wait. It used
+# to dequeue and drop every event ahead of the one it wanted, so a `paused` that landed before the `setip` it
+# follows was thrown away and the next wait for `paused` timed out (25.2 s, wave 5 diagnosis). An `exited`
+# still ends any wait: nothing else is coming.
+$script:pending = New-Object System.Collections.ArrayList
 function Wait-Event {
     param([string]$Kind)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -46,12 +50,12 @@ function Wait-Event {
         foreach ($l in (Read-EngineLines $session)) {
             if ($l -cmatch '^@JSON .*"event":"(paused|setip|exited)"') {
                 Write-Host "    $l"
-                $script:pending.Enqueue((($l -replace '^@JSON ', '') | ConvertFrom-Json))
+                [void]$script:pending.Add((($l -replace '^@JSON ', '') | ConvertFrom-Json))
             }
         }
-        while ($script:pending.Count) {
-            $j = $script:pending.Dequeue()
-            if ($j.event -eq $Kind -or $j.event -eq 'exited') { return $j }
+        for ($i = 0; $i -lt $script:pending.Count; $i++) {
+            $j = $script:pending[$i]
+            if ($j.event -eq $Kind -or $j.event -eq 'exited') { $script:pending.RemoveAt($i); return $j }
         }
         if ($session.Proc.HasExited) { return $null }
         Start-Sleep -Milliseconds 50
@@ -180,10 +184,22 @@ try {
         $p = Wait-Event 'paused'
         Check 'a step on the steady pass reaches line 45' ($null -ne $p -and $p.reason -eq 'step' -and $p.line -eq 45) (Show $p)
         $script:steadyEsp = if ($p) { $p.regs.esp } else { $null }
-        Send 'continue'
-        $p = Wait-Event 'paused'
-        Check 'continue reaches line 44 on the next pass, at the same steady ESP' `
-            ($null -ne $p -and $p.reason -eq 'breakpoint' -and $p.line -eq 44 -and $p.regs.esp -eq $script:steadyEsp) (Show $p)
+        # THE APP'S OWN ACCEPT PASSES ALTERNATE between two stack depths (ESP ...FD40 and ...FD70, depending on
+        # which event ACCEPT returned; wave 5 diagnosis), so "the next pass" is at the steady ESP only about half
+        # the time. Continue until a breakpoint stop on 44 arrives AT that ESP, up to 6 passes. Every pass is a
+        # free run, so the observation is just as dropped, and the refusal below still proves it.
+        # Measured 2026-09-24, 5 live runs: the match came on pass 1 twice and pass 2 three times. The splash's
+        # loop ends after about 3 passes (a forced no-match saw 3 stops, then none), so 6 is a cap, not a budget.
+        $script:steadyHit = $null; $passes = @()
+        for ($k = 1; $k -le 6 -and $null -eq $script:steadyHit; $k++) {
+            Send 'continue'
+            $p = Wait-Event 'paused'
+            if ($null -eq $p) { $passes += "pass ${k}: (no event)"; break }
+            $passes += "pass ${k}: $($p.reason) line $($p.line) esp $($p.regs.esp)"
+            if ($p.reason -eq 'breakpoint' -and $p.line -eq 44 -and $p.regs.esp -eq $script:steadyEsp) { $script:steadyHit = $p }
+        }
+        Check "continue reaches line 44 at the same steady ESP ($($script:steadyEsp)) within 6 passes" `
+            ($null -ne $script:steadyHit) ($passes -join '; ')
         Expect-Refusal 'clbrws026.clw:45' 'stack-unproven'   # observed before the continue: no longer counts
     }
 

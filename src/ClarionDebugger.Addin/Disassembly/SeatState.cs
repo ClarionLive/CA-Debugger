@@ -107,14 +107,13 @@ namespace ClarionDebugger.Disassembly
         /// engine resets its selection to the stopped thread, so everything in flight is retired; and the
         /// stop's own disasm request is the seat, so it is recorded as IN FLIGHT - which is what stops the
         /// `threads` reply that follows a stop from starting a second, identical seat. NOT painted: that
-        /// waits for the reply. It goes straight to disasm, so it awaits no registers.</summary>
+        /// waits for the reply. It goes straight to disasm, so it awaits no registers (NewEpoch clears that).</summary>
         public void Stopped(uint stoppedTid, string sym)
         {
             NewEpoch();
             _emptySeatTid = 0;        // a new stop is a new answer to "can this address be decoded?"
             _seatedTid = 0;
             _seatingTid = stoppedTid;
-            _awaitRegsSeat = false;
             _stopSym = sym;
         }
 

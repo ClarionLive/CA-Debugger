@@ -32,6 +32,7 @@ param(
   [string] $ServicePath = '',
   [string] $WebViewPath = '',
   [string] $PageMessagesPath = '',
+  [string] $HostGrantsPath = '',
   [string] $ReaderPath = '',
   [string] $RedPath = '',
   [string] $VersionPath = '',
@@ -53,6 +54,7 @@ $root = Join-Path $PSScriptRoot '..'
 if (-not $ServicePath) { $ServicePath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs' }
 if (-not $WebViewPath) { $WebViewPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs' }
 if (-not $PageMessagesPath) { $PageMessagesPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\PageMessages.cs' }
+if (-not $HostGrantsPath) { $HostGrantsPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\HostGrants.cs' }
 if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs' }
 if (-not $RedPath) { $RedPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\RedFileService.cs' }
 if (-not $VersionPath) { $VersionPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionVersionService.cs' }
@@ -69,7 +71,7 @@ if (-not $PagePath) { $PagePath = Join-Path $root 'src\ClarionDebugger.Addin\Ter
 # unmutated copies and must pass, which is what makes a red run mean the mutation and not the harness.
 if ($SelfTest) {
   $sources = [ordered]@{
-    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; reader = $ReaderPath; red = $RedPath
+    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; grants = $HostGrantsPath; reader = $ReaderPath; red = $RedPath
     version = $VersionPath; json = $EngineJsonPath; procs = $ProcsCommandPath; pcheck = $ProtocolCheckPath; page = $PagePath
   }
   $M = @(
@@ -171,7 +173,7 @@ if ($SelfTest) {
         $f = { param($name) Join-Path $dir ([IO.Path]::GetFileName(($using:sources)[$name])) }
         if ($r.Suite -eq 'ps') {
           $out = & pwsh -NoProfile -File $using:self -ServicePath (& $f 'service') -WebViewPath (& $f 'web') `
-            -PageMessagesPath (& $f 'msgs') -ReaderPath (& $f 'reader') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
+            -PageMessagesPath (& $f 'msgs') -HostGrantsPath (& $f 'grants') -ReaderPath (& $f 'reader') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
             -EngineJsonPath (& $f 'json') -ProcsCommandPath (& $f 'procs') -ProtocolCheckPath (& $f 'pcheck') -PagePath (& $f 'page') -PendingStartedOk 2>&1
           $ok = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
         } else {
@@ -215,7 +217,7 @@ $xList = (Get-Method 'private void CmdListProcs()') -replace '^private', 'public
   -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow(' -replace 'ClarionDebuggerService\.ListProcesses\(', 'FakeLists.ListProcesses('
 $xProcsJson = Public (Get-Method 'private static string ProcsJson(List<AttachableProcess> procs, string error)')
 $xAttach = Get-Method 'public void CmdAttach(string data)'
-$xAttachSession = (Get-Method 'private void AttachSession(AttachableProcess target)') -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
+$xAttachSession = ((Get-Method 'private void AttachSession(AttachableProcess target)'), (Get-Method 'private void LoadStaticSymbols(string exe)'), (Get-Method 'private string SessionCounts(List<string> solutionDlls)') -join "`n") -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
 $xCtx = Get-Method 'private sealed class AttachContext'
 $xExited = Public (Get-ArrowHandler 'private void OnSvcExited(int code)')
 $xDetached = Public (Get-ArrowHandler 'private void OnSvcDetached(DebugDetach d)')
@@ -359,16 +361,18 @@ namespace ClarionDebugger.Terminal
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('attach-probe-' + [guid]::NewGuid().ToString('N') + '.cs')
 [IO.File]::WriteAllText($tmp, $padProbe)
 try {
-  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $PageMessagesPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
+  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $PageMessagesPath, $HostGrantsPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
   Add-Type -Path ($paths + $tmp) -IgnoreWarnings -WarningAction SilentlyContinue -ReferencedAssemblies @(
     'System.Xml', 'System.Xml.ReaderWriter', 'System.Diagnostics.Process', 'System.Diagnostics.FileVersionInfo',
     'System.ComponentModel.Primitives', 'System.Text.RegularExpressions', 'System.Collections', 'System.Linq',
     'System.Threading', 'System.Threading.Thread', 'System.Runtime.InteropServices') | Out-Null
 } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
 
-# The engine's REAL writers - procs, loaded (with attached), detached, and the attach error - so every engine
-# payload these checks feed the host is one the engine's own code produced. None is hand-written (3f2d747f seam:
-# a hand-written "restored":true passed here while the engine sends a COUNT, and every clean detach warned).
+# The engine's REAL writers - procs, loaded (with attached), detached, and the attach error - so every payload
+# that stands for what the engine sends TODAY is one the engine's own code produced (3f2d747f seam: a hand-written
+# "restored":true passed here while the engine sends a COUNT, and every clean detach warned). The few hand-written
+# lines below are deliberately OFF-contract - an older engine's shape, a malformed or hostile line - which no
+# current writer can produce, and each says so where it is used.
 $engineJson = Get-Content -Raw -LiteralPath $EngineJsonPath
 $procsCmd = Get-Content -Raw -LiteralPath $ProcsCommandPath
 $xLoaded = Get-Method 'public static string Loaded(uint pid, uint loadBase)' $engineJson
@@ -494,7 +498,9 @@ Invoke-CheckSection '2. the engine''s procs line, read by the host (ParseProcsJs
   Check 'no entry is the skipped process' (-not ($got | Where-Object { $_.Pid -eq 9 })) ''
   Check 'no procs line at all reads as null (an error), not as an empty list' ($null -eq (Invoke-Static 'ParseProcsJson' @('procs: --exclude needs a process id'))) ''
   Check 'a malformed procs line reads as null' ($null -eq (Invoke-Static 'ParseProcsJson' @('{"event":"procs","procs":[{"pid":1,'))) ''
-  $empty = Invoke-Static 'ParseProcsJson' @('{"event":"procs","procs":[],"skipped":12}')
+  $noEntries = [System.Collections.Generic.List[AttachEngineSide.ProcEntry]]::new()
+  $noSkips = [System.Collections.Generic.List[AttachEngineSide.ProcSkip]]::new()
+  $empty = Invoke-Static 'ParseProcsJson' @([AttachEngineSide.EngineJson]::Procs($noEntries, $noSkips, $false))
   Check 'an empty listing reads as an empty list' (($null -ne $empty) -and ($empty.Count -eq 0)) ''
   # The engine BINARY is deliberately not run here: test-engine-session.ps1 holds every script that launches
   # it to the shared lifecycle, and test-procs.ps1 already checks what the built engine prints. The writer
@@ -524,9 +530,18 @@ function New-Detach { param([int] $Restored = 3, $Err = $null, [bool] $Named = $
 
 # ================================================================================================ 3. detached + Stop
 # A stand-in engine: reads one command line, records it, then exits or hangs as told.
+#
+# IT SAYS WHEN IT IS UP, AND NOTHING IS ASKED OF IT BEFORE THEN. Stop gives a launched engine QuitWaitMs
+# (1.5 s) to exit, and that budget used to include this stand-in's whole pwsh cold start. Under load that
+# start alone can pass 1.5 s, so sections 4 and 9 and -SelfTest's M6 went red and then passed on a rerun
+# (reported three times in wave 5). The stand-in now writes <Out>.ready as its first act, and
+# Start-FakeEngine waits for that file, so every window below times the ENGINE'S ANSWER, which is what the
+# checks are about, and never the process start. Nothing is scaled: 1.5 s and 8 s are still the service's
+# own constants, read off the compiled type.
 $fakeEngine = Join-Path ([IO.Path]::GetTempPath()) ('attach-fake-engine-' + [guid]::NewGuid().ToString('N') + '.ps1')
 [IO.File]::WriteAllText($fakeEngine, @'
 param([string] $Out, [string] $Mode, [string] $Say = '')
+[IO.File]::WriteAllText($Out + '.ready', 'ready')
 $l = [Console]::In.ReadLine()
 [IO.File]::WriteAllText($Out, [string] $l)
 # 'say': answer with one engine line (base64 of what the engine's own writer produced), then exit like the engine.
@@ -541,6 +556,16 @@ function Start-FakeEngine { param([string] $Mode, [string] $SayLine = '')
   $psi = New-Object System.Diagnostics.ProcessStartInfo 'pwsh', "-NoProfile -File `"$fakeEngine`" -Out `"$out`" -Mode $Mode$say"
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
   $p = [System.Diagnostics.Process]::Start($psi)
+  # A generous bound on the START only: a stand-in that never comes up is a harness failure, said out loud,
+  # not a silent pass or a red check about Stop.
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  while (-not (Test-Path -LiteralPath ($out + '.ready'))) {
+    if ($p.HasExited -or $sw.Elapsed.TotalSeconds -gt 60) {
+      throw "the stand-in engine ($Mode) never signalled ready (exited=$($p.HasExited), $([int]$sw.Elapsed.TotalSeconds) s)"
+    }
+    Start-Sleep -Milliseconds 20
+  }
+  Remove-Item -LiteralPath ($out + '.ready') -ErrorAction SilentlyContinue
   [pscustomobject]@{ Process = $p; Out = $out }
 }
 function New-Service { param($Engine, $AttachTo)
@@ -828,7 +853,6 @@ Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits'
     (($pad.Posts -contains 'console|info|Detached; app.exe is still running.') -and -not (($pad.Posts -join "`n") -match 'console\|err\|')) ($pad.Posts -join ' / ')
   $pad = New-AttachedPad
   $pad.OnSvcDetached((New-Detach))
-  $pad.Posts.Clear()
   $pad.Posts.Clear()
   $pad.OnSvcExited(0)
   Check 'the engine''s exit after a detach posts nothing, so the Detached line survives' ($pad.Posts.Count -eq 0) ($pad.Posts -join ' / ')

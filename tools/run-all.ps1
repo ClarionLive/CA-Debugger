@@ -56,6 +56,7 @@ $Suites = @(
   @{ File = 'test-addin-bpremove.ps1' }
   @{ File = 'test-addin-hooks.ps1' }
   @{ File = 'test-addin-json.ps1' }
+  @{ File = 'test-addin-watch-fields.ps1' }
   @{ File = 'test-addin-lifecycle.ps1' }
   @{ File = 'test-addin-attach.ps1' }
   @{ File = 'test-addin-attach.ps1'; Args = @('-SelfTest') }
@@ -69,8 +70,7 @@ $Suites = @(
   @{ File = 'test-procs.ps1'; Args = @('-WithClarion'); Live = $true }
   @{ File = 'test-attach.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-attach.ps1'; Live = $true }
-  @{ File = 'test-engine-bpowner.ps1'; Success = '^ALL CHECKS PASSED$'
-     NoTotal = 'not yet opted in to Assert-CheckTotal and prints no count - ticket 6493d226' }
+  @{ File = 'test-engine-bpowner.ps1' }
   @{ File = 'test-engine-session.ps1' }
   @{ File = 'test-engine-setip-sites.ps1' }
   @{ File = 'test-engine-setip-sites.ps1'; Args = @('-SelfTest') }
@@ -78,6 +78,8 @@ $Suites = @(
   @{ File = 'test-engine-tid-members.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-engine-hover-sites.ps1' }
   @{ File = 'test-engine-hover-sites.ps1'; Args = @('-SelfTest') }
+  @{ File = 'test-engine-framecache-sites.ps1' }
+  @{ File = 'test-engine-framecache-sites.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-pad-bpstate.js' }
   @{ File = 'test-pad-contrast.js' }
   @{ File = 'test-pad-editmeta.js' }
@@ -87,6 +89,8 @@ $Suites = @(
   @{ File = 'test-pad-source.js' }
   @{ File = 'test-pad-setip.js' }
   @{ File = 'test-pad-threads.js' }
+  @{ File = 'test-pad-frames.js' }
+  @{ File = 'test-pad-xss.js' }
   @{ File = 'test-pad-watch-persist.js' }
   @{ File = 'test-bp-threaded.ps1'; Live = $true }
   @{ File = 'test-watch-threaded.ps1'; Live = $true }
@@ -138,17 +142,10 @@ foreach ($s in $Suites) {
 }
 
 # ---------------------------------------------------------------------------------------------- encoding
-# KNOWN VIOLATORS, each parsing under 5.1 by luck (measured 2026-09-22), awaiting ticket 075e9071. This
-# list may only SHRINK: a file here that no longer needs the exception is a FAILURE, so the list cannot
-# outlive its reason.
-$EncodingPending = @(
-  'spikes/decode-tswd.ps1'
-  'spikes/tswd-datasym2.ps1'
-  'spikes/tswd-datasym5.ps1'
-  'spikes/tswd-datasym6.ps1'
-  'spikes/tswd-locate-line317.ps1'
-  'spikes/watch-eval-probe.ps1'
-)
+# KNOWN VIOLATORS, each parsing under 5.1 by luck. Empty since ticket 075e9071 gave the last six (spikes/)
+# a BOM (2026-09-24). This list may only SHRINK: a file here that no longer needs the exception is a
+# FAILURE, so the list cannot outlive its reason. Do not add to it; give the file a BOM instead.
+$EncodingPending = @()
 $nonAsciiNoBom = @()
 # Tracked AND untracked-but-not-ignored, so a new script is checked before its first commit, not after.
 foreach ($rel in @(& git -C $repo ls-files --cached --others --exclude-standard '*.ps1')) {
@@ -168,7 +165,7 @@ elseif ($newBad.Count) {
 elseif ($stale.Count) {
   Report 'FAIL' 'encoding' ("fixed or gone, so remove from `$EncodingPending: " + ($stale -join ', '))
 }
-else { Report 'PASS' 'encoding' "every .ps1 is ASCII or carries a UTF-8 BOM, bar $($EncodingPending.Count) pending (075e9071)" }
+else { Report 'PASS' 'encoding' "every .ps1 is ASCII or carries a UTF-8 BOM, bar $($EncodingPending.Count) pending" }
 
 # ---------------------------------------------------------------------------------------------- build + protocolcheck
 if (-not $NoBuild) {

@@ -58,7 +58,7 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-addin-hooks.ps1` | offline | the reflection hooks into ClarionAssistant, one child process per scenario |
 | `test-addin-json.ps1` | offline | the add-in's JSON reader and writer |
 | `test-addin-attach.ps1` (plain and `-SelfTest`) | offline | attach host side (3f2d747f): only a host-listed pid is attached, Stop sends `detach` (not `quit`) and waits 8 s, the `detached` event resets the pad, a closing pad still warns durably (log, with a %TEMP% fallback, + a dialog that survives a dead UI context) on an unsafe detach, and an attach carries `--expect-start`; `-SelfTest` breaks each guard (31 mutations) and requires red |
-| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images (not yet total-pinned: ticket 6493d226) |
+| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images: the spec grammar, the image-matching rule and the identity predicates (not that a breakpoint fires in both images) |
 | `test-engine-session.ps1` | offline | the shared engine-session lifecycle, and that harnesses use it |
 | `test-engine-tid-members.ps1` (plain and `-SelfTest`) | offline | no thread-id JSON member written by hand; thread ids to users go through TidText |
 | `test-engine-hover-sites.ps1` (plain and `-SelfTest`) | offline | PausedWait resets the hover tracker as an unconditional top-level statement before its command loop (position, not text) |
@@ -68,15 +68,17 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-interactive.ps1` | **live** | step / stepover / stepout from a startup breakpoint |
 | `test-engine-setip-sites.ps1` (plain and `-SelfTest`) | offline | every resume cuts setip's observations back as ArmResume's first statement, and every step trap records its ESP (position, not text) |
 | `test-procs.ps1` (plain, `-SelfTest`, and **live** `-WithClarion`) | offline | the headers-only PE probe and the `procs --json` attach-candidate list |
-| `test-attach.ps1 -SelfTest` | offline | 13 planted faults each turn protocolcheck red on the check aimed at it: no drain, no EIP rewind; the thread reseed keeping the break thread, breaking a tie the wrong way, not setting main; commands read only on a wait timeout; and the 4b run 2 hardenings removed (a TF-clear or EIP-rewind failure unreported, bytes removed earlier forgotten by the drain or paused on by the loop, an unreadable image reported as not x86, --expect-start never compared, a throwing detach sending nothing) |
+| `test-attach.ps1 -SelfTest` | offline | 14 planted faults each turn protocolcheck red on the check aimed at it: no drain, no EIP rewind; the thread reseed keeping the break thread, breaking a tie the wrong way, not setting main; commands read only on a wait timeout; and the 4b run 2 hardenings removed (a TF-clear or EIP-rewind failure unreported, bytes removed earlier forgotten by the drain or paused on by the loop, an unreadable image reported as not x86, --expect-start never compared, a throwing detach sending nothing); and a QUIET detach (a refused attach) reporting an `exited` |
 | `test-attach.ps1` | **live** | attach to a running clbrws, then detach paused, running, after a step-over, by `quit` and by closing stdin, and `--expect-start` (a wrong creation time refused with nothing planted, the listed one attaching): the app lives, no debugger is attached, and every breakpoint byte matches the file on disk. It cannot reproduce the drain's race (its header says why, with the 2026-09-23 measurement) |
 | `test-setip.ps1` | **live** | set next statement on SplashScreen: back via `observed`, forward refused (stack-unproven), both breakpoints still fire around a setip, Step starts from the new line, nothing observed survives a continue or a step-out, and the ACCEPT-boundary, prologue, routine and Pause-stop refusals |
 
 **Live** suites launch `clbrws.exe` from the Clarion 11 examples
 (`C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses`) under the engine and
 post window messages to it, so they need that install and an unattended desktop. On 2026-09-22
-`test-bp-threaded.ps1` took about 55 s and flaked once (leg 1 under 8 hits, ticket b3e1ade8), which is why
-it is not in the default set.
+`test-bp-threaded.ps1` flaked once (leg 1 under 8 hits): it slept a fixed 5 s per browse open. Since
+ticket b3e1ade8 it waits for each open's hits instead (first hit, then 1.5 s quiet, 30 s cap); measured
+2026-09-24, three runs took 34-43 s with every open landing 8 hits (one 12). It stays live because it
+needs the app, not because it is flaky.
 
 ## Builds
 

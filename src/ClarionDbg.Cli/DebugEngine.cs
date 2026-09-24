@@ -891,6 +891,7 @@ namespace ClarionDbg.Cli
             HoverNewStop();             // one fresh hover answer per stop, however long the step took
             ClearThreadedBlockCache();  // a fresh stop is a fresh episode: re-resolve .cwtls instance blocks
                                         // rather than trust bases cached while the target was last frozen
+            ClearFrameCache();          // and re-walk the stack: frames cached at the last stop are history
 
             // The stop's location. These four are what the step verbs hand BeginStep, so they must describe
             // where EIP IS: `setip` moves it and re-runs AnnounceStop to recompute them (a77abd94 risk 6).
@@ -970,7 +971,7 @@ namespace ClarionDbg.Cli
                         else if (view.HaveCtx)
                             Console.WriteLine($"  EAX={view.Ctx.Eax:X8} EBX={view.Ctx.Ebx:X8} ECX={view.Ctx.Ecx:X8} EDX={view.Ctx.Edx:X8} ESI={view.Ctx.Esi:X8} EDI={view.Ctx.Edi:X8} EBP={view.Ctx.Ebp:X8} ESP={view.Ctx.Esp:X8} EIP={view.Ctx.Eip:X8}");
                         else
-                            EmitError("regs: no context for thread " + view.Tid);
+                            EmitError("regs: no context for thread " + TidText(view.Tid));
                         break;
 
                     case "mem":
@@ -982,7 +983,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "stack": case "bt": case "where":
-                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
+                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid, view.HThread);
                         break;
 
                     case "moduledata": case "moddata":
@@ -1023,7 +1024,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "framelocals":   // locals of one call-stack frame (Call-Stack-driven Variables)
-                        HandleFrameLocalsCommand(parts, view.Tid);
+                        HandleFrameLocalsCommand(parts, view.Tid, ref view.Ctx, view.HaveCtx);
                         break;
 
                     case "disasm": case "u":
@@ -1069,15 +1070,9 @@ namespace ClarionDbg.Cli
                         _detachPending = true;   // the debug loop detaches on THIS held event (DebugEngine.Attach.cs)
                         return;
 
-                    case "quit": case "q":
-                        // An attached app was running before we came and keeps running after: quit (and stdin
-                        // close, which queues quit) lets go of it. `kill` is the verb that ends it.
-                        if (IsAttach) { _detachPending = true; return; }
-                        Native.TerminateProcess(_hProcess, 0);
-                        return; // the EXIT_PROCESS event ends the loop
-
-                    case "kill":
-                        Native.TerminateProcess(_hProcess, 0);
+                    case "quit": case "q": case "kill":
+                        if (QuitDetaches(verb)) { _detachPending = true; return; }
+                        TerminateTarget();
                         return; // the EXIT_PROCESS event ends the loop
 
                     default:
@@ -1169,12 +1164,9 @@ namespace ClarionDbg.Cli
                     case "detach":
                         RequestDetach();
                         break;
-                    case "quit": case "q":
-                        if (IsAttach) { RequestDetach(); break; }   // see the pause loop's quit
-                        if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
-                        break;
-                    case "kill":
-                        if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
+                    case "quit": case "q": case "kill":
+                        if (QuitDetaches(verb)) { RequestDetach(); break; }
+                        TerminateTarget();
                         break;
                     case "setip":   // its own refusal event, so the pad can toast it like any other setip refusal
                         EmitSetIpNotPaused(parts);

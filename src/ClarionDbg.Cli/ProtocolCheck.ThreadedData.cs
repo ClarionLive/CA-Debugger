@@ -349,6 +349,56 @@ namespace ClarionDbg.Cli
             finally { VirtualFree(all, UIntPtr.Zero, MemRelease); }
         }
 
+        /// <summary>
+        /// The watch reply's <c>addr</c> (04b9679e): present only when the address is THIS thread's own storage,
+        /// so the pad's "View memory" never opens the shared THREAD template as if it were the thread's data.
+        /// Drives the shipped <see cref="DebugEngine.OwnStorageAddr"/> with the argument shape each
+        /// HandleWatchCommand arm passes EmitWatchValue, then the shipped <see cref="Json.Watch"/> writer.
+        ///
+        /// NOT COVERED: that each arm really passes the shape named below (reaching the arms needs a paused
+        /// thread's CONTEXT and parsed TSWD info), or the host and page halves (tools/test-pad-memory.js).
+        /// </summary>
+        private static void CheckWatchAddrIsOwnStorage(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("a watch reply carries addr for a thread's own storage (a non-threaded global, a frame "
+                         + "local, a THREADed name's own instance) and none for a value read from the shared "
+                         + "template (unallocated, template, straddling), whatever its editable flag. Not covered: "
+                         + "that each watch arm passes the argument shape tested here.");
+
+            const uint tmpl = 0x4C8010, inst = 0x02A31010, slot = 0x0019FE40, glob = 0x4A2F10;
+            var own = new[]
+            {
+                new { Arm = "Outside (non-threaded global)", Threaded = false, T = glob, I = glob },
+                new { Arm = "frame local", Threaded = false, T = slot, I = slot },
+                new { Arm = "ThreadedResolve.Ok (own instance)", Threaded = true, T = tmpl, I = inst },
+            };
+            foreach (var c in own)
+            {
+                string a = DebugEngine.OwnStorageAddr(c.Threaded, c.T, c.I);
+                string want = "0x" + c.I.ToString("X");
+                if (a != want)
+                    failures.Add("watch addr: " + c.Arm + " gave " + (a ?? "no addr") + ", expected " + want);
+            }
+            // Unallocated, Template and Straddling all read the template itself: instanceVa == templateVa.
+            string shared = DebugEngine.OwnStorageAddr(true, tmpl, tmpl);
+            if (shared != null)
+                failures.Add("watch addr: a THREADed value read from the shared template (Unallocated/Template/Straddling) "
+                             + "carried addr " + shared + " - View memory would show the template as this thread's data");
+
+            // The writer: present exactly when given, independent of editable.
+            var bytes = new byte[] { 1, 2, 3, 4 };
+            string withAddr = Json.Watch("G", true, tmpl, inst, true, 0x03, "LONG", 4, 0, "1", bytes, 4, false,
+                                         addr: "0x" + inst.ToString("X"));
+            if (withAddr.IndexOf("\"addr\":\"0x" + inst.ToString("X") + "\"", StringComparison.Ordinal) < 0)
+                failures.Add("watch addr: Json.Watch given an addr on a NON-editable value did not write it: " + withAddr);
+            string noAddr = Json.Watch("G", true, tmpl, tmpl, true, 0x03, "LONG", 4, 0, "1", bytes, 4, true);
+            if (noAddr.IndexOf("\"addr\"", StringComparison.Ordinal) >= 0)
+                failures.Add("watch addr: Json.Watch with no addr wrote one anyway: " + noAddr);
+            // CONTROL: the editable value above still carries its va, so "no addr" is not "no address at all".
+            if (noAddr.IndexOf("\"va\":\"0x" + tmpl.ToString("X") + "\"", StringComparison.Ordinal) < 0)
+                failures.Add("watch addr control: an editable Json.Watch lost its va: " + noAddr);
+        }
+
         private const uint MemReserve = 0x2000, MemRelease = 0x8000, PageNoAccess = 0x01;
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]

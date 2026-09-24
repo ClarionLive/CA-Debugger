@@ -460,6 +460,43 @@ Invoke-CheckSection '7) a section reads its CALLER''s variables, never the secti
 }
 Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionName, sectionBody
 
+# 8) ORDER. The live harnesses read the engine's lines back in the order they sit in the sink, and a paused
+# read ahead of the setip written before it is a wait that times out (test-setip, 25.2 s, wave 5). The sink
+# used to be filled through PowerShell's event queue, which swaps back-to-back lines; see Connect-EngineOutput.
+# This drives the REAL New-EngineSession/Remove-EngineSession with a stand-in engine: a .bat that ignores the
+# break arguments it is given and writes 3000 back-to-back A/x/B triples, then one stderr line. cmd's echo
+# rather than a pwsh child, so there is no start-up cost and the lines come in bursts, which is what the old
+# sink reordered. Measured 2026-09-24: the old sink put 12 of 3000 pairs out of order in a probe of this
+# shape, and this section goes red against the old engine-session.ps1.
+Invoke-CheckSection '8) the pump keeps the engine''s line order, stdout and stderr (wave 5)' {
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ('engine-order-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    $bat = Join-Path $dir 'fake-engine.bat'
+    $n = 3000
+    [IO.File]::WriteAllText($bat, "@echo off`r`nfor /L %%i in (1,1,$n) do (echo A%%i& echo x%%i& echo B%%i)`r`n1>&2 echo last-err`r`n")
+    $s = $null
+    try {
+        $s = New-EngineSession -Engine $bat -Target 'C:\apps\fake.exe' -CaptureStdErr
+        # Untimed on purpose: after an exit it waits for the redirected output to drain, so every line is in.
+        [void]$s.Proc.WaitForExit(60000); $s.Proc.WaitForExit()
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($s.Sink.Count -lt 3 * $n + 1 -and $sw.Elapsed.TotalSeconds -lt 10) { Start-Sleep -Milliseconds 50 }
+        Remove-EngineSession $s
+        $got = @($s.Sink.ToArray())
+        $stdout = @($got | Where-Object { $_ -notlike 'STDERR: *' })
+        $moved = 0
+        for ($i = 0; $i -lt [Math]::Min($stdout.Count, 3 * $n); $i++) {
+            $want = ('A', 'x', 'B')[$i % 3] + ([int][Math]::Floor($i / 3) + 1)
+            if ($stdout[$i] -cne $want) { $moved++ }
+        }
+        Check "every stdout line arrives ($(3 * $n))" ($stdout.Count -eq 3 * $n) "$($stdout.Count) line(s)"
+        Check '...in the order the engine wrote them' (($stdout.Count -eq 3 * $n) -and ($moved -eq 0)) "$moved line(s) out of place"
+        Check 'stderr lands in the same sink, prefixed STDERR:' (@($got | Where-Object { $_ -ceq 'STDERR: last-err' }).Count -eq 1) ''
+    } finally {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # (b) THE BACKSTOP, in lib-check.ps1's terms. (a) - Invoke-CheckSection turning a thrown section into a
 # failed check - is what actually closes ticket cb9324f2 and needs nothing maintained. This catches the
 # remaining case (a) cannot: a section that returns EARLY without throwing raises nothing to catch, and
@@ -468,7 +505,7 @@ Remove-Variable -Scope Script -Name Name, Body, before, returned, err, sectionNa
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 69   # 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
+$EXPECTED_CHECKS = 72   # +3 section 8, the pump's line order (wave 5); was 69: 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

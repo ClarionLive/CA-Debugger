@@ -60,7 +60,8 @@ if ($SelfTest) {
     @('the debug loop pauses on a stale hit of ours', 'else if (IsStaleHitOfOurs(exAddr))', 'else if (tid0 == 1 && IsStaleHitOfOurs(exAddr))', 'stale hit: the debug loop', 'DebugEngine.cs'),
     @('an unreadable image is reported as not x86', 'if (!probeOk) return ImageArch.Unreadable;', 'if (!probeOk) return ImageArch.NotX86;', 'attach image (c): an x86 process whose image could not be read', 'ProcsCommand.cs'),
     @('--expect-start is never compared', 'if (StartTimeMatches(ExpectStart, read, actual)) return;', 'if (tid0 == 0) return;', 'expect-start (d): a creation-time MISMATCH'),
-    @('a detach that throws sends nothing', ('catch (Exception ex)' + "`n" + '            {' + "`n" + '                aborted = '), ('catch (Exception ex) when (ex == null)' + "`n" + '            {' + "`n" + '                aborted = '), 'detach (e):')
+    @('a detach that throws sends nothing', ('catch (Exception ex)' + "`n" + '            {' + "`n" + '                aborted = '), ('catch (Exception ex) when (ex == null)' + "`n" + '            {' + "`n" + '                aborted = '), 'detach (e):'),
+    @('a quiet detach reports the exit', 'if (EmitJson && !_detachQuiet) Console.WriteLine("@JSON " + Json.Exited(exitCode));', 'if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));', 'detach (f):')
   )
   try {
     $src = Join-Path $PSScriptRoot '..\src'
