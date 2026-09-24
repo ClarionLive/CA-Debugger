@@ -568,7 +568,10 @@
   // here. Relabelling the panels on dispatch left them holding one thread's values under another
   // thread's name whenever a command was dropped, which is the exact failure this ticket exists to stop.
   function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
-  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  // Escapes quotes as well as & < >: esc() output lands inside quoted attributes (data-n, data-name,
+  // data-va), and before 2026-09-24 a `"` in a debuggee symbol name broke out of them (e1dea0d9).
+  function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                                                .replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
   let paused=false;
@@ -1959,8 +1962,8 @@
       box.appendChild(e); return;
     }
     threadRows.forEach(t=>{
-      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols and esc() does not
-      // escape quotes, so interpolating them (especially into the title attribute) would be an injection sink.
+      // DOM APIs, not innerHTML: proc/module come from the debuggee's own symbols, and building with DOM
+      // APIs keeps them out of HTML parsing entirely rather than relying on esc() for every attribute.
       const r=document.createElement('div');
       r.className='throw'+(t.tid===selTid?' sel':'')+(t.tid===stopTid?' stopped':'');
       const mark=document.createElement('span'); mark.className='thmark'; mark.textContent=(t.tid===selTid?'●':'○');
@@ -2468,7 +2471,7 @@
           // withheld the path to avoid, and would open an arbitrary one of the candidate files — the
           // plausible wrong answer this whole contract exists to stop. Declining is the honest action.
           // Title set as a PROPERTY, never interpolated into innerHTML: b.module comes from the debuggee's
-          // TSWD info and is untrusted, and esc() does not escape quotes.
+          // TSWD info and is untrusted.
           lk.classList.add('ambig');
           // SAME behaviour for both, DIFFERENT sentence. Claiming "more than one file claims it" when the
           // host merely sent something unreadable would state a fact about the user's program that we do
@@ -2488,7 +2491,7 @@
       }
       // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
       // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
-      // be an injection sink, since esc() doesn't escape quotes. Absent before symbols load: the row then
+      // make its safety depend on esc() at every site. Absent before symbols load: the row then
       // stays exactly as it was, rather than showing "unknown".
       const own=bpOwner(b.module, b.line);
       if(own){
@@ -2582,8 +2585,8 @@
     el.innerHTML='';
     const frag=document.createDocumentFragment();
     // Build rows with DOM APIs (textContent + .title), never innerHTML — name/module come from the
-    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE (esc() doesn't escape quotes,
-    // so interpolating them into an HTML attribute would be an injection sink).
+    // debuggee's TSWD info and are UNTRUSTED when debugging a hostile EXE, and DOM APIs keep them out
+    // of HTML parsing altogether.
     listed.forEach(p=>{ const module=p.module||'', name=p.name||'';
       const d=document.createElement('div'); d.className='proc'; d.dataset.key=name.toLowerCase();
       // The host's id for this row is what the right-click "Break on entry" sends back; the host looks up
