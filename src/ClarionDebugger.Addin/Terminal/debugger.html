@@ -570,8 +570,10 @@
   function send(action,data){ if(wv) wv.postMessage(JSON.stringify({action:action,data:data===undefined?null:data})); }
   // Escapes quotes as well as & < >: esc() output lands inside quoted attributes (data-n, data-name,
   // data-va), and before 2026-09-24 a `"` in a debuggee symbol name broke out of them (e1dea0d9).
+  // \x22 and \x27 rather than literal quotes: tools/lib-extract.ps1 brace-matches this out with a C#
+  // string scanner, and a bare quote inside a regex literal reads to it as an unterminated string.
   function esc(s){ return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-                                                .replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+                                                .replace(/\x22/g,'&quot;').replace(/\x27/g,'&#39;'); }
   function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),1300); }
 
   let paused=false;
@@ -1287,8 +1289,9 @@
   }
 
   // edit-variable-value: build the inline data-attrs for an editable scalar cell (engine-controlled
-  // hex/number metadata — safe in attributes); empty string for non-editable rows.
-  function editAttrs(v){ return v.va ? (' data-va="'+v.va+'" data-tc="'+v.typeCode+'" data-sz="'+(v.size||0)+'" data-pl="'+(v.places||0)+'"') : ''; }
+  // hex/number metadata); empty string for non-editable rows. Escaped anyway, so the attributes stay
+  // well-formed whatever the reply carries rather than by where the values came from.
+  function editAttrs(v){ return v.va ? (' data-va="'+esc(v.va)+'" data-tc="'+esc(v.typeCode)+'" data-sz="'+esc(v.size||0)+'" data-pl="'+esc(v.places||0)+'"') : ''; }
   // Drop a cell's edit affordance and the instance address it was bound to. The pencil is a SIBLING of the
   // cell (wireEdit inserts it after), so it has to go too — a live pencil over a cleared va is exactly the
   // stale-write hazard this prevents. setEditMeta/wireEdit re-add both when the new reply carries a va.
@@ -1413,7 +1416,10 @@
       }
     });
   }
-  function cssEsc(s){ return s.replace(/["\\]/g,'\\$&'); }
+  // A CSS string body: quote and backslash escaped, and control characters as hex escapes, since a raw
+  // newline in a selector string makes querySelectorAll THROW (and applyValue with it). U+0000 cannot be
+  // expressed in CSS at all (it parses as U+FFFD), so a name containing one simply matches no row.
+  function cssEsc(s){ return String(s).replace(/["\\]/g,'\\$&').replace(/[\x00-\x1f\x7f]/g,c=>'\\'+c.charCodeAt(0).toString(16)+' '); }
 
   // ---- edit-variable-value: double-click a value cell to write a new value into the live process ----
   let isPaused=false;
@@ -2725,8 +2731,14 @@
     if(names.length){ try{ re=new RegExp('(?<![A-Za-z0-9_])('+names.map(reEsc).join('|')+')(?![A-Za-z0-9_:])','g'); }catch(e){ re=null; } }
     lines.forEach((txt,i)=>{ const ln=startLine+i; const d=document.createElement('div');
       d.className='sline'+(ln===current?' cur':''); d.dataset.line=ln;
-      let body=esc(txt);
-      if(re) body=body.replace(re,'<span class="srcid id" data-name="$1">$1</span>');
+      // Match on the RAW line and escape each piece as it is emitted. Running the regex over esc(txt)
+      // matched inside entities (a symbol named LT split `&lt;`) and wrote the match into data-name unescaped.
+      let body='';
+      if(re){ let last=0, mm; re.lastIndex=0;
+        while((mm=re.exec(txt))){ body+=esc(txt.slice(last,mm.index))
+            +'<span class="srcid id" data-name="'+esc(mm[1])+'">'+esc(mm[1])+'</span>'; last=re.lastIndex; }
+        body+=esc(txt.slice(last));
+      } else body=esc(txt);
       d.innerHTML='<span class="gut">'+ln+'</span><span>'+body+'</span>'; src.appendChild(d); });
     src.querySelectorAll('.srcid').forEach(attachTip);
     renderBpDots();
@@ -2801,9 +2813,18 @@
   function renderTA(q){
     const m=allSyms.filter(s=>s.name.toLowerCase().includes(q.toLowerCase())).slice(0,8);
     if(!q||!m.length){ ta.classList.remove('show'); return; }
-    ta.innerHTML=m.map(s=>'<div class="ta-item" data-n="'+esc(s.name)+'"><span class="tn">'+esc(s.name)+'</span><span class="tt">'+esc(s.type||'')+'</span></div>').join('');
+    // DOM APIs, not innerHTML: s.name comes from the debuggee's debug info, and the click handler reads it
+    // back from dataset, so it has to arrive there byte for byte rather than via HTML attribute parsing.
+    ta.innerHTML='';
+    m.forEach(s=>{
+      const it=document.createElement('div'); it.className='ta-item'; it.dataset.n=s.name;
+      const tn=document.createElement('span'); tn.className='tn'; tn.textContent=s.name;
+      const tt=document.createElement('span'); tt.className='tt'; tt.textContent=s.type||'';
+      it.appendChild(tn); it.appendChild(tt);
+      it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); };
+      ta.appendChild(it);
+    });
     ta.classList.add('show');
-    ta.querySelectorAll('.ta-item').forEach(it=>it.onclick=()=>{ addWatch(it.dataset.n); inp.value=''; ta.classList.remove('show'); });
   }
   inp.addEventListener('input',()=>renderTA(inp.value));
   inp.addEventListener('keydown',e=>{ if(e.key==='Enter'&&inp.value.trim()){ addWatch(inp.value.trim()); inp.value=''; ta.classList.remove('show'); } if(e.key==='Escape') ta.classList.remove('show'); });
