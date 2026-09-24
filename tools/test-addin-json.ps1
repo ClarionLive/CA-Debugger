@@ -1163,6 +1163,13 @@ $pad.RunPushProcedures('C:\App\app.exe')
 $procMsg = if ($pad.Posts.Count -ge 1) { $pad.Posts[$pad.Posts.Count - 1] } else { '' }
 Check 'CONTROL: PushProcedures posts an empty "loading" list, then the list' `
   (($pad.Posts.Count -eq 2) -and ($pad.Posts[0] -cmatch '"procs":\[\],"loading":true') -and ($procMsg -cmatch '"name":"MAIN"')) "$($pad.Posts.Count) post(s)"
+# A launch and an attach load the list (and the globals) through ONE method (70860d6b C7), so a change to
+# either reaches both kinds of session.
+$webCode = Get-CSharpCodeOnly $web
+Check 'StartSession and AttachSession both load symbols through LoadStaticSymbols, the one reader of the globals' `
+  (((Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)) -match 'LoadStaticSymbols\(_exe\);') -and `
+   ((Get-CSharpCodeOnly (Get-Method 'private void AttachSession(AttachableProcess target)' $web)) -match 'LoadStaticSymbols\(exe\);') -and `
+   ([regex]::Matches($webCode, 'GetGlobalsJson\(').Count -eq 1)) ''
 
 $watch = New-Object ClarionDebugger.Terminal.DebugWatch
 $watch.Name = 'GLO:Count'; $watch.Found = $true; $watch.Value = '5'; $watch.TypeName = 'LONG'
@@ -2439,7 +2446,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 401
+$EXPECTED_CHECKS = 402
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

@@ -857,8 +857,7 @@ namespace ClarionDebugger.Terminal
                 Post("{\"type\":\"clear\"}");
                 var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
                 string label = (target.Name ?? "process") + " (pid " + target.Pid.ToString(CultureInfo.InvariantCulture) + ")";
-                Console("info", "attaching to " + label + "  (" + _pending.Count + " breakpoint(s)"
-                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                Console("info", "attaching to " + label + SessionCounts(solutionDlls));
                 _attach = new AttachContext { Name = target.Name };
                 _lastAttachName = target.Name;
                 try { _svc.AttachSession(target, _pending.ToArray(), solutionDlls); }
@@ -868,16 +867,7 @@ namespace ClarionDebugger.Terminal
 
                 // Symbols come from the image on disk, as for a launch, when the listed path still resolves.
                 string exe = target.Path;
-                if (!string.IsNullOrEmpty(exe) && File.Exists(exe))
-                {
-                    System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                    {
-                        string g = ClarionDebuggerService.GetGlobalsJson(exe);
-                        if (!string.IsNullOrEmpty(g))
-                            UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
-                    });
-                    PushProcedures(exe);
-                }
+                if (!string.IsNullOrEmpty(exe) && File.Exists(exe)) LoadStaticSymbols(exe);
             }
             catch (Exception ex) { Console("err", "attach failed: " + ex.Message); }
         }
@@ -1176,21 +1166,33 @@ namespace ClarionDebugger.Terminal
                 // Pre-load the solution's output DLLs so breakpoints set in DLL source bind before
                 // launch (multi-DLL apps); other DLLs are still picked up automatically as they load.
                 var solutionDlls = ProjectTargetService.ResolveSolutionDlls();
-                Console("info", "starting: " + Path.GetFileName(_exe) + "  (" + _pending.Count + " breakpoint(s)"
-                    + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")");
+                Console("info", "starting: " + Path.GetFileName(_exe) + SessionCounts(solutionDlls));
                 _svc.StartSession(_exe, _pending.ToArray(), solutionDlls);
 
-                // load static data symbols (file buffers) for the Variables tree, off the UI thread
-                string exe = _exe;
-                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    string g = ClarionDebuggerService.GetGlobalsJson(exe);
-                    if (!string.IsNullOrEmpty(g))
-                        UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
-                });
-                PushProcedures(exe);   // refresh the Procedures list against the just-resolved target
+                LoadStaticSymbols(_exe);
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
+        }
+
+        /// <summary>A session's static symbols, read from the image on disk for a launch and an attach alike
+        /// (70860d6b C7): the data symbols (file buffers) for the Variables tree, off the UI thread, and the
+        /// Procedures list against this target.</summary>
+        private void LoadStaticSymbols(string exe)
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string g = ClarionDebuggerService.GetGlobalsJson(exe);
+                if (!string.IsNullOrEmpty(g))
+                    UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
+            });
+            PushProcedures(exe);
+        }
+
+        /// <summary>The "  (N breakpoint(s), M solution DLL(s))" a session's start line ends with.</summary>
+        private string SessionCounts(List<string> solutionDlls)
+        {
+            return "  (" + _pending.Count + " breakpoint(s)"
+                + (solutionDlls.Count > 0 ? ", " + solutionDlls.Count + " solution DLL(s)" : "") + ")";
         }
 
         /// <summary>Merge the gutter's (red-dot) breakpoints, set before the session, into _pending.</summary>
