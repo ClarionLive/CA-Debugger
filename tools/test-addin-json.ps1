@@ -37,6 +37,8 @@ param(
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
   # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
   [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
+  # the host-issued id and grant tables, split out of PageMessages.cs (6ac29815 #4)
+  [string] $HostGrantsPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\HostGrants.cs'),
   # the engine's Variables-row writer, whose edit members the host grants on the way out
   [string] $EngineLocalsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Locals.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
@@ -67,6 +69,9 @@ $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 # GetStr reads through the bridge's JsonMessageReader since 079ff431, so every probe that compiles it needs the
 # real reader beside it.
 $readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
+# The host's absent-tid rule lives in WireRules.TidIsKnown since 6ac29815, so every probe compiling a tid
+# reader or writer (TidMember, TidOf) carries the real class beside it.
+$wireRules = (Get-Method 'internal static class WireRules' $readerEarly) -replace 'internal static class', 'public static class'
 
 # Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
 # lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
@@ -87,6 +92,7 @@ $methods = @(
   (Get-Method 'private static uint? GetUIntOrNull(string json, string key)'),
   (Get-Method 'private static string TidJson(uint? tid)' $web),
   (Get-Method 'private static string TidMember(string name, uint? tid)' $web),
+  $wireRules,
   # the declared names the writer checks against (c299aced), lifted rather than retyped
   $tidNameDecls
 ) -join "`n"
@@ -574,6 +580,100 @@ if (-not (Test-Path -LiteralPath $HostSourceFixture)) {
 }
 
 Write-Host ''
+Write-Host 'the source pane follows the SELECTED thread (0955b29f)'
+# SendSource used to run only at a stop, so after a thread switch the pane and its header kept the STOPPED
+# thread's location. The page re-reads the stack on every switch; the host now takes the selected thread's
+# location from that tid-stamped reply. RUN below: the real OnStack, FollowSelectedThread, SourceFrameOf,
+# NoteStopSource and SendSource, with Post as a recorder. The stop itself (OnPaused) is too large to run here,
+# so what it contributes - remembering the stop just before sending its source - is pinned by position.
+# Hoisted out of the here-string: an unbalanced '(' in a signature breaks $() inside @"..."@.
+$followParts = @(
+  (Get-Method 'private void SendSource(' $web) -replace '^private void', 'public void'
+  (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid)' $web) -replace '^private void', 'public void'
+  (Get-Statement 'private DebugPause _stopSource' $web) -replace '^private', 'public'
+  Get-Statement 'private uint? _stopTid' $web
+  Get-Statement 'private uint? _sourceTid' $web
+  (Get-Method 'private void NoteStopSource(DebugPause p)' $web) -replace '^private void', 'public void'
+  Get-Method 'private void FollowSelectedThread(List<DebugStackFrame> frames, uint? tid)' $web
+  (Get-Method 'internal static DebugStackFrame SourceFrameOf(List<DebugStackFrame> frames)' $web) -replace '^internal static', 'public static'
+  Get-Method 'private static string Str(string s)' $web
+  Get-Method 'private static string TidJson(uint? tid)' $web
+  Get-Method 'private static string TidMember(string name, uint? tid)' $web
+  $wireRules
+  $tidNameDecls
+) -join "`n"
+$followTypes = (Get-Method 'public sealed class DebugStackFrame') + "`n" + (Get-Method 'public sealed class DebugPause')
+$followSrc = @"
+using System;
+using System.IO;
+using System.Text;
+using System.Globalization;
+using System.Collections.Generic;
+namespace ClarionDebugger.Terminal {
+$followTypes
+public class SourceFollowProbe {
+  public List<string> Posts = new List<string>();
+  private void Post(string json) { Posts.Add(json); }
+$followParts
+}
+}
+"@
+Add-Type -TypeDefinition $followSrc -Language CSharp | Out-Null
+
+function SFrame { param([int] $n, $proc, $module, [int] $line, $ebp = '0x19FF00')
+  $f = New-Object ClarionDebugger.Terminal.DebugStackFrame; $f.Frame = $n; $f.Proc = $proc; $f.Module = $module; $f.Line = $line; $f.Ebp = $ebp; $f
+}
+function Frames { param([object[]] $fs) $l = New-Object 'System.Collections.Generic.List[ClarionDebugger.Terminal.DebugStackFrame]'; foreach ($f in $fs) { $l.Add($f) }; ,$l }
+# The source messages one stack reply produced (the stack post itself is always first).
+function SourcesAfter { param($probe, $frames, $tid)
+  $probe.Posts.Clear(); $probe.OnStack($frames, $tid)
+  ,@($probe.Posts | Where-Object { $_ -like '{"type":"source"*' })
+}
+$follow = New-Object ClarionDebugger.Terminal.SourceFollowProbe
+$stop = New-Object ClarionDebugger.Terminal.DebugPause
+$stop.Module = 'stopmod.clw'; $stop.Proc = 'STOPPROC'; $stop.Line = 42; $stop.Tid = 100
+$follow.NoteStopSource($stop)
+$stoppedStack = Frames @((SFrame 0 'STOPPROC' 'stopmod.clw' 42))
+# Thread 200 is inside the runtime: frame 0 has no line, frame 1 has one but an unknown ebp, frame 2 is real.
+$runtimeStack = Frames @((SFrame 0 $null $null 0 '0x0'), (SFrame 1 'WORKER' 'worker.clw' 17 '0x0'), (SFrame 2 'MAIN' 'main.clw' 88))
+
+$s = SourcesAfter $follow $stoppedStack 100
+Check 'CONTROL: the stopped thread''s own stack reply sends no second source' ($s.Count -eq 0) ($s -join ' | ')
+$s = SourcesAfter $follow $runtimeStack 200
+Check 'a switch to another thread sends ITS location: the first real Clarion frame with a line (MAIN, main.clw:88)' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":"main\.clw","proc":"MAIN"') -and ($s[0] -cmatch '"current":88[,}]')) ($s -join ' | ')
+Check 'and a frame whose ebp is unknown ("0x0") is passed over (not WORKER, worker.clw:17)' `
+  (($s -join ' ') -notmatch 'worker\.clw') ($s -join ' | ')
+$s = SourcesAfter $follow $runtimeStack 200
+Check 'a repeated reply for the thread already shown sends nothing' ($s.Count -eq 0) ($s -join ' | ')
+$s = SourcesAfter $follow $runtimeStack 100
+Check 'switching BACK restores the stop''s own source and marker (stopmod.clw:42, STOPPROC), not a frame''s' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":"stopmod\.clw","proc":"STOPPROC"') -and ($s[0] -cmatch '"current":42[,}]')) ($s -join ' | ')
+$s = SourcesAfter $follow (Frames @((SFrame 0 'OTHER' 'other.clw' 5 '0x0'), (SFrame 1 'MAIN' 'main.clw' 88))) 300
+Check 'frame 0 with a line is the thread''s location, whatever its ebp (OTHER, other.clw:5)' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":"other\.clw","proc":"OTHER"') -and ($s[0] -cmatch '"current":5[,}]')) ($s -join ' | ')
+$s = SourcesAfter $follow (Frames @((SFrame 0 $null $null 0 '0x0'))) 400
+Check 'a thread with no frame that has a line still gets a source message, with NO lines and no file' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":null') -and ($s[0] -cmatch '"lines":\[\]')) ($s -join ' | ')
+$s = SourcesAfter $follow $stoppedStack $null
+Check 'a reply that names no thread moves nothing' ($s.Count -eq 0) ($s -join ' | ')
+$follow._stopSource = $null
+$s = SourcesAfter $follow $runtimeStack 200
+Check 'with no stop to return to (resumed), a reply moves nothing' ($s.Count -eq 0) ($s -join ' | ')
+$noTid = New-Object ClarionDebugger.Terminal.SourceFollowProbe
+$stop.Tid = $null; $noTid.NoteStopSource($stop)
+$s = SourcesAfter $noTid $runtimeStack 200
+Check 'a stop that named no thread never follows: its own stack reply cannot be told from a switch' ($s.Count -eq 0) ($s -join ' | ')
+# The two wires into the session, by position: the stop is remembered IMMEDIATELY before its source is sent,
+# resume forgets it, and OnStack follows only after posting the stack (the page must hold the frames first).
+$onPausedCode = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $web)
+Check 'OnPaused remembers the stop as the statement right before it sends the stop''s source' `
+  ($onPausedCode -match 'NoteStopSource\(p\);\s*SendSource\(p\.Module, p\.ResolvedPath, p\.Proc, p\.Line\);') ''
+Check 'OnSvcResumed forgets the stop' ((Get-Method 'private void OnSvcResumed(' $web) -match '_stopSource = null;') ''
+Check 'OnStack follows as its LAST statement, after the stack is posted' `
+  ((Get-CSharpCodeOnly (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid)' $web)) -match 'Post\(sb\.ToString\(\)\);\s*FollowSelectedThread\(frames, tid\);\s*\}\s*$') ''
+
+Write-Host ''
 Write-Host 'teardown: "stopped" has to be a check, not a claim'
 # Task 51d2f1e4. Stop() used to discard the WaitForExit result, swallow the Kill and set Idle in a finally
 # regardless, so a debugger that reported "stopped" could still own a live process. The decision table below
@@ -925,6 +1025,7 @@ Write-Host 'the retired rule is not lying around waiting to be followed again'
 # afbc68c7 retired JsonVal itself. Every inbound field is now read by the typed request DTOs in
 # PageMessages.cs, one Parse per request, and the retirement notice moved there with the readers.
 $pageMsgs = Get-Content -Raw -LiteralPath $PageMessagesPath
+$hostGrants = Get-Content -Raw -LiteralPath $HostGrantsPath
 $jsonValCalls = [regex]::Matches((Get-CSharpCodeOnly $web), '\bJsonVal\(')
 Check 'no JsonVal( is left in the bridge; the DTOs read every field' ($jsonValCalls.Count -eq 0) "$($jsonValCalls.Count) call(s)"
 # CONTROL: the scan sees a call when there is one, so the zero above is a zero somebody looked for.
@@ -960,6 +1061,7 @@ Write-Host 'the page hands back only what the host ISSUED: procedure ids and edi
 # the probe runs that work item inline (ThreadPool.QueueUserWorkItem -> RunNow). Nothing else is edited.
 
 $pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
+$hostGrantsBody = ($hostGrants -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
 # Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
 # `);` that closes UI( is put back here.
@@ -975,8 +1077,10 @@ using System.IO;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using ClarionDebugger.Wire;
 $readerBody
 $pageMsgsBody
+$hostGrantsBody
 namespace ClarionDebugger.Terminal {
 $(Get-Method 'public enum DebugSessionState')
 $bpRecord
@@ -985,6 +1089,11 @@ $(Get-Method 'public sealed class DebugProcedure')
 public sealed class ClarionDebuggerService {
   public static List<DebugProcedure> Listed = new List<DebugProcedure>();
   public static List<DebugProcedure> GetProcedures(string exe) { return new List<DebugProcedure>(Listed); }
+  $((Get-Method 'internal static DebugProcedure ProcedureFromSymbol(string obj)') -replace '^internal static', 'public static')
+  $(Get-Method 'private static string GetStr(string json, string key)')
+  $(Get-Method 'private static int GetInt(string json, string key)')
+  $(Get-Method 'private static int? GetIntOrNull(string json, string key)')
+  $(Get-Method 'private static string ScanNumberToken(string json, string key)')
   $(Get-Method 'public static bool IsValidModuleName(string module)')
   $((Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)') -replace 'internal static', 'public static')
 }
@@ -1045,8 +1154,9 @@ public sealed class BridgePad {
 Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
 function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
-function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0)
-  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine; $p
+function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0, [switch] $ExtentUnknown)
+  $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine
+  $p.ExtentUnknown = [bool] $ExtentUnknown; $p
 }
 
 # ---- host writers, run --------------------------------------------------------------------------------
@@ -1058,6 +1168,13 @@ $pad.RunPushProcedures('C:\App\app.exe')
 $procMsg = if ($pad.Posts.Count -ge 1) { $pad.Posts[$pad.Posts.Count - 1] } else { '' }
 Check 'CONTROL: PushProcedures posts an empty "loading" list, then the list' `
   (($pad.Posts.Count -eq 2) -and ($pad.Posts[0] -cmatch '"procs":\[\],"loading":true') -and ($procMsg -cmatch '"name":"MAIN"')) "$($pad.Posts.Count) post(s)"
+# A launch and an attach load the list (and the globals) through ONE method (70860d6b C7), so a change to
+# either reaches both kinds of session.
+$webCode = Get-CSharpCodeOnly $web
+Check 'StartSession and AttachSession both load symbols through LoadStaticSymbols, the one reader of the globals' `
+  (((Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)) -match 'LoadStaticSymbols\(_exe\);') -and `
+   ((Get-CSharpCodeOnly (Get-Method 'private void AttachSession(AttachableProcess target)' $web)) -match 'LoadStaticSymbols\(exe\);') -and `
+   ([regex]::Matches($webCode, 'GetGlobalsJson\(').Count -eq 1)) ''
 
 $watch = New-Object ClarionDebugger.Terminal.DebugWatch
 $watch.Name = 'GLO:Count'; $watch.Found = $true; $watch.Value = '5'; $watch.TypeName = 'LONG'
@@ -1273,10 +1390,12 @@ Check 'CONTROL: an idle request for a good module is staged once' `
 # ClarionAssistant has a file and a line, not an id. The position is only a key into the SAME host-issued
 # list, and it must be CONTAINED by a procedure (PM ruling, codex adversary gate) - never "the nearest one
 # above". Containment needs the procedure's END, which the bundled engine sends as endLine since e049e07; a
-# procedure with no end is refused as an engine/host version mismatch (pipeline run 2), never bounded by the
-# next procedure's start. clbrws011.clw: MAIN 42..70 with a routine inside it at 45, OTHER 80..120.
-# clbrws003.clw: LAST 20, no end. clbrws004.clw: BOUNDED 10..30, AFTERDATA 60. clbrws005.clw: the adversary's
-# case, A 10 with NO end and B 50..70.
+# procedure with no end is refused (pipeline run 2), never bounded by the next procedure's start. WHY it is
+# refused depends on what the engine sent (f1a98318): no extent member at all is an engine/host version
+# mismatch, while "extent":"unknown" is a same-build engine that could not bound it from the debug info.
+# clbrws011.clw: MAIN 42..70 with a routine inside it at 45, OTHER 80..120. clbrws003.clw: LAST 20, no end.
+# clbrws004.clw: BOUNDED 10..30, AFTERDATA 60. clbrws005.clw: the adversary's case, A 10 with NO end and
+# B 50..70. clbrws006.clw: UNBOUNDED 10, extent unknown, and NEXTP 50..70.
 $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Clear()
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'MAIN' 'clbrws011.clw' 42 'procedure' 70))
@@ -1288,6 +1407,8 @@ $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'AFTERDATA' 'clbrws004.clw' 60))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'A' 'clbrws005.clw' 10))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'B' 'clbrws005.clw' 50 'procedure' 70))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'UNBOUNDED' 'clbrws006.clw' 10 -ExtentUnknown))
+[ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'NEXTP' 'clbrws006.clw' 50 'procedure' 70))
 $posPad.RunPushProcedures('C:\App\app.exe')
 function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
 function PosRefused { param($path, $line, $reason)
@@ -1315,9 +1436,35 @@ Check 'CONTROL: a procedure WITH an end still resolves in the same module (B 50.
 Check 'with an end of 30, cursor 20 resolves (BOUNDED 10..30)' ((PosAdd 'C:\Src\clbrws004.clw' 20) -ceq 'clbrws004.clw:10') ($posPad._svc.Adds -join ',')
 Check 'and cursor 40, past that end, is refused' (PosRefused 'C:\Src\clbrws004.clw' 40 'past the end of BOUNDED') ($posPad.Lines -join ' / ')
 Check 'REFUSED: a file the list does not cover' (PosRefused 'C:\Src\unlisted.clw' 50 'no listed procedure is in') ($posPad.Lines -join ' / ')
+# f1a98318: the SAME refusal, worded by its cause. A procedure the engine said it could not bound is not a
+# broken install, so its message names the debug info and never the version mismatch.
+Check 'REFUSED: UNBOUNDED(10, extent unknown), cursor 20 - the debug info does not bound it' `
+  (PosRefused 'C:\Src\clbrws006.clw' 20 'the debug info does not say where UNBOUNDED ends') ($posPad.Lines -join ' / ')
+Check 'and that refusal does not blame an engine/host version mismatch' `
+  (($posPad.Lines -join ' / ') -notmatch 'mismatch|reinstall') ($posPad.Lines -join ' / ')
+Check 'CONTROL: NEXTP, bounded, still resolves beside it (50..70, cursor 60)' `
+  ((PosAdd 'C:\Src\clbrws006.clw' 60) -ceq 'clbrws006.clw:50') ($posPad._svc.Adds -join ',')
+Check 'and the version-mismatch refusal (A, no extent member at all) does not claim the debug info is at fault' `
+  ((PosRefused 'C:\Src\clbrws005.clw' 40 'engine/host version mismatch') -and (($posPad.Lines -join ' / ') -notmatch 'debug info')) ($posPad.Lines -join ' / ')
+# The service's reading of an engine row, RUN on rows in the engine's shape (Json.Symbols): the three cases
+# the host tells apart.
+$symRow = { param($extra) '{"name":"P","raw":"P","kind":"procedure","rva":"0x1000","line":10' + $extra + ',"moduleIdx":1,"module":"m.clw"}' }
+$withEnd = [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol((& $symRow ',"endLine":20'))
+$unknownEnd = [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol((& $symRow ',"extent":"unknown"'))
+$oldEngine = [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol((& $symRow ''))
+Check 'a row WITH endLine reads as bounded, not unknown' (($withEnd.EndLine -eq 20) -and -not $withEnd.ExtentUnknown) "end=$($withEnd.EndLine) unknown=$($withEnd.ExtentUnknown)"
+Check 'a row with "extent":"unknown" reads as unbounded BY THE ENGINE' (($unknownEnd.EndLine -eq 0) -and $unknownEnd.ExtentUnknown) "end=$($unknownEnd.EndLine) unknown=$($unknownEnd.ExtentUnknown)"
+Check 'a row with neither reads as an old engine (no end, not said unknown)' (($oldEngine.EndLine -eq 0) -and -not $oldEngine.ExtentUnknown) "end=$($oldEngine.EndLine) unknown=$($oldEngine.ExtentUnknown)"
+Check 'CONTROL: a routine row is read, a data row is skipped' `
+  (($null -ne [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol('{"name":"R","kind":"routine","line":12,"module":"m.clw"}')) -and `
+   ($null -eq [ClarionDebugger.Terminal.ClarionDebuggerService]::ProcedureFromSymbol('{"name":"D","kind":"other","line":12,"module":"m.clw"}'))) ''
+Check 'the list hands the engine''s "unknown" through to the id table (PushProcedures copies ExtentUnknown)' `
+  ((Get-Method 'private void PushProcedures(string exe)' $web) -match 'ExtentUnknown = p\.ExtentUnknown') ''
 Check 'the service reads an engine endLine when there is one, and treats one before the start as unknown' `
-  (((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
-   ((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'end\.HasValue && end\.Value >= line\) \? end\.Value : 0')) ''
+  (((Get-Method 'internal static DebugProcedure ProcedureFromSymbol(string obj)') -match 'GetIntOrNull\(obj, "endLine"\)') -and `
+   ((Get-Method 'internal static DebugProcedure ProcedureFromSymbol(string obj)') -match 'end\.HasValue && end\.Value >= line\) \? end\.Value : 0')) ''
+Check 'GetProcedures reads each row through ProcedureFromSymbol, the reader run above' `
+  ((Get-Method 'public static List<DebugProcedure> GetProcedures(string targetExe)') -match 'ProcedureFromSymbol\(m\.Value\)') ''
 
 # ---- edits, through the real page ---------------------------------------------------------------------
 function Sets { param($pad) ($pad._svc.Sets -join ' ; ') }
@@ -1487,6 +1634,20 @@ $g3 = New-Object ClarionDebugger.Terminal.EditGrants
 $g3.Grant('0x10', '0x03', 4, 0, 5)
 Check 'a thread-scoped grant does not answer a page with no thread selection' (-not $g3.IsGranted('0x10', '0x03', 4, 0, $null)) ''
 Check 'CONTROL: ...and does answer its own thread' ($g3.IsGranted('0x10', '0x03', 4, 0, 5)) ''
+# ONE tuple reader (6ac29815 #2): the grant and the edit read size/places with PageNumbers.ReadEditTuple, so a
+# row the engine sent and the page's echo of it agree, whichever member is missing or malformed. Run, per
+# shape: grant the row, then parse the page's edit carrying the same members.
+foreach ($t in @('"size":4,"places":2', '"size":4', '"places":2', '"size":"4","places":"x"', '"size":4,"places":null', '')) {
+  $sep = if ($t) { ',' } else { '' }
+  $gt = New-Object ClarionDebugger.Terminal.EditGrants
+  $gt.GrantRows('{"va":"0x30","typeCode":"0x03"' + $sep + $t + '}', 5)
+  $er = [ClarionDebugger.Terminal.EditVarRequest]::Parse('{"va":"0x30","typeCode":"0x03"' + $sep + $t + ',"tid":5,"value":"1"}')
+  Check "edit tuple {$t}: the grant and the page's echo of it read the same size and places" `
+    (($null -ne $er) -and $gt.IsGranted($er.Va, $er.TypeCode, $er.Size, $er.Places, $er.Tid)) "size=$($er.Size) places=$($er.Places)"
+}
+Check 'and both read it through PageNumbers.ReadEditTuple' `
+  (((Get-Method 'public static EditVarRequest Parse(string data)' $pageMsgs) -match 'PageNumbers\.ReadEditTuple\(data, out size, out places\)') -and `
+   ((Get-Method 'public void GrantRows(string itemsJson, uint? tid)' $hostGrants) -match 'PageNumbers\.ReadEditTuple\(o, out size, out places\)')) ''
 
 # ---- the other request DTOs ---------------------------------------------------------------------------
 # These payloads are delimiter strings, parsed exactly as before and now in one place each. Checked on the
@@ -1534,7 +1695,9 @@ Check 'mem: the host, the engine and the page share one cap' `
    -and [int]$pageCap.Groups[1].Value -eq [ClarionDebugger.Terminal.MemRequest]::MaxLen) `
   "engine=$($engineCap.Groups[1].Value) host=$([ClarionDebugger.Terminal.MemRequest]::MaxLen) page=$($pageCap.Groups[1].Value)"
 
-# RequestMem is the service-side gate, run for real over a recording SendCommand.
+# RequestMem is the service-side gate, run for real over a recording SendCommand. It and MemRequest.Parse
+# share WireRules (70860d6b D2); the regex RequestMem had before let "0x10<newline>" through, since .NET's
+# $ matches before a trailing newline - a second command on the engine's stdin. That case is first below.
 $memProbeSrc = @"
 using System;
 using System.Globalization;
@@ -1543,16 +1706,18 @@ public class MemRequestProbe {
   public string Sent;
   private bool SendCommand(string c) { Sent = c; return true; }
   $(Get-Method 'public bool RequestMem(int reqId, string addrHex, int len)')
+  $(Get-Method 'internal static class WireRules' $reader)
 }
 "@
 Add-Type -TypeDefinition $memProbeSrc -Language CSharp | Out-Null
 $mp = New-Object MemRequestProbe
 Check 'RequestMem sends mem ADDR LEN reqId (the reqId TRAILS, where the engine reads it)' `
   ($mp.RequestMem(4, '0x401000', 256) -and $mp.Sent -ceq 'mem 0x401000 256 4') (ShowVal $mp.Sent)
-foreach ($c in @(@(4, '0x40 1000', 16), @(4, '401000', 16), @(4, '0x1234567890', 16), @(4, '0x10', 0), @(4, '0x10', 4097), @(-1, '0x10', 16), @(4, $null, 16))) {
+foreach ($c in @(@(4, "0x10`n", 16), @(4, '0x40 1000', 16), @(4, '401000', 16), @(4, '0x1234567890', 16), @(4, '0x10', 0), @(4, '0x10', 4097), @(-1, '0x10', 16), @(4, $null, 16))) {
   # PowerShell stores $null into a C# string field as '', so "sent nothing" is IsNullOrEmpty, not -eq $null.
   $mp.Sent = $null
-  Check "RequestMem refuses reqId=$($c[0]) addr=$(ShowVal $c[1]) len=$($c[2]) and sends nothing" `
+  Check "RequestMem refuses reqId=$($c[0]) addr=$((ShowVal $c[1]) -replace "`n", '
+') len=$($c[2]) and sends nothing" `
     ((-not $mp.RequestMem($c[0], $c[1], $c[2])) -and [string]::IsNullOrEmpty($mp.Sent)) (ShowVal $mp.Sent)
 }
 Check 'RequestMem carries its security reasoning (read-only, capped, paused-only, validated)' `
@@ -1979,6 +2144,7 @@ public static class DisasmTagProbe {
   public const string FwdTag = "winf";
   public const string BwdTag = "winb";
 $(($fmtTag, $parseTag, $tidMatch, $tidOf -join "`n") -replace 'private static', 'public static')
+$wireRules
 }
 "@
 Add-Type -TypeDefinition $tagShim -Language CSharp | Out-Null
@@ -2240,6 +2406,7 @@ $($tidNameDecls)
   private void UI(Action a) { a(); }
 $(Get-Method 'private static string TidJson(uint? tid)' $web)
 $(Get-Method 'private static string TidMember(string name, uint? tid)' $web)
+$wireRules
 $onSvcHoverSrc
   // the service's `case "hover"` hop, making the calls pinned below
   public void Deliver(string engineJson) {
@@ -2294,7 +2461,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 370
+$EXPECTED_CHECKS = 402
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
