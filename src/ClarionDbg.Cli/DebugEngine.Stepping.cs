@@ -100,7 +100,7 @@ namespace ClarionDbg.Cli
                             _skipEntryEbp = ctx.Ebp;   // at the callee's entry, still the caller's frame
                             _skipEventLoopKind = EventLoopCallKindAt(_prevVa, ret);
                             _skipRetVa = ret;
-                            _skipLoopHeadVa = _skipEventLoopKind == 2 ? PlantLoopHeadTemp(ret) : 0;
+                            _skipLoopHeadVa = _skipEventLoopKind == EventLoopEnd ? PlantLoopHeadTemp(ret) : 0;
                             _skipRunning = true;
                             _prevVa = va;
                             return; // TF stays clear → full speed until the temp BP (or a user BP)
@@ -294,21 +294,29 @@ namespace ClarionDbg.Cli
         //   - End has a SECOND way back. When the loop goes round it does not return to its call site at all:
         //     it resumes at the loop head, Start's return address. So skipping End also plants a temp there,
         //     and whichever of the two the frame reaches first ends the skip and takes the other one out.
-        private int _skipEventLoopKind;   // the call being skipped: 1 = StartEventLoop, 2 = EndEventLoop, 0 = other
+        // _skipEventLoopKind's values, which are EventLoopImportKind's (DebugEngine.SetIp.cs).
+        private const int NotEventLoop = 0;
+        private const int EventLoopStart = 1;
+        private const int EventLoopEnd = 2;
+
+        private int _skipEventLoopKind;   // the call being skipped: EventLoopStart, EventLoopEnd or NotEventLoop
         private uint _skipEntryEbp;       // EBP at the callee's entry (the caller's frame)
-        private uint _skipRetVa;          // the skipped call's return address (its temp INT3)
-        private uint _skipLoopHeadVa;     // End only: the loop-head temp THIS skip planted, or 0
+        private uint _skipRetVa;          // the skipped call's return address (its temp INT3, or a user bp's)
+        private uint _skipLoopHeadVa;     // End only: the loop head this skip watches (see PlantLoopHeadTemp), or 0
 
         /// <summary>Plant a temp INT3 at the loop head of the back-edge that follows a `call [End]` returning
         /// to <paramref name="endRet"/>, and return its VA; 0 when there is no back-edge there, or the head
-        /// already carries an INT3 (a user breakpoint pauses there anyway; an existing temp is not ours to
-        /// remove).</summary>
+        /// already carries a TEMP (not ours to remove). A head that carries a USER breakpoint is returned
+        /// unplanted: that INT3 already catches the frame, and OnUserBp ends the skip on it even when the
+        /// breakpoint's gate does not pause (<see cref="IsSkipLanding"/>).</summary>
         private uint PlantLoopHeadTemp(uint endRet)
         {
             uint head = EventLoopBackEdgeTargetAt(endRet);
             byte orig;
-            if (head == 0 || head == endRet || _armed.ContainsKey(head) || _temp.ContainsKey(head)
-                || !ReadByte(head, out orig))
+            var watch = LoopHeadWatchFor(head, endRet, _armed.ContainsKey(head), _temp.ContainsKey(head));
+            if (watch == LoopHeadWatch.None) return 0;
+            if (watch == LoopHeadWatch.UserBreakpoint) return head;
+            if (!ReadByte(head, out orig))
                 return 0;
             WriteByte(head, 0xCC);
             _temp[head] = orig;
@@ -316,12 +324,67 @@ namespace ClarionDbg.Cli
             return head;
         }
 
+        internal enum LoopHeadWatch { None, UserBreakpoint, PlantTemp }
+
+        /// <summary><see cref="PlantLoopHeadTemp"/>'s choice, pure so `protocolcheck` can drive it: no head, a
+        /// head that is the return itself, or one already holding a temp is not watched; a head holding a user
+        /// breakpoint is watched through that breakpoint; any other gets a temp of its own.</summary>
+        internal static LoopHeadWatch LoopHeadWatchFor(uint head, uint endRet, bool userBpThere, bool tempThere)
+        {
+            if (head == 0 || head == endRet || tempThere) return LoopHeadWatch.None;
+            return userBpThere ? LoopHeadWatch.UserBreakpoint : LoopHeadWatch.PlantTemp;
+        }
+
         /// <summary>Has the skipped call returned to the stepping frame? For an ordinary call, ESP is back above
         /// the callee's entry. For an event-loop call, whose return ESP is not its call site's, EBP is back at
         /// the caller's frame.</summary>
         private static bool SkipHasReturned(int eventLoopKind, uint esp, uint ebp, uint entryEsp, uint entryEbp)
         {
-            return eventLoopKind != 0 ? ebp == entryEbp : esp >= entryEsp + 4;
+            return eventLoopKind != NotEventLoop ? ebp == entryEbp : esp >= entryEsp + 4;
+        }
+
+        /// <summary>Is a USER breakpoint hit at <paramref name="va"/> the stepping thread's skip landing? A
+        /// covered return (StepMachine plants no temp where a user bp already sits) or a loop head carrying a
+        /// user bp is caught by the user INT3 alone, so when that breakpoint's gate does NOT pause (a false
+        /// condition, an unmet hit count, a tracepoint), OnUserBp must end the skip here, or _skipRunning stays
+        /// set, StepMachine never runs again, and the step runs free.</summary>
+        private bool IsSkipLanding(uint tid, uint va, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
+            return _mode != StepMode.None && tid == _stepTid && _skipRunning && haveCtx
+                   && (va == _skipRetVa || (_skipLoopHeadVa != 0 && va == _skipLoopHeadVa))
+                   && SkipHasReturned(_skipEventLoopKind, ctx.Esp, ctx.Ebp, _skipEntryEsp, _skipEntryEbp);
+        }
+
+        /// <summary>The skipped call is back in the stepping frame at <paramref name="va"/>, through a temp INT3
+        /// (OnTempBp) or a non-pausing user breakpoint (OnUserBp): end the skip, then either stop there, when it
+        /// is a stop boundary, or resume stepping. <paramref name="ctx"/>'s EIP is already <paramref
+        /// name="va"/>.</summary>
+        private void FinishSkipAt(uint tid, uint va, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
+            _skipRunning = false;
+            EndSkip(va, ctx.Esp, haveCtx);   // before IsStepStop: an event-loop return re-bases its ESP gate
+            if (_mode != StepMode.None && haveCtx && IsStepStop(va, ctx.Esp))
+            {
+                // The skipped call returned straight onto a stop boundary. For source-level Over this is a
+                // new-statement record (a call as a line's last op → its return address is the next line's
+                // record); for instruction-granular OverInstr it's simply the return address. Stop here
+                // rather than resume stepping and trap only at the following instruction (missing it). The
+                // INT3 advanced the thread's EIP to va+1, so commit the corrected EIP (=va) before pausing,
+                // otherwise the next resume runs from mid-instruction and crashes the target.
+                Native.SetThreadContext(hThread, ref ctx);   // commit the corrected EIP (=va)
+                StopStepAndPause(tid, hThread, ref ctx, _mode == StepMode.OverInstr ? "stepi" : "step");
+            }
+            else if (_mode != StepMode.None && haveCtx)
+            {
+                // back at the caller — resume source-level stepping
+                _prevVa = va;
+                ctx.EFlags |= TRAP_FLAG;
+                Native.SetThreadContext(hThread, ref ctx);
+            }
+            else if (haveCtx)
+            {
+                Native.SetThreadContext(hThread, ref ctx); // just fix EIP
+            }
         }
 
         /// <summary>The skipped call has returned: an event-loop call moves the step's ESP baseline to the ESP
@@ -332,7 +395,7 @@ namespace ClarionDbg.Cli
         /// return with no skip behind it.</para></summary>
         private void EndSkip(uint va, uint esp, bool haveEsp)
         {
-            if (_skipEventLoopKind != 0 && haveEsp) _startEsp = esp;
+            if (_skipEventLoopKind != NotEventLoop && haveEsp) _startEsp = esp;
             uint other = va == _skipLoopHeadVa ? _skipRetVa : _skipLoopHeadVa;
             byte orig;
             if (_skipLoopHeadVa != 0 && other != va && _temp.TryGetValue(other, out orig))
@@ -340,7 +403,7 @@ namespace ClarionDbg.Cli
                 WriteByte(other, orig);
                 _temp.Remove(other);
             }
-            _skipEventLoopKind = 0;
+            _skipEventLoopKind = NotEventLoop;
             _skipLoopHeadVa = 0;
         }
 
@@ -355,8 +418,8 @@ namespace ClarionDbg.Cli
         {
             _mode = StepMode.None;
             _skipRunning = false;
-            _skipEventLoopKind = 0;
-            _skipLoopHeadVa = 0;   // its byte is in _temp, which the loop below restores
+            _skipEventLoopKind = NotEventLoop;
+            _skipLoopHeadVa = 0;   // a temp's byte is in _temp, which the loop below restores
             // The prologue bypass is step-session state. It was set once in BeginStep and never cleared,
             // so it survived into the NEXT step session and disabled that session's ESP gate too until
             // BeginStep happened to recompute it. Clearing it here means a cancelled step leaves nothing
@@ -384,7 +447,7 @@ namespace ClarionDbg.Cli
             _stepStartVa = _prevVa;
             _stepCount = 0;
             _skipRunning = false;
-            _skipEventLoopKind = 0;
+            _skipEventLoopKind = NotEventLoop;
             _skipLoopHeadVa = 0;
 
             // "Am I starting inside the prologue?" measured with the right instrument.
@@ -455,7 +518,8 @@ namespace ClarionDbg.Cli
 
         /// <summary>Arm an IN-FLIGHT <b>Step Over</b> session the way BeginStep leaves one: the Over mode,
         /// the stepping thread, the previous trap's EIP (<c>_prevVa</c> — the call-entry detector's anchor)
-        /// and one call-skip temp INT3. BeginStep itself needs a live context and a real line table, and the
+        /// and one call-skip temp INT3 (none when <paramref name="tempVa"/> is 0: a return a user breakpoint
+        /// covers gets no temp). BeginStep itself needs a live context and a real line table, and the
         /// property under test is what a breakpoint hit does to a session that is ALREADY in flight, which
         /// is a separate claim.
         /// <para>Named for the ONE mode it arms rather than taking a <c>StepMode</c>: the call-skip temp
@@ -470,24 +534,26 @@ namespace ClarionDbg.Cli
             _mode = StepMode.Over;
             _stepTid = tid;
             _prevVa = prevVa;
-            _temp[tempVa] = 0x90;
+            if (tempVa != 0) _temp[tempVa] = 0x90;
         }
 
         /// <summary>Put an armed Step Over session into its run-to-return state, as StepMachine leaves it after
         /// planting a call-skip temp INT3: the step's ESP baseline, the callee-entry ESP and EBP, which call is
         /// being skipped (<see cref="EventLoopCallKind"/>'s 1/2/0), and the thread running at full speed.
-        /// <paramref name="retVa"/> must already be a recorded temp (ArmStepOverSessionForTest); a non-zero
-        /// <paramref name="loopHeadVa"/> is recorded as the End skip's loop-head temp.</summary>
+        /// <paramref name="retVa"/> must already be a recorded temp (ArmStepOverSessionForTest) or, for a
+        /// return a user breakpoint covers, an armed user breakpoint (ArmUserBpForTest). A non-zero
+        /// <paramref name="loopHeadVa"/> is recorded as the End skip's loop head: a temp of its own, unless a
+        /// user breakpoint is armed there, as PlantLoopHeadTemp leaves it.</summary>
         internal void ArmCallSkipForTest(uint retVa, uint loopHeadVa, uint startEsp, uint entryEsp, uint entryEbp,
                                          int eventLoopKind)
         {
             RefuseSeamIfAttached("ArmCallSkipForTest");
-            if (!_temp.ContainsKey(retVa))
+            if (!_temp.ContainsKey(retVa) && !_armed.ContainsKey(retVa))
                 throw new InvalidOperationException("ArmCallSkipForTest: 0x" + retVa.ToString("X8")
-                                                    + " is not a recorded temp INT3");
+                                                    + " is neither a recorded temp INT3 nor an armed user breakpoint");
             _skipRetVa = retVa;
             _skipLoopHeadVa = loopHeadVa;
-            if (loopHeadVa != 0) _temp[loopHeadVa] = 0x90;
+            if (loopHeadVa != 0 && !_armed.ContainsKey(loopHeadVa)) _temp[loopHeadVa] = 0x90;
             _startEsp = startEsp;
             _skipEntryEsp = entryEsp;
             _skipEntryEbp = entryEbp;

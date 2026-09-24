@@ -439,13 +439,22 @@ namespace ClarionDbg.Cli
 
         private uint OnUserBp(uint tid, uint va)
         {
-            Hits++;
-            var m = ModuleAt(va);
-            uint rva = m != null ? va - m.LoadBase : va;
-
             IntPtr hThread = OpenThreadForContext(tid);
             var ctx = NewContext();
             bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+            uint status = OnUserBpCore(tid, va, hThread, ref ctx, haveCtx);
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return status;
+        }
+
+        /// <summary>The user-breakpoint hit with the thread context already read, so OnUserBpForTest can hand
+        /// it a context (a skip landing is decided on ESP/EBP) without a live thread behind it. The caller
+        /// owns <paramref name="hThread"/>.</summary>
+        private uint OnUserBpCore(uint tid, uint va, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
+            Hits++;
+            var m = ModuleAt(va);
+            uint rva = m != null ? va - m.LoadBase : va;
 
             // un-patch: restore the original byte and back EIP up over the INT3 so the real
             // instruction executes on resume; re-plant after one single-step (persistent BP)
@@ -487,14 +496,23 @@ namespace ClarionDbg.Cli
                     // nobody else's: OnSingleStep drives StepMachine for `tid == _stepTid` alone, so a
                     // silent hit on any other thread has no step of its own to re-anchor. Unguarded, a
                     // tracepoint firing on thread B moved thread A's anchor to an address A never ran.
-                    if (tid == _stepTid) _prevVa = va;
-                    if (haveCtx)
+                    //
+                    // UNLESS this is the stepping thread's skip landing (IsSkipLanding): a user bp there is the
+                    // only INT3 at that address, so the skip ends here exactly as OnTempBp ends it, stopping
+                    // if the landing is a stop boundary. Without it _skipRunning stayed set, StepMachine never
+                    // ran again, and Step Over over a call (or END) whose landing has a tracepoint ran free.
+                    if (IsSkipLanding(tid, va, ref ctx, haveCtx))
+                        FinishSkipAt(tid, va, hThread, ref ctx, haveCtx);
+                    else
                     {
-                        Native.GetThreadContext(hThread, ref ctx);
-                        ctx.EFlags |= TRAP_FLAG;
-                        Native.SetThreadContext(hThread, ref ctx);
+                        if (tid == _stepTid) _prevVa = va;
+                        if (haveCtx)
+                        {
+                            Native.GetThreadContext(hThread, ref ctx);
+                            ctx.EFlags |= TRAP_FLAG;
+                            Native.SetThreadContext(hThread, ref ctx);
+                        }
                     }
-                    if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
                     return Native.DBG_CONTINUE;
                 }
                 EmitBpSet(ubp); // pausing — push the updated live hit count to the breakpoints pane
@@ -524,7 +542,6 @@ namespace ClarionDbg.Cli
                 Native.SetThreadContext(hThread, ref ctx);
             }
 
-            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
         }
 
@@ -618,30 +635,7 @@ namespace ClarionDbg.Cli
             else
             {
                 _temp.Remove(va);
-                _skipRunning = false;
-                EndSkip(va, ctx.Esp, haveCtx);   // before IsStepStop: an event-loop return re-bases its ESP gate
-                if (_mode != StepMode.None && haveCtx && IsStepStop(va, ctx.Esp))
-                {
-                    // The skipped call returned straight onto a stop boundary. For source-level Over this is a
-                    // new-statement record (a call as a line's last op → its return address is the next line's
-                    // record); for instruction-granular OverInstr it's simply the return address. Stop here
-                    // rather than resume stepping and trap only at the following instruction (missing it). The
-                    // INT3 advanced the thread's EIP to va+1, so commit the corrected EIP (=va) before pausing,
-                    // otherwise the next resume runs from mid-instruction and crashes the target.
-                    Native.SetThreadContext(hThread, ref ctx);   // commit the corrected EIP (=va)
-                    StopStepAndPause(tid, hThread, ref ctx, _mode == StepMode.OverInstr ? "stepi" : "step");
-                }
-                else if (_mode != StepMode.None && haveCtx)
-                {
-                    // back at the caller — resume source-level stepping
-                    _prevVa = va;
-                    ctx.EFlags |= TRAP_FLAG;
-                    Native.SetThreadContext(hThread, ref ctx);
-                }
-                else if (haveCtx)
-                {
-                    Native.SetThreadContext(hThread, ref ctx); // just fix EIP
-                }
+                FinishSkipAt(tid, va, hThread, ref ctx, haveCtx);
             }
 
             return Native.DBG_CONTINUE;
@@ -689,6 +683,26 @@ namespace ClarionDbg.Cli
                 throw new InvalidOperationException(
                     "OnUserBpForTest: refuses an interactive engine — the pausing route blocks in PausedWait");
             return OnUserBp(tid, va);
+        }
+
+        /// <summary><see cref="OnUserBpForTest(uint,uint)"/> with an invented context: thread
+        /// <paramref name="tid"/> hitting <paramref name="va"/> at ESP <paramref name="esp"/> and EBP
+        /// <paramref name="ebp"/>, for the skip-landing decision (<see cref="IsSkipLanding"/>). No thread is
+        /// opened; SetThreadContext goes to a null handle and fails. Same refusals as the other overload.</summary>
+        internal uint OnUserBpForTest(uint tid, uint va, uint esp, uint ebp)
+        {
+            RefuseSeamIfAttached("OnUserBpForTest");
+            if (_once)
+                throw new InvalidOperationException(
+                    "OnUserBpForTest: refuses a --once engine — the pausing route calls TerminateProcess");
+            if (_interactive)
+                throw new InvalidOperationException(
+                    "OnUserBpForTest: refuses an interactive engine — the pausing route blocks in PausedWait");
+            var ctx = NewContext();
+            ctx.Esp = esp;
+            ctx.Ebp = ebp;
+            ctx.Eip = va + 1;   // where the INT3 leaves EIP
+            return OnUserBpCore(tid, va, IntPtr.Zero, ref ctx, true);
         }
 
         /// <summary>Drive the REAL temp-INT3 handler as thread <paramref name="tid"/> arriving at
