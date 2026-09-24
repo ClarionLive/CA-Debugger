@@ -248,12 +248,6 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>The single composite value renderer. Three shapes:
-        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
-        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
-        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
-        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
-        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
         /// <summary>The `refKind` every ref:true row carries (contract frozen by the PM, 2026-09-23): "other" when
         /// the referent is unknown or declares no members, else "class" or "aggregate" by
         /// <see cref="LooksLikeClassLayout"/>, the SAME predicate the watch path walker refuses class heads with.
@@ -275,6 +269,12 @@ namespace ClarionDbg.Cli
             return NodeJson(name, type, code, target, size, places, va, null, module, note, editable);
         }
 
+        /// <summary>The single composite value renderer. Three shapes:
+        ///  • a DIRECT GROUP/QUEUE -> eager inline "children" (members read live at va + offset);
+        ///  • a REFERENCE to a group/queue/class -> a LAZY node ("ref":true + addr/module/typeRef) the host
+        ///    expands on demand via the `expand` command (avoids chasing deep/cyclic ABC object graphs);
+        ///  • everything else -> a leaf through the shared FormatValueAt/ClarionTypeLabel.
+        /// <paramref name="module"/> is the owning image's name, echoed on ref rows for re-resolution.</summary>
         /// <remarks>`note` and `editable` are REQUIRED, like the two child builders this delegates to.
         /// They were fenced there first, which left the fence one level ABOVE the thing it was fencing:
         /// THIS is the function that actually writes `editable` into the payload, so a caller that said
