@@ -176,6 +176,14 @@ namespace ClarionDebugger.Terminal
         // an expand reply grants its rows only when the host forwarded that request (_expandsInFlight).
         private readonly HashSet<string> _expandable = new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _expandsInFlight = new HashSet<string>(StringComparer.Ordinal);
+        // FRAME LOCALS are issued the same way (49538b78 wave 5, codex adversary). A framelocals request names
+        // a procedure VA and an EBP, and the engine renders that procedure's locals at EBP + each local's
+        // offset - edit metadata included. Forwarded unchecked, a real VA with a made-up EBP minted grants at
+        // addresses the page chose. So the (va, ebp) of every frame a stack reply offered is recorded, per
+        // thread, and a framelocals reply grants only when the host forwarded that request for one of them.
+        private readonly Dictionary<string, HashSet<string>> _framesByTid =
+            new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        private readonly HashSet<string> _frameLocalsInFlight = new HashSet<string>(StringComparer.Ordinal);
 
         /// <summary>The number of EDIT tuples granted.</summary>
         public int Count { get { return _keys.Count; } }
@@ -183,9 +191,13 @@ namespace ClarionDebugger.Terminal
         /// <summary>The number of EXPANDABLE tuples issued.</summary>
         public int ExpandableCount { get { return _expandable.Count; } }
 
-        /// <summary>Retire everything: edit grants, expandable rows and forwarded expands. One clear, so no
-        /// clear site can retire one family and leave the other live.</summary>
-        public void Clear() { _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); _writesInFlight.Clear(); }
+        /// <summary>Retire everything: edit grants, expandable rows, offered frames and forwarded requests. One
+        /// clear, so no clear site can retire one family and leave another live.</summary>
+        public void Clear()
+        {
+            _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); _writesInFlight.Clear();
+            _framesByTid.Clear(); _frameLocalsInFlight.Clear();
+        }
 
         // A grant is CONSUMED by the write it authorises (afbc68c7, codex security gate): otherwise one grant
         // let the same write be replayed for the rest of the pause. The consumed key waits here, by address,
@@ -258,6 +270,42 @@ namespace ClarionDebugger.Terminal
         /// <summary>Consume the record that <paramref name="reqId"/> was a verified, forwarded expand. False
         /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
         public bool ExpandVerified(string reqId) { return reqId != null && _expandsInFlight.Remove(reqId); }
+
+        /// <summary>A stack reply for <paramref name="tid"/> offered exactly these frames, each a (va, ebp) pair:
+        /// they replace whatever that thread's previous stack reply offered. A frame with no VA, or with the
+        /// engine's "unknown" EBP (0x0), offers nothing: the page never asks about one.</summary>
+        public void OfferFrames(uint? tid, IEnumerable<KeyValuePair<string, string>> vaEbp)
+        {
+            var set = new HashSet<string>(StringComparer.Ordinal);
+            if (vaEbp != null)
+                foreach (var f in vaEbp)
+                    if (!string.IsNullOrEmpty(f.Key) && !string.IsNullOrEmpty(f.Value) && f.Value != "0x0")
+                        set.Add(FrameKey(f.Key, f.Value));
+            _framesByTid[TidKey(tid)] = set;
+        }
+
+        /// <summary>True when this exact (va, ebp) is a frame a stack reply offered since the last clear. The
+        /// request names no thread, and a clear follows every thread switch, so any thread's offer counts.</summary>
+        public bool IsFrameOffered(string va, string ebp)
+        {
+            if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(ebp)) return false;
+            string key = FrameKey(va, ebp);
+            foreach (var set in _framesByTid.Values)
+                if (set.Contains(key)) return true;
+            return false;
+        }
+
+        /// <summary>The host forwarded framelocals <paramref name="reqId"/> to the engine after verifying it.</summary>
+        public void FrameLocalsForwarded(int reqId) { _frameLocalsInFlight.Add(reqId.ToString(CultureInfo.InvariantCulture)); }
+
+        /// <summary>Consume the record that <paramref name="reqId"/> was a verified, forwarded framelocals. False
+        /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
+        public bool FrameLocalsVerified(string reqId) { return reqId != null && _frameLocalsInFlight.Remove(reqId); }
+
+        private static string FrameKey(string va, string ebp)
+        {
+            return va.ToUpperInvariant() + "|" + ebp.ToUpperInvariant();
+        }
 
         private static string ExpandKey(string module, uint typeRef, string addr)
         {

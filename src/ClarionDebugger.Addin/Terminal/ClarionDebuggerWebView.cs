@@ -336,7 +336,10 @@ namespace ClarionDebugger.Terminal
 
         private void OnSvcFrameLocals(string reqId, string itemsJson, uint? tid) => UI(() =>
         {
-            _editGrants.GrantRows(itemsJson, tid);
+            // Only a reply to a framelocals the host VERIFIED and forwarded may grant (49538b78 wave 5): its rows
+            // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
+            // posted for display, and grants nothing.
+            if (_editGrants.FrameLocalsVerified(reqId)) _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
@@ -677,13 +680,7 @@ namespace ClarionDebugger.Terminal
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
                     case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
-                    case "framelocals":   // call-stack frame locals: data = "reqId|va|ebp"
-                        if (_svc.State == DebugSessionState.Paused)
-                        {
-                            var fl = FrameLocalsRequest.Parse(data);
-                            if (fl != null) _svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp);
-                        }
-                        break;
+                    case "framelocals": FrameLocals(data); break;   // call-stack frame locals: data = "reqId|va|ebp"
                     case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
                         if (_svc.State == DebugSessionState.Paused)
                         {
@@ -1740,6 +1737,10 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"uncertain\":").Append(f.Uncertain ? "true" : "false").Append('}');
             }
             sb.Append(']').Append(TidJson(tid)).Append('}');
+            // The frames just offered are the only ones whose locals the page may ask for (see FrameLocals).
+            var offered = new List<KeyValuePair<string, string>>();
+            foreach (var f in frames) offered.Add(new KeyValuePair<string, string>(f.Va, f.Ebp));
+            _editGrants.OfferFrames(tid, offered);
             Post(sb.ToString());
             FollowSelectedThread(frames, tid);
         }
@@ -1835,6 +1836,46 @@ namespace ClarionDebugger.Terminal
                 return;
             }
             _editGrants.ExpandForwarded(x.ReqId);
+        }
+
+        /// <summary>A call-stack frame's locals: data is <c>reqId|va|ebp</c>, and it is forwarded ONLY when that
+        /// exact (va, ebp) is a frame the host's own stack reply offered since the last stop, resume or thread
+        /// switch (49538b78 wave 5, codex adversary). The engine renders the locals of the procedure at va at
+        /// EBP + each local's offset, edit metadata included, so a real va with a made-up EBP would mint edit
+        /// grants at addresses the page chose - and the page is trusted to READ memory, never to write it.
+        /// <para>
+        /// A frame that was not offered is REFUSED, not forwarded for display only. The page asks only about
+        /// frames it was shown, so a refusal costs a genuine page nothing but a lost race with the next stack
+        /// reply, which re-offers the frames that are current; a display-only forward would keep a second,
+        /// unverified path to the engine that no user needs. Like an expand refusal it is ANSWERED with an
+        /// empty reply for that reqId, so the frame the page is opening does not wait forever - and so is a
+        /// request the service would not send.
+        /// </para></summary>
+        private void FrameLocals(string data)
+        {
+            if (_svc.State != DebugSessionState.Paused) return;
+            var fl = FrameLocalsRequest.Parse(data);
+            if (fl == null) return;
+            if (!_editGrants.IsFrameOffered(fl.Va, fl.Ebp))
+            {
+                RefuseFrameLocals(fl.ReqId, "that frame is no longer current (or was never offered) — let the call stack refresh, then open it again");
+                return;
+            }
+            if (!_svc.RequestFrameLocals(fl.ReqId, fl.Va, fl.Ebp))
+            {
+                RefuseFrameLocals(fl.ReqId, "the engine did not take the request");
+                return;
+            }
+            _editGrants.FrameLocalsForwarded(fl.ReqId);
+        }
+
+        // No tid: this answer is not from any thread, and an unstamped reply is one the page accepts whatever
+        // thread it is showing.
+        private void RefuseFrameLocals(int reqId, string why)
+        {
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId.ToString(CultureInfo.InvariantCulture))
+                + ",\"items\":[],\"refused\":true}");
+            Console("err", "frame locals refused: " + why);
         }
 
         private void RefuseExpand(int reqId, string why)
