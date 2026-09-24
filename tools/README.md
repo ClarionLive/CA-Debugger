@@ -75,8 +75,10 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 **Live** suites launch `clbrws.exe` from the Clarion 11 examples
 (`C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses`) under the engine and
 post window messages to it, so they need that install and an unattended desktop. On 2026-09-22
-`test-bp-threaded.ps1` took about 55 s and flaked once (leg 1 under 8 hits, ticket b3e1ade8), which is why
-it is not in the default set.
+`test-bp-threaded.ps1` flaked once (leg 1 under 8 hits): it slept a fixed 5 s per browse open. Since
+ticket b3e1ade8 it waits for each open's hits instead (first hit, then 1.5 s quiet, 30 s cap); measured
+2026-09-24, three runs took 34-43 s with every open landing 8 hits (one 12). It stays live because it
+needs the app, not because it is flaky.
 
 ## Builds
 
