@@ -1517,7 +1517,22 @@ namespace ClarionDbg.Cli
         /// were called "stopped" and "selected" (ticket 3b043dfc). Nesting is the ONLY thing that separates
         /// the `threads` event's top-level "stopped" — a thread id — from a row's own "stopped" boolean, so
         /// asking the question by name alone would answer about the wrong member.</summary>
-        private static bool HasTopLevelMember(string json, string name)
+        private static bool HasTopLevelMember(string json, string name) { return TopLevelValueAt(json, name) >= 0; }
+
+        /// <summary>Is the TOP-level member <paramref name="name"/> there with exactly the value
+        /// <paramref name="valueJson"/>, written as JSON (a string with its quotes)? A nested row's member of
+        /// the same name does not count.</summary>
+        private static bool TopLevelMemberIs(string json, string name, string valueJson)
+        {
+            int at = TopLevelValueAt(json, name);
+            if (at < 0 || string.CompareOrdinal(json, at, valueJson, 0, valueJson.Length) != 0) return false;
+            int end = at + valueJson.Length;
+            return end == json.Length || json[end] == ',' || json[end] == '}';
+        }
+
+        /// <summary>Where the value of the top-level member <paramref name="name"/> starts, or -1. Strings are
+        /// skipped whole, because values like "{…}" and names like "[1]" carry brackets.</summary>
+        private static int TopLevelValueAt(string json, string name)
         {
             string needle = "\"" + name + "\":";
             int depth = 0;
@@ -1529,13 +1544,13 @@ namespace ClarionDbg.Cli
                 if (c == '"')
                 {
                     if (depth == 1 && string.CompareOrdinal(json, i, needle, 0, needle.Length) == 0)
-                        return true;
+                        return i + needle.Length;
                     inStr = true; continue;
                 }
                 if (c == '{' || c == '[') depth++;
                 else if (c == '}' || c == ']') depth--;
             }
-            return false;
+            return -1;
         }
     }
 }

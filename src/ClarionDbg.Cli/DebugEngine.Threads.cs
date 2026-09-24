@@ -586,7 +586,7 @@ namespace ClarionDbg.Cli
             }
             _selectedTid = tid;
             EmitThreadSelected(tid, true, null);
-            Console.WriteLine($"  thread {tid} selected{(tid == stoppedTid ? " (the stopped thread)" : " — reads now answer for this thread")}");
+            Console.WriteLine($"  thread {TidText(tid)} selected{(tid == stoppedTid ? " (the stopped thread)" : " — reads now answer for this thread")}");
         }
 
         /// <summary>The reply to `thread &lt;tid&gt;`. On success the tid is the thread now selected; on a
@@ -714,7 +714,7 @@ namespace ClarionDbg.Cli
         /// chosen thread either way, so the log stays readable when the member is absent.</summary>
         private void LogPauseChoice(uint tid, string rule, int candidates)
         {
-            string text = $"pause: thread {tid} chosen by {rule} ({candidates} Clarion candidate(s) of {_threads.Count} live thread(s))";
+            string text = $"pause: thread {TidText(tid)} chosen by {rule} ({candidates} Clarion candidate(s) of {_threads.Count} live thread(s))";
             Console.WriteLine("  [" + text + "]");
             if (EmitJson) Console.WriteLine("@JSON " + PauseChoiceJson(text, tid));
         }

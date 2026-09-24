@@ -170,7 +170,7 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
-        /// Five ways a detach we called clean could leave the app to crash (3f2d747f, 4b pipeline run 2), each driven
+        /// Six ways a detach we called clean could leave the app to crash (3f2d747f, 4b pipeline run 2), each driven
         /// through the REAL code with the one input moved:
         ///   (a) a context operation that FAILS - clearing TF, rewinding EIP - reaches `detached` as an error naming
         ///       the tids and addresses;
@@ -178,7 +178,9 @@ namespace ClarionDbg.Cli
         ///       debug loop itself (launch mode too) instead of pausing at va+1;
         ///   (c) an unreadable image is not reported as "not x86";
         ///   (d) `--expect-start` with the wrong creation time refuses the attach before anything is planted;
-        ///   (e) a detach that throws part-way still sends `detached`, with the error.
+        ///   (e) a detach that throws part-way still sends `detached`, with the error;
+        ///   (f) a process that exits during the QUIET detach of a refused attach sends no `exited`: the host would
+        ///       show an exit for an app it never attached to (70860d6b C11).
         /// </summary>
         private static void CheckDetachHardening(List<string> failures, ClaimLog claims)
         {
@@ -280,11 +282,34 @@ namespace ClarionDbg.Cli
             if (!sE.Continues.Contains("0:0x00010002"))
                 failures.Add("detach (e): the held event was not continued before the aborted detach let go: " + string.Join(",", sE.Continues));
 
+            // ---- (f) the target exits during the drain of a quiet detach ----
+            Func<bool, string> exitDuringDrain = quiet =>
+            {
+                var sF = new DebugEngine.DetachScenario
+                {
+                    Quiet = quiet,
+                    Queue = new List<byte[]> { DebugEngine.DebugEventForTest(Native.EXIT_PROCESS_DEBUG_EVENT, 121, 0, 0) },
+                };
+                var engF = NewEngine();
+                engF.EmitJson = true;
+                return CaptureConsole(() => engF.RunDetachScenarioForTest(sF));
+            };
+            string outF = exitDuringDrain(true);
+            if (outF.IndexOf("\"event\":\"exited\"", StringComparison.Ordinal) >= 0)
+                failures.Add("detach (f): a process that exited during the QUIET detach of a refused attach sent `exited` - "
+                             + "the host would report an exit for an app it never attached to; output: " + outF.Replace("\r\n", " | "));
+            // CONTROL: the same exit during an ordinary detach IS reported.
+            string outF0 = exitDuringDrain(false);
+            if (outF0.IndexOf("\"event\":\"exited\"", StringComparison.Ordinal) < 0)
+                failures.Add("detach (f) control: a process that exited during an ordinary detach sent no `exited`; output: "
+                             + outF0.Replace("\r\n", " | "));
+
             claims.Claim("detach hardening (4b run 2): a failed TF clear or EIP rewind is named in detached.error; a queued hit "
                          + "on a byte planted earlier and removed is rewound by the drain AND by the debug loop (never paused at "
                          + "va+1), while an address never planted is not; an unreadable image is code 0, only a confirmed "
                          + "non-i386 is 50; --expect-start refuses a mismatched or unreadable creation time before anything is "
-                         + "planted and a matching one proceeds; a detach that throws still sends `detached` with the error.");
+                         + "planted and a matching one proceeds; a detach that throws still sends `detached` with the error; "
+                         + "an exit during the quiet detach of a refused attach sends no `exited`, and during an ordinary one does.");
         }
 
         /// <summary>The "error" member of a `detached` event, or null when absent (or no event).</summary>

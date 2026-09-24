@@ -366,9 +366,11 @@ try {
     'System.Threading', 'System.Threading.Thread', 'System.Runtime.InteropServices') | Out-Null
 } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
 
-# The engine's REAL writers - procs, loaded (with attached), detached, and the attach error - so every engine
-# payload these checks feed the host is one the engine's own code produced. None is hand-written (3f2d747f seam:
-# a hand-written "restored":true passed here while the engine sends a COUNT, and every clean detach warned).
+# The engine's REAL writers - procs, loaded (with attached), detached, and the attach error - so every payload
+# that stands for what the engine sends TODAY is one the engine's own code produced (3f2d747f seam: a hand-written
+# "restored":true passed here while the engine sends a COUNT, and every clean detach warned). The few hand-written
+# lines below are deliberately OFF-contract - an older engine's shape, a malformed or hostile line - which no
+# current writer can produce, and each says so where it is used.
 $engineJson = Get-Content -Raw -LiteralPath $EngineJsonPath
 $procsCmd = Get-Content -Raw -LiteralPath $ProcsCommandPath
 $xLoaded = Get-Method 'public static string Loaded(uint pid, uint loadBase)' $engineJson
@@ -494,7 +496,9 @@ Invoke-CheckSection '2. the engine''s procs line, read by the host (ParseProcsJs
   Check 'no entry is the skipped process' (-not ($got | Where-Object { $_.Pid -eq 9 })) ''
   Check 'no procs line at all reads as null (an error), not as an empty list' ($null -eq (Invoke-Static 'ParseProcsJson' @('procs: --exclude needs a process id'))) ''
   Check 'a malformed procs line reads as null' ($null -eq (Invoke-Static 'ParseProcsJson' @('{"event":"procs","procs":[{"pid":1,'))) ''
-  $empty = Invoke-Static 'ParseProcsJson' @('{"event":"procs","procs":[],"skipped":12}')
+  $noEntries = [System.Collections.Generic.List[AttachEngineSide.ProcEntry]]::new()
+  $noSkips = [System.Collections.Generic.List[AttachEngineSide.ProcSkip]]::new()
+  $empty = Invoke-Static 'ParseProcsJson' @([AttachEngineSide.EngineJson]::Procs($noEntries, $noSkips, $false))
   Check 'an empty listing reads as an empty list' (($null -ne $empty) -and ($empty.Count -eq 0)) ''
   # The engine BINARY is deliberately not run here: test-engine-session.ps1 holds every script that launches
   # it to the shared lifecycle, and test-procs.ps1 already checks what the built engine prints. The writer
@@ -828,7 +832,6 @@ Invoke-CheckSection '6. the pad: attached, then detached, then the engine exits'
     (($pad.Posts -contains 'console|info|Detached; app.exe is still running.') -and -not (($pad.Posts -join "`n") -match 'console\|err\|')) ($pad.Posts -join ' / ')
   $pad = New-AttachedPad
   $pad.OnSvcDetached((New-Detach))
-  $pad.Posts.Clear()
   $pad.Posts.Clear()
   $pad.OnSvcExited(0)
   Check 'the engine''s exit after a detach posts nothing, so the Detached line survives' ($pad.Posts.Count -eq 0) ($pad.Posts -join ' / ')
