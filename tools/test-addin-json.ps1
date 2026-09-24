@@ -574,6 +574,99 @@ if (-not (Test-Path -LiteralPath $HostSourceFixture)) {
 }
 
 Write-Host ''
+Write-Host 'the source pane follows the SELECTED thread (0955b29f)'
+# SendSource used to run only at a stop, so after a thread switch the pane and its header kept the STOPPED
+# thread's location. The page re-reads the stack on every switch; the host now takes the selected thread's
+# location from that tid-stamped reply. RUN below: the real OnStack, FollowSelectedThread, SourceFrameOf,
+# NoteStopSource and SendSource, with Post as a recorder. The stop itself (OnPaused) is too large to run here,
+# so what it contributes - remembering the stop just before sending its source - is pinned by position.
+# Hoisted out of the here-string: an unbalanced '(' in a signature breaks $() inside @"..."@.
+$followParts = @(
+  (Get-Method 'private void SendSource(' $web) -replace '^private void', 'public void'
+  (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid)' $web) -replace '^private void', 'public void'
+  (Get-Statement 'private DebugPause _stopSource' $web) -replace '^private', 'public'
+  Get-Statement 'private uint? _stopTid' $web
+  Get-Statement 'private uint? _sourceTid' $web
+  (Get-Method 'private void NoteStopSource(DebugPause p)' $web) -replace '^private void', 'public void'
+  Get-Method 'private void FollowSelectedThread(List<DebugStackFrame> frames, uint? tid)' $web
+  (Get-Method 'internal static DebugStackFrame SourceFrameOf(List<DebugStackFrame> frames)' $web) -replace '^internal static', 'public static'
+  Get-Method 'private static string Str(string s)' $web
+  Get-Method 'private static string TidJson(uint? tid)' $web
+  Get-Method 'private static string TidMember(string name, uint? tid)' $web
+  $tidNameDecls
+) -join "`n"
+$followTypes = (Get-Method 'public sealed class DebugStackFrame') + "`n" + (Get-Method 'public sealed class DebugPause')
+$followSrc = @"
+using System;
+using System.IO;
+using System.Text;
+using System.Globalization;
+using System.Collections.Generic;
+namespace ClarionDebugger.Terminal {
+$followTypes
+public class SourceFollowProbe {
+  public List<string> Posts = new List<string>();
+  private void Post(string json) { Posts.Add(json); }
+$followParts
+}
+}
+"@
+Add-Type -TypeDefinition $followSrc -Language CSharp | Out-Null
+
+function SFrame { param([int] $n, $proc, $module, [int] $line, $ebp = '0x19FF00')
+  $f = New-Object ClarionDebugger.Terminal.DebugStackFrame; $f.Frame = $n; $f.Proc = $proc; $f.Module = $module; $f.Line = $line; $f.Ebp = $ebp; $f
+}
+function Frames { param([object[]] $fs) $l = New-Object 'System.Collections.Generic.List[ClarionDebugger.Terminal.DebugStackFrame]'; foreach ($f in $fs) { $l.Add($f) }; ,$l }
+# The source messages one stack reply produced (the stack post itself is always first).
+function SourcesAfter { param($probe, $frames, $tid)
+  $probe.Posts.Clear(); $probe.OnStack($frames, $tid)
+  ,@($probe.Posts | Where-Object { $_ -like '{"type":"source"*' })
+}
+$follow = New-Object ClarionDebugger.Terminal.SourceFollowProbe
+$stop = New-Object ClarionDebugger.Terminal.DebugPause
+$stop.Module = 'stopmod.clw'; $stop.Proc = 'STOPPROC'; $stop.Line = 42; $stop.Tid = 100
+$follow.NoteStopSource($stop)
+$stoppedStack = Frames @((SFrame 0 'STOPPROC' 'stopmod.clw' 42))
+# Thread 200 is inside the runtime: frame 0 has no line, frame 1 has one but an unknown ebp, frame 2 is real.
+$runtimeStack = Frames @((SFrame 0 $null $null 0 '0x0'), (SFrame 1 'WORKER' 'worker.clw' 17 '0x0'), (SFrame 2 'MAIN' 'main.clw' 88))
+
+$s = SourcesAfter $follow $stoppedStack 100
+Check 'CONTROL: the stopped thread''s own stack reply sends no second source' ($s.Count -eq 0) ($s -join ' | ')
+$s = SourcesAfter $follow $runtimeStack 200
+Check 'a switch to another thread sends ITS location: the first real Clarion frame with a line (MAIN, main.clw:88)' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":"main\.clw","proc":"MAIN"') -and ($s[0] -cmatch '"current":88[,}]')) ($s -join ' | ')
+Check 'and a frame whose ebp is unknown ("0x0") is passed over (not WORKER, worker.clw:17)' `
+  (($s -join ' ') -notmatch 'worker\.clw') ($s -join ' | ')
+$s = SourcesAfter $follow $runtimeStack 200
+Check 'a repeated reply for the thread already shown sends nothing' ($s.Count -eq 0) ($s -join ' | ')
+$s = SourcesAfter $follow $runtimeStack 100
+Check 'switching BACK restores the stop''s own source and marker (stopmod.clw:42, STOPPROC), not a frame''s' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":"stopmod\.clw","proc":"STOPPROC"') -and ($s[0] -cmatch '"current":42[,}]')) ($s -join ' | ')
+$s = SourcesAfter $follow (Frames @((SFrame 0 'OTHER' 'other.clw' 5 '0x0'), (SFrame 1 'MAIN' 'main.clw' 88))) 300
+Check 'frame 0 with a line is the thread''s location, whatever its ebp (OTHER, other.clw:5)' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":"other\.clw","proc":"OTHER"') -and ($s[0] -cmatch '"current":5[,}]')) ($s -join ' | ')
+$s = SourcesAfter $follow (Frames @((SFrame 0 $null $null 0 '0x0'))) 400
+Check 'a thread with no frame that has a line still gets a source message, with NO lines and no file' `
+  (($s.Count -eq 1) -and ($s[0] -cmatch '"file":null') -and ($s[0] -cmatch '"lines":\[\]')) ($s -join ' | ')
+$s = SourcesAfter $follow $stoppedStack $null
+Check 'a reply that names no thread moves nothing' ($s.Count -eq 0) ($s -join ' | ')
+$follow._stopSource = $null
+$s = SourcesAfter $follow $runtimeStack 200
+Check 'with no stop to return to (resumed), a reply moves nothing' ($s.Count -eq 0) ($s -join ' | ')
+$noTid = New-Object ClarionDebugger.Terminal.SourceFollowProbe
+$stop.Tid = $null; $noTid.NoteStopSource($stop)
+$s = SourcesAfter $noTid $runtimeStack 200
+Check 'a stop that named no thread never follows: its own stack reply cannot be told from a switch' ($s.Count -eq 0) ($s -join ' | ')
+# The two wires into the session, by position: the stop is remembered IMMEDIATELY before its source is sent,
+# resume forgets it, and OnStack follows only after posting the stack (the page must hold the frames first).
+$onPausedCode = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $web)
+Check 'OnPaused remembers the stop as the statement right before it sends the stop''s source' `
+  ($onPausedCode -match 'NoteStopSource\(p\);\s*SendSource\(p\.Module, p\.ResolvedPath, p\.Proc, p\.Line\);') ''
+Check 'OnSvcResumed forgets the stop' ((Get-Method 'private void OnSvcResumed(' $web) -match '_stopSource = null;') ''
+Check 'OnStack follows as its LAST statement, after the stack is posted' `
+  ((Get-CSharpCodeOnly (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid)' $web)) -match 'Post\(sb\.ToString\(\)\);\s*FollowSelectedThread\(frames, tid\);\s*\}\s*$') ''
+
+Write-Host ''
 Write-Host 'teardown: "stopped" has to be a check, not a claim'
 # Task 51d2f1e4. Stop() used to discard the WaitForExit result, swallow the Kill and set Idle in a finally
 # regardless, so a debugger that reported "stopped" could still own a live process. The decision table below
@@ -2320,7 +2413,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 380
+$EXPECTED_CHECKS = 393
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

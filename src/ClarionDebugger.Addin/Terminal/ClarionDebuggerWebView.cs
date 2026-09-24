@@ -309,7 +309,7 @@ namespace ClarionDebugger.Terminal
         // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
         // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
         // emit 'resumed', so they leave the marker alone.
-        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames, uint? tid) => UI(() => OnStack(frames, tid));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
@@ -1559,6 +1559,7 @@ namespace ClarionDebugger.Terminal
                 // The module goes in as well as the path: when the path does not resolve there is still a
                 // source message, carrying the module so the page can name the stop and clear the last one's
                 // listing instead of leaving it on screen.
+                NoteStopSource(p);
                 SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
                 _svc.RequestStack();          // per-frame locals now load lazily from the Call Stack (frame 0 auto)
                 _svc.RequestModuleData();
@@ -1737,6 +1738,7 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append(']').Append(TidJson(tid)).Append('}');
             Post(sb.ToString());
+            FollowSelectedThread(frames, tid);
         }
 
         private void OnWatch(DebugWatch w)
@@ -2048,6 +2050,53 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append("]}");
             Post(sb.ToString());
+        }
+
+        // ------------------------------------------------------------------ the source pane follows the selected thread
+        // (0955b29f, Owner decision 2026-09-24). SendSource used to run only at a stop, so after a thread switch
+        // the pane and its header still showed the STOPPED thread's location. The page re-reads the stack on a
+        // switch, and that reply is stamped with the thread it describes, so it is the switch's source.
+
+        private DebugPause _stopSource;   // the stop's own location; null = not paused (cleared on resume)
+        private uint? _stopTid;           // the stopped thread; null = unknown, and then the pane never follows
+        private uint? _sourceTid;         // the thread whose location the source pane shows now
+
+        private void NoteStopSource(DebugPause p)
+        {
+            _stopSource = p;
+            _stopTid = p.Tid;
+            _sourceTid = p.Tid;
+        }
+
+        /// <summary>Re-points the source pane when a stack reply is for a thread other than the one it shows.
+        /// Back on the stopped thread it restores the stop's OWN source (its location may be a line no frame
+        /// carries, e.g. a step inside runtime code). Repeated replies for the thread on screen send nothing,
+        /// and neither does any reply when the stop named no thread: there is then no way to tell a switch from
+        /// the stop's own stack.</summary>
+        private void FollowSelectedThread(List<DebugStackFrame> frames, uint? tid)
+        {
+            if (_stopSource == null || !_stopTid.HasValue || !tid.HasValue || tid == _sourceTid) return;
+            _sourceTid = tid;
+            if (tid == _stopTid) { SendSource(_stopSource.Module, _stopSource.ResolvedPath, _stopSource.Proc, _stopSource.Line); return; }
+            var f = SourceFrameOf(frames);
+            // No frame with a line: still a source message, so the pane stops showing the other thread's code.
+            if (f == null) SendSource(null, null, null, 0);
+            else SendSource(f.Module, f.ResolvedPath, f.Proc, f.Line);
+        }
+
+        /// <summary>The frame whose line is a thread's location: frame 0 when it has a line, else the first frame
+        /// that is a real Clarion frame (a proc, and an ebp other than "0x0") with a line. A thread stopped inside
+        /// the runtime has no line in frame 0; the engine gives frames above a runtime frame a real ebp.</summary>
+        internal static DebugStackFrame SourceFrameOf(List<DebugStackFrame> frames)
+        {
+            if (frames == null) return null;
+            for (int i = 0; i < frames.Count; i++)
+            {
+                var f = frames[i];
+                if (f == null || f.Line <= 0 || string.IsNullOrEmpty(f.Module)) continue;
+                if (i == 0 || (f.Proc != null && f.Ebp != "0x0")) return f;
+            }
+            return null;
         }
 
         // ------------------------------------------------------------------ gutter breakpoints
