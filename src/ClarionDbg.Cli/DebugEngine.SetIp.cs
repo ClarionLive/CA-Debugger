@@ -66,12 +66,12 @@ namespace ClarionDbg.Cli
             SetIpCodeUnreadable, SetIpAcceptUnpaired, SetIpStackUnproven, SetIpAcceptBoundary, SetIpWriteFailed,
         };
 
-        /// <summary>The sentence the pad shows for a refusal code. Null for an unknown code, which
-        /// protocolcheck treats as a failure: a code with no sentence would reach the user as a bare slug.</summary>
         /// <summary>How to get past a proof refusal: the observed path allows a move back to a line this frame
         /// has already stopped on at the same stack depth.</summary>
         internal const string SetIpStepFirstHint = "Step to that line first; then you can return to it.";
 
+        /// <summary>The sentence the pad shows for a refusal code. Null for an unknown code, which
+        /// protocolcheck treats as a failure: a code with no sentence would reach the user as a bare slug.</summary>
         internal static string SetIpMessage(string code)
         {
             switch (code)
@@ -156,17 +156,8 @@ namespace ClarionDbg.Cli
             for (int i = 0; i + 4 <= len; i++)
                 if (EventLoopImportKind(slotName(BitConverter.ToUInt32(code, i))) != 0) rawRefs++;
 
-            // 2) linear decode
-            var reader = new Iced.Intel.ByteArrayCodeReader(code, 0, len);
-            var decoder = Iced.Intel.Decoder.Create(32, reader);
-            decoder.IP = baseAddr;
-            var ins = new List<Iced.Intel.Instruction>();
-            while (reader.CanReadByte)
-            {
-                Iced.Intel.Instruction instr;
-                decoder.Decode(out instr);
-                ins.Add(instr);   // invalid ones too: they keep the indexes honest and never match below
-            }
+            // 2) linear decode. Invalid instructions stay in: they keep the indexes honest and never match below.
+            var ins = DecodeLinear(code, len, baseAddr);
 
             var starts = new Dictionary<uint, uint>();   // Start call's return address -> Start call site
             var ends = new List<int>();                  // instruction index of each End call
@@ -212,12 +203,40 @@ namespace ClarionDbg.Cli
             return null;
         }
 
+        /// <summary>A linear 32-bit decode of <paramref name="code"/>[0, len) placed at <paramref name="baseAddr"/>,
+        /// INVALID instructions included. What one of those means is each caller's call: FindEventLoopRegions
+        /// keeps them so its instruction indexes stay honest, ProveCallsBalanced refuses the procedure.</summary>
+        private static List<Iced.Intel.Instruction> DecodeLinear(byte[] code, int len, uint baseAddr)
+        {
+            var reader = new Iced.Intel.ByteArrayCodeReader(code, 0, len);
+            var decoder = Iced.Intel.Decoder.Create(32, reader);
+            decoder.IP = baseAddr;
+            var ins = new List<Iced.Intel.Instruction>();
+            while (reader.CanReadByte)
+            {
+                Iced.Intel.Instruction i;
+                decoder.Decode(out i);
+                ins.Add(i);
+            }
+            return ins;
+        }
+
+        /// <summary>Is <paramref name="i"/> `call dword ptr [disp32]`, with no base or index register: a call
+        /// through the absolute address <paramref name="slot"/>, which for an import is its IAT slot?</summary>
+        private static bool IsAbsoluteSlotCall(Iced.Intel.Instruction i, out uint slot)
+        {
+            slot = 0;
+            if (i.Code != Iced.Intel.Code.Call_rm32 || i.Op0Kind != Iced.Intel.OpKind.Memory) return false;
+            if (i.MemoryBase != Iced.Intel.Register.None || i.MemoryIndex != Iced.Intel.Register.None) return false;
+            slot = (uint)i.MemoryDisplacement64;
+            return true;
+        }
+
         /// <summary>1/2 when <paramref name="i"/> is `call dword ptr [disp32]` through the Start/End slot.</summary>
         private static int CallSlotKind(Iced.Intel.Instruction i, Func<uint, string> slotName)
         {
-            if (i.Code != Iced.Intel.Code.Call_rm32 || i.Op0Kind != Iced.Intel.OpKind.Memory) return 0;
-            if (i.MemoryBase != Iced.Intel.Register.None || i.MemoryIndex != Iced.Intel.Register.None) return 0;
-            return EventLoopImportKind(slotName((uint)i.MemoryDisplacement64));
+            uint slot;
+            return IsAbsoluteSlotCall(i, out slot) ? EventLoopImportKind(slotName(slot)) : 0;
         }
 
         /// <summary>Which event-loop import the ONE call instruction at <paramref name="callVa"/> calls, by the
@@ -342,8 +361,10 @@ namespace ClarionDbg.Cli
         /// </summary>
         internal static readonly string[] MeasuredBalancedImports =
         {
-            // 549 balanced statement segments, 2026-09-23; the count is how often each ran inside one.
-            // Through `call [slot]`:
+            // 549 balanced statement segments, 2026-09-23; the count is how often each ran inside one. The two
+            // groups say only how each entry happened to be OBSERVED: an entry on the list counts as measured
+            // whichever way it is called (IsMeasuredBalancedImport does not look at the call path).
+            // (observed via `call [slot]`)
             "ClaRUN.dll!Cla$ADDqueue",            // 14
             "ClaRUN.dll!Cla$CLEAR",               // 3
             "ClaRUN.dll!Cla$comparestr",          // 2
@@ -368,7 +389,7 @@ namespace ClarionDbg.Cli
             "ClaRUN.dll!Cla$StackCompareN",       // 4
             "ClaRUN.dll!Cla$StackRotate",         // 2
             "ClaRUN.dll!Cla$storestr",            // 1
-            // Through the image's `jmp [slot]` thunk:
+            // (observed via the image's `jmp [slot]` thunk)
             "ClaRUN.dll!Cla$CLOSEwindow",         // 2
             "ClaRUN.dll!Cla$DISPLAY",             // 1
             "ClaRUN.dll!Cla$ERRORCODE",           // 14
@@ -491,18 +512,12 @@ namespace ClarionDbg.Cli
             measuredSlots = new List<uint>();
             if (code == null || len <= 0 || len > code.Length) return "no code";
             uint end = baseAddr + (uint)len;
-            var reader = new Iced.Intel.ByteArrayCodeReader(code, 0, len);
-            var decoder = Iced.Intel.Decoder.Create(32, reader);
-            decoder.IP = baseAddr;
+            var ins = DecodeLinear(code, len, baseAddr);
             var starts = new HashSet<uint>();
-            var ins = new List<Iced.Intel.Instruction>();
-            while (reader.CanReadByte)
+            foreach (var i in ins)
             {
-                Iced.Intel.Instruction i;
-                decoder.Decode(out i);
                 if (i.IsInvalid) return "undecodable bytes at 0x" + ((uint)i.IP).ToString("X");
                 starts.Add((uint)i.IP);
-                ins.Add(i);
             }
 
             // In step with the code: every line record, and every jump that lands inside the span, must fall
@@ -545,35 +560,48 @@ namespace ClarionDbg.Cli
                 if (fc != Iced.Intel.FlowControl.Call && fc != Iced.Intel.FlowControl.IndirectCall) continue;
                 if ((uint)i.IP < bodyStart) continue;   // the prologue: see bodyStart above
 
-                string at = " at 0x" + ((uint)i.IP).ToString("X");
-                if (i.Code == Iced.Intel.Code.Call_rel32_32)
-                {
-                    uint t = (uint)i.NearBranchTarget;
-                    if (isSymbolEntry(t)) continue;                       // a Clarion procedure / routine / method
-                    uint slot = thunkSlot(t);
-                    string viaThunk = slot != 0 ? slotName(slot) : null;
-                    if (viaThunk == null)
-                        return "a call" + at + " to 0x" + t.ToString("X") + ", which is neither a procedure nor an import";
-                    if (EventLoopImportKind(viaThunk) != 0)
-                        return viaThunk + " reached through a thunk" + at + ", not in the modelled ACCEPT shape";
-                    if (!IsMeasuredBalancedImport(viaThunk)) return viaThunk + " not measured";
-                    if (!measuredSlots.Contains(slot)) measuredSlots.Add(slot);
-                    continue;
-                }
-                if (i.Code == Iced.Intel.Code.Call_rm32 && i.Op0Kind == Iced.Intel.OpKind.Memory
-                    && i.MemoryBase == Iced.Intel.Register.None && i.MemoryIndex == Iced.Intel.Register.None)
-                {
-                    uint s = (uint)i.MemoryDisplacement64;
-                    string name = slotName(s);
-                    if (name == null) return "a call" + at + " through 0x" + s.ToString("X") + ", which is not an import slot";
-                    if (EventLoopImportKind(name) != 0) continue;           // the ACCEPT pair: the region rule decides
-                    if (!IsMeasuredBalancedImport(name)) return name + " not measured";
-                    if (!measuredSlots.Contains(s)) measuredSlots.Add(s);
-                    continue;
-                }
-                return "an indirect call" + at + " (" + i.ToString() + ")";
+                uint measuredSlot;
+                string why = ClassifyCall(i, slotName, isSymbolEntry, thunkSlot, out measuredSlot);
+                if (why != null) return why;
+                if (measuredSlot != 0 && !measuredSlots.Contains(measuredSlot)) measuredSlots.Add(measuredSlot);
             }
             return null;
+        }
+
+        /// <summary>One call instruction's effect on ESP: null when it is KNOWN (the list above this section),
+        /// else the reason it is not. <paramref name="measuredSlot"/> is the IAT slot of the measured import it
+        /// relied on, or 0 when it relied on none (Clarion code, or the ACCEPT pair).</summary>
+        private static string ClassifyCall(Iced.Intel.Instruction i, Func<uint, string> slotName,
+                                           Func<uint, bool> isSymbolEntry, Func<uint, uint> thunkSlot,
+                                           out uint measuredSlot)
+        {
+            measuredSlot = 0;
+            string at = " at 0x" + ((uint)i.IP).ToString("X");
+            if (i.Code == Iced.Intel.Code.Call_rel32_32)
+            {
+                uint t = (uint)i.NearBranchTarget;
+                if (isSymbolEntry(t)) return null;                        // a Clarion procedure / routine / method
+                uint slot = thunkSlot(t);
+                string viaThunk = slot != 0 ? slotName(slot) : null;
+                if (viaThunk == null)
+                    return "a call" + at + " to 0x" + t.ToString("X") + ", which is neither a procedure nor an import";
+                if (EventLoopImportKind(viaThunk) != 0)
+                    return viaThunk + " reached through a thunk" + at + ", not in the modelled ACCEPT shape";
+                if (!IsMeasuredBalancedImport(viaThunk)) return viaThunk + " not measured";
+                measuredSlot = slot;
+                return null;
+            }
+            uint s;
+            if (IsAbsoluteSlotCall(i, out s))
+            {
+                string name = slotName(s);
+                if (name == null) return "a call" + at + " through 0x" + s.ToString("X") + ", which is not an import slot";
+                if (EventLoopImportKind(name) != 0) return null;            // the ACCEPT pair: the region rule decides
+                if (!IsMeasuredBalancedImport(name)) return name + " not measured";
+                measuredSlot = s;
+                return null;
+            }
+            return "an indirect call" + at + " (" + i.ToString() + ")";
         }
 
         // ------------------------------------------------------------------ OBSERVED ESP (the second path)
@@ -1052,7 +1080,7 @@ namespace ClarionDbg.Cli
                         f.StopEntryRva = stopSym.EntryRva;
                         f.NextEntryRva = m.Dbg.NextSymbolEntryRva(stopSym.EntryRva);
                         f.FirstRecordRva = FirstRecordRvaInProc(m, stopSym.EntryRva);
-                        ReadEventLoopRegions(m, f);
+                        ReadProcCodeFacts(m, f);
                     }
 
                     // The observed path: has THIS frame instance stopped on the target with this very ESP?
@@ -1105,10 +1133,12 @@ namespace ClarionDbg.Cli
             return true;
         }
 
-        /// <summary>Read the stop symbol's span and find its ACCEPT loops into <paramref name="f"/>. The bytes
-        /// come from the live image through ReadCleanBlock, so our own INT3s read as the original code, and
-        /// the IAT slot addresses in them are the relocated ones that LoadBase + slot RVA name.</summary>
-        private void ReadEventLoopRegions(LoadedModule m, SetIpFacts f)
+        /// <summary>Read the stop symbol's span and record in <paramref name="f"/> the two facts setip's proof
+        /// path decides on: its ACCEPT loops (<c>Regions</c>, or <c>RegionError</c>), and whether every call in
+        /// it has a known effect on ESP on a measured runtime (<c>StackError</c>). The bytes come from the live
+        /// image through ReadCleanBlock, so our own INT3s read as the original code, and the IAT slot addresses
+        /// in them are the relocated ones that LoadBase + slot RVA name.</summary>
+        private void ReadProcCodeFacts(LoadedModule m, SetIpFacts f)
         {
             f.CodeRead = false;
             // The last symbol in an image has no upper bound; a span we cannot bound is a span we cannot check.
@@ -1169,8 +1199,10 @@ namespace ClarionDbg.Cli
             }
         }
 
-        /// <summary>1 MB: far past any real procedure (the largest measured was 0x4188 bytes), and a bound on
-        /// what a garbage span can make us read.</summary>
+        /// <summary>1 MB: far past any real span, and a bound on what a garbage span can make us read. The
+        /// largest span setip can read in clbrws.exe (symbol entry to the next, over all 2054 symbols, from
+        /// `ClarionDbg symbols --json`) is 0x4B78 bytes, WMFPARSER.TAKERECORD: measured 2026-09-24. An earlier
+        /// undated figure of 0x4188 could not be reproduced by that measure.</summary>
         private const uint MAX_SETIP_SPAN = 0x100000;
 
         private void EmitSetIpRefusal(uint tid, string code, string module, int line, int candidates, string detail = null)

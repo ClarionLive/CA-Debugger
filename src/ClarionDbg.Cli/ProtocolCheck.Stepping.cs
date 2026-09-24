@@ -57,6 +57,13 @@ namespace ClarionDbg.Cli
             kind("call [End slot]", callSlot(endSlot), retVa, 2);
             kind("call [another ClaRUN import]", callSlot(otherSlot), retVa, 0);
             kind("call rel32", new byte[] { 0xE8, 0, 0, 0, 0, 0x90 }, callVa + 5, 0);
+            // The Start slot as a displacement off a register is not a call THROUGH the slot (IsAbsoluteSlotCall,
+            // which ProveCallsBalanced shares).
+            var viaBase = callSlot(startSlot); viaBase[1] = 0x90;                 // call dword [eax+disp32]
+            kind("call [eax + Start slot]", viaBase, retVa, 0);
+            var viaIndex = new byte[] { 0xFF, 0x14, 0x85, 0, 0, 0, 0 };          // call dword [eax*4+disp32]
+            BitConverter.GetBytes(startSlot).CopyTo(viaIndex, 3);
+            kind("call [eax*4 + Start slot]", viaIndex, callVa + 7, 0);
             // The right slot, but the return address the step machine saw is not where this call ends: it is
             // not the call that was entered, and must not be named as one.
             kind("call [Start slot] whose decode does not end at the return address", callSlot(startSlot), retVa + 1, 0);

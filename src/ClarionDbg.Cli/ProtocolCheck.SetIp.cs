@@ -635,9 +635,9 @@ namespace ClarionDbg.Cli
         {
             var codes = DebugEngine.SetIpRefusalCodes;
             claims.Claim("setip's " + codes.Length + " frozen refusal codes each carry a distinct user-facing "
-                         + "sentence, the step-first hint on exactly the three proof refusals the observed path can "
-                         + "override, and the refusal and success replies carry no tid of their own (an unknown "
-                         + "tid stays absent, a known one is stamped once), `candidates` only on ambiguous-line, "
+                         + "sentence, the step-first hint on stack-unproven and on no other code (the one refusal "
+                         + "the observed path can override), no sentence saying 'safe', and the refusal and success "
+                         + "replies carry no tid of their own (an unknown tid stays absent, a known one is stamped once), `candidates` only on ambiguous-line, "
                          + "no module/line when unparsable; the parser takes a bare module:line only; setip is "
                          + "not a resume verb.");
 
