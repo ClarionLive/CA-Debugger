@@ -570,10 +570,36 @@ namespace ClarionDbg.Cli
             IntPtr hThread = OpenThreadForContext(tid);
             var ctx = NewContext();
             bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
+            uint status = OnTempBpCore(tid, va, hThread, ref ctx, haveCtx);
+            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
+            return status;
+        }
 
+        /// <summary>The temp-INT3 hit with the thread context already read, so OnTempBpForTest can hand it a
+        /// context (the ESP is what the decision turns on) without a live thread behind it.</summary>
+        private uint OnTempBpCore(uint tid, uint va, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
+        {
             byte orig = _temp[va];
             WriteByte(va, orig);
             if (haveCtx) ctx.Eip = va;
+
+            // ANOTHER THREAD ran through the stepping thread's call-skip return address (65931ddd). The temp
+            // INT3 sits in shared code, so any thread can execute it, but everything below belongs to
+            // _stepTid's step: _skipEntryEsp is ITS callee-entry ESP, _prevVa ITS anchor, _skipRunning ITS
+            // run-to-return. Compared with thread B's ESP, `returned` could read true and end A's skip on B's
+            // behalf (A's step then ran on as a Continue), or put TF and A's anchor on B. So B gets what a
+            // user breakpoint gives a passing thread: the byte back, one TF step off it, and the temp
+            // re-planted by OnSingleStep's re-arm if it still exists by then. No step state is touched.
+            if (_mode != StepMode.None && tid != _stepTid)
+            {
+                _rearm[tid] = new Rearm { Va = va, IsTemp = true };
+                if (haveCtx)
+                {
+                    ctx.EFlags |= TRAP_FLAG;
+                    Native.SetThreadContext(hThread, ref ctx);
+                }
+                return Native.DBG_CONTINUE;
+            }
 
             // recursion guard: the same call-site return address fires for INNER frames too.
             // We've truly returned to our frame only when ESP is back above the callee entry.
@@ -616,7 +642,6 @@ namespace ClarionDbg.Cli
                 }
             }
 
-            if (hThread != IntPtr.Zero) Native.CloseHandle(hThread);
             return Native.DBG_CONTINUE;
         }
 
@@ -662,6 +687,30 @@ namespace ClarionDbg.Cli
                 throw new InvalidOperationException(
                     "OnUserBpForTest: refuses an interactive engine — the pausing route blocks in PausedWait");
             return OnUserBp(tid, va);
+        }
+
+        /// <summary>Drive the REAL temp-INT3 handler as thread <paramref name="tid"/> arriving at
+        /// <paramref name="va"/> with ESP <paramref name="esp"/>. The context is invented and no thread is
+        /// opened, because ESP against <c>_skipEntryEsp</c> is the decision under test; SetThreadContext goes
+        /// to a null handle and fails. The route that PAUSES needs a line table to reach, and this engine has
+        /// none, so nothing here can block in PausedWait.</summary>
+        internal uint OnTempBpForTest(uint tid, uint va, uint esp)
+        {
+            RefuseSeamIfAttached("OnTempBpForTest");
+            if (!_temp.ContainsKey(va))
+                throw new InvalidOperationException("OnTempBpForTest: no temp INT3 recorded at 0x" + va.ToString("X8")
+                                                    + " - the dispatcher would never route this hit here");
+            var ctx = NewContext();
+            ctx.Esp = esp;
+            ctx.Eip = va + 1;   // where the INT3 leaves EIP
+            return OnTempBpCore(tid, va, IntPtr.Zero, ref ctx, true);
+        }
+
+        /// <summary>Is there a pending TEMP re-plant (<c>IsTemp = true</c>) for this thread at this VA?</summary>
+        internal bool HasTempRearmForTest(uint tid, uint va)
+        {
+            Rearm r;
+            return _rearm.TryGetValue(tid, out r) && r.Va == va && r.IsTemp;
         }
 
         /// <summary>Register a mapped image (once) plus one armed user breakpoint at <paramref name="va"/>,

@@ -395,6 +395,18 @@ namespace ClarionDbg.Cli
             _temp[tempVa] = 0x90;
         }
 
+        /// <summary>Put an armed Step Over session into its run-to-return state, as StepMachine leaves it after
+        /// planting a call-skip temp INT3: the callee-entry ESP recorded and the thread running at full speed.</summary>
+        internal void ArmCallSkipForTest(uint entryEsp)
+        {
+            RefuseSeamIfAttached("ArmCallSkipForTest");
+            _skipEntryEsp = entryEsp;
+            _skipRunning = true;
+        }
+
+        /// <summary>Is the stepping thread still running at full speed to a call-skip return?</summary>
+        internal bool SkipRunningForTest { get { return _skipRunning; } }
+
         /// <summary>Is a step session still in flight? This is the exact condition OnSingleStep's step-2
         /// guard tests (<c>_mode != StepMode.None</c>) before it runs StepMachine, so a false here means
         /// nothing will stop the target.</summary>
