@@ -1,4 +1,4 @@
-$Exe = "C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe"
+﻿$Exe = "C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses\clbrws.exe"
 $b = [System.IO.File]::ReadAllBytes($Exe)
 $base = 0x16CC00
 # clbrws013 chunk 0x1F90..0x21F0 phase 2 — find lines 315..325

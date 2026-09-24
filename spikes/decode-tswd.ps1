@@ -1,4 +1,4 @@
-# decode-tswd.ps1
+﻿# decode-tswd.ps1
 # Decodes and validates the Clarion 'TSWD' embedded debug blob from a Full-debug EXE.
 # Locates the blob via the PE Debug Directory, parses the TOC header, and validates the
 # two line-number tables (source-line<->address). Reports % of addresses landing in .text.

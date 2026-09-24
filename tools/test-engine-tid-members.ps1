@@ -561,8 +561,10 @@ if ($SelfTest) {
       '" and thread " + TidText(SelectedTid) + " has no instance of it";' `
       '" and thread " + TidText(SelectedTid) + " has no instance of it" + "; last written by thread " + OwnerTid;' 'tidtext'
 
-    # 6. THE CONTROL FOR THE WALK ITSELF. A member name typed in a COMMENT must NOT be reported -- the rule
+    # 11. THE CONTROL FOR THE WALK ITSELF. A member name typed in a COMMENT must NOT be reported -- the rule
     #    holder's own comments are full of them, and a check that cries wolf on prose gets deleted.
+    #    (Labelled a second '6.' until 2026-09-24; the one "mutation 6" cross-reference above means the
+    #    nameless-member mutation, which kept its number.)
     $mut = @{}
     foreach ($k in $sources.Keys) { $mut[$k] = $sources[$k] }
     $mut['DebugEngine.Threads.cs'] = $mut['DebugEngine.Threads.cs'].Replace(
@@ -585,7 +587,8 @@ if ($SelfTest) {
 # that returned early simply shrank the number. Invoke-CheckSection above closes a section that throws or
 # breaks out of the script; this closes one that returns early or is skipped. COUNTING RULE: the RUNTIME
 # count of Check calls ($script:checks before this line) on a clean run, measured 2026-09-22 - the
-# -SelfTest run adds its 12 mutation checks. Update both deliberately with the checks.
+# -SelfTest run adds its 12 mutation checks (1-10 above, the comment control 11, and the coverage
+# check). Update both deliberately with the checks.
 $EXPECTED_CHECKS = if ($SelfTest) { 28 } else { 16 }
 Assert-CheckTotal $EXPECTED_CHECKS
 

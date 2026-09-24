@@ -58,7 +58,7 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 | `test-addin-hooks.ps1` | offline | the reflection hooks into ClarionAssistant, one child process per scenario |
 | `test-addin-json.ps1` | offline | the add-in's JSON reader and writer |
 | `test-addin-attach.ps1` (plain and `-SelfTest`) | offline | attach host side (3f2d747f): only a host-listed pid is attached, Stop sends `detach` (not `quit`) and waits 8 s, the `detached` event resets the pad, a closing pad still warns durably (log, with a %TEMP% fallback, + a dialog that survives a dead UI context) on an unsafe detach, and an attach carries `--expect-start`; `-SelfTest` breaks each guard (31 mutations) and requires red |
-| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images (not yet total-pinned: ticket 6493d226) |
+| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images: the spec grammar, the image-matching rule and the identity predicates (not that a breakpoint fires in both images) |
 | `test-engine-session.ps1` | offline | the shared engine-session lifecycle, and that harnesses use it |
 | `test-engine-tid-members.ps1` (plain and `-SelfTest`) | offline | no thread-id JSON member written by hand; thread ids to users go through TidText |
 | `test-engine-hover-sites.ps1` (plain and `-SelfTest`) | offline | PausedWait resets the hover tracker as an unconditional top-level statement before its command loop (position, not text) |
@@ -75,8 +75,10 @@ As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only ex
 **Live** suites launch `clbrws.exe` from the Clarion 11 examples
 (`C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses`) under the engine and
 post window messages to it, so they need that install and an unattended desktop. On 2026-09-22
-`test-bp-threaded.ps1` took about 55 s and flaked once (leg 1 under 8 hits, ticket b3e1ade8), which is why
-it is not in the default set.
+`test-bp-threaded.ps1` flaked once (leg 1 under 8 hits): it slept a fixed 5 s per browse open. Since
+ticket b3e1ade8 it waits for each open's hits instead (first hit, then 1.5 s quiet, 30 s cap); measured
+2026-09-24, three runs took 34-43 s with every open landing 8 hits (one 12). It stays live because it
+needs the app, not because it is flaky.
 
 ## Builds
 

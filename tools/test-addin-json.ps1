@@ -2174,7 +2174,17 @@ Check 'a STAMPED reply is DROPPED while the view does not know its own thread' `
 Check 'CONTROL: fail-open does not extend to a genuine disagreement' `
   (-not [DisasmTagProbe]::TidMatches([uint] 1, [uint] 2)) ''
 
-Check 'OnDisasm applies the tid gate as well as the epoch' ($onDisasm -match 'TidMatchesView\(tid\)') ''
+# SHAPE, NOT TEXT (49538b78 item 8c). This used to be `$onDisasm -match 'TidMatchesView\(tid\)'`, which
+# passes against `if (false && !TidMatchesView(tid)) return;` - a gate still present and never applied - and
+# against a comment that quotes it. So the comments are stripped, and the gate must be the marshal's SECOND
+# statement, in exactly this form, straight after the inner epoch check: nothing between them, nothing
+# ahead of them, no extra condition. Measured 2026-09-24: deleting the gate, `if (false && ...)`, a
+# non-constant-false `&&`, an `||` in its condition, the gate commented out and the gate moved below the
+# next statement each turn this red; the shipped source passes.
+$tidGateShape = '(?s)UI\(\(\)\s*=>\s*\{\s*if\s*\(\s*!_seat\.IsCurrent\(epoch\)\s*\)\s*return\s*;' +
+                '\s*if\s*\(\s*!TidMatchesView\(tid\)\s*\)\s*return\s*;'
+Check 'OnDisasm applies the tid gate as well as the epoch, as the marshal''s second statement, unconditionally' `
+  ((Get-CSharpCodeOnly $onDisasm) -match $tidGateShape) ''
 # NEITHER GATE MAY REPLACE THE OTHER. A tid check written in place of the marshal-side epoch check reads
 # like a strengthening and is a silent regression: it restores the exact race the second epoch check
 # exists to close, and the tid cannot see it (a switch away and back leaves the tid agreeing again).
