@@ -2743,13 +2743,18 @@
   // a file the user was no longer stopped in.
   function buildSource(file, proc, startLine, lines, current){
     setSrcLocation(file, proc, current);
+    // After a thread switch the host sends the SELECTED thread's source (0955b29f) and says nothing about
+    // which thread that is, so the header says it here: the page knows both tids. Here and not in
+    // setSrcLocation, whose other caller (the 'paused' arm) runs before this stop's tids are adopted.
+    const otherThread=viewingOtherThread();
+    if(otherThread) $('srchdrText').innerHTML+=' <span class="srcthread">('+esc(threadName(threadRowFor(selTid), selTid))+')</span>';
     const src=$('src'); src.innerHTML='';
     if(!lines || !lines.length){
       // No listing => no file to act on. Everything keyed off curFile (run-to-cursor, the source
       // right-click, the breakpoint dots) reads null and does nothing, rather than acting on the last stop.
       curFile=null; curLine=0;
       const none=document.createElement('div'); none.className='empty';
-      none.textContent='No source for this stop'+(file?' ('+file+')':'')+'.';
+      none.textContent=(otherThread ? "No source for this thread's location" : 'No source for this stop')+(file?' ('+file+')':'')+'.';
       src.appendChild(none);
       return;
     }

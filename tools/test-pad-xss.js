@@ -31,6 +31,7 @@ const window = { innerWidth: 1200, innerHeight: 800 };
 function attachTip() { }
 function renderBpDots() { }
 function setSrcLocation() { }
+function viewingOtherThread() { return false; }   // buildSource's thread label: tools/test-pad-source.js section 6
 const ADDED = [];
 function addWatch(n) { ADDED.push(n); }
 let curFile = null, curLine = 0, allSyms = [];
