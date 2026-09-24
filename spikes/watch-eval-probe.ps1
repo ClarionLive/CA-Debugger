@@ -1,4 +1,4 @@
-# Item-5b probe: watch command — non-threaded direct read + THREADed func-eval round trip.
+﻿# Item-5b probe: watch command — non-threaded direct read + THREADed func-eval round trip.
 # At the startup BP the JOBS buffer is empty, but this exercises the full hijack→trap→restore
 # path and proves the engine survives it (re-pause, then continue/quit cleanly).
 $exe = "H:\DevLaptop\Projects\ClarionDebugger\src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe"

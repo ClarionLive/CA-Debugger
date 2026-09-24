@@ -1,4 +1,4 @@
-# Phase 3 item-5 spike: pin the +0x2C pointer convention and walk one record's children.
+﻿# Phase 3 item-5 spike: pin the +0x2C pointer convention and walk one record's children.
 # Anchor: JOBS$JOB:RECORD tag-04 record at blob 0xDF180 (link 0x5740E -> base = 0x87D72).
 # Its type info: 00 08 <u32 size=0x37> <u32 childCount=4?> then 4 u32 child pointers.
 # Goal: resolve each child pointer to a tag-0C field record and print

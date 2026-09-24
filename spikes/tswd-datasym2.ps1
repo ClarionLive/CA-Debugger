@@ -1,4 +1,4 @@
-# Phase 3 item-4 spike part 2: where do app globals (JOB:JOBID etc.) live?
+﻿# Phase 3 item-4 spike part 2: where do app globals (JOB:JOBID etc.) live?
 # (a) dump the +0x28 backref VALUES — are they blob offsets (module block keys)?
 # (b) find the pool nameRef of known globals and search the whole blob for u32 refs to them
 # (c) hexdump around whatever references we find
