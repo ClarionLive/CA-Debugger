@@ -1622,6 +1622,20 @@ $g3 = New-Object ClarionDebugger.Terminal.EditGrants
 $g3.Grant('0x10', '0x03', 4, 0, 5)
 Check 'a thread-scoped grant does not answer a page with no thread selection' (-not $g3.IsGranted('0x10', '0x03', 4, 0, $null)) ''
 Check 'CONTROL: ...and does answer its own thread' ($g3.IsGranted('0x10', '0x03', 4, 0, 5)) ''
+# ONE tuple reader (6ac29815 #2): the grant and the edit read size/places with PageNumbers.ReadEditTuple, so a
+# row the engine sent and the page's echo of it agree, whichever member is missing or malformed. Run, per
+# shape: grant the row, then parse the page's edit carrying the same members.
+foreach ($t in @('"size":4,"places":2', '"size":4', '"places":2', '"size":"4","places":"x"', '"size":4,"places":null', '')) {
+  $sep = if ($t) { ',' } else { '' }
+  $gt = New-Object ClarionDebugger.Terminal.EditGrants
+  $gt.GrantRows('{"va":"0x30","typeCode":"0x03"' + $sep + $t + '}', 5)
+  $er = [ClarionDebugger.Terminal.EditVarRequest]::Parse('{"va":"0x30","typeCode":"0x03"' + $sep + $t + ',"tid":5,"value":"1"}')
+  Check "edit tuple {$t}: the grant and the page's echo of it read the same size and places" `
+    (($null -ne $er) -and $gt.IsGranted($er.Va, $er.TypeCode, $er.Size, $er.Places, $er.Tid)) "size=$($er.Size) places=$($er.Places)"
+}
+Check 'and both read it through PageNumbers.ReadEditTuple' `
+  (((Get-Method 'public static EditVarRequest Parse(string data)' $pageMsgs) -match 'PageNumbers\.ReadEditTuple\(data, out size, out places\)') -and `
+   ((Get-Method 'public void GrantRows(string itemsJson, uint? tid)' $pageMsgs) -match 'PageNumbers\.ReadEditTuple\(o, out size, out places\)')) ''
 
 # ---- the other request DTOs ---------------------------------------------------------------------------
 # These payloads are delimiter strings, parsed exactly as before and now in one place each. Checked on the
@@ -2425,7 +2439,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 394
+$EXPECTED_CHECKS = 401
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

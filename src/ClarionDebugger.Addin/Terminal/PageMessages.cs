@@ -202,8 +202,7 @@ namespace ClarionDebugger.Terminal
         {
             if (string.IsNullOrEmpty(data)) return null;
             int size, places;
-            PageNumbers.TryInt(JsonMessageReader.ReadField(data, "size"), out size);
-            if (!PageNumbers.TryInt(JsonMessageReader.ReadField(data, "places"), out places)) places = 0;
+            PageNumbers.ReadEditTuple(data, out size, out places);
             uint tid;
             bool haveTid = PageNumbers.TryUInt(JsonMessageReader.ReadField(data, "tid"), out tid);
             return new EditVarRequest
@@ -323,6 +322,16 @@ namespace ClarionDebugger.Terminal
         {
             v = 0;
             return s != null && uint.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out v);
+        }
+
+        /// <summary>The size and places of an edit tuple, read ONE way (6ac29815 #2). The grant is recorded from
+        /// the engine's row and the edit is checked from the page's echo of it; two readers with different
+        /// defaults would refuse a legitimate edit with nothing on screen to say why. A missing or
+        /// non-integer member reads as 0.</summary>
+        public static void ReadEditTuple(string obj, out int size, out int places)
+        {
+            TryInt(JsonMessageReader.ReadField(obj, "size"), out size);
+            TryInt(JsonMessageReader.ReadField(obj, "places"), out places);
         }
     }
 
@@ -608,8 +617,7 @@ namespace ClarionDebugger.Terminal
                 string tc = JsonMessageReader.ReadField(o, "typeCode");
                 if (va == null || tc == null) return;
                 int size, places;
-                PageNumbers.TryInt(JsonMessageReader.ReadField(o, "size"), out size);
-                if (!PageNumbers.TryInt(JsonMessageReader.ReadField(o, "places"), out places)) places = 0;
+                PageNumbers.ReadEditTuple(o, out size, out places);
                 Grant(va, tc, size, places, tid);
             });
         }
