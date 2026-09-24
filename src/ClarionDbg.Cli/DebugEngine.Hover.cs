@@ -87,8 +87,9 @@ namespace ClarionDbg.Cli
         // THE HIT-TEST SENDS NOTHING. Its inputs are GetCursorPos, EnumWindows (true z-order, topmost first),
         // IsWindowVisible, GetWindowRect, GetWindow, GetWindowThreadProcessId and GetWindowLongW, plus
         // DwmGetWindowAttribute (which asks DWM, not the window): all state reads, blessed with the
-        // prohibition above the user32 imports in DebugEngine.Threads.cs. It uses its OWN EnumWindows pass over EVERY process's top-level windows, not EnumerateTargetWindows, because
-        // "is the debuggee's window the one on top here" cannot be answered from the debuggee's windows alone:
+        // prohibition above the user32 imports in DebugEngine.Threads.cs. It makes its OWN EnumWindows pass
+        // over EVERY process's top-level windows, not EnumerateTargetWindows, because "is the debuggee's
+        // window the one on top here" cannot be answered from the debuggee's windows alone:
         // when the IDE covers the point, the answer is "none", not the debuggee window underneath.
 
         private const int HOVER_POLL_MS = 150;
@@ -133,7 +134,7 @@ namespace ClarionDbg.Cli
             catch (Exception) { tid = 0; }
             if (!_hover.Changed(tid, paused)) return;
             if (EmitJson) Console.WriteLine("@JSON " + HoverJson(true, paused, tid));
-            else Console.WriteLine("  hover: " + (TidIsKnown(tid) ? "thread " + tid : "no debuggee window under the cursor"));
+            else Console.WriteLine("  hover: " + (TidIsKnown(tid) ? "thread " + TidText(tid) : "no debuggee window under the cursor"));
         }
 
         private uint HoverTidUnderCursor(bool paused)
