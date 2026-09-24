@@ -611,8 +611,17 @@ using System.Globalization;
 using System.Collections.Generic;
 namespace ClarionDebugger.Terminal {
 $followTypes
+// OnStack also OFFERS its frames to the grant table (49538b78 wave 5). The real EditGrants is compiled into
+// the bridge probe below, and one type cannot be defined twice, so here a recorder takes its place.
+public sealed class FrameOfferRecorder {
+  public int Calls; public uint? Tid; public List<string> Frames = new List<string>();
+  public void OfferFrames(uint? tid, IEnumerable<KeyValuePair<string, string>> vaEbp) {
+    Calls++; Tid = tid; Frames.Clear(); foreach (var f in vaEbp) Frames.Add(f.Key + "|" + f.Value);
+  }
+}
 public class SourceFollowProbe {
   public List<string> Posts = new List<string>();
+  public FrameOfferRecorder _editGrants = new FrameOfferRecorder();
   private void Post(string json) { Posts.Add(json); }
 $followParts
 }
@@ -1067,7 +1076,7 @@ $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal
 # `);` that closes UI( is put back here.
 function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
 $pushProcs = (Get-Method 'private void PushProcedures(string exe)' $web) -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
-$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(', 'private void OnSvcExpanded(' |
+$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(', 'private void OnSvcExpanded(', 'private void OnSvcFrameLocals(' |
   ForEach-Object { (Get-ArrowHandler $_) -replace '^private void', 'public void' }) -join "`n"
 
 $bridgeSrc = @"
@@ -1104,6 +1113,9 @@ public sealed class FakeSvc {
   public List<string> Sets = new List<string>();
   public List<string> Expands = new List<string>();
   public bool AcceptExpand = true;
+  public List<string> FrameLocalsSent = new List<string>();
+  public bool AcceptFrameLocals = true;
+  public bool RequestFrameLocals(int reqId, string va, string ebp) { FrameLocalsSent.Add(reqId + "|" + va + "|" + ebp); return AcceptFrameLocals; }
   public bool RequestExpand(int reqId, string module, uint typeRef, string addr) { Expands.Add(reqId + "|" + module + "|" + typeRef + "|" + addr); return AcceptExpand; }
   public void PrimeTarget(string exe) { }
   public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
@@ -1145,6 +1157,8 @@ public sealed class BridgePad {
   $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void Expand(string data)' $web) -replace '^private void', 'public void')
   $(Get-Method 'private void RefuseExpand(int reqId, string why)' $web)
+  $((Get-Method 'private void FrameLocals(string data)' $web) -replace '^private void', 'public void')
+  $(Get-Method 'private void RefuseFrameLocals(int reqId, string why)' $web)
   $(Get-Method 'private void PostVarSet(string va, bool ok, string value, string error)' $web)
   $arrowHandlers
   public void RunPushProcedures(string exe) { PushProcedures(exe); }
@@ -1198,6 +1212,13 @@ $vsPad = New-Object ClarionDebugger.Terminal.BridgePad
 $vsPad.OnSvcVariableSet('0x4A10F0', $true, '7', $null)
 $varsetMsg = $vsPad.Posts[$vsPad.Posts.Count - 1]
 
+# A call stack as the real OnStack posts it (the follow probe above), and the frames it OFFERED on the way.
+$flProbe = New-Object ClarionDebugger.Terminal.SourceFollowProbe
+$flFrames = Frames @((SFrame 0 'MAIN' 'main.clw' 88 '0x19FF00'), (SFrame 1 'CALLER' 'main.clw' 12 '0x19FF40'), (SFrame 2 'LOST' $null 0 '0x0'))
+$flFrames[0].Va = '0x401000'; $flFrames[1].Va = '0x402000'; $flFrames[2].Va = '0x403000'
+$flProbe.OnStack($flFrames, 4812)
+$stackMsg = $flProbe.Posts[0]
+
 # ---- the page, run ------------------------------------------------------------------------------------
 $pageJs = @(
   (Get-Method 'function send(action,data)' $page),
@@ -1211,10 +1232,11 @@ $pageJs = @(
   (Get-Method 'function stripEditQuotes(s){' $page),
   (Get-Method 'function beginEdit(cell){' $page),
   (Get-Method 'function requestExpand(v, cb){' $page),
+  (Get-Method 'function requestFrameLocals(f, cb){' $page),
   (Get-Method 'function onVarSet(m){' $page)
 ) -join "`n"
 $inputFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-in-' + [Guid]::NewGuid().ToString('N') + '.json')
-@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg; varset = $varsetMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
+@{ procs = $procMsg; watch = $watchMsg; moduledata = $moduleMsg; varset = $varsetMsg; stack = $stackMsg } | ConvertTo-Json -Compress | Set-Content -LiteralPath $inputFile -Encoding UTF8
 $bridgeJs = @'
 const fs = require('fs');
 const INPUT = JSON.parse(fs.readFileSync(process.argv[2], 'utf8').replace(/^\uFEFF/, ''));
@@ -1231,6 +1253,7 @@ let allProcs = [], procIndex = null, bps = [], procCtx = null;
 function buildBps(){} function filterProcs(){}
 let isPaused = true, activeEdit = null, selTid = null;
 let _expandSeq = 0; const _expandCbs = {};
+let _flSeq = 0; const _flCbs = {};
 function editThreadSuffix(){ return ''; } function viewingOtherThread(){ return false; } function toast(){}
 '@ + "`n" + $pageJs + "`n" + @'
 
@@ -1264,6 +1287,10 @@ out.treeEdit = commit(tcell, '2.25');
 // Opening the reference row the host posted: the page's own expand request for it.
 const refRow = JSON.parse(INPUT.moduledata).items[0].children[1];
 wire = null; requestExpand(refRow, function(){}); out.expand = wire;
+
+// Opening the CALLER frame (frame 1) of the stack the host posted: the page's own framelocals request.
+const callerFrame = JSON.parse(INPUT.stack).frames[1];
+wire = null; requestFrameLocals(callerFrame, function(){}); out.framelocals = wire;
 console.log(JSON.stringify(out));
 '@
 $bridgeFile = Join-Path ([IO.Path]::GetTempPath()) ('cabridge-' + [Guid]::NewGuid().ToString('N') + '.js')
@@ -1553,9 +1580,9 @@ Check 'a new stop clears the grants BEFORE requesting the replies that re-grant'
   (($iClearP -ge 0) -and ($iReq -gt $iClearP)) "clear=$iClearP request=$iReq"
 Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
-Check 'the frame-locals and expand replies grant their rows as module data does' `
-  (((Get-ArrowHandler 'private void OnSvcFrameLocals(') -match '_editGrants\.GrantRows\(itemsJson, tid\)') -and `
-   ((Get-ArrowHandler 'private void OnSvcExpanded(') -match '_editGrants\.GrantRows\(itemsJson, null\)')) ''
+Check 'the frame-locals and expand replies grant their rows only for a request the host verified' `
+  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'if \(_editGrants\.FrameLocalsVerified\(reqId\)\) _editGrants\.GrantRows\(itemsJson, tid\)') -and `
+   ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExpanded(')) -match 'if \(_editGrants\.ExpandVerified\(reqId\)\) _editGrants\.GrantRows\(itemsJson, null\)')) ''
 
 # ---- one write per address at a time (codex security, pipeline run 2) ---------------------------------
 # The varset reply names only the ADDRESS. With two issued tuples on one va (two type or thread views of it)
@@ -1622,6 +1649,109 @@ $xp.OnSvcThreadSelected(9001, $true, $null)
 $xp._svc.Expands.Clear()
 $xp.Expand($expandData)
 Check 'after a thread switch the old reference row cannot be expanded until re-read' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
+
+# ---- frame locals are issued like expand (49538b78 wave 5, codex adversary) ---------------------------
+# A framelocals request names a procedure VA and an EBP, and the engine renders that procedure's locals at
+# EBP + each local's offset WITH edit metadata. Forwarded unchecked, a real VA and a made-up EBP minted edit
+# grants at addresses the page chose. Now the host forwards only a (va, ebp) its own stack reply offered, and
+# grants a reply's rows only when it forwarded that very request. Every hop real: OnStack's post and its
+# offer (the follow probe), the page's requestFrameLocals, then FrameLocals, OnSvcFrameLocals and EditVar.
+Check 'OnStack offers every frame it posts, with that reply''s thread' `
+  (($flProbe._editGrants.Calls -eq 1) -and ($flProbe._editGrants.Tid -eq 4812) -and `
+   (($flProbe._editGrants.Frames -join ',') -ceq '0x401000|0x19FF00,0x402000|0x19FF40,0x403000|0x0')) `
+  ("tid=$($flProbe._editGrants.Tid) " + ($flProbe._editGrants.Frames -join ','))
+$flData = if ($pageOut) { DataOf $pageOut.framelocals } else { '' }
+Check 'the page asks for the caller frame''s locals exactly as the host posted it' ($flData -ceq '1|0x402000|0x19FF40') $flData
+function Offer { param($grants, $offers, $tid)
+  $kv = New-Object 'System.Collections.Generic.List[System.Collections.Generic.KeyValuePair[string,string]]'
+  foreach ($o in $offers) { $p = $o -split '\|'; $kv.Add((New-Object 'System.Collections.Generic.KeyValuePair[string,string]' $p[0], $p[1])) }
+  $grants.OfferFrames($tid, $kv)
+}
+# One local of CALLER at its real EBP (0x19FF40 - 8), and the same local at forged EBPs. Each check below
+# edits its OWN address: a write one check let through leaves that address pending, and a later check on it
+# would then be refused for that reason instead of the one it names.
+function LocalAt { param($va) '{"name":"L:N","type":"LONG","value":"1","va":"' + $va + '","typeCode":"0x03","size":4,"places":0}' }
+function EditAt  { param($va) '{"va":"' + $va + '","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"9"}' }
+$realLocal = LocalAt '0x19FF38'; $editReal = EditAt '0x19FF38'
+
+$fp = New-Object ClarionDebugger.Terminal.BridgePad
+Offer $fp._editGrants $flProbe._editGrants.Frames 4812
+$fp.FrameLocals($flData)
+Check 'an offered frame''s locals are requested' `
+  (($fp._svc.FrameLocalsSent.Count -eq 1) -and ($fp._svc.FrameLocalsSent[0] -ceq '1|0x402000|0x19FF40')) ($fp._svc.FrameLocalsSent -join ',')
+$fp.OnSvcFrameLocals('1', $realLocal, 4812)
+$fp.EditVar($editReal)
+Check 'and the verified reply''s locals are editable' ($fp._svc.Sets.Count -eq 1) ($fp._svc.Sets -join ' ; ')
+
+# THE FORGERY: a real procedure VA, at an EBP no stack reply offered.
+$fp._svc.FrameLocalsSent.Clear(); $fp.Posts.Clear(); $fp.Lines.Clear()
+$fp.FrameLocals('2|0x402000|0x500000')
+Check 'a forged framelocals (an offered VA at a non-offered EBP) is not forwarded' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
+Check 'and is answered: an empty, refused reply for that reqId, and a console line' `
+  (($fp.Posts.Count -eq 1) -and ($fp.Posts[0] -cmatch '^\{"type":"framelocals","reqId":"2","items":\[\],"refused":true\}$') -and (@(Errs $fp).Count -eq 1)) ($fp.Posts -join ' / ')
+# Even if an engine reply for it arrived anyway, the host never forwarded it: shown, and grants nothing.
+$fp.Posts.Clear(); $fp._svc.Sets.Clear()
+$fp.OnSvcFrameLocals('2', (LocalAt '0x4FFFF8'), 4812)
+$fp.EditVar((EditAt '0x4FFFF8'))
+Check 'a reply to a framelocals the host did not forward creates no edit grant' ($fp._svc.Sets.Count -eq 0) ($fp._svc.Sets -join ' ; ')
+Check 'CONTROL: that reply was still posted for display' (($fp.Posts.Count -ge 1) -and ($fp.Posts[0] -cmatch '"type":"framelocals","reqId":"2","items":\[\{"name":"L:N"')) ($fp.Posts -join ' / ')
+# A reqId the host never saw at all grants nothing either.
+$fp._svc.Sets.Clear()
+$fp.OnSvcFrameLocals('77', (LocalAt '0x4FFFE8'), 4812)
+$fp.EditVar((EditAt '0x4FFFE8'))
+Check 'a reply whose reqId was never verified creates no edit grant' ($fp._svc.Sets.Count -eq 0) ($fp._svc.Sets -join ' ; ')
+# CONSUMED: a verified reqId grants once. A second reply under the same id is not the one the host asked for.
+$fp.FrameLocals('5|0x402000|0x19FF40')
+$fp.OnSvcFrameLocals('5', $realLocal, 4812)
+$fp._svc.Sets.Clear()
+$fp.OnSvcFrameLocals('5', (LocalAt '0x4FFFD8'), 4812)
+$fp.EditVar((EditAt '0x4FFFD8'))
+Check 'a verified reqId grants once: a second reply under it creates no edit grant' ($fp._svc.Sets.Count -eq 0) ($fp._svc.Sets -join ' ; ')
+# An EBP the engine could not recover (0x0) is offered by nobody: the page never asks about one.
+$fp._svc.FrameLocalsSent.Clear()
+$fp.FrameLocals('6|0x403000|0x0')
+Check 'a frame posted with the unknown EBP 0x0 is not an offer' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
+# A request the service would not send is answered, and recorded as nothing.
+$fp._svc.AcceptFrameLocals = $false; $fp.Posts.Clear(); $fp._svc.Sets.Clear()
+$fp.FrameLocals('8|0x401000|0x19FF00')
+$fp._svc.AcceptFrameLocals = $true
+Check 'a request the service refused is answered with an empty, refused reply' `
+  (($fp.Posts.Count -eq 1) -and ($fp.Posts[0] -cmatch '"reqId":"8","items":\[\],"refused":true') -and ($fp.Lines[$fp.Lines.Count - 1] -cmatch 'did not take')) ($fp.Posts -join ' / ')
+$fp.OnSvcFrameLocals('8', (LocalAt '0x4FFFC8'), 4812)
+$fp.EditVar((EditAt '0x4FFFC8'))
+Check 'and a reply under its reqId creates no edit grant' ($fp._svc.Sets.Count -eq 0) ($fp._svc.Sets -join ' ; ')
+
+# CURRENT, as for edits and expands. A thread's NEXT stack reply replaces its offer: a frame that has left
+# the stack cannot be asked about.
+$fp._svc.FrameLocalsSent.Clear()
+Offer $fp._editGrants @('0x401000|0x19FF00') 4812
+$fp.FrameLocals('9|0x402000|0x19FF40')
+Check 'a thread''s next stack reply replaces its offer: a frame no longer on it is refused' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
+# A request forwarded before a thread switch is answered AFTER it: the clear retired that request, so its
+# reply grants nothing...
+$fp.FrameLocals('10|0x401000|0x19FF00')
+Check 'CONTROL: the frame still on the stack is forwarded' ($fp._svc.FrameLocalsSent.Count -eq 1) ($fp._svc.FrameLocalsSent -join ',')
+$fp.OnSvcThreadSelected(9001, $true, $null)
+$fp._svc.Sets.Clear()
+$fp.OnSvcFrameLocals('10', (LocalAt '0x19FF34'), 4812)
+$fp.EditVar((EditAt '0x19FF34'))
+Check 'a reply to a request forwarded before the switch creates no edit grant' ($fp._svc.Sets.Count -eq 0) ($fp._svc.Sets -join ' ; ')
+# ...and the clear retired the offer too: the previous stop's frame is refused until a stack re-offers it.
+$fp._svc.FrameLocalsSent.Clear()
+$fp.FrameLocals('11|0x401000|0x19FF00')
+Check 'after the switch a frame from the previous offer is refused' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
+# EditGrants on its own: Clear retires offers and forwarded requests, whoever calls it (a stop, a resume).
+$gf = New-Object ClarionDebugger.Terminal.EditGrants
+Offer $gf @('0x401000|0x19FF00') 7
+$gf.FrameLocalsForwarded(1)
+$gf.Clear()
+Check 'EditGrants.Clear retires the offered frames and the forwarded framelocals' `
+  ((-not $gf.IsFrameOffered('0x401000', '0x19FF00')) -and (-not $gf.FrameLocalsVerified('1'))) ''
+Offer $gf @('0x40100A|0x19FF0B') 7
+Check 'CONTROL: an offered frame matches without regard to hex case' ($gf.IsFrameOffered('0x40100a', '0x19ff0b')) ''
+Check 'the bridge routes framelocals through the checked FrameLocals, not straight to the service' `
+  (((Get-CSharpCodeOnly $web) -match 'case "framelocals": FrameLocals\(data\); break;') -and `
+   ([regex]::Matches((Get-CSharpCodeOnly $web), '_svc\.RequestFrameLocals\(').Count -eq 1)) ''
 
 # ---- the grant walker on its own ----------------------------------------------------------------------
 $g = New-Object ClarionDebugger.Terminal.EditGrants
@@ -2462,7 +2592,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 402
+$EXPECTED_CHECKS = 422
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
