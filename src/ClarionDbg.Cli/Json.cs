@@ -510,8 +510,8 @@ namespace ClarionDbg.Cli
         /// "attached":true, so a host that does not read it is unaffected.</summary>
         public static string Loaded(uint pid, uint loadBase, bool attached)
         {
-            string s = Loaded(pid, loadBase);
-            return attached ? s.Substring(0, s.Length - 1) + ",\"attached\":true}" : s;
+            return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\""
+                 + (attached ? ",\"attached\":true" : "") + "}";
         }
 
         /// <summary>The engine let go of the target and it keeps running. drained = debug events that were
