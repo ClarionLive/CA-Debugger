@@ -22,10 +22,11 @@ namespace ClarionDbg.Cli
         {
             claims.Claim("a foreign top frame (a Pause in the OS) is walked up its saved-EBP links to the first link "
                          + "whose return is Clarion code, skipping a stale Clarion return between links; a frameless "
-                         + "callee (DebugBreak) yields its caller at the LOWEST Clarion return below EBP, and only when "
-                         + "EBP itself is the first Clarion link; a link that is misaligned, below ESP, too close to "
-                         + "StackBase, not climbing, or unreadable fails the walk, as does a chain longer than the link "
-                         + "cap. Not covered: the chain walk from the link, the TEB read, return validation.");
+                         + "callee (DebugBreak) yields its caller from the Clarion return AT ESP, and only when EBP "
+                         + "itself is the first Clarion link; a Clarion return higher in [ESP, EBP) is reported as "
+                         + "uncertain, and one past the scan cap not at all; a link that is misaligned, below ESP, too "
+                         + "close to StackBase, not climbing, or unreadable fails the walk, as does a chain longer than "
+                         + "the link cap. Not covered: the chain walk from the link, the TEB read, return validation.");
 
             // Pause: esp 0x1000; user32's frame at 0x1040 -> ClaRUN 0x1080 -> ClaRUN 0x10C0, whose return slot
             // 0x10C4 is Clarion. 0x1048 is a stale Clarion return INSIDE a runtime frame, 0x1004 another below.
@@ -35,10 +36,30 @@ namespace ClarionDbg.Cli
 
             // DebugBreak: esp 0x2000 holds the return into the Clarion caller, whose own frame is EBP = 0x2040;
             // 0x2044 returns into ITS caller. 0x2010 is a stale Clarion return in the caller's locals: the
-            // frameless callee's slot is the LOWEST one.
+            // frameless callee's slot is the one AT ESP.
             var brk = new Dictionary<uint, uint> { { 0x2040, 0x2080 } };
             ExpectLink(failures, "DebugBreak", 0x2040, 0x2000, 0x3000, brk, new uint[] { 0x2000, 0x2010, 0x2044 },
                        true, 0x2040, 0x2000);
+
+            // A FRAMED foreign function called straight from Clarion looks the same from EBP: its EBP 0x2040 is
+            // the first Clarion link. ESP 0x2000 is its own data, and 0x2010 a stale Clarion return among its
+            // locals. That is no proof of a caller, so it is reported uncertain (no frame base).
+            ExpectLink(failures, "a stale return above ESP (framed foreign callee)", 0x2040, 0x2000, 0x3000, brk,
+                       new uint[] { 0x2010, 0x2044 }, true, 0x2040, 0x2010, true);
+
+            // The frameless scan is capped like every other walk: 0x5000 above ESP is past it. Nothing is
+            // reported, and the scan asked about no slot past the cap.
+            uint capLo = 0x10000, capEbp = capLo + 0x8000;
+            var capAsked = new List<uint>();
+            uint capLink, capSlot; bool capUnc;
+            bool capFound = DebugEngine.FindForeignTopLink(capEbp, capLo, capEbp + 0x100,
+                va => (uint?)null, s => { capAsked.Add(s); return s == capLo + 0x5000 || s == capEbp + 4; },
+                out capLink, out capSlot, out capUnc);
+            if (!capFound || capLink != capEbp || capSlot != 0)
+                failures.Add("foreign top: a Clarion return 0x5000 above ESP was taken from a capped scan: found="
+                             + capFound + " link=0x" + capLink.ToString("X") + " frameless=0x" + capSlot.ToString("X"));
+            if (capAsked.Exists(s => s != capEbp + 4 && s >= capLo + 0x4000))
+                failures.Add("foreign top: the frameless scan read past its cap (0x4000 above ESP)");
 
             // A frameless candidate is taken ONLY when EBP is the first Clarion link. Here the first link is
             // one runtime frame up, so 0x2000 lies inside that frame and is no caller.
@@ -69,9 +90,9 @@ namespace ClarionDbg.Cli
                        new Dictionary<uint, uint>(), new uint[] { 8 }, false, 0, 0);
 
             // The link cap: an endless climbing chain with no Clarion return must end, and fail.
-            uint link, framelessSlot; int reads = 0;
+            uint link, framelessSlot; bool uncertainSlot; int reads = 0;
             bool found = DebugEngine.FindForeignTopLink(0x1000, 0x1000, 0x7FFFFFF0,
-                va => { reads++; return va + 0x10000; }, slot => false, out link, out framelessSlot);
+                va => { reads++; return va + 0x10000; }, slot => false, out link, out framelessSlot, out uncertainSlot);
             if (found)
                 failures.Add("foreign top: an endless chain with no Clarion return reported link 0x" + link.ToString("X"));
             if (reads > 1000)
@@ -226,17 +247,18 @@ namespace ClarionDbg.Cli
 
         private static void ExpectLink(List<string> failures, string what, uint ebp, uint lo, uint hi,
                                        Dictionary<uint, uint> mem, uint[] clarionSlots,
-                                       bool wantFound, uint wantLink, uint wantFrameless)
+                                       bool wantFound, uint wantLink, uint wantFrameless, bool wantUncertain = false)
         {
             var slots = new HashSet<uint>(clarionSlots);
-            uint link, framelessSlot;
+            uint link, framelessSlot; bool uncertain;
             bool found = DebugEngine.FindForeignTopLink(ebp, lo, hi,
                 va => { uint v; return mem.TryGetValue(va, out v) ? v : (uint?)null; },
-                slots.Contains, out link, out framelessSlot);
-            if (found != wantFound || link != wantLink || framelessSlot != wantFrameless)
+                slots.Contains, out link, out framelessSlot, out uncertain);
+            if (found != wantFound || link != wantLink || framelessSlot != wantFrameless || uncertain != wantUncertain)
                 failures.Add("foreign top: " + what + ": got found=" + found + " link=0x" + link.ToString("X")
-                             + " frameless=0x" + framelessSlot.ToString("X") + ", expected found=" + wantFound
-                             + " link=0x" + wantLink.ToString("X") + " frameless=0x" + wantFrameless.ToString("X"));
+                             + " frameless=0x" + framelessSlot.ToString("X") + " uncertain=" + uncertain
+                             + ", expected found=" + wantFound + " link=0x" + wantLink.ToString("X") + " frameless=0x"
+                             + wantFrameless.ToString("X") + " uncertain=" + wantUncertain);
         }
     }
 }
