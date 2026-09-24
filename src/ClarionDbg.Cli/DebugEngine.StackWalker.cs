@@ -214,10 +214,42 @@ namespace ClarionDbg.Cli
         /// on it, so after a Pause they describe the Clarion code, not the OS call it idles in.</summary>
         private StackFrame FirstClarionFrame(ref Native.CONTEXT_X86 ctx, IntPtr hThread)
         {
-            foreach (var f in BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, STACK_FRAMES_DEFAULT, hThread))
+            foreach (var f in FramesForStop(ref ctx, hThread))
                 if (f.Proc != null && f.Ebp != 0) return f;
             return null;
         }
+
+        // One stack walk per stop and register set, shared by every watch, module-data and local read at that
+        // stop: a walk per watch per stop is dozens of reads each, times every watch the host re-sends. Cleared
+        // on EVERY stop (PausedWait), which covers each resume. Keyed on EIP/ESP/EBP as well, so a setip or a
+        // thread switch inside one stop re-walks rather than reads another register set's frames.
+        private List<StackFrame> _stopFrames;
+        private uint _stopFramesEip, _stopFramesEsp, _stopFramesEbp;
+
+        private void ClearFrameCache() { _stopFrames = null; }
+
+        /// <summary>The walked frames for these registers at this stop (see <see cref="_stopFrames"/>).</summary>
+        private List<StackFrame> FramesForStop(ref Native.CONTEXT_X86 ctx, IntPtr hThread)
+        {
+            if (_stopFrames == null || _stopFramesEip != ctx.Eip || _stopFramesEsp != ctx.Esp || _stopFramesEbp != ctx.Ebp)
+            {
+                _stopFrames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, STACK_FRAMES_MAX, hThread);
+                _stopFramesEip = ctx.Eip; _stopFramesEsp = ctx.Esp; _stopFramesEbp = ctx.Ebp;
+            }
+            return _stopFrames;
+        }
+
+        /// <summary>Test seams for `protocolcheck`: the per-stop frame cache through the REAL FramesForStop and
+        /// ClearFrameCache. With no target every walk is frame 0 alone, which is enough: the check asserts
+        /// WHICH list instance comes back, not what is in it. Changes nothing but the cache itself.</summary>
+        internal List<StackFrame> FramesForStopForTest(uint eip, uint esp, uint ebp)
+        {
+            var c = NewContext();
+            c.Eip = eip; c.Esp = esp; c.Ebp = ebp;
+            return FramesForStop(ref c, IntPtr.Zero);
+        }
+
+        internal void ClearFrameCacheForTest() { ClearFrameCache(); }
 
         /// <summary>True when <paramref name="va"/> is exactly the entry of its containing procedure
         /// (prologue not yet run, so the frame's EBP is still the caller's).</summary>

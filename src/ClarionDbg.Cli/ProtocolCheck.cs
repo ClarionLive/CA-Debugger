@@ -97,6 +97,8 @@ namespace ClarionDbg.Cli
                 CheckCommandsNeverStarved,
                 CheckDetachHardening,
                 CheckForeignTopChain,
+                CheckFrameBoundWatch,
+                CheckRoutineOwnerWalk,
             };
 
             foreach (var check in checks)
