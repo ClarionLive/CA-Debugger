@@ -108,7 +108,8 @@ namespace ClarionDbg.Cli
                          + "code, other compilands and the next procedure's start line. It is omitted (never 0) for "
                          + "routines, runtime symbols, a procedure with no record, and one whose own records are "
                          + "owned by a same-entry alias. Every emitted endLine is >= its line and < the next "
-                         + "procedure's line. Not covered: byte-faithfulness to real compiler output, or the host's lookup.");
+                         + "procedure's line. A procedure or method with no endLine says \"extent\":\"unknown\" and nothing "
+                         + "else does (f1a98318). Not covered: byte-faithfulness to real compiler output, or the host's lookup.");
 
             TswdDebugInfo dbg;
             try { dbg = new TswdDebugInfo(BuildExtentsBlob(), 0, 0x1000, 0x2000, 0x10000); }
@@ -162,6 +163,20 @@ namespace ClarionDbg.Cli
             expect("PROCX", 0, 0);                // no line record at all
             expect("PROCY", 60, 0);               // its records belong to the alias: unknown, NOT PROCD's 55
             expect("demo$$$__alias", 60, 0);
+            // f1a98318: a procedure or method with no endLine SAYS "extent":"unknown"; nothing else carries it.
+            int saidUnknown = 0;
+            foreach (var kv in rows)
+            {
+                string row = kv.Value.Value;
+                bool extentKind = row.Contains("\"kind\":\"procedure\"") || row.Contains("\"kind\":\"method\"");
+                bool said = row.Contains("\"extent\":\"unknown\"");
+                if (said) saidUnknown++;
+                if (said != (extentKind && !kv.Value.Groups[3].Success))
+                    failures.Add("symbols extent: " + kv.Key + (said ? " says extent unknown but is not an unbounded procedure"
+                                                                     : " omits endLine without saying extent unknown"));
+            }
+            if (saidUnknown != 2)   // PROCX (no record) and PROCY (alias-owned)
+                failures.Add("symbols extent control: " + saidUnknown + " row(s) say extent unknown, expected 2 (PROCX, PROCY)");
 
             // THE PROPERTY, over every row emitted, independent of the per-symbol table above.
             if (json.IndexOf("\"endLine\":0", StringComparison.Ordinal) >= 0 || json.IndexOf("\"endLine\":-", StringComparison.Ordinal) >= 0)
