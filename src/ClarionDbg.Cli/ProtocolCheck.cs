@@ -102,6 +102,7 @@ namespace ClarionDbg.Cli
                 CheckForeignTopChain,
                 CheckFrameBoundWatch,
                 CheckRoutineOwnerWalk,
+                CheckStackReqIdEcho,
                 CheckWatchAddrIsOwnStorage,
             };
 

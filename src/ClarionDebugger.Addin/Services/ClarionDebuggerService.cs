@@ -322,7 +322,7 @@ namespace ClarionDebugger.Services
         // per-event stamp). The pad uses it to DROP a reply for a thread it is no longer showing: a thread
         // switch leaves the previous thread's replies in flight, and painting one into the new thread's
         // panels would show one thread's values under another thread's name.
-        public event Action<List<DebugStackFrame>, uint?> StackReceived;  // resolved call stack (frames, tid)
+        public event Action<List<DebugStackFrame>, uint?, string> StackReceived;  // resolved call stack (frames, tid, reqId)
         public event Action<string, string, uint?> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
@@ -837,8 +837,13 @@ namespace ClarionDebugger.Services
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
 
-        /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived.</summary>
-        public bool RequestStack() { return SendCommand("stack"); }
+        /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived. A
+        /// <paramref name="reqId"/> (digits only) is sent as <c>reqid=N</c> and echoed on the reply, so the
+        /// host can tell which request a reply answers (49538b78 wave 5 run 3).</summary>
+        public bool RequestStack(string reqId = null)
+        {
+            return SendCommand(reqId == null ? "stack" : "stack reqid=" + reqId);
+        }
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
         public bool RequestModuleData() { return SendCommand("moduledata"); }
@@ -1220,7 +1225,7 @@ namespace ClarionDebugger.Services
                 case "stack":
                     var frames = ParseStack(json);
                     foreach (var f in frames) f.ResolvedPath = ResolveModulePath(f.Module);
-                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"));
+                    StackReceived?.Invoke(frames, GetUIntOrNull(json, "tid"), GetStr(json, "reqId"));
                     break;
 
                 case "moduledata":

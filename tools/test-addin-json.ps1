@@ -589,7 +589,7 @@ Write-Host 'the source pane follows the SELECTED thread (0955b29f)'
 # Hoisted out of the here-string: an unbalanced '(' in a signature breaks $() inside @"..."@.
 $followParts = @(
   (Get-Method 'private void SendSource(' $web) -replace '^private void', 'public void'
-  (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid)' $web) -replace '^private void', 'public void'
+  (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)' $web) -replace '^private void', 'public void'
   (Get-Statement 'private DebugPause _stopSource' $web) -replace '^private', 'public'
   Get-Statement 'private uint? _stopTid' $web
   Get-Statement 'private uint? _sourceTid' $web
@@ -614,9 +614,10 @@ $followTypes
 // OnStack also OFFERS its frames to the grant table (49538b78 wave 5). The real EditGrants is compiled into
 // the bridge probe below, and one type cannot be defined twice, so here a recorder takes its place.
 public sealed class FrameOfferRecorder {
-  public int Calls; public uint? Tid; public List<string> Frames = new List<string>();
-  public void OfferFrames(uint? tid, IEnumerable<KeyValuePair<string, string>> vaEbp) {
-    Calls++; Tid = tid; Frames.Clear(); foreach (var f in vaEbp) Frames.Add(f.Key + "|" + f.Value);
+  public int Calls; public uint? Tid; public string ReqId; public List<string> Frames = new List<string>();
+  public bool OfferFrames(uint? tid, string reqId, IEnumerable<KeyValuePair<string, string>> vaEbp) {
+    Calls++; Tid = tid; ReqId = reqId; Frames.Clear(); foreach (var f in vaEbp) Frames.Add(f.Key + "|" + f.Value);
+    return true;
   }
 }
 public class SourceFollowProbe {
@@ -635,7 +636,7 @@ function SFrame { param([int] $n, $proc, $module, [int] $line, $ebp = '0x19FF00'
 function Frames { param([object[]] $fs) $l = New-Object 'System.Collections.Generic.List[ClarionDebugger.Terminal.DebugStackFrame]'; foreach ($f in $fs) { $l.Add($f) }; ,$l }
 # The source messages one stack reply produced (the stack post itself is always first).
 function SourcesAfter { param($probe, $frames, $tid)
-  $probe.Posts.Clear(); $probe.OnStack($frames, $tid)
+  $probe.Posts.Clear(); $probe.OnStack($frames, $tid, [NullString]::Value)
   ,@($probe.Posts | Where-Object { $_ -like '{"type":"source"*' })
 }
 $follow = New-Object ClarionDebugger.Terminal.SourceFollowProbe
@@ -680,7 +681,7 @@ Check 'OnPaused remembers the stop as the statement right before it sends the st
   ($onPausedCode -match 'NoteStopSource\(p\);\s*SendSource\(p\.Module, p\.ResolvedPath, p\.Proc, p\.Line\);') ''
 Check 'OnSvcResumed forgets the stop' ((Get-Method 'private void OnSvcResumed(' $web) -match '_stopSource = null;') ''
 Check 'OnStack follows as its LAST statement, after the stack is posted' `
-  ((Get-CSharpCodeOnly (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid)' $web)) -match 'Post\(sb\.ToString\(\)\);\s*FollowSelectedThread\(frames, tid\);\s*\}\s*$') ''
+  ((Get-CSharpCodeOnly (Get-Method 'private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)' $web)) -match 'Post\(sb\.ToString\(\)\);\s*FollowSelectedThread\(frames, tid\);\s*\}\s*$') ''
 
 Write-Host ''
 Write-Host 'teardown: "stopped" has to be a check, not a claim'
@@ -1216,7 +1217,7 @@ $varsetMsg = $vsPad.Posts[$vsPad.Posts.Count - 1]
 $flProbe = New-Object ClarionDebugger.Terminal.SourceFollowProbe
 $flFrames = Frames @((SFrame 0 'MAIN' 'main.clw' 88 '0x19FF00'), (SFrame 1 'CALLER' 'main.clw' 12 '0x19FF40'), (SFrame 2 'LOST' $null 0 '0x0'))
 $flFrames[0].Va = '0x401000'; $flFrames[1].Va = '0x402000'; $flFrames[2].Va = '0x403000'
-$flProbe.OnStack($flFrames, 4812)
+$flProbe.OnStack($flFrames, 4812, '5')
 $stackMsg = $flProbe.Posts[0]
 
 # ---- the page, run ------------------------------------------------------------------------------------
@@ -1587,10 +1588,15 @@ $tsel = Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcThreadSelected('
 Check 'an accepted thread switch clears, then selects the new thread' `
   ($tsel -match 'if \(ok\) \{ _editGrants\.Clear\(\); _editGrants\.SelectThread\(tid\); \}') ''
 $webCode = Get-CSharpCodeOnly $web
-Check 'every stack request is counted: the page''s and the stop''s go through RequestStack, the only _svc.RequestStack call' `
+Check 'every stack request carries a recorded id: the page''s and the stop''s go through RequestStack, the only _svc.RequestStack call' `
   (($webCode -match 'case "stack": if \(_svc\.State == DebugSessionState\.Paused\) RequestStack\(\); break;') -and `
    ([regex]::Matches($webCode, '_svc\.RequestStack\(').Count -eq 1) -and `
-   ((Get-CSharpCodeOnly (Get-Method 'private void RequestStack()' $web)) -match 'if \(_svc\.RequestStack\(\)\) _editGrants\.StackRequested\(\);')) ''
+   ((Get-CSharpCodeOnly (Get-Method 'private void RequestStack()' $web)) -match 'string id = _editGrants\.NewStackRequestId\(\);\s*if \(_svc\.RequestStack\(id\)\) _editGrants\.StackRequested\(id\);')) ''
+# The service sends the id as reqid=N and hands the reply's echo to the stack event.
+$svcCode = Get-CSharpCodeOnly (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'))
+Check 'the service sends reqid=N with a stack request and passes the reply''s reqId on' `
+  (($svcCode -match 'return SendCommand\(reqId == null \? "stack" : "stack reqid=" \+ reqId\);') -and `
+   ($svcCode -match 'StackReceived\?\.Invoke\(frames, GetUIntOrNull\(json, "tid"\), GetStr\(json, "reqId"\)\);')) ''
 Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
 Check 'the frame-locals and expand replies grant their rows only for a request the host verified' `
@@ -1669,20 +1675,22 @@ Check 'after a thread switch the old reference row cannot be expanded until re-r
 # grants at addresses the page chose. Now the host forwards only a (va, ebp) its own stack reply offered, and
 # grants a reply's rows only when it forwarded that very request. Every hop real: OnStack's post and its
 # offer (the follow probe), the page's requestFrameLocals, then FrameLocals, OnSvcFrameLocals and EditVar.
-Check 'OnStack offers every frame it posts, with that reply''s thread' `
-  (($flProbe._editGrants.Calls -eq 1) -and ($flProbe._editGrants.Tid -eq 4812) -and `
+Check 'OnStack offers every frame it posts, with that reply''s thread and request id' `
+  (($flProbe._editGrants.Calls -eq 1) -and ($flProbe._editGrants.Tid -eq 4812) -and ($flProbe._editGrants.ReqId -ceq '5') -and `
    (($flProbe._editGrants.Frames -join ',') -ceq '0x401000|0x19FF00,0x402000|0x19FF40,0x403000|0x0')) `
-  ("tid=$($flProbe._editGrants.Tid) " + ($flProbe._editGrants.Frames -join ','))
+  ("tid=$($flProbe._editGrants.Tid) reqId=$($flProbe._editGrants.ReqId) " + ($flProbe._editGrants.Frames -join ','))
 $flData = if ($pageOut) { DataOf $pageOut.framelocals } else { '' }
 Check 'the page asks for the caller frame''s locals exactly as the host posted it' ($flData -ceq '1|0x402000|0x19FF40') $flData
-# A stack reply for $tid carrying $offers, answering a stack request the host sent (and counted) just before.
-# It offers only when $tid is the selected thread: callers select it. Returns whether it offered.
-function Offer { param($grants, $offers, $tid, [switch] $Unrequested)
+# A stack reply for $tid carrying $offers. With no -ReqId it answers a stack request the host sends (and
+# records) just before; with -ReqId it echoes that id as given, whatever was requested. It offers only when
+# $tid is the selected thread: callers select it. Returns whether it offered.
+function Offer { param($grants, $offers, $tid, $ReqId = 'auto')
   $kv = New-Object 'System.Collections.Generic.List[System.Collections.Generic.KeyValuePair[string,string]]'
   foreach ($o in $offers) { $p = $o -split '\|'; $kv.Add((New-Object 'System.Collections.Generic.KeyValuePair[string,string]' $p[0], $p[1])) }
-  if (-not $Unrequested) { $grants.StackRequested() }
-  $grants.OfferFrames($tid, $kv)
+  if ($ReqId -ceq 'auto') { $ReqId = $grants.NewStackRequestId(); $grants.StackRequested($ReqId) }
+  $grants.OfferFrames($tid, $ReqId, $kv)
 }
+function StackAsked { param($grants) $id = $grants.NewStackRequestId(); $grants.StackRequested($id); $id }
 # One local of CALLER at its real EBP (0x19FF40 - 8), and the same local at forged EBPs. Each check below
 # edits its OWN address: a write one check let through leaves that address pending, and a later check on it
 # would then be refused for that reason instead of the one it names.
@@ -1776,10 +1784,10 @@ Check 'CONTROL: an offered frame matches without regard to hex case' ($gf.IsFram
 # OnSvcFrameLocals and EditVar.
 $rp = New-Object ClarionDebugger.Terminal.BridgePad
 $rp._editGrants.SelectThread(4812)                     # stopped on A (4812)
-$rp._editGrants.StackRequested()                       # the page asks for A's stack...
+$idA = StackAsked $rp._editGrants                      # the page asks for A's stack...
 $rp.OnSvcThreadSelected(9001, $true, $null)            # ...switches to B (9001) before it is answered...
-$rp._editGrants.StackRequested()                       # ...and asks for B's
-$aLate = Offer $rp._editGrants @('0x402000|0x19FF40') 4812 -Unrequested   # A's reply lands after the switch
+$idB = StackAsked $rp._editGrants                      # ...and asks for B's
+$aLate = Offer $rp._editGrants @('0x402000|0x19FF40') 4812 -ReqId $idA    # A's reply lands after the switch
 Check 'a stale stack reply for the OLD thread, after the switch, offers nothing' (-not $aLate) ''
 $rp.FrameLocals('20|0x402000|0x19FF40')
 Check 'and a framelocals for its frame is refused, not forwarded' `
@@ -1790,7 +1798,7 @@ $rp.EditVar('{"va":"0x19FF30","typeCode":"0x03","size":4,"places":0,"tid":9001,"
 Check 'and a reply under its reqId, stamped for the new thread, creates no edit grant' ($rp._svc.Sets.Count -eq 0) ($rp._svc.Sets -join ' ; ')
 # CONTROL, the genuine flow on the new thread: B's own reply to the counted request offers, is forwarded,
 # and its verified reply's locals are editable.
-$bOwn = Offer $rp._editGrants @('0x405000|0x2AFF40') 9001 -Unrequested
+$bOwn = Offer $rp._editGrants @('0x405000|0x2AFF40') 9001 -ReqId $idB
 $rp.FrameLocals('21|0x405000|0x2AFF40')
 $rp.OnSvcFrameLocals('21', (LocalAt '0x2AFF38'), 9001)
 $rp.EditVar('{"va":"0x2AFF38","typeCode":"0x03","size":4,"places":0,"tid":9001,"value":"9"}')
@@ -1798,20 +1806,58 @@ Check 'CONTROL: the new thread''s own stack reply offers, and its frame''s local
   ($bOwn -and ($rp._svc.FrameLocalsSent.Count -eq 1) -and ($rp._svc.Sets.Count -eq 1)) `
   ("offered=$bOwn sent=" + ($rp._svc.FrameLocalsSent -join ',') + " sets=" + ($rp._svc.Sets -join ' ; '))
 
+# THE REGRESSION (run 3, codex security + adversary): freshness proven by a COUNT let a stale reply for the
+# SAME thread spend the fresh request. A's stack is asked for, the page switches to B and back to A (each
+# switch a clear), asks again, and the OLD A reply arrives first: same tid, so only its id tells it apart.
+$cx = New-Object ClarionDebugger.Terminal.BridgePad
+$cx._editGrants.SelectThread(4812)
+$old = StackAsked $cx._editGrants
+$cx.OnSvcThreadSelected(9001, $true, $null)
+$cx.OnSvcThreadSelected(4812, $true, $null)
+$new = StackAsked $cx._editGrants
+$stale = Offer $cx._editGrants @('0x402000|0x19FF40') 4812 -ReqId $old
+Check 'THE REGRESSION: an old reply for the SAME thread, arriving before the fresh one, offers nothing' (-not $stale) ''
+$cx.FrameLocals('40|0x402000|0x19FF40')
+Check 'and a framelocals for its frame is refused' `
+  (($cx._svc.FrameLocalsSent.Count -eq 0) -and ($cx.Posts[$cx.Posts.Count - 1] -cmatch '"reqId":"40","items":\[\],"refused":true')) `
+  (($cx._svc.FrameLocalsSent -join ',') + ' / ' + ($cx.Posts -join ' / '))
+$fresh = Offer $cx._editGrants @('0x402000|0x19FE40') 4812 -ReqId $new
+$cx.FrameLocals('41|0x402000|0x19FE40')
+$cx.OnSvcFrameLocals('41', (LocalAt '0x19FE38'), 4812)
+$cx.EditVar((EditAt '0x19FE38'))
+Check 'CONTROL: the fresh reply then offers, and its frame''s locals are forwarded and editable' `
+  ($fresh -and ($cx._svc.FrameLocalsSent.Count -eq 1) -and ($cx._svc.Sets.Count -eq 1)) `
+  ("offered=$fresh sent=" + ($cx._svc.FrameLocalsSent -join ',') + " sets=" + ($cx._svc.Sets -join ' ; '))
+
 # THE EPOCH: a stack reply to a request sent before a clear (a stop, a resume, a switch) offers nothing, even
-# for the same thread; only a request counted after the clear can be answered with an offer.
+# for the same thread; only a request recorded after the clear can be answered with an offer.
 $ep = New-Object ClarionDebugger.Terminal.EditGrants
 $ep.SelectThread(4812)
-$ep.StackRequested()
+$before = StackAsked $ep
 $ep.Clear()
-$preBump = Offer $ep @('0x402000|0x19FF40') 4812 -Unrequested
+$preBump = Offer $ep @('0x402000|0x19FF40') 4812 -ReqId $before
 Check 'a stack reply requested before the epoch bump offers nothing, even for the selected thread' `
   ((-not $preBump) -and (-not $ep.IsFrameOffered('0x402000', '0x19FF40'))) "offered=$preBump"
-$postBump = Offer $ep @('0x402000|0x19FF40') 4812
-Check 'CONTROL: a reply to a request counted after the bump offers' ($postBump -and $ep.IsFrameOffered('0x402000', '0x19FF40')) "offered=$postBump"
-# Each reply spends ONE request: a second reply to one request is not an answer to anything.
-$second = Offer $ep @('0x403000|0x19FF80') 4812 -Unrequested
-Check 'a second stack reply to one request offers nothing' ((-not $second) -and $ep.IsFrameOffered('0x402000', '0x19FF40')) "offered=$second"
+$after = StackAsked $ep
+$postBump = Offer $ep @('0x402000|0x19FF40') 4812 -ReqId $after
+Check 'CONTROL: a reply to a request recorded after the bump offers' ($postBump -and $ep.IsFrameOffered('0x402000', '0x19FF40')) "offered=$postBump"
+# An id is answered ONCE: a second reply under it is not an answer to anything.
+$second = Offer $ep @('0x403000|0x19FF80') 4812 -ReqId $after
+Check 'a reused (already answered) request id offers nothing' ((-not $second) -and $ep.IsFrameOffered('0x402000', '0x19FF40')) "offered=$second"
+# A reply with no id (an engine that does not echo one, or a stack nobody asked for) offers nothing, even while
+# a request is outstanding.
+$pending = StackAsked $ep
+$noId = Offer $ep @('0x404000|0x19FFC0') 4812 -ReqId ([NullString]::Value)
+$neverSent = Offer $ep @('0x404000|0x19FFC0') 4812 -ReqId '999999'
+Check 'a reply without a reqId, or with an id never sent, offers nothing' `
+  ((-not $noId) -and (-not $neverSent) -and (-not $ep.IsFrameOffered('0x404000', '0x19FFC0'))) "noId=$noId neverSent=$neverSent"
+# A LIVE id is still refused when the reply is stamped for a thread other than the selected one.
+$wt = StackAsked $ep
+$wrongTid = Offer $ep @('0x405000|0x19FFE0') 9001 -ReqId $wt
+Check 'a reply echoing a live request id but stamped for another thread offers nothing' `
+  ((-not $wrongTid) -and (-not $ep.IsFrameOffered('0x405000', '0x19FFE0'))) "offered=$wrongTid"
+Check 'request ids are never reused, across clears too' `
+  (($before -cne $after) -and ($after -cne $pending) -and ($before -cne $pending)) "$before,$after,$pending"
 
 # THE REPLY'S THREAD: a forwarded request grants only a reply stamped for the thread of the offer it was
 # checked against; any other thread's stamp grants nothing.
@@ -2668,7 +2714,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 433
+$EXPECTED_CHECKS = 440
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

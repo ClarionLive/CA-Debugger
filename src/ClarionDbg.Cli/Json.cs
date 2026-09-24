@@ -309,10 +309,14 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
-        public static string Stack(List<StackFrame> frames)
+        /// <summary>The stack reply. <paramref name="reqId"/>, when the request carried one, is echoed as
+        /// "reqId" ahead of the frames; with none, the member is absent.</summary>
+        public static string Stack(List<StackFrame> frames, string reqId = null)
         {
             var sb = new StringBuilder();
-            sb.Append("{\"event\":\"stack\",\"frames\":[");
+            sb.Append("{\"event\":\"stack\"");
+            if (reqId != null) sb.Append(",\"reqId\":").Append(Str(reqId));
+            sb.Append(",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
             {
                 var f = frames[i];

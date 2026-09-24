@@ -16,21 +16,19 @@ namespace ClarionDbg.Cli
         private const int STACK_FRAMES_DEFAULT = 32;
         private const int STACK_FRAMES_MAX = 256;
 
-        /// <summary>stack [maxFrames] — resolved call stack while paused (frame 0 = current EIP). Walks the
-        /// SELECTED thread's registers, which is usually but not always the stopped thread's; the reply is
-        /// stamped with that tid so the host can drop it if it has since switched threads.</summary>
+        /// <summary>stack [maxFrames] [reqid=N] — resolved call stack while paused (frame 0 = current EIP). Walks
+        /// the SELECTED thread's registers, which is usually but not always the stopped thread's; the reply is
+        /// stamped with that tid so the host can drop it if it has since switched threads. A reqid is echoed on
+        /// the reply as "reqId", so the host can tell WHICH request a reply answers (49538b78 wave 5 run 3): a
+        /// stale reply for the same thread carries the same tid, and only its id tells it apart.</summary>
         private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
                                         IntPtr hThread)
         {
             if (!haveCtx) { EmitError("stack: no context for thread " + TidText(tid)); return; }
-            int max = STACK_FRAMES_DEFAULT;
-            if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX))
-            {
-                EmitError($"stack: max frames must be 1..{STACK_FRAMES_MAX}");
-                return;
-            }
+            int max; string reqId, error;
+            if (!TryParseStackArgs(parts, out max, out reqId, out error)) { EmitError(error); return; }
             var frames = BuildStack(ctx.Eip, ctx.Esp, ctx.Ebp, max, hThread);
-            EmitThreadEvent(tid, Json.Stack(frames));
+            EmitThreadEvent(tid, Json.Stack(frames, reqId));
             Console.WriteLine($"  stack of thread {TidText(tid)} ({frames.Count} frame(s)):");
             for (int i = 0; i < frames.Count; i++)
             {
@@ -40,6 +38,56 @@ namespace ClarionDbg.Cli
                 string unc = f.Uncertain ? "  (uncertain — possibly a stale return address)" : "";
                 Console.WriteLine($"    #{i,-2} {name}{loc}  RVA 0x{f.Rva:X}{(f.Kind != null ? "  [" + f.Kind + "]" : "")}{unc}");
             }
+        }
+
+        private const string STACK_REQID = "reqid=";   // a token no frame count can be
+        private const int STACK_REQID_MAX_DIGITS = 10;
+
+        /// <summary>The arguments of `stack` (and `bt`/`where`): an optional frame count, then an optional
+        /// <c>reqid=N</c> (1 to 10 digits), in that order. Anything else is refused with the reason in
+        /// <paramref name="error"/>. <paramref name="reqId"/> is null when none was given.</summary>
+        internal static bool TryParseStackArgs(string[] parts, out int max, out string reqId, out string error)
+        {
+            max = STACK_FRAMES_DEFAULT; reqId = null; error = null;
+            int i = 1;
+            if (parts.Length > i && !parts[i].StartsWith(STACK_REQID, StringComparison.Ordinal))
+            {
+                if (!int.TryParse(parts[i], out max) || max < 1 || max > STACK_FRAMES_MAX)
+                {
+                    error = $"stack: max frames must be 1..{STACK_FRAMES_MAX}";
+                    return false;
+                }
+                i++;
+            }
+            if (parts.Length > i)
+            {
+                string id = parts[i].StartsWith(STACK_REQID, StringComparison.Ordinal) ? parts[i].Substring(STACK_REQID.Length) : null;
+                if (id == null || id.Length == 0 || id.Length > STACK_REQID_MAX_DIGITS || !IsAllDigits(id))
+                {
+                    error = "stack: expected [maxFrames] [reqid=N], N 1.." + STACK_REQID_MAX_DIGITS + " digits";
+                    return false;
+                }
+                reqId = id;
+                i++;
+            }
+            if (parts.Length > i) { error = "stack: expected [maxFrames] [reqid=N]"; return false; }
+            return true;
+        }
+
+        private static bool IsAllDigits(string s)
+        {
+            foreach (char c in s) if (c < '0' || c > '9') return false;
+            return true;
+        }
+
+        /// <summary>Test seam: the REAL HandleStackCommand for <paramref name="line"/>, with an invented context
+        /// and no target (every walk is frame 0 alone), so `protocolcheck` can read the reply it emits.</summary>
+        internal void HandleStackCommandForTest(string line, uint tid)
+        {
+            RefuseSeamIfAttached("HandleStackCommandForTest");
+            var c = NewContext();
+            c.Eip = 0x401000; c.Esp = 0x19F000; c.Ebp = 0x19F100;
+            HandleStackCommand(line.Split(' '), ref c, true, tid, IntPtr.Zero);
         }
 
         /// <summary>

@@ -312,7 +312,7 @@ namespace ClarionDebugger.Terminal
         // emit 'resumed', so they leave the marker alone.
         private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
-        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid) => UI(() => OnStack(frames, tid));
+        private void OnSvcStack(List<DebugStackFrame> frames, uint? tid, string reqId) => UI(() => OnStack(frames, tid, reqId));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
         // fields); forward its array bodies verbatim so the structure survives intact.
 
@@ -1723,14 +1723,15 @@ namespace ClarionDebugger.Terminal
                 + Str(why) + "}");
         }
 
-        /// <summary>Ask the engine for the selected thread's stack, and count the request in the current epoch:
-        /// only a reply to a counted request may offer frames (EditGrants.OfferFrames).</summary>
+        /// <summary>Ask the engine for the selected thread's stack under a fresh request id, recorded for the
+        /// current epoch once sent: only a reply echoing a recorded id may offer frames (EditGrants.OfferFrames).</summary>
         private void RequestStack()
         {
-            if (_svc.RequestStack()) _editGrants.StackRequested();
+            string id = _editGrants.NewStackRequestId();
+            if (_svc.RequestStack(id)) _editGrants.StackRequested(id);
         }
 
-        private void OnStack(List<DebugStackFrame> frames, uint? tid)
+        private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)
         {
             var sb = new StringBuilder("{\"type\":\"stack\",\"frames\":[");
             for (int i = 0; i < frames.Count; i++)
@@ -1748,10 +1749,10 @@ namespace ClarionDebugger.Terminal
             }
             sb.Append(']').Append(TidJson(tid)).Append('}');
             // The frames just offered are the only ones whose locals the page may ask for (see FrameLocals), and
-            // only when this reply is for the selected thread and answers a request of this epoch (OfferFrames).
+            // only when this reply is for the selected thread and echoes a request id of this epoch (OfferFrames).
             var offered = new List<KeyValuePair<string, string>>();
             foreach (var f in frames) offered.Add(new KeyValuePair<string, string>(f.Va, f.Ebp));
-            _editGrants.OfferFrames(tid, offered);
+            _editGrants.OfferFrames(tid, reqId, offered);
             Post(sb.ToString());
             FollowSelectedThread(frames, tid);
         }

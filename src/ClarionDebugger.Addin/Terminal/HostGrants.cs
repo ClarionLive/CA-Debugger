@@ -188,14 +188,18 @@ namespace ClarionDebugger.Terminal
         // for it was forwarded, and the engine rendered A's locals at A's EBP in a reply stamped and granted
         // for B. Now a stack reply offers only when it answers a stack request made in the CURRENT epoch (a
         // clear - stop, resume, thread switch - starts a new one) and is for the thread the host last
-        // selected. A forwarded request remembers the thread of the offer it was checked against, and its
+        // selected. WHICH request it answers is proven by the id the engine echoes (run 3, codex security +
+        // adversary): a count of requests could be spent by a stale reply for the same thread - A's stack,
+        // a switch to B and back to A, a new request, and the OLD reply arriving first - which carries the
+        // same tid, and only its id tells it apart. A forwarded request remembers the thread of the offer it was checked against, and its
         // reply grants only when stamped for that thread; the clear that ends an epoch retires every
         // forwarded request, so a reply after it grants nothing (the epoch is not stored with the request as
         // well: with the clear in front of it, that comparison could never fail).
         private readonly HashSet<string> _framesOffered = new HashSet<string>(StringComparer.Ordinal);
         private uint? _framesTid;          // the thread the current offer came from
         private uint? _selectedTid;        // the thread the host last selected (a stop's thread, or a switch)
-        private int _stacksRequested;      // stack requests sent in this epoch (since the last clear), unanswered
+        private readonly HashSet<string> _stackIds = new HashSet<string>(StringComparer.Ordinal);  // sent this epoch, unanswered
+        private uint _nextStackId;         // never reset: an id is unique for the session
         private readonly Dictionary<string, uint?> _frameLocalsInFlight =
             new Dictionary<string, uint?>(StringComparer.Ordinal);
 
@@ -212,15 +216,22 @@ namespace ClarionDebugger.Terminal
         {
             _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); _writesInFlight.Clear();
             _framesOffered.Clear(); _framesTid = null; _frameLocalsInFlight.Clear();
-            _stacksRequested = 0;
+            _stackIds.Clear();
         }
 
         /// <summary>The host selected <paramref name="tid"/>: a stop's thread, or a thread switch the engine
         /// accepted. Only a stack reply for this thread offers frames.</summary>
         public void SelectThread(uint? tid) { _selectedTid = tid; }
 
-        /// <summary>The host sent a stack request in the current epoch.</summary>
-        public void StackRequested() { _stacksRequested++; }
+        /// <summary>A fresh stack request id, never issued before in this session.</summary>
+        public string NewStackRequestId()
+        {
+            _nextStackId++;
+            return _nextStackId.ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>The host sent stack request <paramref name="id"/> in the current epoch.</summary>
+        public void StackRequested(string id) { if (!string.IsNullOrEmpty(id)) _stackIds.Add(id); }
 
         // A grant is CONSUMED by the write it authorises (afbc68c7, codex security gate): otherwise one grant
         // let the same write be replayed for the rest of the pause. The consumed key waits here, by address,
@@ -294,18 +305,20 @@ namespace ClarionDebugger.Terminal
         /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
         public bool ExpandVerified(string reqId) { return reqId != null && _expandsInFlight.Remove(reqId); }
 
-        /// <summary>A stack reply for <paramref name="tid"/> carried exactly these frames, each a (va, ebp) pair.
-        /// They are OFFERED, replacing the previous offer, only when <paramref name="tid"/> is the selected
-        /// thread and the reply answers a stack request made in this epoch (each such reply spends one); otherwise
-        /// nothing is offered and false is returned. A frame with no VA, or with the engine's "unknown" EBP
-        /// (0x0), offers nothing: the page never asks about one.</summary>
-        public bool OfferFrames(uint? tid, IEnumerable<KeyValuePair<string, string>> vaEbp)
+        /// <summary>A stack reply for <paramref name="tid"/>, echoing request <paramref name="reqId"/>, carried
+        /// exactly these frames, each a (va, ebp) pair. They are OFFERED, replacing the previous offer, only when
+        /// <paramref name="reqId"/> is a request sent in this epoch and not yet answered (it is answered now,
+        /// and cannot offer again) and <paramref name="tid"/> is the selected thread; otherwise nothing is
+        /// offered and false is returned. A frame with no VA, or with the engine's "unknown" EBP (0x0), offers
+        /// nothing: the page never asks about one.</summary>
+        public bool OfferFrames(uint? tid, string reqId, IEnumerable<KeyValuePair<string, string>> vaEbp)
         {
-            // Another thread's reply answers none of this epoch's requests, which are all for the selected
-            // thread, so it spends none: that would leave the selected thread's own reply unanswered.
+            // An id from before the last clear, one never sent, one already answered, or none at all (a null
+            // is in no set). It is answered either way: a live id stamped for another thread spends it too.
+            if (!_stackIds.Remove(reqId)) return false;
+            // A live id is always the selected thread's request, so a reply stamped otherwise comes from an
+            // engine that does not agree about the selection: its frames are not the ones asked for.
             if (!WireRules.TidIsKnown(tid) || tid != _selectedTid) return false;
-            if (_stacksRequested <= 0) return false;   // requested before the last clear, or never
-            _stacksRequested--;
             _framesOffered.Clear();
             _framesTid = tid;
             if (vaEbp != null)
