@@ -32,11 +32,12 @@ namespace ClarionDbg.Cli
             // G: A LONG@0, S STRING(4)@4, SUB GROUP@8 { X LONG@0, Y LONG@4 }, R &GROUP@16, ARR LONG,DIM(2)@20
             var longT = new ClarionType { Kind = TypeKind.Int, Tag = 0x11, Size = 4 };
             var strT = new ClarionType { Kind = TypeKind.String, Tag = 0x18, Size = 4, Length = 4 };
-            var sub = Group(8, M("X", 0, longT), M("Y", 4, longT));
-            var inner = Group(4, M("Z", 0, longT));
+            var sub = WpGroupType(8, WpMember("X", 0, longT), WpMember("Y", 4, longT));
+            var inner = WpGroupType(4, WpMember("Z", 0, longT));
             var refT = new ClarionType { Kind = TypeKind.Reference, Tag = 0x16, Size = 4, Referent = inner };
             var arrT = new ClarionType { Kind = TypeKind.Array, Tag = 0x18, Size = 8, ElemType = longT, ElemSize = 4, Length = 2, LoBound = 1 };
-            var g = Group(28, M("A", 0, longT), M("S", 4, strT), M("SUB", 8, sub), M("R", 16, refT), M("ARR", 20, arrT));
+            var g = WpGroupType(28, WpMember("A", 0, longT), WpMember("S", 4, strT), WpMember("SUB", 8, sub),
+                                WpMember("R", 16, refT), WpMember("ARR", 20, arrT));
             const uint gVa = 0x1000;
             Func<uint, uint?> noRead = va => { failures.Add("watch path: a head that must not be dereferenced read a pointer at 0x" + va.ToString("X")); return null; };
 
@@ -54,7 +55,7 @@ namespace ClarionDbg.Cli
 
             // Q: the QUEUE:BROWSE:1 shape measured on clbrws (3a0c915d item 0) - a local 0x16 reference to a
             // group whose first member is at +0. The slot is at 0x2000 and holds 0x9000, then 0xA000.
-            var q = Group(60, M("BRW1::JOB:JOBID", 0, longT), M("BRW1::JOB:JOB_DESC", 6, strT));
+            var q = WpGroupType(60, WpMember("BRW1::JOB:JOBID", 0, longT), WpMember("BRW1::JOB:JOB_DESC", 6, strT));
             var qRef = new ClarionType { Kind = TypeKind.Reference, Tag = 0x16, Size = 4, Referent = q };
             const uint slot = 0x2000;
             uint held = 0x9000;
@@ -79,23 +80,23 @@ namespace ClarionDbg.Cli
             ExpectOutcome(failures, "QG.BRW1::JOB:JOBID", qRef, 0x16, false, slot, noRead, DebugEngine.WatchPathOutcome.Unsupported, DebugEngine.PathUnsupported);
 
             // WINRESIZE's shape: a reference to a class, whose first data member sits after the VMT at +4
-            var cls = Group(51, M("APPSTRATEGY", 4, longT), M("AUTOTRANSPARENT", 5, longT));
+            var cls = WpGroupType(51, WpMember("APPSTRATEGY", 4, longT), WpMember("AUTOTRANSPARENT", 5, longT));
             var clsRef = new ClarionType { Kind = TypeKind.Reference, Tag = 0x16, Size = 4, Referent = cls };
             ExpectOutcome(failures, "WINRESIZE.APPSTRATEGY", clsRef, 0x16, true, slot, noRead, DebugEngine.WatchPathOutcome.Unsupported, DebugEngine.PathClassRef);
         }
 
-        private static ClarionType Group(uint size, params TypeMember[] members)
+        private static ClarionType WpGroupType(uint size, params TypeMember[] members)
         {
             return new ClarionType { Kind = TypeKind.Group, Tag = 0x08, Size = size, Members = new List<TypeMember>(members) };
         }
 
-        private static TypeMember M(string name, int offset, ClarionType type)
+        private static TypeMember WpMember(string name, int offset, ClarionType type)
         {
             return new TypeMember { Name = name, Offset = offset, Type = type };
         }
 
-        private static DebugEngine.WatchPathOutcome Walk(string path, ClarionType head, byte code, bool local, uint headVa,
-                                                         Func<uint, uint?> read, out uint leafVa, out ClarionType leafType, out string error)
+        private static DebugEngine.WatchPathOutcome WpWalkPath(string path, ClarionType head, byte code, bool local, uint headVa,
+                                                               Func<uint, uint?> read, out uint leafVa, out ClarionType leafType, out string error)
         {
             var parts = new List<string>(path.Split('.'));
             parts.RemoveAt(0);
@@ -106,7 +107,7 @@ namespace ClarionDbg.Cli
                                        Func<uint, uint?> read, uint wantVa, ClarionType wantType)
         {
             uint va; ClarionType t; string error;
-            var o = Walk(path, head, code, local, headVa, read, out va, out t, out error);
+            var o = WpWalkPath(path, head, code, local, headVa, read, out va, out t, out error);
             if (o != DebugEngine.WatchPathOutcome.Ok)
                 failures.Add("watch path " + path + ": expected a leaf at 0x" + wantVa.ToString("X") + ", got " + o + " (" + (error ?? "no error") + ")");
             else if (va != wantVa)
@@ -119,7 +120,7 @@ namespace ClarionDbg.Cli
                                           Func<uint, uint?> read, DebugEngine.WatchPathOutcome want, string wantError)
         {
             uint va; ClarionType t; string error;
-            var o = Walk(path, head, code, local, headVa, read, out va, out t, out error);
+            var o = WpWalkPath(path, head, code, local, headVa, read, out va, out t, out error);
             if (o != want)
                 failures.Add("watch path " + path + ": expected " + want + ", got " + o + (o == DebugEngine.WatchPathOutcome.Ok ? " at 0x" + va.ToString("X") : ""));
             else if (wantError != null && error != wantError)

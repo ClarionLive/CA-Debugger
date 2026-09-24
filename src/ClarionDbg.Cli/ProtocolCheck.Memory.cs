@@ -57,7 +57,7 @@ namespace ClarionDbg.Cli
                 uint addr; int len, read; string reqId; byte[] buf;
 
                 // ---- 1+2: a 64-byte read from 0xFE0 has 32 readable bytes, then the reserved page.
-                string err = eng.MemReadForTest(Parts("0x" + (page + 0xFE0).ToString("X"), "64", "7"),
+                string err = eng.MemReadForTest(MemCommandParts("0x" + (page + 0xFE0).ToString("X"), "64", "7"),
                                                 out addr, out len, out reqId, out buf, out read);
                 if (err != null)
                     failures.Add("mem: a read that runs into an unreadable page was refused (" + err + ") - it must "
@@ -93,7 +93,7 @@ namespace ClarionDbg.Cli
                     failures.Add("mem: a reply to a request with no reqId invented one");
 
                 // ---- a read wholly inside the unreadable page is refused, and the refusal is correlatable.
-                err = eng.MemReadForTest(Parts("0x" + (page + 0x1000).ToString("X"), "16", "8"),
+                err = eng.MemReadForTest(MemCommandParts("0x" + (page + 0x1000).ToString("X"), "16", "8"),
                                          out addr, out len, out reqId, out buf, out read);
                 if (err == null || err.IndexOf("read failed", StringComparison.Ordinal) < 0)
                     failures.Add("mem: a read of an unreadable page was not refused as a failed read (" + (err ?? "null") + ")");
@@ -107,14 +107,14 @@ namespace ClarionDbg.Cli
                 }
 
                 // ---- bounds. The top of the cap is ACCEPTED (a whole committed page), one past it is not.
-                err = eng.MemReadForTest(Parts("0x" + page.ToString("X"), DebugEngine.MemMaxLen.ToString(), "9"),
+                err = eng.MemReadForTest(MemCommandParts("0x" + page.ToString("X"), DebugEngine.MemMaxLen.ToString(), "9"),
                                          out addr, out len, out reqId, out buf, out read);
                 if (err != null || read != DebugEngine.MemMaxLen)
                     failures.Add("mem bounds: a " + DebugEngine.MemMaxLen + "-byte read of a committed page was not "
                                  + "returned whole (" + (err ?? "read " + read) + ")");
                 foreach (var bad in new[] { "0", "-1", (DebugEngine.MemMaxLen + 1).ToString(), "x" })
                 {
-                    err = eng.MemReadForTest(Parts("0x" + page.ToString("X"), bad, "9"), out addr, out len, out reqId, out buf, out read);
+                    err = eng.MemReadForTest(MemCommandParts("0x" + page.ToString("X"), bad, "9"), out addr, out len, out reqId, out buf, out read);
                     if (err == null || err.IndexOf("length", StringComparison.Ordinal) < 0)
                         failures.Add("mem bounds: length '" + bad + "' was not refused as a length");
                     if (reqId != "9") failures.Add("mem bounds: a refused length lost its reqId");
@@ -122,15 +122,15 @@ namespace ClarionDbg.Cli
 
                 // The wrap: 0xFFFFFFF0 + 32 ends past the address space. Its CONTROL is 0xFFFFFFF0 + 16, which
                 // ends exactly at it and must reach the read (and fail there, as kernel space), not the guard.
-                err = eng.MemReadForTest(Parts("0xFFFFFFF0", "32", "10"), out addr, out len, out reqId, out buf, out read);
+                err = eng.MemReadForTest(MemCommandParts("0xFFFFFFF0", "32", "10"), out addr, out len, out reqId, out buf, out read);
                 if (err == null || err.IndexOf("past the end", StringComparison.Ordinal) < 0)
                     failures.Add("mem bounds: a span past 0xFFFFFFFF was not refused (" + (err ?? "null") + ")");
-                err = eng.MemReadForTest(Parts("0xFFFFFFF0", "16", "10"), out addr, out len, out reqId, out buf, out read);
+                err = eng.MemReadForTest(MemCommandParts("0xFFFFFFF0", "16", "10"), out addr, out len, out reqId, out buf, out read);
                 if (err == null || err.IndexOf("past the end", StringComparison.Ordinal) >= 0)
                     failures.Add("mem bounds control: a span ending exactly at 4 GB was refused by the wrap guard ("
                                  + (err ?? "null") + ") - the guard is off by one");
 
-                err = eng.MemReadForTest(Parts("0xZZ", "16", "11"), out addr, out len, out reqId, out buf, out read);
+                err = eng.MemReadForTest(MemCommandParts("0xZZ", "16", "11"), out addr, out len, out reqId, out buf, out read);
                 if (err == null || err.IndexOf("bad address", StringComparison.Ordinal) < 0 || reqId != "11")
                     failures.Add("mem: a malformed address was not refused with its reqId");
             }
@@ -176,11 +176,11 @@ namespace ClarionDbg.Cli
             {
                 string g = eng.NodeJsonForTest("G", grp, 0x08, 0, 8, 0, 0x400000, "m.clw", editable ? null : vetoNote, editable);
                 string tag = editable ? "group" : "vetoed group";
-                if (!TopLevelHas(g, "\"addr\":\"0x400000\""))
+                if (!TopLevelMemberIs(g, "addr", "\"0x400000\""))
                     failures.Add("row addr: a " + tag + " row carries no addr of its own: " + g);
                 if (g.IndexOf("\"addr\":\"0x400004\"", StringComparison.Ordinal) < 0)
                     failures.Add("row addr: a " + tag + "'s second member carries no addr");
-                if (TopLevelHas(g, "\"va\":"))
+                if (HasTopLevelMember(g, "va"))
                     failures.Add("row addr: a " + tag + " row gained a va - that is an edit grant for the whole group");
                 int va = CountVa(g);
                 if (va != (editable ? 2 : 0))
@@ -190,7 +190,7 @@ namespace ClarionDbg.Cli
 
             // An array: the row and its elements.
             string a = eng.NodeJsonForTest("A", arr, 0x18, 0, 8, 0, 0x400000, "m.clw", vetoNote, false);
-            if (!TopLevelHas(a, "\"addr\":\"0x400000\"") || a.IndexOf("\"addr\":\"0x400004\"", StringComparison.Ordinal) < 0)
+            if (!TopLevelMemberIs(a, "addr", "\"0x400000\"") || a.IndexOf("\"addr\":\"0x400004\"", StringComparison.Ordinal) < 0)
                 failures.Add("row addr: an array row or its element carries no addr: " + a);
             if (CountVa(a) != 0) failures.Add("row addr: a vetoed array gained a va");
 
@@ -222,7 +222,7 @@ namespace ClarionDbg.Cli
                 string r = live.NodeJsonForTest("R", refType, 0x16, 0, 4, 0, slotVa, "m.clw", null, true);
                 if (r.IndexOf("\"ref\":true", StringComparison.Ordinal) < 0)
                     failures.Add("row addr control: the by-ref group did not build as a ref row: " + r);
-                if (Occurrences(r, "\"addr\":") != 1 || r.IndexOf("\"addr\":\"0x12345678\"", StringComparison.Ordinal) < 0)
+                if (Count(r, "\"addr\":") != 1 || r.IndexOf("\"addr\":\"0x12345678\"", StringComparison.Ordinal) < 0)
                     failures.Add("row addr: a by-ref group row must carry exactly one addr, its target 0x12345678: " + r);
                 string rn = live.NodeJsonForTest("R", refType, 0x16, 0, 4, 0, slotVa + 4, "m.clw", null, true);
                 if (rn.IndexOf("\"addr\":", StringComparison.Ordinal) >= 0)
@@ -313,7 +313,7 @@ namespace ClarionDbg.Cli
                 var arrCls = new ClarionType { Kind = TypeKind.Array, Size = 32, Length = 2, LoBound = 1, ElemSize = 16, ElemType = cls };
                 string a = live.NodeJsonForTest("A", arrCls, 0x18, 0, 32, 0, 0x400000, "m.clw", null, true);
                 rows.Add(new KeyValuePair<string, string>("array of class-layout groups", a));
-                if (Occurrences(a, "\"refKind\":\"class\"") != 2)
+                if (Count(a, "\"refKind\":\"class\"") != 2)
                     failures.Add("refKind: the array-of-group elements over a class layout do not each say 'class': " + a);
                 string plain = live.NodeJsonForTest("G", agg, 0x08, 0, 16, 0, 0x400000, "m.clw", null, true);
                 rows.Add(new KeyValuePair<string, string>("direct group", plain));
@@ -321,7 +321,7 @@ namespace ClarionDbg.Cli
                 // Every ref:true row carries one, every refKind sits on a ref:true row, and each value is legal.
                 foreach (var kv in rows)
                 {
-                    int refs = Occurrences(kv.Value, "\"ref\":true"), kinds = Occurrences(kv.Value, "\"refKind\":");
+                    int refs = Count(kv.Value, "\"ref\":true"), kinds = Count(kv.Value, "\"refKind\":");
                     if (refs != kinds)
                         failures.Add("refKind: the " + kv.Key + " output has " + refs + " ref:true row(s) and " + kinds + " refKind(s)");
                     foreach (System.Text.RegularExpressions.Match m in
@@ -329,7 +329,7 @@ namespace ClarionDbg.Cli
                         if (m.Groups[1].Value != "aggregate" && m.Groups[1].Value != "class" && m.Groups[1].Value != "other")
                             failures.Add("refKind: the " + kv.Key + " output carries an illegal refKind '" + m.Groups[1].Value + "'");
                 }
-                if (Occurrences(plain, "\"refKind\":") != 0)
+                if (Count(plain, "\"refKind\":") != 0)
                     failures.Add("refKind: a direct (non-ref) group row carries a refKind: " + plain);
             }
             finally { Marshal.FreeHGlobal(slot); }
@@ -337,44 +337,12 @@ namespace ClarionDbg.Cli
 
         private const uint MemCommitFlag = 0x1000, PageReadWriteFlag = 0x04;
 
-        private static string[] Parts(params string[] args)
+        private static string[] MemCommandParts(params string[] args)
         {
             var p = new string[args.Length + 1];
             p[0] = "mem";
             Array.Copy(args, 0, p, 1, args.Length);
             return p;
-        }
-
-        private static int Occurrences(string s, string what)
-        {
-            int n = 0, i = 0;
-            while ((i = s.IndexOf(what, i, StringComparison.Ordinal)) >= 0) { n++; i += what.Length; }
-            return n;
-        }
-
-        /// <summary>True when <paramref name="member"/> appears among the row's OWN members: the text at
-        /// nesting depth 1, so a descendant row's member does not count wherever "children" sits. Strings are
-        /// skipped whole, because values like "{…}" and names like "[1]" carry brackets.</summary>
-        private static bool TopLevelHas(string row, string member)
-        {
-            var own = new System.Text.StringBuilder();
-            int depth = 0; bool inStr = false;
-            for (int i = 0; i < row.Length; i++)
-            {
-                char c = row[i];
-                if (inStr)
-                {
-                    if (depth == 1) own.Append(c);
-                    if (c == '\\' && i + 1 < row.Length) { i++; if (depth == 1) own.Append(row[i]); }
-                    else if (c == '"') inStr = false;
-                    continue;
-                }
-                if (c == '{' || c == '[') { depth++; if (depth == 1) continue; }
-                else if (c == '}' || c == ']') { depth--; continue; }
-                else if (c == '"') inStr = true;
-                if (depth == 1) own.Append(c);
-            }
-            return own.ToString().IndexOf(member, StringComparison.Ordinal) >= 0;
         }
     }
 }
