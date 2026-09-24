@@ -37,6 +37,8 @@ param(
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
   # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
   [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
+  # the host-issued id and grant tables, split out of PageMessages.cs (6ac29815 #4)
+  [string] $HostGrantsPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\HostGrants.cs'),
   # the engine's Variables-row writer, whose edit members the host grants on the way out
   [string] $EngineLocalsPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Locals.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html'),
@@ -1023,6 +1025,7 @@ Write-Host 'the retired rule is not lying around waiting to be followed again'
 # afbc68c7 retired JsonVal itself. Every inbound field is now read by the typed request DTOs in
 # PageMessages.cs, one Parse per request, and the retirement notice moved there with the readers.
 $pageMsgs = Get-Content -Raw -LiteralPath $PageMessagesPath
+$hostGrants = Get-Content -Raw -LiteralPath $HostGrantsPath
 $jsonValCalls = [regex]::Matches((Get-CSharpCodeOnly $web), '\bJsonVal\(')
 Check 'no JsonVal( is left in the bridge; the DTOs read every field' ($jsonValCalls.Count -eq 0) "$($jsonValCalls.Count) call(s)"
 # CONTROL: the scan sees a call when there is one, so the zero above is a zero somebody looked for.
@@ -1058,6 +1061,7 @@ Write-Host 'the page hands back only what the host ISSUED: procedure ids and edi
 # the probe runs that work item inline (ThreadPool.QueueUserWorkItem -> RunNow). Nothing else is edited.
 
 $pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
+$hostGrantsBody = ($hostGrants -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
 # Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
 # `);` that closes UI( is put back here.
@@ -1076,6 +1080,7 @@ using System.Text.RegularExpressions;
 using ClarionDebugger.Wire;
 $readerBody
 $pageMsgsBody
+$hostGrantsBody
 namespace ClarionDebugger.Terminal {
 $(Get-Method 'public enum DebugSessionState')
 $bpRecord
@@ -1642,7 +1647,7 @@ foreach ($t in @('"size":4,"places":2', '"size":4', '"places":2', '"size":"4","p
 }
 Check 'and both read it through PageNumbers.ReadEditTuple' `
   (((Get-Method 'public static EditVarRequest Parse(string data)' $pageMsgs) -match 'PageNumbers\.ReadEditTuple\(data, out size, out places\)') -and `
-   ((Get-Method 'public void GrantRows(string itemsJson, uint? tid)' $pageMsgs) -match 'PageNumbers\.ReadEditTuple\(o, out size, out places\)')) ''
+   ((Get-Method 'public void GrantRows(string itemsJson, uint? tid)' $hostGrants) -match 'PageNumbers\.ReadEditTuple\(o, out size, out places\)')) ''
 
 # ---- the other request DTOs ---------------------------------------------------------------------------
 # These payloads are delimiter strings, parsed exactly as before and now in one place each. Checked on the
