@@ -85,7 +85,7 @@ namespace ClarionDbg.Cli
             var rt = RuntimeModule();
             if (rt == null) { EmitLibStateError(tid, reqId, "RTL not dynamically linked (no ClaRUN.dll) — Library State needs a DLL-runtime build"); return; }
             if (_hProcess == IntPtr.Zero) { EmitLibStateError(tid, reqId, "no running process"); return; }
-            if (hThread == IntPtr.Zero)   { EmitLibStateError(tid, reqId, "no thread handle for thread " + tid); return; }
+            if (hThread == IntPtr.Zero)   { EmitLibStateError(tid, reqId, "no thread handle for thread " + TidText(tid)); return; }
 
             uint teb = GetTebBase(hThread);
             if (teb == 0) { EmitLibStateError(tid, reqId, "could not resolve the thread's TEB"); return; }

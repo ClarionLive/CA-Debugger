@@ -377,7 +377,13 @@ Invoke-CheckSection 'no member name is assembled around a variable outside the r
 # sites (the thread-select echo and the pause-choice line) and this suite was green. An interpolation HOLE
 # whose preceding text ends in `thread ` must be `{TidText(...)}`. And DebugEngine.Hover.cs, which writes
 # "thread " + tid in its hover trace, was not in the list at all.
-$tidTextFiles = @('DebugEngine.VarEdit.cs', 'DebugEngine.Locals.cs', 'DebugEngine.Threads.cs', 'DebugEngine.Hover.cs')
+#
+# EVERY ENGINE SOURCE, NOT A LIST (wave 5, 2026-09-24). A hand-kept list of four files missed three more raw
+# sites (LibState.cs's no-thread-handle error, StackWalker.cs's and the regs command's no-context errors), each
+# the engine's own selected thread rather than an echo, so each now uses TidText. The scan reads every .cs in
+# the engine folder except ProtocolCheck*, which build test inputs and assert on them rather than talk to a
+# user; a new file is scanned the day it is added.
+$tidTextFiles = @($sources.Keys | Where-Object { $_ -notlike 'ProtocolCheck*' } | Sort-Object)
 
 # THREE SITES ARE EXEMPT, for three DIFFERENT reasons, and the count is asserted below so the list cannot
 # grow quietly. Measured 2026-09-20 against integration/w2run2. Keyed on (file, literal) rather than on a
@@ -494,10 +500,11 @@ Invoke-CheckSection 'every thread id headed for a human goes through TidText' {
   Check 'every "thread " message that is not an echo renders its id through TidText' ($tidBad.Count -eq 0) `
         ($(if ($tidBad.Count) { ($tidBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Literal) $($_.Tail)" }) -join ' | ' } else { '' }))
   # CONTROL: the scan must SEE the real sites, or the rule above is satisfied by finding nothing at all.
-  # 13 since wave 5 (measured 2026-09-24): the 9 concatenations, Hover.cs's one, and 3 interpolation holes
-  # (Threads.cs select + pause lines, Locals.cs module data).
+  # 18 since wave 5 (measured 2026-09-24): 13 concatenations (VarEdit, Locals, Hover, LibState, StackWalker,
+  # the regs command) and 5 interpolation holes (Threads.cs select + pause lines, Locals.cs module data,
+  # Attach.cs's EIP-rewind error, StackWalker.cs's header).
   $tidGood = @($tidSites | Where-Object { $_.ViaTidText })
-  Check 'and the scan actually reaches them (13 sites go through TidText)' ($tidGood.Count -eq 13) `
+  Check 'and the scan actually reaches them (18 sites go through TidText)' ($tidGood.Count -eq 18) `
         "found $($tidGood.Count)"
   # A NUMBER, not "some": a fourth exemption must be argued for, not absorbed.
   $tidEx = @($tidSites | Where-Object { $_.Exempt })
@@ -570,7 +577,7 @@ if ($SelfTest) {
         'nameless'      { $ndBad.Count -gt 0 }
         'namelessCount' { $ndOk.Count -ne 4 }
         'tidtext'       { $tsBad.Count -gt 0 }
-        'tidtextCount'  { $tsGood.Count -ne 13 }
+        'tidtextCount'  { $tsGood.Count -ne 18 }
         default         { $false }
       }
       if ($caught) { $script:caughtKinds += $Expect }
@@ -622,16 +629,16 @@ if ($SelfTest) {
 
     # 8-9. THE TidText RULE, the two mutations the Run 2 verifier ran by hand (6874c2d1). A REVERTED site: an
     #    existing TidText(...) changed back to the raw id. It must be reported by file:line, AND the control
-    #    must drop from 13 to 12 - one mutation, two rules, so it is run once per rule.
+    #    must drop from 18 to 17 - one mutation, two rules, so it is run once per rule.
     Test-Mutation 'a TidText site reverted to the raw id is reported' 'DebugEngine.VarEdit.cs' `
       '" touches thread " + TidText(OwnerTid) + "''s copy of the "' `
       '" touches thread " + OwnerTid + "''s copy of the "' 'tidtext'
-    Test-Mutation '...and the same revert drops the TidText control from 13' 'DebugEngine.VarEdit.cs' `
+    Test-Mutation '...and the same revert drops the TidText control from 18' 'DebugEngine.VarEdit.cs' `
       '" touches thread " + TidText(OwnerTid) + "''s copy of the "' `
       '" touches thread " + OwnerTid + "''s copy of the "' 'tidtextCount'
 
     # 10. A BRAND-NEW raw site nobody has written yet - the case the runtime check in ProtocolCheck cannot
-    #    see, and the reason this source rule exists. The 13 real sites are untouched, so only the rule fires.
+    #    see, and the reason this source rule exists. The 18 real sites are untouched, so only the rule fires.
     Test-Mutation 'a new raw "thread " + id site is reported' 'DebugEngine.VarEdit.cs' `
       '" and thread " + TidText(SelectedTid) + " has no instance of it";' `
       '" and thread " + TidText(SelectedTid) + " has no instance of it" + "; last written by thread " + OwnerTid;' 'tidtext'

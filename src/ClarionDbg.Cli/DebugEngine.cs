@@ -971,7 +971,7 @@ namespace ClarionDbg.Cli
                         else if (view.HaveCtx)
                             Console.WriteLine($"  EAX={view.Ctx.Eax:X8} EBX={view.Ctx.Ebx:X8} ECX={view.Ctx.Ecx:X8} EDX={view.Ctx.Edx:X8} ESI={view.Ctx.Esi:X8} EDI={view.Ctx.Edi:X8} EBP={view.Ctx.Ebp:X8} ESP={view.Ctx.Esp:X8} EIP={view.Ctx.Eip:X8}");
                         else
-                            EmitError("regs: no context for thread " + view.Tid);
+                            EmitError("regs: no context for thread " + TidText(view.Tid));
                         break;
 
                     case "mem":

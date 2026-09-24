@@ -22,7 +22,7 @@ namespace ClarionDbg.Cli
         private void HandleStackCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
                                         IntPtr hThread)
         {
-            if (!haveCtx) { EmitError("stack: no context for thread " + tid); return; }
+            if (!haveCtx) { EmitError("stack: no context for thread " + TidText(tid)); return; }
             int max = STACK_FRAMES_DEFAULT;
             if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX))
             {
