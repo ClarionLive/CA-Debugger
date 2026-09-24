@@ -49,7 +49,10 @@
 param(
   # Mutate the source IN MEMORY and require this check to catch each mutation. A guard that has never been
   # seen to fail is not known to be a guard; this repo has shipped one that was dead to its own test.
-  [switch] $SelfTest
+  [switch] $SelfTest,
+  # The engine source to scan. Only for a before/after proof against an older tree (e.g. files lifted out of
+  # git into a temp folder); every normal run scans the working tree.
+  [string] $EngineDir = ''
 )
 
 Set-StrictMode -Version Latest
@@ -58,7 +61,7 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\lib-extract.ps1"
 
 $repo      = Split-Path -Parent $PSScriptRoot
-$engineDir = Join-Path $repo 'src\ClarionDbg.Cli'
+$engineDir = if ($EngineDir) { $EngineDir } else { Join-Path $repo 'src\ClarionDbg.Cli' }
 $ruleFileName = 'DebugEngine.cs'
 $ruleFile  = Join-Path $engineDir $ruleFileName
 
@@ -368,7 +371,13 @@ Invoke-CheckSection 'no member name is assembled around a variable outside the r
 # THE RULE: a string literal ending in "thread " and concatenated onward with ` + ` must be concatenated
 # with TidText(...). A bare uint reaches the user as "thread 0" or "thread 4294967295" for exactly the two
 # sentinels TidIsKnown rejects.
-$tidTextFiles = @('DebugEngine.VarEdit.cs', 'DebugEngine.Locals.cs', 'DebugEngine.Threads.cs')
+#
+# THE SAME RULE FOR AN INTERPOLATED STRING (wave 5, measured 2026-09-24). `$"  thread {tid} selected..."` has
+# no ` + ` to follow, so the concatenation walk below never saw it: on ef3b7ff Threads.cs carried two such raw
+# sites (the thread-select echo and the pause-choice line) and this suite was green. An interpolation HOLE
+# whose preceding text ends in `thread ` must be `{TidText(...)}`. And DebugEngine.Hover.cs, which writes
+# "thread " + tid in its hover trace, was not in the list at all.
+$tidTextFiles = @('DebugEngine.VarEdit.cs', 'DebugEngine.Locals.cs', 'DebugEngine.Threads.cs', 'DebugEngine.Hover.cs')
 
 # THREE SITES ARE EXEMPT, for three DIFFERENT reasons, and the count is asserted below so the list cannot
 # grow quietly. Measured 2026-09-20 against integration/w2run2. Keyed on (file, literal) rather than on a
@@ -409,6 +418,70 @@ function Get-ThreadPrefixSites([hashtable] $Sources) {
         Tail    = ($tail -replace '\s+', ' ').Trim()
       })
     }
+    foreach ($h in (Get-InterpolatedHoles $src)) {
+      if (-not $h.Before.EndsWith('thread ', [StringComparison]::Ordinal)) { continue }
+      [void] $out.Add([pscustomobject] @{
+        File    = $f
+        Line    = ($src.Substring(0, $h.Start) -split "`n").Count
+        Literal = '$"...thread {' + $h.Expr + '}"'
+        ViaTidText = ($h.Expr -match '^\s*TidText\s*\(')
+        Exempt  = $false        # no interpolated site is an echo today; the exemptions key on literals
+        Tail    = '{' + $h.Expr + '}'
+      })
+    }
+  }
+  return $out
+}
+
+# Every hole of every interpolated string in CODE: its expression, and the literal text before it within that
+# string. Walks the file the way Get-StringLiterals does, so a `$"` inside a comment or another literal is not
+# one; inside a hole, nested literals are skipped with Skip-CSharpLiteral so a `"}"` in a ternary cannot end
+# the hole early. Handles $"..." and the verbatim $@"..." / @$"..." forms.
+function Get-InterpolatedHoles([string] $Src) {
+  $out = New-Object System.Collections.ArrayList
+  $n = $Src.Length
+  $j = 0
+  while ($j -lt $n) {
+    $c0 = $Src[$j]
+    $verb = $false; $q = -1
+    if ($c0 -eq '$' -and $j + 1 -lt $n -and $Src[$j + 1] -eq '"') { $q = $j + 1 }
+    elseif ($c0 -eq '$' -and $j + 2 -lt $n -and $Src[$j + 1] -eq '@' -and $Src[$j + 2] -eq '"') { $q = $j + 2; $verb = $true }
+    elseif ($c0 -eq '@' -and $j + 2 -lt $n -and $Src[$j + 1] -eq '$' -and $Src[$j + 2] -eq '"') { $q = $j + 2; $verb = $true }
+    if ($q -lt 0) {
+      if ($c0 -ne '/' -and $c0 -ne '"' -and $c0 -ne "'" -and $c0 -ne '@') { $j++; continue }
+      $k = Skip-CSharpLiteral $Src $j
+      $j = if ($k -ne $j) { $k } else { $j + 1 }
+      continue
+    }
+    $k = $q + 1
+    $text = New-Object System.Text.StringBuilder
+    while ($k -lt $n) {
+      $c = $Src[$k]
+      if (-not $verb -and $c -eq '') { [void] $text.Append($Src, $k, [Math]::Min(2, $n - $k)); $k += 2; continue }
+      if ($c -eq '"') {
+        if ($verb -and $k + 1 -lt $n -and $Src[$k + 1] -eq '"') { [void] $text.Append('"'); $k += 2; continue }
+        $k++; break
+      }
+      if (($c -eq '{' -or $c -eq '}') -and $k + 1 -lt $n -and $Src[$k + 1] -eq $c) { [void] $text.Append($c); $k += 2; continue }
+      if ($c -eq '{') {
+        $h = $k + 1; $depth = 1; $m = $h
+        while ($m -lt $n -and $depth -gt 0) {
+          $cm = $Src[$m]
+          if ($cm -eq '"' -or $cm -eq "'" -or $cm -eq '@' -or $cm -eq '/') {
+            $mk = Skip-CSharpLiteral $Src $m
+            if ($mk -ne $m) { $m = $mk; continue }
+          }
+          if ($cm -eq '{') { $depth++ } elseif ($cm -eq '}') { $depth-- }
+          $m++
+        }
+        [void] $out.Add([pscustomobject] @{ Start = $k; Before = $text.ToString(); Expr = $Src.Substring($h, [Math]::Max(0, $m - 1 - $h)) })
+        [void] $text.Append('{}')
+        $k = $m
+        continue
+      }
+      [void] $text.Append($c); $k++
+    }
+    $j = $k
   }
   return $out
 }
@@ -421,8 +494,10 @@ Invoke-CheckSection 'every thread id headed for a human goes through TidText' {
   Check 'every "thread " message that is not an echo renders its id through TidText' ($tidBad.Count -eq 0) `
         ($(if ($tidBad.Count) { ($tidBad | ForEach-Object { "$($_.File):$($_.Line) $($_.Literal) $($_.Tail)" }) -join ' | ' } else { '' }))
   # CONTROL: the scan must SEE the real sites, or the rule above is satisfied by finding nothing at all.
+  # 13 since wave 5 (measured 2026-09-24): the 9 concatenations, Hover.cs's one, and 3 interpolation holes
+  # (Threads.cs select + pause lines, Locals.cs module data).
   $tidGood = @($tidSites | Where-Object { $_.ViaTidText })
-  Check 'and the scan actually reaches them (9 sites go through TidText)' ($tidGood.Count -eq 9) `
+  Check 'and the scan actually reaches them (13 sites go through TidText)' ($tidGood.Count -eq 13) `
         "found $($tidGood.Count)"
   # A NUMBER, not "some": a fourth exemption must be argued for, not absorbed.
   $tidEx = @($tidSites | Where-Object { $_.Exempt })
@@ -495,7 +570,7 @@ if ($SelfTest) {
         'nameless'      { $ndBad.Count -gt 0 }
         'namelessCount' { $ndOk.Count -ne 4 }
         'tidtext'       { $tsBad.Count -gt 0 }
-        'tidtextCount'  { $tsGood.Count -ne 9 }
+        'tidtextCount'  { $tsGood.Count -ne 13 }
         default         { $false }
       }
       if ($caught) { $script:caughtKinds += $Expect }
@@ -547,16 +622,16 @@ if ($SelfTest) {
 
     # 8-9. THE TidText RULE, the two mutations the Run 2 verifier ran by hand (6874c2d1). A REVERTED site: an
     #    existing TidText(...) changed back to the raw id. It must be reported by file:line, AND the control
-    #    must drop from 9 to 8 - one mutation, two rules, so it is run once per rule.
+    #    must drop from 13 to 12 - one mutation, two rules, so it is run once per rule.
     Test-Mutation 'a TidText site reverted to the raw id is reported' 'DebugEngine.VarEdit.cs' `
       '" touches thread " + TidText(OwnerTid) + "''s copy of the "' `
       '" touches thread " + OwnerTid + "''s copy of the "' 'tidtext'
-    Test-Mutation '...and the same revert drops the TidText control from 9' 'DebugEngine.VarEdit.cs' `
+    Test-Mutation '...and the same revert drops the TidText control from 13' 'DebugEngine.VarEdit.cs' `
       '" touches thread " + TidText(OwnerTid) + "''s copy of the "' `
       '" touches thread " + OwnerTid + "''s copy of the "' 'tidtextCount'
 
     # 10. A BRAND-NEW raw site nobody has written yet - the case the runtime check in ProtocolCheck cannot
-    #    see, and the reason this source rule exists. The 9 real sites are untouched, so only the rule fires.
+    #    see, and the reason this source rule exists. The 13 real sites are untouched, so only the rule fires.
     Test-Mutation 'a new raw "thread " + id site is reported' 'DebugEngine.VarEdit.cs' `
       '" and thread " + TidText(SelectedTid) + " has no instance of it";' `
       '" and thread " + TidText(SelectedTid) + " has no instance of it" + "; last written by thread " + OwnerTid;' 'tidtext'
@@ -576,6 +651,25 @@ if ($SelfTest) {
           ((@($h | Where-Object { -not $_.Boolean })).Count -eq 0) `
           'a member name discussed in prose was reported as an emit'
 
+    # 12-13. The two forms wave 5 added to the TidText scan, each reverted once (2026-09-24): an INTERPOLATED
+    #    hole, and the Hover.cs concatenation that was not scanned at all before.
+    Test-Mutation 'an interpolated {TidText(tid)} reverted to {tid} is reported' 'DebugEngine.Threads.cs' `
+      '$"  thread {TidText(tid)} selected' '$"  thread {tid} selected' 'tidtext'
+    Test-Mutation 'the Hover.cs trace reverted to a raw tid is reported' 'DebugEngine.Hover.cs' `
+      '"thread " + TidText(tid)' '"thread " + tid' 'tidtext'
+
+    # 14. CONTROLS FOR THE INTERPOLATION WALK, both directions. The same raw hole in a COMMENT or inside an
+    #    ordinary literal is not code and must not be reported; and a hole AFTER one whose ternary holds a
+    #    quoted brace must still be found, or a `"}"` would end the walk early and hide the rest of the string.
+    $ctl = @{ 'X.cs' = ('// $"thread {tid}" in prose' + "`n" + 'var a = "$\"thread {tid}\"";' + "`n") }
+    Check 'NOT caught (correctly): a raw interpolated hole in a comment or a plain literal' `
+          (@(Get-ThreadPrefixSites $ctl).Count -eq 0) ((@(Get-ThreadPrefixSites $ctl) | ForEach-Object { $_.Literal }) -join ', ')
+    $ctl = @{ 'X.cs' = ('var b = $"x {(f ? "}" : "{")} and thread {tid} too";' + "`n") }
+    $ctlHits = @(Get-ThreadPrefixSites $ctl)
+    Check 'CAUGHT: a raw hole after a hole whose ternary holds quoted braces' `
+          ($ctlHits.Count -eq 1 -and -not $ctlHits[0].ViaTidText -and $ctlHits[0].Tail -eq '{tid}') `
+          (($ctlHits | ForEach-Object { $_.Tail }) -join ', ')
+
     # The table covers the file: every rule above was seen to fail at least once.
     $uncovered = @($RuleKinds | Where-Object { $script:caughtKinds -notcontains $_ })
     Check "every rule has a caught self-test mutation ($($RuleKinds.Count) rules)" ($uncovered.Count -eq 0) `
@@ -587,9 +681,9 @@ if ($SelfTest) {
 # that returned early simply shrank the number. Invoke-CheckSection above closes a section that throws or
 # breaks out of the script; this closes one that returns early or is skipped. COUNTING RULE: the RUNTIME
 # count of Check calls ($script:checks before this line) on a clean run, measured 2026-09-22 - the
-# -SelfTest run adds its 12 mutation checks (1-10 above, the comment control 11, and the coverage
-# check). Update both deliberately with the checks.
-$EXPECTED_CHECKS = if ($SelfTest) { 28 } else { 16 }
+# -SelfTest run adds its 16 mutation checks (1-10 above, the comment control 11, 12-13, the two walk
+# controls 14, and the coverage check; 12 before wave 5). Update both deliberately with the checks.
+$EXPECTED_CHECKS = if ($SelfTest) { 32 } else { 16 }
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
