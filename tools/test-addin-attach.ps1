@@ -530,9 +530,18 @@ function New-Detach { param([int] $Restored = 3, $Err = $null, [bool] $Named = $
 
 # ================================================================================================ 3. detached + Stop
 # A stand-in engine: reads one command line, records it, then exits or hangs as told.
+#
+# IT SAYS WHEN IT IS UP, AND NOTHING IS ASKED OF IT BEFORE THEN. Stop gives a launched engine QuitWaitMs
+# (1.5 s) to exit, and that budget used to include this stand-in's whole pwsh cold start. Under load that
+# start alone can pass 1.5 s, so sections 4 and 9 and -SelfTest's M6 went red and then passed on a rerun
+# (reported three times in wave 5). The stand-in now writes <Out>.ready as its first act, and
+# Start-FakeEngine waits for that file, so every window below times the ENGINE'S ANSWER, which is what the
+# checks are about, and never the process start. Nothing is scaled: 1.5 s and 8 s are still the service's
+# own constants, read off the compiled type.
 $fakeEngine = Join-Path ([IO.Path]::GetTempPath()) ('attach-fake-engine-' + [guid]::NewGuid().ToString('N') + '.ps1')
 [IO.File]::WriteAllText($fakeEngine, @'
 param([string] $Out, [string] $Mode, [string] $Say = '')
+[IO.File]::WriteAllText($Out + '.ready', 'ready')
 $l = [Console]::In.ReadLine()
 [IO.File]::WriteAllText($Out, [string] $l)
 # 'say': answer with one engine line (base64 of what the engine's own writer produced), then exit like the engine.
@@ -547,6 +556,16 @@ function Start-FakeEngine { param([string] $Mode, [string] $SayLine = '')
   $psi = New-Object System.Diagnostics.ProcessStartInfo 'pwsh', "-NoProfile -File `"$fakeEngine`" -Out `"$out`" -Mode $Mode$say"
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
   $p = [System.Diagnostics.Process]::Start($psi)
+  # A generous bound on the START only: a stand-in that never comes up is a harness failure, said out loud,
+  # not a silent pass or a red check about Stop.
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  while (-not (Test-Path -LiteralPath ($out + '.ready'))) {
+    if ($p.HasExited -or $sw.Elapsed.TotalSeconds -gt 60) {
+      throw "the stand-in engine ($Mode) never signalled ready (exited=$($p.HasExited), $([int]$sw.Elapsed.TotalSeconds) s)"
+    }
+    Start-Sleep -Milliseconds 20
+  }
+  Remove-Item -LiteralPath ($out + '.ready') -ErrorAction SilentlyContinue
   [pscustomobject]@{ Process = $p; Out = $out }
 }
 function New-Service { param($Engine, $AttachTo)
