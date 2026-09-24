@@ -77,6 +77,7 @@ namespace ClarionDbg.Cli
                 CheckFieldNameResolvesToFileRecord,
                 CheckStepAnchorBelongsToSteppingThread,
                 CheckTempBpBelongsToSteppingThread,
+                CheckEventLoopStepOver,
                 CheckSymbolsEndLine,
                 CheckTemplateSpanDiscriminator,
                 CheckFileRecordShape,

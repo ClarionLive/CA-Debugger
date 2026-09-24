@@ -311,18 +311,19 @@ namespace ClarionDbg.Cli
             const uint entryEsp = 0x0012F000;    // ESP at the callee's entry; returned = ESP >= this + 4
             const uint highEsp = entryEsp + 4;   // exactly back at the caller's depth
             const uint lowEsp = entryEsp - 0x40; // a deeper (recursive) frame
+            const uint frameEbp = 0x0012F100;    // the stepping frame's EBP
 
             Func<DebugEngine> armed = () =>
             {
                 var e = NewEngine();
                 e.ArmStepOverSessionForTest(stepTid, prevVa, tempVa);
-                e.ArmCallSkipForTest(entryEsp);
+                e.ArmCallSkipForTest(tempVa, 0, entryEsp + 4, entryEsp, frameEbp, 0);   // an ordinary call
                 return e;
             };
 
             // ---- case 1: THE BUG. Thread B passes A's return address at an ESP that reads as "returned".
             var b = armed();
-            string outcome = SeamOutcome(() => b.OnTempBpForTest(otherTid, tempVa, highEsp));
+            string outcome = SeamOutcome(() => b.OnTempBpForTest(otherTid, tempVa, highEsp, frameEbp));
             if (outcome != "returned without refusing")
                 failures.Add("temp-bp control: OnTempBpForTest " + (outcome ?? "refused") + " on an engine with no target");
             if (b.TempBpCountForTest != 1)
@@ -343,7 +344,7 @@ namespace ClarionDbg.Cli
             // ---- case 2: the stepping thread's own return still ends the skip. No line table, so IsStepStop
             // is false and the handler takes the resume-stepping route, which re-anchors on the return address.
             var a = armed();
-            SeamOutcome(() => a.OnTempBpForTest(stepTid, tempVa, highEsp));
+            SeamOutcome(() => a.OnTempBpForTest(stepTid, tempVa, highEsp, frameEbp));
             if (a.TempBpCountForTest != 0 || a.SkipRunningForTest || a.PrevVaForTest != tempVa)
                 failures.Add("temp-bp: the STEPPING thread's own return did not end its skip (temps "
                              + a.TempBpCountForTest + ", skipRunning " + a.SkipRunningForTest + ", anchor 0x"
@@ -352,7 +353,7 @@ namespace ClarionDbg.Cli
 
             // ---- case 3: the stepping thread's own DEEPER hit (recursion through the same return address).
             var r = armed();
-            SeamOutcome(() => r.OnTempBpForTest(stepTid, tempVa, lowEsp));
+            SeamOutcome(() => r.OnTempBpForTest(stepTid, tempVa, lowEsp, frameEbp));
             if (r.TempBpCountForTest != 1 || !r.SkipRunningForTest || !r.HasTempRearmForTest(stepTid, tempVa))
                 failures.Add("temp-bp: a deeper hit on the stepping thread did not re-arm and run on - the "
                              + "recursion guard no longer applies to the stepping thread");
@@ -363,8 +364,8 @@ namespace ClarionDbg.Cli
             if (hProcField == null) { failures.Add("temp-bp control: DebugEngine._hProcess not found"); return; }
             var att = armed();
             hProcField.SetValue(att, new IntPtr(0x1234));
-            string o1 = SeamOutcome(() => att.OnTempBpForTest(otherTid, tempVa, highEsp));
-            string o2 = SeamOutcome(() => att.ArmCallSkipForTest(entryEsp));
+            string o1 = SeamOutcome(() => att.OnTempBpForTest(otherTid, tempVa, highEsp, frameEbp));
+            string o2 = SeamOutcome(() => att.ArmCallSkipForTest(tempVa, 0, entryEsp + 4, entryEsp, frameEbp, 0));
             if (o1 != null) failures.Add("temp-bp seam-guard: OnTempBpForTest " + o1 + " against an ATTACHED engine");
             if (o2 != null) failures.Add("temp-bp seam-guard: ArmCallSkipForTest " + o2 + " against an ATTACHED engine");
         }

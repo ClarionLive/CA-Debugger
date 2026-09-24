@@ -185,14 +185,8 @@ namespace ClarionDbg.Cli
             foreach (int k in ends)
             {
                 if (k + 2 >= ins.Count) return "EndEventLoop at 0x" + ((uint)ins[k].IP).ToString("X") + " has no back-edge after it";
-                var cmp = ins[k + 1];
                 var je = ins[k + 2];
-                // `cmp al,0` has two encodings: 3C 00 (what clbrws has, 2 bytes at 0x756A3) and 80 F8 00.
-                bool cmpAl0 = (cmp.Code == Iced.Intel.Code.Cmp_AL_imm8 || cmp.Code == Iced.Intel.Code.Cmp_rm8_imm8)
-                              && cmp.Op0Kind == Iced.Intel.OpKind.Register
-                              && cmp.Op0Register == Iced.Intel.Register.AL && cmp.Immediate8 == 0;
-                bool isJe = je.Code == Iced.Intel.Code.Je_rel8_32 || je.Code == Iced.Intel.Code.Je_rel32_32;
-                if (!cmpAl0 || !isJe) return "EndEventLoop at 0x" + ((uint)ins[k].IP).ToString("X") + " is not followed by cmp al,0 / je";
+                if (!IsBackEdge(ins[k + 1], je)) return "EndEventLoop at 0x" + ((uint)ins[k].IP).ToString("X") + " is not followed by cmp al,0 / je";
                 uint target = (uint)je.NearBranchTarget;
                 uint startCall;
                 if (!starts.TryGetValue(target, out startCall))
@@ -224,6 +218,84 @@ namespace ClarionDbg.Cli
             if (i.Code != Iced.Intel.Code.Call_rm32 || i.Op0Kind != Iced.Intel.OpKind.Memory) return 0;
             if (i.MemoryBase != Iced.Intel.Register.None || i.MemoryIndex != Iced.Intel.Register.None) return 0;
             return EventLoopImportKind(slotName((uint)i.MemoryDisplacement64));
+        }
+
+        /// <summary>Which event-loop import the ONE call instruction at <paramref name="callVa"/> calls, by the
+        /// same test FindEventLoopRegions uses (<see cref="CallSlotKind"/>): 1 = Start, 2 = End, 0 = anything
+        /// else. <paramref name="retVa"/> is the return address the step machine saw on the stack; a decode
+        /// that does not end exactly there is not this call, and answers 0. PURE, like FindEventLoopRegions:
+        /// the step machine's consumer is <see cref="EventLoopCallKindAt"/>.</summary>
+        internal static int EventLoopCallKind(byte[] code, int len, uint callVa, uint retVa, Func<uint, string> slotName)
+        {
+            if (code == null || len <= 0 || len > code.Length) return 0;
+            var decoder = Iced.Intel.Decoder.Create(32, new Iced.Intel.ByteArrayCodeReader(code, 0, len));
+            decoder.IP = callVa;
+            Iced.Intel.Instruction i;
+            decoder.Decode(out i);
+            if ((uint)i.NextIP != retVa) return 0;
+            return CallSlotKind(i, slotName);
+        }
+
+        /// <summary>Are these the two instructions after `call [End]` that make an ACCEPT back-edge,
+        /// `cmp al,0; je T`?</summary>
+        private static bool IsBackEdge(Iced.Intel.Instruction cmp, Iced.Intel.Instruction je)
+        {
+            // `cmp al,0` has two encodings: 3C 00 (what clbrws has, 2 bytes at 0x756A3) and 80 F8 00.
+            bool cmpAl0 = (cmp.Code == Iced.Intel.Code.Cmp_AL_imm8 || cmp.Code == Iced.Intel.Code.Cmp_rm8_imm8)
+                          && cmp.Op0Kind == Iced.Intel.OpKind.Register
+                          && cmp.Op0Register == Iced.Intel.Register.AL && cmp.Immediate8 == 0;
+            bool isJe = je.Code == Iced.Intel.Code.Je_rel8_32 || je.Code == Iced.Intel.Code.Je_rel32_32;
+            return cmpAl0 && isJe;
+        }
+
+        /// <summary>The loop head T of the back-edge `cmp al,0; je T` starting at <paramref name="at"/> (the
+        /// return address of a `call [End]`), or 0 when the bytes there are not that shape. T is the Start
+        /// call's return address. PURE.
+        ///
+        /// The step machine needs it because EndEventLoop does not return to its call site when the loop goes
+        /// round: it re-seats ESP and resumes at T itself (measured on clbrws SplashScreen 2026-09-24: a temp
+        /// INT3 at End's return address never fired, and the next pass ran from T). Only the loop's exit
+        /// returns to the call site.</summary>
+        internal static uint EventLoopBackEdgeTarget(byte[] code, int len, uint at)
+        {
+            if (code == null || len <= 0 || len > code.Length) return 0;
+            var decoder = Iced.Intel.Decoder.Create(32, new Iced.Intel.ByteArrayCodeReader(code, 0, len));
+            decoder.IP = at;
+            Iced.Intel.Instruction cmp, je;
+            decoder.Decode(out cmp);
+            decoder.Decode(out je);   // bytes that run out decode as invalid, which IsBackEdge refuses
+            return IsBackEdge(cmp, je) ? (uint)je.NearBranchTarget : 0;
+        }
+
+        /// <summary><see cref="EventLoopBackEdgeTarget"/> on the live image, read clean.</summary>
+        private uint EventLoopBackEdgeTargetAt(uint at)
+        {
+            var buf = new byte[9];   // the longest back-edge: 80 F8 00 + 0F 84 rel32
+            int got = ReadCleanBlock(at, buf);
+            return got > 0 ? EventLoopBackEdgeTarget(buf, got, at) : 0;
+        }
+
+        /// <summary><see cref="EventLoopCallKind"/> on the live image: the call at <paramref name="callVa"/>,
+        /// read clean (our INT3s show as the original bytes), with the slot names of the image it is in.</summary>
+        private int EventLoopCallKindAt(uint callVa, uint retVa)
+        {
+            var m = ModuleAt(callVa);
+            if (m == null || m.Pe == null || retVa <= callVa || retVa - callVa > CALL_WINDOW) return 0;
+            var buf = new byte[retVa - callVa];
+            if (ReadCleanBlock(callVa, buf) != buf.Length) return 0;
+            return EventLoopCallKind(buf, buf.Length, callVa, retVa, IatSlotNames(m));
+        }
+
+        /// <summary>An absolute IAT slot address in <paramref name="m"/> to its "dll!func" name, or null.</summary>
+        private static Func<uint, string> IatSlotNames(LoadedModule m)
+        {
+            var iat = m.Pe.BuildIatNameMap();   // slot RVA -> "dll!func"
+            uint loadBase = m.LoadBase;
+            return abs =>
+            {
+                string nm;
+                return abs >= loadBase && iat.TryGetValue(abs - loadBase, out nm) ? nm : null;
+            };
         }
 
         /// <summary>The INNERMOST region containing <paramref name="addr"/>, as its StartCall, or 0 when the
@@ -1048,13 +1120,8 @@ namespace ClarionDbg.Cli
             if (got != (int)size) return;
             f.CodeRead = true;
 
-            var iat = m.Pe.BuildIatNameMap();   // slot RVA -> "dll!func"
             uint loadBase = m.LoadBase;
-            Func<uint, string> slotName = abs =>
-            {
-                string nm;
-                return abs >= loadBase && iat.TryGetValue(abs - loadBase, out nm) ? nm : null;
-            };
+            Func<uint, string> slotName = IatSlotNames(m);
             f.RegionError = FindEventLoopRegions(buf, got, loadBase + f.StopEntryRva, slotName, f.Regions);
 
             // Every call must have a known effect on ESP (ProveCallsBalanced). Clarion code - a procedure,

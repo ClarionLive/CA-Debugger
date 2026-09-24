@@ -602,8 +602,9 @@ namespace ClarionDbg.Cli
             }
 
             // recursion guard: the same call-site return address fires for INNER frames too.
-            // We've truly returned to our frame only when ESP is back above the callee entry.
-            bool returned = haveCtx && ctx.Esp >= _skipEntryEsp + 4;
+            // We've truly returned to our frame only when ESP is back above the callee entry - or, for
+            // ACCEPT's two event-loop calls, which return with ESP elsewhere, when EBP is back at our frame.
+            bool returned = haveCtx && SkipHasReturned(_skipEventLoopKind, ctx.Esp, ctx.Ebp, _skipEntryEsp, _skipEntryEbp);
             if (_mode != StepMode.None && !returned)
             {
                 // deeper frame returning through the same code point — re-arm and keep running
@@ -618,6 +619,7 @@ namespace ClarionDbg.Cli
             {
                 _temp.Remove(va);
                 _skipRunning = false;
+                EndSkip(va, ctx.Esp, haveCtx);   // before IsStepStop: an event-loop return re-bases its ESP gate
                 if (_mode != StepMode.None && haveCtx && IsStepStop(va, ctx.Esp))
                 {
                     // The skipped call returned straight onto a stop boundary. For source-level Over this is a
@@ -690,11 +692,11 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Drive the REAL temp-INT3 handler as thread <paramref name="tid"/> arriving at
-        /// <paramref name="va"/> with ESP <paramref name="esp"/>. The context is invented and no thread is
-        /// opened, because ESP against <c>_skipEntryEsp</c> is the decision under test; SetThreadContext goes
-        /// to a null handle and fails. The route that PAUSES needs a line table to reach, and this engine has
-        /// none, so nothing here can block in PausedWait.</summary>
-        internal uint OnTempBpForTest(uint tid, uint va, uint esp)
+        /// <paramref name="va"/> with ESP <paramref name="esp"/> and EBP <paramref name="ebp"/>. The context is
+        /// invented and no thread is opened, because the stack registers against the recorded callee entry are
+        /// the decision under test; SetThreadContext goes to a null handle and fails. The route that PAUSES
+        /// needs a line table to reach, and this engine has none, so nothing here can block in PausedWait.</summary>
+        internal uint OnTempBpForTest(uint tid, uint va, uint esp, uint ebp)
         {
             RefuseSeamIfAttached("OnTempBpForTest");
             if (!_temp.ContainsKey(va))
@@ -702,6 +704,7 @@ namespace ClarionDbg.Cli
                                                     + " - the dispatcher would never route this hit here");
             var ctx = NewContext();
             ctx.Esp = esp;
+            ctx.Ebp = ebp;
             ctx.Eip = va + 1;   // where the INT3 leaves EIP
             return OnTempBpCore(tid, va, IntPtr.Zero, ref ctx, true);
         }
