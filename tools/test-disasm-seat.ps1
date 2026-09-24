@@ -296,6 +296,17 @@ $s = New-Seat
 $s.Stopped($B, $null)
 [void]$s.WindowLanded($B, $B, 0)
 Check 'recentre retries a thread that decoded to nothing (an explicit ask is worth one retry)' ($s.BeginRecentre($B)) ''
+# A STOP RETIRES A PENDING RECENTRE'S REGISTER REQUEST (wave 5, from Oscar). The stop seat goes straight to
+# disasm, so a recentre still waiting on registers when the target stops must not stay armed: its regs reply
+# would re-seat the fresh stop on the OLD request. Measured 2026-09-24: a Stopped() that carried the flag
+# across its NewEpoch() passed all 130 checks before these two.
+$s = New-Seat
+$s.Stopped($A, $null)
+[void]$s.WindowLanded($A, $A, 3)
+[void]$s.BeginRecentre($A)
+$s.Stopped($B, $null)
+Check 'a stop clears a pending recentre''s AwaitRegs' (-not $s.AwaitRegs) "await=$($s.AwaitRegs) seating=$($s.SeatingTid)"
+Check '...so the stopped thread''s registers are not taken on the recentre''s behalf' (-not $s.TakeRegs($B, [uint32] 0x401000)) ''
 
 # ------------------------------------------------------------------------------------------------------------
 Write-Host ''
@@ -463,7 +474,7 @@ Check 'a coarse seek never re-asserts a thread seat' `
   ($coarse -notmatch 'BeginRecentre|TryBeginSeat|SeatOnSelectedThread|RequestRegs') ''
 
 # The count, asserted: "ALL CHECKS PASSED" is equally true of a run that silently skipped a section.
-$EXPECTED_CHECKS = 130
+$EXPECTED_CHECKS = 132
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
