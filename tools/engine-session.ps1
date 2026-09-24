@@ -34,6 +34,38 @@ function New-EngineSessionState {
     }
 }
 
+# THE SINK IS FILLED BY A C# HANDLER, IN THE ENGINE'S OWN ORDER (wave 5). It used to be a Register-ObjectEvent
+# -Action block, and PowerShell's event queue does not keep back-to-back lines in order: measured 2026-09-24,
+# 7 and 6 of 1000 A-before-B pairs came out swapped (a paused landing ahead of the setip before it, which is
+# how test-setip timed out), against 0 of 1000 for a DataReceivedEventHandler that adds to the sink directly.
+# Process raises DataReceived for one stream from one reader, in order; the handler must not hop through a
+# queue on the way. test-engine-session.ps1 section 8 drives this through New-EngineSession with a stand-in
+# engine and fails on the old sink.
+if (-not ('EngineSessionSink' -as [type])) {
+    Add-Type -TypeDefinition @'
+public static class EngineSessionSink {
+    public static System.Diagnostics.DataReceivedEventHandler Into(System.Collections.IList sink, string prefix) {
+        return (s, e) => { if (e.Data != null) sink.Add(prefix + e.Data); };
+    }
+}
+'@
+}
+
+# Attaches the sink to $Proc's stdout (and stderr, each line prefixed "STDERR: ") before it starts. Returns
+# what Remove-EngineSession needs to detach them again.
+function Connect-EngineOutput {
+    param($Proc, $Sink, [switch]$StdErr)
+    $out = [EngineSessionSink]::Into($Sink, '')
+    $Proc.add_OutputDataReceived($out)
+    $h = @(@{ Proc = $Proc; Event = 'OutputDataReceived'; Handler = $out })
+    if ($StdErr) {
+        $err = [EngineSessionSink]::Into($Sink, 'STDERR: ')
+        $Proc.add_ErrorDataReceived($err)
+        $h += @{ Proc = $Proc; Event = 'ErrorDataReceived'; Handler = $err }
+    }
+    return $h
+}
+
 function New-EngineSession {
     param(
         [Parameter(Mandatory = $true)][string]$Engine,
@@ -60,15 +92,7 @@ function New-EngineSession {
     $proc.StartInfo = $psi
     # filled from the OutputDataReceived event, which runs on a threadpool thread
     $sink = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-    $handlers = @()
-    $handlers += Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $sink -Action {
-        if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add($EventArgs.Data) }
-    }
-    if ($CaptureStdErr) {
-        $handlers += Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $sink -Action {
-            if ($EventArgs.Data -ne $null) { [void]$Event.MessageData.Add('STDERR: ' + $EventArgs.Data) }
-        }
-    }
+    $handlers = @(Connect-EngineOutput $proc $sink -StdErr:$CaptureStdErr)
 
     $session = New-EngineSessionState -Proc $proc -Sink $sink -Handlers $handlers -Target $Target -StartedAt $StartedAt
     [void]$proc.Start()
@@ -192,6 +216,8 @@ function Stop-EngineTarget {
 function Remove-EngineSession {
     param($Session)
     foreach ($h in $Session.Handlers) {
-        if ($h) { Unregister-Event -SourceIdentifier $h.Name -ErrorAction SilentlyContinue }
+        if (-not $h -or -not $h.Proc) { continue }
+        if ($h.Event -eq 'OutputDataReceived') { $h.Proc.remove_OutputDataReceived($h.Handler) }
+        elseif ($h.Event -eq 'ErrorDataReceived') { $h.Proc.remove_ErrorDataReceived($h.Handler) }
     }
 }
