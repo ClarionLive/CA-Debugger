@@ -74,21 +74,24 @@ namespace ClarionDbg.Cli
             // foreign links until one returns into Clarion code; that link's saved EBP is the Clarion
             // frame's base, so its locals and module data are readable (70b58a1a). A frameless callee
             // (DebugBreak) never pushed EBP, so ctx.Ebp is already the Clarion caller's own: that caller is
-            // the lowest return below the first link, and it reads its locals at ctx.Ebp.
+            // the return at ESP itself, and it reads its locals at ctx.Ebp. A Clarion return found higher in
+            // [ESP, EBP) is ambiguous: it may be a stale slot inside a FRAMED foreign function called directly
+            // from Clarion, whose EBP is not the Clarion frame's, so it is shown Uncertain with no EBP.
             // Only when the chain proves nothing (FPO in the runtime, no stack bounds) do we scan, and a
             // scanned frame is Uncertain with no EBP: no locals rather than a guessed frame base.
             bool topIsClarion = m0 != null && m0.Dbg != null;
             if (!topIsClarion)
             {
-                uint lo, hi, link, framelessSlot;
+                uint lo, hi, link, framelessSlot; bool framelessUncertain;
                 if (TryStackBounds(hThread, esp, out lo, out hi)
                     && FindForeignTopLink(ebp, lo, hi, ReadStackU32, IsClarionReturnSlot,
-                                          out link, out framelessSlot))
+                                          out link, out framelessSlot, out framelessUncertain))
                 {
                     StackFrame fc;
                     if (framelessSlot != 0 && TryFrameForReturn(ReadU32(framelessSlot), framelessSlot, out fc))
                     {
-                        fc.Ebp = ebp;
+                        fc.Ebp = framelessUncertain ? 0 : ebp;
+                        fc.Uncertain = framelessUncertain;
                         frames.Add(fc);
                     }
                     WalkEbpChain(frames, link, esp, maxFrames);
@@ -134,6 +137,7 @@ namespace ClarionDbg.Cli
         }
 
         private const int FOREIGN_LINKS_MAX = 256;   // EBP links walked through runtime/OS code before giving up
+        private const uint FRAMELESS_SCAN_BYTES = 0x4000;   // how far above ESP to look for a frameless callee's return
 
         /// <summary>
         /// The EBP-chain walk above a foreign (non-Clarion) top frame. Starting at <paramref name="ebp"/>,
@@ -146,17 +150,20 @@ namespace ClarionDbg.Cli
         ///
         /// <paramref name="framelessSlot"/> is set only when the first validated link is <paramref name="ebp"/>
         /// ITSELF: then EBP was never pushed below it, so a frameless callee (DebugBreak's int3) sits on top of a
-        /// Clarion frame whose base IS <paramref name="ebp"/>. Its return slot is the lowest validated return in
-        /// [lo, ebp). In any other shape a return below the first link lies inside a foreign frame, and is
-        /// not a caller.
+        /// Clarion frame whose base IS <paramref name="ebp"/>, and its return is at ESP (<paramref name="lo"/>).
+        /// A FRAMED foreign function called straight from Clarion has the same shape, with perhaps a stale
+        /// Clarion return among its locals, so only a return AT lo is taken as the caller. Failing that, the
+        /// lowest validated return in [lo, ebp), searched at most FRAMELESS_SCAN_BYTES up, is reported with
+        /// <paramref name="framelessUncertain"/> set: an Uncertain frame with no base. In any other shape a
+        /// return below the first link lies inside a foreign frame, and is not a caller.
         ///
         /// Static and fed through delegates so `protocolcheck` can drive it over synthetic stacks.
         /// </summary>
         internal static bool FindForeignTopLink(uint ebp, uint lo, uint hi,
                                                 Func<uint, uint?> read32, Func<uint, bool> isClarionReturnSlot,
-                                                out uint link, out uint framelessSlot)
+                                                out uint link, out uint framelessSlot, out bool framelessUncertain)
         {
-            link = 0; framelessSlot = 0;
+            link = 0; framelessSlot = 0; framelessUncertain = false;
             if (hi < 8) return false;                 // hi - 8 below must not wrap
             uint cur = ebp, prev = 0;                 // prev = 0 also refuses a null EBP on the first link
             for (int n = 0; n < FOREIGN_LINKS_MAX; n++)
@@ -168,8 +175,17 @@ namespace ClarionDbg.Cli
                 {
                     link = cur;
                     if (n == 0)
-                        for (uint s = (lo + 3) & ~3u; s < cur; s += 4)
-                            if (isClarionReturnSlot(s)) { framelessSlot = s; break; }
+                    {
+                        uint first = (lo + 3) & ~3u;
+                        uint end = cur - first > FRAMELESS_SCAN_BYTES ? first + FRAMELESS_SCAN_BYTES : cur;
+                        for (uint s = first; s < end; s += 4)
+                            if (isClarionReturnSlot(s))
+                            {
+                                framelessSlot = s;
+                                framelessUncertain = s != lo;
+                                break;
+                            }
+                    }
                     return true;
                 }
                 uint? next = read32(cur);
@@ -214,9 +230,25 @@ namespace ClarionDbg.Cli
         /// on it, so after a Pause they describe the Clarion code, not the OS call it idles in.</summary>
         private StackFrame FirstClarionFrame(ref Native.CONTEXT_X86 ctx, IntPtr hThread)
         {
-            foreach (var f in FramesForStop(ref ctx, hThread))
-                if (f.Proc != null && f.Ebp != 0) return f;
-            return null;
+            var frames = FramesForStop(ref ctx, hThread);
+            int i = FirstClarionFrameIndex(frames);
+            return i < 0 ? null : frames[i];
+        }
+
+        /// <summary>Where <see cref="FirstClarionFrame"/> sits in <paramref name="frames"/>; -1 when none can
+        /// read locals.</summary>
+        internal static int FirstClarionFrameIndex(IList<StackFrame> frames)
+        {
+            for (int i = 0; i < frames.Count; i++)
+                if (CanReadLocals(frames[i])) return i;
+            return -1;
+        }
+
+        /// <summary>Can this frame's locals be read? It needs a procedure (a local set to look in) and a frame
+        /// base (somewhere to read one); a scanned, Uncertain frame has no base.</summary>
+        internal static bool CanReadLocals(StackFrame f)
+        {
+            return f.Proc != null && f.Ebp != 0;
         }
 
         // One stack walk per stop and register set, shared by every watch, module-data and local read at that

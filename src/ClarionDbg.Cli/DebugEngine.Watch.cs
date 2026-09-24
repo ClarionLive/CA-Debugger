@@ -306,24 +306,27 @@ namespace ClarionDbg.Cli
             if (parts.Length < 2) { EmitError("watch expects: watch NAME"); return; }
             string name = parts[1];
 
-            // A procedure-local shadows a same-named global while its procedure is on the stack, so resolve the
-            // stack's locals FIRST, innermost frame first. Locals live on the stack (never .cwtls), so this is a
-            // direct read. A local found in a caller's frame says which one (bae5f46d).
-            uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
-            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, out slotVa, out lsym, out lowner, out fIdx, out fProc))
-            {
-                EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places,
-                               frameIdx: fIdx, frameProc: fProc);
-                return;
-            }
-
             // What the rest reads: a global's template address and type, or a global-headed watch PATH's
             // member. target/places stay 0 for a plain global, whose DataLocation does not carry them.
             // spanSize is what the symbol OCCUPIES, which differs from the render size for a &STRING member
             // (a 4-byte pointer that renders its referent's length).
             TswdDebugInfo.DataLocation loc; LoadedModule owner;
             uint templateVa, size, spanSize; byte typeCode, target = 0; int places = 0;
-            if (ResolveDataAcrossModules(name, out owner, out loc))
+            bool isGlobal = ResolveDataAcrossModules(name, out owner, out loc);
+
+            // Clarion's scope order (WatchFrameFor): the stopped frame's local, then the global, then a caller
+            // frame's local. Locals live on the stack (never .cwtls), so this is a direct read. A local found in
+            // a caller's frame says which one (bae5f46d).
+            uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
+            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, isGlobal,
+                                       out slotVa, out lsym, out lowner, out fIdx, out fProc))
+            {
+                EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places,
+                               frameIdx: fIdx, frameProc: fProc);
+                return;
+            }
+
+            if (isGlobal)
             {
                 templateVa = owner.LoadBase + loc.Rva;
                 typeCode = loc.TypeCode; size = loc.Size; spanSize = loc.Size;
@@ -521,8 +524,8 @@ namespace ClarionDbg.Cli
             GlobalMember,
         }
 
-        /// <summary>watch HEAD.MEMBER[.MEMBER]: resolve the head as a local on the stack (innermost frame first), then as a global
-        /// data symbol, and walk to the leaf (see <see cref="WalkWatchPath"/>). A local-headed leaf is
+        /// <summary>watch HEAD.MEMBER[.MEMBER]: resolve the head in the same scope order as a plain name (the stopped
+        /// frame's local, a global data symbol, a caller frame's local; see WatchFrameFor), and walk to the leaf (see <see cref="WalkWatchPath"/>). A local-headed leaf is
         /// answered here: a local lives on the stack, and a reference head's buffer on the heap, never in
         /// .cwtls. A global-headed leaf goes back to HandleWatchCommand, so the span classification and the
         /// instance mapping stay the one copy every global goes through.</summary>
@@ -546,9 +549,17 @@ namespace ClarionDbg.Cli
             uint leafVa; ClarionType leafType; string error;
             WatchPathOutcome outcome;
 
+            DataSymbol ds = null;
+            if (_exe != null && _exe.Dbg != null && _exe.Dbg.TryGetDataSymbol(head, out ds)) owner = _exe;
+            else
+                foreach (var m in _modules)
+                    if (m != _exe && m.Dbg != null && m.Dbg.TryGetDataSymbol(head, out ds)) { owner = m; break; }
+
             uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
-            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, head, out slotVa, out lsym, out lowner, out fIdx, out fProc))
+            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, head, owner != null,
+                                       out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
+                owner = null;
                 outcome = WalkWatchPath(lsym.Type, lsym.TypeCode, true, slotVa, members, readPointer,
                                         out leafVa, out leafType, out error);
                 if (outcome != WatchPathOutcome.Ok) { EmitPathFailure(tid, name, outcome, error); return PathResolve.Answered; }
@@ -557,12 +568,6 @@ namespace ClarionDbg.Cli
                                frameIdx: fIdx, frameProc: fProc);
                 return PathResolve.Answered;
             }
-
-            DataSymbol ds = null;
-            if (_exe != null && _exe.Dbg != null && _exe.Dbg.TryGetDataSymbol(head, out ds)) owner = _exe;
-            else
-                foreach (var m in _modules)
-                    if (m != _exe && m.Dbg != null && m.Dbg.TryGetDataSymbol(head, out ds)) { owner = m; break; }
             if (owner == null) return PathResolve.NoHead;
 
             outcome = WalkWatchPath(ds.Type, ds.TypeCode, false, owner.LoadBase + ds.Rva, members, readPointer,

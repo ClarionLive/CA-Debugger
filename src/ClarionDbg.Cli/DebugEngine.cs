@@ -1024,7 +1024,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "framelocals":   // locals of one call-stack frame (Call-Stack-driven Variables)
-                        HandleFrameLocalsCommand(parts, view.Tid);
+                        HandleFrameLocalsCommand(parts, view.Tid, ref view.Ctx, view.HaveCtx);
                         break;
 
                     case "disasm": case "u":
