@@ -982,7 +982,7 @@ namespace ClarionDbg.Cli
                         break;
 
                     case "stack": case "bt": case "where":
-                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid);
+                        HandleStackCommand(parts, ref view.Ctx, view.HaveCtx, view.Tid, view.HThread);
                         break;
 
                     case "moduledata": case "moddata":

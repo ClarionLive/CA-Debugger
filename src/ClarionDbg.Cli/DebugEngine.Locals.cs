@@ -93,26 +93,36 @@ namespace ClarionDbg.Cli
             return best;
         }
 
-        /// <summary>Resolve a named local of the CURRENTLY-EXECUTING frame (frame 0): map the paused EIP to its
-        /// procedure (a ROUTINE shares its host procedure's frame, so route to the enclosing proc), then find a
-        /// local of that name (case-insensitive) in the proc's <see cref="LocalSym"/> set and compute its live
-        /// slot at [EBP + FrameOff]. Locals always live on the stack — never .cwtls — so the read is a direct,
-        /// synchronous one (no THR$GetInstance func-eval). Returns false when not paused-with-context, the owning
-        /// image has no debug info, or this frame declares no local of that name. Used by `watch NAME` so a
-        /// procedure-local shadows a same-named global while we are paused inside its frame.</summary>
-        private bool TryResolveLocalInCurrentFrame(ref Native.CONTEXT_X86 ctx, bool haveCtx, string name,
+        /// <summary>Resolve a named local of the CURRENT Clarion frame: the first frame with a procedure and a
+        /// frame base (<see cref="FirstClarionFrame"/>) — frame 0 after an ordinary stop, the Clarion frame
+        /// under the event loop after a Pause. Map its address to its procedure (a ROUTINE shares its host
+        /// procedure's frame, so route to the enclosing proc), then find a local of that name (case-insensitive)
+        /// in the proc's <see cref="LocalSym"/> set and compute its live slot at [frame EBP + FrameOff]. Locals
+        /// always live on the stack — never .cwtls — so the read is a direct, synchronous one (no THR$GetInstance
+        /// func-eval). Returns false when not paused-with-context, no frame qualifies, or it declares no local of
+        /// that name. Used by `watch NAME` so a procedure-local shadows a same-named global.</summary>
+        private bool TryResolveLocalInCurrentFrame(ref Native.CONTEXT_X86 ctx, bool haveCtx, IntPtr hThread, string name,
             out uint slotVa, out LocalSym found, out LoadedModule owner)
         {
             slotVa = 0; found = null; owner = null;
-            if (!haveCtx || ctx.Ebp == 0) return false;
-            var m = ModuleAt(ctx.Eip);
+            if (!haveCtx) return false;
+            var f = FirstClarionFrame(ref ctx, hThread);
+            return f != null && TryLocalInFrame(f, name, out slotVa, out found, out owner);
+        }
+
+        /// <summary>A named local of ONE stack frame, read at that frame's own base.</summary>
+        private bool TryLocalInFrame(StackFrame f, string name, out uint slotVa, out LocalSym found, out LoadedModule owner)
+        {
+            slotVa = 0; found = null; owner = null;
+            if (f == null || f.Ebp == 0) return false;
+            var m = ModuleAt(f.Va);
             if (m == null || m.Dbg == null) return false;
             ProcSymbol sym;
-            if (!m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym)) return false;
+            if (!m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym)) return false;
             uint entry = sym.EntryRva;
             if (sym.Kind == SymbolKind.Routine)
             {
-                uint pe = EnclosingProcedureEntry(m, ctx.Eip - m.LoadBase);
+                uint pe = EnclosingProcedureEntry(m, f.Va - m.LoadBase);
                 if (pe != 0) entry = pe;
             }
             List<LocalSym> locals;
@@ -121,7 +131,7 @@ namespace ClarionDbg.Cli
                 if (string.Equals(l.Name, name, StringComparison.OrdinalIgnoreCase))
                 {
                     found = l; owner = m;
-                    slotVa = (uint)((long)ctx.Ebp + l.FrameOff);
+                    slotVa = (uint)((long)f.Ebp + l.FrameOff);
                     return true;
                 }
             return false;
@@ -578,14 +588,21 @@ namespace ClarionDbg.Cli
             var rows = new List<string>();
             string module = null;
 
-            if (haveCtx)
+            // Keyed on the first Clarion frame, not on EIP: after a Pause EIP is in win32u under ClaRUN's event
+            // loop, which has no module data of its own (70b58a1a).
+            var f = haveCtx ? FirstClarionFrame(ref ctx, hThread) : null;
+            if (f != null)
             {
-                var m = ModuleAt(ctx.Eip);
+                var m = ModuleAt(f.Va);
                 ProcSymbol sym;
-                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(ctx.Eip - m.LoadBase, out sym))
+                if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym))
                 {
                     int mi = sym.ModuleIdx;
-                    module = m.Dbg.ModuleNameForIdx(mi);
+                    // The LABEL comes from the +0x1C line table (FrameAt's moduleIdx), the index space
+                    // ModuleNameForIdx takes. sym.ModuleIdx is the +0x28 backref's, a different space, so
+                    // naming the module by it could print another compiland's name (52458d89). The filter
+                    // below still uses it: DataSymbol.ModuleIdx is a backref index too.
+                    module = f.Module;
                     var syms = m.Dbg.DataSymbols;
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
@@ -653,7 +670,7 @@ namespace ClarionDbg.Cli
             EmitThreadEvent(tid, "{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
                 + ",\"items\":[" + string.Join(",", rows) + "]}");
             if (!EmitJson)
-                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {tid}");
+                Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {TidText(tid)}");
         }
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by

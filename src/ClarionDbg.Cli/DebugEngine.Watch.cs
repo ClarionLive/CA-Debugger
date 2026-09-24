@@ -309,7 +309,7 @@ namespace ClarionDbg.Cli
             // A procedure-local shadows a same-named global while we are paused inside its frame, so resolve the
             // CURRENT frame's locals FIRST. Locals live on the stack (never .cwtls), so this is a direct read.
             uint slotVa; LocalSym lsym; LoadedModule lowner;
-            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, name, out slotVa, out lsym, out lowner))
+            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, hThread, name, out slotVa, out lsym, out lowner))
             {
                 EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places);
                 return;
@@ -330,7 +330,7 @@ namespace ClarionDbg.Cli
             {
                 // A watch PATH (GROUP.MEMBER) is tried only here, after both lookups above missed, so no
                 // name that resolves today changes meaning (a restored watch list reads as it did).
-                var path = TryWatchPath(name, tid, ref ctx, haveCtx, out owner, out templateVa, out typeCode, out target,
+                var path = TryWatchPath(name, tid, ref ctx, haveCtx, hThread, out owner, out templateVa, out typeCode, out target,
                                         out size, out places, out spanSize);
                 if (path == PathResolve.Answered) return;
                 if (path == PathResolve.NoHead)
@@ -524,7 +524,7 @@ namespace ClarionDbg.Cli
         /// answered here: a local lives on the stack, and a reference head's buffer on the heap, never in
         /// .cwtls. A global-headed leaf goes back to HandleWatchCommand, so the span classification and the
         /// instance mapping stay the one copy every global goes through.</summary>
-        private PathResolve TryWatchPath(string name, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx,
+        private PathResolve TryWatchPath(string name, uint tid, ref Native.CONTEXT_X86 ctx, bool haveCtx, IntPtr hThread,
                                          out LoadedModule owner, out uint templateVa, out byte code, out byte target,
                                          out uint size, out int places, out uint spanSize)
         {
@@ -545,7 +545,7 @@ namespace ClarionDbg.Cli
             WatchPathOutcome outcome;
 
             uint slotVa; LocalSym lsym; LoadedModule lowner;
-            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, head, out slotVa, out lsym, out lowner))
+            if (TryResolveLocalInCurrentFrame(ref ctx, haveCtx, hThread, head, out slotVa, out lsym, out lowner))
             {
                 outcome = WalkWatchPath(lsym.Type, lsym.TypeCode, true, slotVa, members, readPointer,
                                         out leafVa, out leafType, out error);
