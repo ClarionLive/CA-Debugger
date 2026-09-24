@@ -60,12 +60,21 @@ namespace ClarionDbg.Cli
             if (_detachThrowAt == name) throw new InvalidOperationException("planted fault at " + name);
         }
 
-        // The detach's debug-API calls, as delegates so protocolcheck can feed the DRAIN a queue of events and
-        // see how each one is answered. In a real session they are exactly the Win32 functions. The live suite
+        // The detach waits and continues through the debug loop's own delegates (_loopWait, _loopContinue), so
+        // protocolcheck can feed the DRAIN a queue of events and see how each one is answered. The live suite
         // cannot reproduce the race the drain exists for (tools\test-attach.ps1 says why), so this is the only
         // place the drain's answers are checked against events it actually has to answer.
-        private Func<byte[], uint, bool> _detachWait = Native.WaitForDebugEvent;
-        private Func<uint, uint, uint, bool> _detachContinue = Native.ContinueDebugEvent;
+
+        /// <summary>Put the loop's wait and continue back on the Win32 functions: every seam's cleanup.</summary>
+        private void RestoreDebugApi()
+        {
+            _loopWait = Native.WaitForDebugEvent;
+            _loopContinue = Native.ContinueDebugEvent;
+        }
+
+        /// <summary>For a seam whose source serves the LOOP: true once DetachAt has begun, when the source
+        /// should answer "nothing queued" so the drain ends at once. Needs <see cref="_detachTrace"/> set.</summary>
+        private bool DetachBegunForTest { get { return _detachTrace != null && _detachTrace.Count > 0; } }
 
         // The two thread-context operations the detach and a stale hit depend on, each answering whether it
         // WORKED (4b run 2, Codex HIGH: they used to fail silently, and a thread left with TF set, or a queued
@@ -161,6 +170,14 @@ namespace ClarionDbg.Cli
             Console.WriteLine($"attached to pid {_attachPid}; {_bps.Count} breakpoint(s)");
             return true;
         }
+
+        /// <summary>quit, q or kill, in either loop: does it detach rather than terminate? An attached app was
+        /// running before we came and keeps running after, so quit (and stdin close, which queues quit) lets go
+        /// of it. `kill` is the verb that ends it, attached or not.</summary>
+        private bool QuitDetaches(string verb) { return IsAttach && verb != "kill"; }
+
+        /// <summary>The terminate half of quit/kill. The EXIT_PROCESS event that follows ends the loop.</summary>
+        private void TerminateTarget() { if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0); }
 
         /// <summary>Ask for a detach from the RUNNING state: inject a break so an event arrives to detach on.
         /// A target that has not reported CREATE_PROCESS yet needs no break: its attach burst is on the way.</summary>
@@ -286,19 +303,19 @@ namespace ClarionDbg.Cli
 
                 DetachStep("continue-held");
                 uint status = heldStatus ?? DetachClassify(held, ours, rewindFailed, ref exited, ref exitCode);
-                _detachContinue(Pid(held), Tid(held), status);
+                _loopContinue(Pid(held), Tid(held), status);
                 heldContinued = true;
 
                 DetachStep("drain");
                 var buf = new byte[1024];
                 var sw = Stopwatch.StartNew();
                 while (!exited && drained < DetachDrainCapEvents && sw.ElapsedMilliseconds < DetachDrainCapMs
-                       && _detachWait(buf, DetachDrainWaitMs))
+                       && _loopWait(buf, DetachDrainWaitMs))
                 {
                     drained++;
                     if (IsOursOrTrap(buf, ours)) oursDrained++;
                     uint st = DetachClassify(buf, ours, rewindFailed, ref exited, ref exitCode);
-                    _detachContinue(Pid(buf), Tid(buf), st);
+                    _loopContinue(Pid(buf), Tid(buf), st);
                 }
 
                 _hProcess = IntPtr.Zero;   // kernel32 owns the event's handles and closes them at the stop
@@ -306,7 +323,9 @@ namespace ClarionDbg.Cli
                 if (exited)
                 {
                     Console.WriteLine($"process exited (code {exitCode}) while detaching");
-                    if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));
+                    // Not on the QUIET detach of a refused attach: that process is not the one the host listed,
+                    // and `error` has already said so. Its exit is not a session's end to report.
+                    if (EmitJson && !_detachQuiet) Console.WriteLine("@JSON " + Json.Exited(exitCode));
                     return null;
                 }
 
@@ -322,7 +341,7 @@ namespace ClarionDbg.Cli
                 aborted = "detach aborted: " + ex.Message;
                 // Best effort, in the order the normal path would have: the held event must not be left to the
                 // stop (which would hand it to the app as unhandled), and the debugger must still let go.
-                if (!heldContinued) { try { _detachContinue(Pid(held), Tid(held), heldStatus ?? Native.DBG_CONTINUE); } catch { } }
+                if (!heldContinued) { try { _loopContinue(Pid(held), Tid(held), heldStatus ?? Native.DBG_CONTINUE); } catch { } }
                 _hProcess = IntPtr.Zero;
                 if (!stopTried && !exited)
                 {
@@ -498,6 +517,7 @@ namespace ClarionDbg.Cli
             public List<byte[]> Queue = new List<byte[]>();
             public HashSet<uint> TfFailTids = new HashSet<uint>(), EipFailTids = new HashSet<uint>();
             public string ThrowAt;
+            public bool Quiet;      // the detach of a refused attach (--expect-start mismatch)
             // results
             public List<string> Order, Continues = new List<string>(), Rewinds = new List<string>();
             public string Json, Escaped;
@@ -518,9 +538,10 @@ namespace ClarionDbg.Cli
             foreach (var va in s.PlantedEver) NotePlanted(va, 0x55);
             _hover.Set(true);
             _seenInitialBreak = true;
+            _detachQuiet = s.Quiet;
 
             int next = 0;
-            _detachWait = (buf, ms) =>
+            _loopWait = (buf, ms) =>
             {
                 if (next >= s.Queue.Count) return false;
                 Array.Clear(buf, 0, buf.Length);
@@ -528,7 +549,7 @@ namespace ClarionDbg.Cli
                 next++;
                 return true;
             };
-            _detachContinue = (p, t, st) => { s.Continues.Add(t + ":0x" + st.ToString("X8")); return true; };
+            _loopContinue = (p, t, st) => { s.Continues.Add(t + ":0x" + st.ToString("X8")); return true; };
             _setEipHook = (t, eip) => { s.Rewinds.Add(t + ":0x" + eip.ToString("X")); return !s.EipFailTids.Contains(t); };
             _clearTfHook = t => !s.TfFailTids.Contains(t);
             _detachTrace = new List<string>();
@@ -541,7 +562,7 @@ namespace ClarionDbg.Cli
             finally
             {
                 s.Order = _detachTrace; _detachTrace = null; _detachThrowAt = null;
-                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
+                RestoreDebugApi();
                 _setEipHook = null; _clearTfHook = null;
                 foreach (var t in s.Threads) _threads.Remove(t);
             }
@@ -580,8 +601,10 @@ namespace ClarionDbg.Cli
             RefuseSeamIfAttached("DebugLoopStarvationForTest");
             if (!_interactive) throw new InvalidOperationException("DebugLoopStarvationForTest: needs an interactive engine");
             int served = 0;
+            _detachTrace = new List<string>();
             _loopWait = (buf, ms) =>
             {
+                if (DetachBegunForTest) return false;      // nothing queued behind the held event
                 if (served >= maxEvents) throw new EventSourceExhausted();
                 Array.Clear(buf, 0, buf.Length);
                 BitConverter.GetBytes(Native.OUTPUT_DEBUG_STRING_EVENT).CopyTo(buf, 0);
@@ -589,16 +612,10 @@ namespace ClarionDbg.Cli
                 return true;
             };
             _loopContinue = (p, t, s) => true;
-            _detachWait = (buf, ms) => false;           // nothing queued behind the held event
-            _detachContinue = (p, t, s) => true;
             _cmds.Enqueue(command);
             try { DebugLoop(); return served; }
             catch (EventSourceExhausted) { return -1; }
-            finally
-            {
-                _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent;
-                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
-            }
+            finally { _detachTrace = null; RestoreDebugApi(); }
         }
 
         /// <summary>Run the REAL debug loop on ONE event - <paramref name="ev"/> - and hand back how it was continued
@@ -624,10 +641,7 @@ namespace ClarionDbg.Cli
             _setEipHook = (t, eip) => { rew.Add(t + ":0x" + eip.ToString("X")); return true; };
             try { DebugLoop(); }
             catch (EventSourceExhausted) { }
-            finally
-            {
-                _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent; _setEipHook = null;
-            }
+            finally { RestoreDebugApi(); _setEipHook = null; }
             continues = cont; rewinds = rew;
         }
 
@@ -641,8 +655,10 @@ namespace ClarionDbg.Cli
             ExpectStart = expected;
             ApplyListedProcessCheck(read, actual);
             bool given = false;
+            _detachTrace = new List<string>();
             _loopWait = (buf, ms) =>
             {
+                if (DetachBegunForTest) return false;      // nothing queued behind the held event
                 if (given) throw new EventSourceExhausted();
                 Array.Clear(buf, 0, buf.Length);
                 BitConverter.GetBytes(Native.CREATE_PROCESS_DEBUG_EVENT).CopyTo(buf, 0);
@@ -650,15 +666,9 @@ namespace ClarionDbg.Cli
                 return true;
             };
             _loopContinue = (p, t, st) => true;
-            _detachWait = (buf, ms) => false;
-            _detachContinue = (p, t, st) => true;
             try { DebugLoop(); }
             catch (EventSourceExhausted) { }
-            finally
-            {
-                _loopWait = Native.WaitForDebugEvent; _loopContinue = Native.ContinueDebugEvent;
-                _detachWait = Native.WaitForDebugEvent; _detachContinue = Native.ContinueDebugEvent;
-            }
+            finally { _detachTrace = null; RestoreDebugApi(); }
             planted = _plantAllCalls > 0;
             refused = AttachFailed;
         }

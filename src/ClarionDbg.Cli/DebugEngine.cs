@@ -1069,15 +1069,9 @@ namespace ClarionDbg.Cli
                         _detachPending = true;   // the debug loop detaches on THIS held event (DebugEngine.Attach.cs)
                         return;
 
-                    case "quit": case "q":
-                        // An attached app was running before we came and keeps running after: quit (and stdin
-                        // close, which queues quit) lets go of it. `kill` is the verb that ends it.
-                        if (IsAttach) { _detachPending = true; return; }
-                        Native.TerminateProcess(_hProcess, 0);
-                        return; // the EXIT_PROCESS event ends the loop
-
-                    case "kill":
-                        Native.TerminateProcess(_hProcess, 0);
+                    case "quit": case "q": case "kill":
+                        if (QuitDetaches(verb)) { _detachPending = true; return; }
+                        TerminateTarget();
                         return; // the EXIT_PROCESS event ends the loop
 
                     default:
@@ -1169,12 +1163,9 @@ namespace ClarionDbg.Cli
                     case "detach":
                         RequestDetach();
                         break;
-                    case "quit": case "q":
-                        if (IsAttach) { RequestDetach(); break; }   // see the pause loop's quit
-                        if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
-                        break;
-                    case "kill":
-                        if (_hProcess != IntPtr.Zero) Native.TerminateProcess(_hProcess, 0);
+                    case "quit": case "q": case "kill":
+                        if (QuitDetaches(verb)) { RequestDetach(); break; }
+                        TerminateTarget();
                         break;
                     case "setip":   // its own refusal event, so the pad can toast it like any other setip refusal
                         EmitSetIpNotPaused(parts);
