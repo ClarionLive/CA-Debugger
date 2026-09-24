@@ -100,10 +100,12 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
-        /// The frame-bound watch (ticket bae5f46d): a local-headed watch resolves against the INNERMOST stack
-        /// frame whose procedure declares the head, and says which frame when it is not frame 0. Drives the
-        /// shipped DebugEngine.InnermostFrameWith (the frame choice), Json.Watch (the frozen frameIdx/frameProc
-        /// contract, 2026-09-24) and the per-stop frame cache through its seams.
+        /// The frame-bound watch (ticket bae5f46d): a local-headed watch resolves in Clarion's scope order (the
+        /// Owner's decision of 2026-09-24): the stopped frame's locals, then global data, then the INNERMOST
+        /// caller frame whose procedure declares the head, and it says which frame when it is not frame 0. Drives the
+        /// shipped DebugEngine.WatchFrameFor (the scope order), InnermostFrameWith (the caller-frame choice),
+        /// Json.Watch (the frozen frameIdx/frameProc contract, 2026-09-24) and the per-stop frame cache through
+        /// its seams.
         ///
         /// NOT COVERED: whether a frame's procedure declares a name (TSWD locals), the slot arithmetic, and
         /// that PausedWait clears the cache at every stop, which tools/test-engine-framecache-sites.ps1 pins by
@@ -112,9 +114,11 @@ namespace ClarionDbg.Cli
         /// </summary>
         private static void CheckFrameBoundWatch(List<string> failures, ClaimLog claims)
         {
-            claims.Claim("a local-headed watch takes the INNERMOST frame that declares the head, never asking a frame "
-                         + "with no procedure or no frame base, so a recursive procedure answers from its innermost "
-                         + "activation; the watch event carries frameIdx/frameProc flat only for a frame other than 0; "
+            claims.Claim("a watched name resolves in Clarion's scope order: the stopped frame's local (after a Pause, "
+                         + "the first Clarion frame), then a global, and only then the INNERMOST caller frame that "
+                         + "declares it, so a caller's local never shadows a global the stopped code reads; a frame "
+                         + "with no procedure or no frame base is never asked, and a recursive procedure answers from "
+                         + "its innermost activation; the watch event carries frameIdx/frameProc flat only for a frame other than 0; "
                          + "the per-stop frame cache is reused for the same registers and re-walked after a clear or "
                          + "for other registers. Not covered: TSWD local lookup, the PausedWait call site.");
 
@@ -140,6 +144,45 @@ namespace ClarionDbg.Cli
             got = DebugEngine.InnermostFrameWith(frames, f => false);
             if (got != -1)
                 failures.Add("frame-bound watch: a name no frame declares resolves nowhere (-1), got " + got);
+
+            // The scope order. Stopped in Q (frame 0), called from P (frame 1), called from MAIN (frame 2).
+            var stop = new List<StackFrame>
+            {
+                new StackFrame { Proc = "Q", Ebp = 0x1000 },
+                new StackFrame { Proc = "P", Ebp = 0x2000 },
+                new StackFrame { Proc = "MAIN", Ebp = 0x3000 },
+            };
+            Func<string[], Func<StackFrame, bool>> declaredBy = procs => f => Array.IndexOf(procs, f.Proc) >= 0;
+            got = DebugEngine.WatchFrameFor(stop, declaredBy(new[] { "P" }), true);
+            if (got != -1)
+                failures.Add("watch scope: Q has no local X and a global X exists, so X is the global Q reads (-1); "
+                             + "got frame " + got + ", the CALLER's local, whose edit would write into P's stack");
+            got = DebugEngine.WatchFrameFor(stop, declaredBy(new[] { "P", "MAIN" }), false);
+            if (got != 1)
+                failures.Add("watch scope: with no global, a local only callers declare resolves in the innermost "
+                             + "of them, frame 1 (P); got " + got);
+            got = DebugEngine.WatchFrameFor(stop, declaredBy(new[] { "Q", "P" }), true);
+            if (got != 0)
+                failures.Add("watch scope: the stopped frame's own local shadows the global (frame 0); got " + got);
+            got = DebugEngine.WatchFrameFor(stop, declaredBy(new string[0]), false);
+            if (got != -1)
+                failures.Add("watch scope: a name nothing declares resolves nowhere (-1); got " + got);
+
+            // After a Pause: frame 0 is the OS call, and the stopped Clarion frame is Q at 1.
+            var paused = new List<StackFrame>
+            {
+                new StackFrame { Proc = null, Ebp = 0x0F00 },
+                new StackFrame { Proc = "Q", Ebp = 0x1000 },
+                new StackFrame { Proc = "P", Ebp = 0x2000 },
+            };
+            got = DebugEngine.WatchFrameFor(paused, declaredBy(new[] { "Q" }), true);
+            if (got != 1)
+                failures.Add("watch scope: after a Pause the first Clarion frame's local (frame 1) comes before the "
+                             + "global; got " + got);
+            got = DebugEngine.WatchFrameFor(paused, declaredBy(new[] { "P" }), true);
+            if (got != -1)
+                failures.Add("watch scope: after a Pause a caller of the first Clarion frame still comes after the "
+                             + "global (-1); got " + got);
 
             // The contract: flat, only for a frame other than 0.
             var bytes = new byte[4];
@@ -190,17 +233,22 @@ namespace ClarionDbg.Cli
             claims.Claim("a routine frame's locals come from its OWNER's frame: the first return up the saved-EBP chain "
                          + "that does not land in a routine (a procedure or a method), whose saved EBP is the owner's base; "
                          + "a hop into another compiland or image, a link that does not climb, an unreadable link or a "
-                         + "chain past the nesting cap finds no owner. Not covered: the TSWD lookup of a return site.");
+                         + "chain past the nesting cap finds no owner. A routine stopped at its ENTRY (prologue not run) "
+                         + "takes its DOer from the return at ESP: a procedure is the owner at the current EBP, and a "
+                         + "routine's owner is walked from the current EBP. Not covered: the TSWD lookup of a return "
+                         + "site, and the entry test itself (AtProcEntry).");
 
             const int MI = 7;
             Func<SymbolKind, uint, int, DebugEngine.ReturnSiteInfo> site =
                 (k, e, mi) => new DebugEngine.ReturnSiteInfo { Kind = k, EntryRva = e, ModuleIdx = mi };
-            // Returns: 0x500 in INITIALIZEWINDOW (a routine), 0x600 in BROWSEJOBSGRAPHS (the procedure), 0x700 in a
-            // method, 0x800 in a routine of ANOTHER compiland, 0x900 outside the image.
+            // Returns: 0x500 in INITIALIZEWINDOW (a routine), 0x600 in BROWSEJOBSGRAPHS (the procedure), 0x650 in
+            // the procedure that called BROWSEJOBSGRAPHS (same compiland), 0x700 in a method, 0x800 in a routine
+            // of ANOTHER compiland, 0x900 outside the image.
             var sites = new Dictionary<uint, DebugEngine.ReturnSiteInfo>
             {
                 { 0x500, site(SymbolKind.Routine, 0x7CEAD, MI) },
                 { 0x600, site(SymbolKind.Procedure, 0x7E000, MI) },
+                { 0x650, site(SymbolKind.Procedure, 0x70000, MI) },
                 { 0x700, site(SymbolKind.Method, 0x7D000, MI) },
                 { 0x800, site(SymbolKind.Routine, 0x1000, MI + 1) },
             };
@@ -222,9 +270,29 @@ namespace ClarionDbg.Cli
             ExpectOwner(failures, "an unreadable saved EBP", 0xC18, MI, siteOf,
                         new Dictionary<uint, uint> { { 0xC1C, 0x600 } }, false, 0, 0);
 
+            // At a routine's ENTRY its prologue has not run: EBP is still the DOer's, and the return into the
+            // DOer is at ESP (0xB00). Walked from EBP, BROWSEJOBSGRAPHS's own return into ITS caller (0x650, a
+            // procedure of the same compiland) would be taken as the owner, with that caller's EBP 0xF00.
+            var atEntry = new Dictionary<uint, uint>
+            {
+                { 0xB00, 0x600 },                       // [ESP]: the routine's return into BROWSEJOBSGRAPHS
+                { 0xEB8, 0xF00 }, { 0xEBC, 0x650 },     // BROWSEJOBSGRAPHS's frame: its return into its caller
+            };
+            ExpectOwner(failures, "a routine at its entry, DOne from the procedure", 0xEB8, MI, siteOf, atEntry,
+                        true, 0x7E000, 0xEB8, 0xB00);
+            // DOne from another routine: EBP is INITIALIZEWINDOW's own frame, whose owner is walked from there.
+            ExpectOwner(failures, "a routine at its entry, DOne from a routine", 0xC2C, MI, siteOf,
+                        new Dictionary<uint, uint> { { 0xB00, 0x500 }, { 0xC2C, 0xEB8 }, { 0xC30, 0x600 } },
+                        true, 0x7E000, 0xEB8, 0xB00);
+            ExpectOwner(failures, "a routine at its entry, DOer in another compiland", 0xEB8, MI, siteOf,
+                        new Dictionary<uint, uint> { { 0xB00, 0x800 }, { 0xEB8, 0xF00 }, { 0xEBC, 0x600 } },
+                        false, 0, 0, 0xB00);
+            ExpectOwner(failures, "a routine at its entry, unreadable ESP", 0xEB8, MI, siteOf,
+                        new Dictionary<uint, uint> { { 0xEB8, 0xF00 }, { 0xEBC, 0x600 } }, false, 0, 0, 0xB00);
+
             // The nesting cap: routines all the way up must end, and fail.
             int reads = 0; uint oe, ob;
-            bool found = DebugEngine.FindRoutineOwner(0x1000, MI, va => { reads++; return (va & 4) != 0 ? 0x500u : va + 0x10000; },
+            bool found = DebugEngine.FindRoutineOwner(0x1000, MI, 0, va => { reads++; return (va & 4) != 0 ? 0x500u : va + 0x10000; },
                                                       siteOf, out oe, out ob);
             if (found)
                 failures.Add("routine owner: an endless chain of routines reported owner 0x" + oe.ToString("X"));
@@ -234,10 +302,10 @@ namespace ClarionDbg.Cli
 
         private static void ExpectOwner(List<string> failures, string what, uint ebp, int mi,
                                         Func<uint, DebugEngine.ReturnSiteInfo> siteOf, Dictionary<uint, uint> mem,
-                                        bool wantFound, uint wantEntry, uint wantEbp)
+                                        bool wantFound, uint wantEntry, uint wantEbp, uint entrySlot = 0)
         {
             uint entry, oebp;
-            bool found = DebugEngine.FindRoutineOwner(ebp, mi, va => { uint v; return mem.TryGetValue(va, out v) ? v : (uint?)null; },
+            bool found = DebugEngine.FindRoutineOwner(ebp, mi, entrySlot, va => { uint v; return mem.TryGetValue(va, out v) ? v : (uint?)null; },
                                                       siteOf, out entry, out oebp);
             if (found != wantFound || entry != wantEntry || oebp != wantEbp)
                 failures.Add("routine owner: " + what + ": got found=" + found + " entry=0x" + entry.ToString("X")
