@@ -6,7 +6,7 @@
      sha256 of its exact text, so ANY edit to that script must re-hash it here: tools/test-pad-csp.js fails
      until it does and prints the hash to paste. There are no inline on*= handlers (CSP blocks them): wire
      events from the script. Styles stay 'unsafe-inline' for the style= attributes and runtime styles. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-XgDDoM4uHZZgiL3scPBbSs5Gi8IW7tHp35gwxkrfLVM='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-/wIn/pX2AIEIwVq6v/A1X65FqOh54npQJM29QDNdxt8='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
 <title>CA Debugger</title>
 <style>
   :root {
@@ -77,6 +77,13 @@
   .exebar .path:hover { color:var(--accent-hi); text-decoration:underline; }
   .exebar .path.none { color:var(--fg-dim); cursor:default; text-decoration:none; font-style:italic; }
   .exebar .path.missing { color:var(--red); }
+  /* A path the host kept to retry but could NOT confirm for the current solution (0214f33a). It must not
+     read as the answer: dimmed and italic like "no target", with the caution mark and the host's note in
+     --warn so the reason is the legible part. */
+  .exebar .path.unconfirmed { color:var(--fg-dim); font-style:italic; }
+  .exebar .path.unconfirmed:hover { color:var(--fg-dim); }
+  .exebar .tmark { color:var(--warn); font-style:normal; margin-right:5px; }
+  .exebar .tnote { color:var(--warn); font-style:normal; margin-left:8px; }
 
   .main { flex:1; display:flex; min-height:0; }
   .sidebar { width:360px; min-width:180px; background:var(--panel); display:flex; flex-direction:column; overflow-y:auto; flex:none; }
@@ -281,6 +288,10 @@
      flex child shrink below its content at all, and is required for the ellipsis to appear. */
   .bp .bpproc { color:var(--yellow); font-size:11px; opacity:.85; flex:0 999 auto; min-width:0;
                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:help; }
+  /* which image a row belongs to - shown only when two or more rows share module:line (1be3b82e) */
+  .bp .bpimg { color:var(--fg-dim); font-size:11px; border:1px solid var(--border); border-radius:3px;
+               padding:0 4px; flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; cursor:help; }
 
   .procfilter { padding:5px 10px 5px 14px; }
   .procfilter input { width:100%; background:var(--input); border:1px solid var(--popup-border); color:var(--fg); border-radius:3px; padding:3px 7px; font-size:12px; outline:none; }
@@ -747,14 +758,36 @@
   // ---- Target bar --------------------------------------------------------------------------
   // textContent throughout: the path comes from the host, but it is a filesystem string we do not
   // control the contents of, and this file has had a DOM-XSS bug of exactly that shape before.
+  // `state` (0214f33a): auto | manual | unconfirmed | none. ABSENT means an older host, which renders exactly
+  // as before. A value we do not know is read as "unconfirmed": a newer host's state that this page cannot
+  // interpret must not be shown as the authoritative target.
+  var TARGET_STATES=['auto','manual','unconfirmed','none'];
+  function targetState(m){
+    if(!m || m.state===undefined || m.state===null) return null;
+    return TARGET_STATES.indexOf(m.state)>=0 ? m.state : 'unconfirmed';
+  }
   var targetPath=null;
   function setTarget(m){
     var el=$('exePath');
-    targetPath = m && m.path ? m.path : null;
+    var st=targetState(m), note=(m && typeof m.note==='string') ? m.note : '';
+    targetPath = (st!=='none' && m && m.path) ? m.path : null;
     if(!targetPath){
       el.className='path none';
-      el.textContent='No target resolved — open a project, or build the app.';
+      el.textContent='No target resolved — open a project, or build the app.'+(note ? ' '+note : '');
       el.title='';
+      return;
+    }
+    if(st==='unconfirmed'){
+      // Built from spans, never markup: both the path and the note are strings we do not control.
+      el.className='path unconfirmed';
+      el.textContent='';
+      var mk=document.createElement('span'); mk.className='tmark'; mk.textContent='⚠';
+      var pt=document.createElement('span'); pt.className='tpath'; pt.textContent=targetPath;
+      el.appendChild(mk); el.appendChild(pt);
+      if(note){ var nt=document.createElement('span'); nt.className='tnote'; nt.textContent=note; el.appendChild(nt); }
+      el.title='NOT confirmed for the current solution — kept only to retry, and it may not be the app you mean.'
+              +(m.exists ? '' : ' Not on disk.')+(note ? '\n'+note : '')+'\nClick to show it in File Explorer.';
+      restoreWatchesFor(targetPath);
       return;
     }
     el.className = m.exists ? 'path' : 'path missing';
@@ -2513,6 +2546,7 @@
     // Computed ONCE per list, not per row: the question is about the list, and asking it per row would
     // be quadratic for no reason.
     const dupeKeys=bpAmbiguousActionKeys(bps);
+    const sharedLines=bpSharedLines(bps);
     bps.forEach(b=>{
       const wrap=document.createElement('div'); wrap.className='bpitem';
       const d=document.createElement('div'); d.className='bp';
@@ -2544,6 +2578,9 @@
           lk.onclick=()=>send('jump', b.module+':'+b.line);
         }
       }
+      // Two or more rows on one module:line are the same source line in different images (1be3b82e):
+      // name the image so the rows can be told apart. Unique rows get no label.
+      if(sharedLines[bpLineKey(b)]) d.appendChild(bpImageLabel(b));
       // Owning procedure (+ routine crumb). DOM APIs only: these names come from the debuggee's TSWD info
       // and are untrusted, and the row above is built with innerHTML — interpolating a name into it would
       // make its safety depend on esc() at every site. Absent before symbols load: the row then
@@ -2589,6 +2626,26 @@
       el.appendChild(wrap);
     });
     if(curFile) renderBpDots();
+  }
+  // module compared case-insensitively: the host can report one compiland's name in two spellings.
+  function bpLineKey(b){ return String(b && b.module ? b.module : '').toLowerCase() + ':' + ((b && b.line) || 0); }
+  function bpSharedLines(list){
+    const seen=Object.create(null), shared=Object.create(null);
+    (list||[]).forEach(b=>{ const k=bpLineKey(b); if(seen[k]) shared[k]=true; else seen[k]=true; });
+    return shared;
+  }
+  // File name of the row's image, split on both separators; "(pending)" while the host does not know it.
+  function bpImageName(image){
+    if(image===null || image===undefined || image==='') return '(pending)';
+    const s=String(image), base=s.split(/[\\/]/).pop();
+    return base || s;
+  }
+  function bpImageLabel(b){
+    const known=!(b.image===null || b.image===undefined || b.image==='');
+    const s=document.createElement('span'); s.className='bpimg';
+    s.textContent=bpImageName(b.image);
+    s.title=(known ? String(b.image) : '(pending)')+' - hit counts are per image; remove/edit applies to every image';
+    return s;
   }
   function badge(cls,text,title){ const s=document.createElement('span'); s.className='badge '+cls; s.textContent=text; s.title=title; return s; }
   function hitLabel(mode,val){ return (mode==='eq'?'= ':mode==='gte'?'≥ ':mode==='mod'?'every ':'')+(val||0)+(mode==='mod'?'th':''); }
