@@ -17,14 +17,9 @@ namespace ClarionDbg.Cli
             var ctx = NewContext();
             bool haveCtx = hThread != IntPtr.Zero && Native.GetThreadContext(hThread, ref ctx);
 
-            // 1) pending re-plant after THIS thread stepped off a restored breakpoint byte
-            Rearm pr;
-            if (_rearm.TryGetValue(tid, out pr))
-            {
-                bool stillWanted = pr.IsTemp ? _temp.ContainsKey(pr.Va) : _armed.ContainsKey(pr.Va);
-                if (stillWanted) WriteByte(pr.Va, 0xCC);
-                _rearm.Remove(tid);
-            }
+            // 1) pending re-plant after THIS thread stepped off a restored breakpoint byte. This is also the
+            // trap that ends the re-arm hold: the loop's reconcile sees no re-plant pending and resumes the others.
+            ReplantPending(tid);
 
             // 2) drive the step machine (TF auto-clears on each trap; re-set it to keep stepping)
             if (_mode != StepMode.None && tid == _stepTid && !_skipRunning && haveCtx)
@@ -59,6 +54,180 @@ namespace ClarionDbg.Cli
                 WriteByte(va, orig);
                 _rearm[tid] = new Rearm { Va = va, IsTemp = false };
             }
+        }
+
+        /// <summary>Put back the INT3 a thread's pending re-plant is owed, and drop the entry: at that thread's
+        /// single-step, or when it exits before taking one.
+        /// <para>
+        /// NOT while another thread still owes a step off the SAME address. Two threads can each have had the
+        /// byte restored for them - their hits were queued together - and the first to step would otherwise
+        /// plant 0xCC under the second, which then executes it as a fresh hit on a breakpoint it has already
+        /// reported. The last one to step plants it.
+        /// </para></summary>
+        private void ReplantPending(uint tid)
+        {
+            Rearm pr;
+            if (!_rearm.TryGetValue(tid, out pr)) return;
+            _rearm.Remove(tid);
+            bool stillWanted = pr.IsTemp ? _temp.ContainsKey(pr.Va) : _armed.ContainsKey(pr.Va);
+            if (stillWanted && !RearmOwedAt(pr.Va))
+            {
+                WriteByte(pr.Va, 0xCC);
+                if (_replantTrace != null) _replantTrace.Add(pr.Va);
+            }
+        }
+
+        // protocolcheck's record of the INT3s ReplantPending wrote, in order. Null in a session.
+        private List<uint> _replantTrace;
+
+        private bool RearmOwedAt(uint va)
+        {
+            foreach (var kv in _rearm) if (kv.Value.Va == va) return true;
+            return false;
+        }
+
+        // ------------------------------------------------------------------ the re-arm hold (ca29e2da)
+        //
+        // A breakpoint is re-armed by restoring the original byte, single-stepping the thread that hit it over
+        // the real instruction, and planting 0xCC again at that thread's trap. Until 2026-09-25 every OTHER
+        // thread ran during that step, so one of them could execute the address while no INT3 was there and
+        // go straight past the breakpoint. Visual Studio, WinDbg and gdb all close this the same way, and so
+        // does this: while a thread steps off a restored byte, every other thread of the process is suspended.
+        //
+        // THE RULE IS RECONCILED AT EVERY CONTINUE, not set at each place that releases a thread with TF. Those
+        // places are many (OnUserBpCore's silent and non-interactive routes, ArmResume after a breakpoint stop,
+        // a stepi or a setip, OnTempBpCore's two re-arms, FinishSkipAt), and a hold set at each would need a
+        // release at each of the ways out as well. At the continue there is one question: is a thread about to run that owes a
+        // re-plant AND has TF set? If so it is the holder and everything else stays suspended; if not, nothing
+        // is held. So the hold ends at the holder's first trap (OnSingleStep drops its re-plant), and equally
+        // when its event is passed to the app (an exception: TF is not ours to count on across a handler),
+        // when it exits (ForgetRearmThread drops the re-plant), at the process's exit, and at a detach.
+        //
+        // IT IS NEVER HELD ACROSS A STEP SESSION OR A CALL-SKIP: an ordinary step trap owes no re-plant, and a
+        // call-skip runs with TF clear. Holding there would deadlock the first callee that waits on another
+        // thread. It is one instruction, always.
+        //
+        // COUNTS ARE BALANCED PER TID: _held records exactly the threads whose SuspendThread WE made succeed, and
+        // each gets exactly one ResumeThread. A thread the app had already suspended, or one with an event
+        // queued behind this one, ends with the count it started with. A queued event from a held thread is
+        // still delivered (it was raised before the suspend); the thread stays suspended after its continue.
+        // If that event made it a stepper too, the hold passes to it at the current holder's trap.
+        //
+        // A THREAD CREATED DURING THE HOLD is suspended at its CREATE_THREAD event, whose continue reconciles
+        // like any other; a thread that cannot be opened or suspended runs unheld, which is the old behaviour.
+
+        /// <summary>The thread operations the hold needs, so protocolcheck can drive the real reconcile
+        /// against a fake thread table. <see cref="Win32ThreadOps"/> in a session.</summary>
+        internal abstract class ThreadOps
+        {
+            /// <summary>Suspend once. True when the suspend took, and so is owed exactly one <see cref="Resume"/>.</summary>
+            public abstract bool Suspend(uint tid);
+            /// <summary>Undo one successful <see cref="Suspend"/>.</summary>
+            public abstract void Resume(uint tid);
+            /// <summary>The thread exited while we held it: let go of whatever was kept for it, resume nothing.</summary>
+            public abstract void Forget(uint tid);
+            /// <summary>Is the thread's TF set? False when its context cannot be read.</summary>
+            public abstract bool TrapFlagSet(uint tid);
+        }
+
+        /// <summary>The real thread operations. A held thread's handle is kept from its suspend to its resume, so
+        /// the resume goes to the very thread that was suspended rather than to whatever a reopened tid names.</summary>
+        private sealed class Win32ThreadOps : ThreadOps
+        {
+            private readonly Dictionary<uint, IntPtr> _handles = new Dictionary<uint, IntPtr>();
+
+            public override bool Suspend(uint tid)
+            {
+                if (_handles.ContainsKey(tid)) return false;
+                IntPtr h = OpenThread(Native.THREAD_SUSPEND_RESUME, false, tid);
+                if (h == IntPtr.Zero) return false;
+                if (Native.SuspendThread(h) == uint.MaxValue) { Native.CloseHandle(h); return false; }
+                _handles[tid] = h;
+                return true;
+            }
+
+            public override void Resume(uint tid)
+            {
+                IntPtr h;
+                if (!_handles.TryGetValue(tid, out h)) return;
+                Native.ResumeThread(h);
+                Native.CloseHandle(h);
+                _handles.Remove(tid);
+            }
+
+            public override void Forget(uint tid)
+            {
+                IntPtr h;
+                if (!_handles.TryGetValue(tid, out h)) return;
+                Native.CloseHandle(h);
+                _handles.Remove(tid);
+            }
+
+            public override bool TrapFlagSet(uint tid)
+            {
+                IntPtr h = OpenThreadForContext(tid);
+                if (h == IntPtr.Zero) return false;
+                try
+                {
+                    var c = NewContext();
+                    return Native.GetThreadContext(h, ref c) && (c.EFlags & TRAP_FLAG) != 0;
+                }
+                finally { Native.CloseHandle(h); }
+            }
+        }
+
+        private ThreadOps _threadOps = new Win32ThreadOps();
+        private readonly HashSet<uint> _held = new HashSet<uint>();   // tids WE suspended, one count each
+        private uint _holdFor;                                        // the thread stepping off a restored byte, or 0
+
+        /// <summary>Make the hold right for the event about to be continued (thread <paramref name="eventTid"/>,
+        /// continue status <paramref name="status"/>). Called by the debug loop immediately before every
+        /// ContinueDebugEvent, while the whole process is still frozen, so the suspends land before anything runs.</summary>
+        private void ReconcileRearmHold(uint eventTid, uint status)
+        {
+            if (_rearm.Count == 0 && _held.Count == 0) return;   // the common case: no re-plant owed, nothing held
+            uint holder = PickRearmHolder(eventTid, status);
+            if (holder == 0) { ReleaseRearmHold(); return; }
+            if (_held.Remove(holder)) _threadOps.Resume(holder);   // the hold passes to a thread we were holding
+            foreach (uint t in _threads)
+                if (t != holder && !_held.Contains(t) && _threadOps.Suspend(t)) _held.Add(t);
+            _holdFor = holder;
+        }
+
+        /// <summary>The thread that is about to step off a restored byte, or 0. A candidate owes a re-plant and
+        /// has TF set; the event's own thread is one only if it is continued DBG_CONTINUE, because an event passed
+        /// to the app runs the app's handler, not one instruction. The current holder keeps the hold while it is
+        /// still a candidate (it has not trapped yet); otherwise the event's thread is preferred.</summary>
+        private uint PickRearmHolder(uint eventTid, uint status)
+        {
+            uint best = 0;
+            foreach (var kv in _rearm)
+            {
+                uint t = kv.Key;
+                if (t == eventTid && status != Native.DBG_CONTINUE) continue;
+                if (!_threadOps.TrapFlagSet(t)) continue;
+                if (t == _holdFor) return t;
+                if (best == 0 || t == eventTid) best = t;
+            }
+            return best;
+        }
+
+        /// <summary>Resume every thread the hold suspended, once each.</summary>
+        private void ReleaseRearmHold()
+        {
+            foreach (uint t in _held) _threadOps.Resume(t);
+            _held.Clear();
+            _holdFor = 0;
+        }
+
+        /// <summary>A thread exited. A re-plant it still owed is paid now (the process is frozen on its exit
+        /// event, so nothing can be executing the byte), and if we were holding it there is nothing left to resume.
+        /// The continue that follows reconciles the hold without it.</summary>
+        private void ForgetRearmThread(uint tid)
+        {
+            ReplantPending(tid);
+            if (_held.Remove(tid)) _threadOps.Forget(tid);
+            if (_holdFor == tid) _holdFor = 0;
         }
 
         private void StepMachine(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx)
@@ -578,5 +747,55 @@ namespace ClarionDbg.Cli
         /// <summary>How many call-skip temp INT3s are still recorded. CancelStep restores and clears them
         /// all, so this distinguishes a cancelled session from a surviving one independently of the mode.</summary>
         internal int TempBpCountForTest { get { return _temp.Count; } }
+
+        /// <summary>Run the REAL debug loop over <paramref name="events"/> with the re-arm hold's thread operations
+        /// answered by <paramref name="ops"/> (a fake thread table), on a NON-interactive engine with no target.
+        /// <paramref name="threads"/> are registered as live first. <paramref name="beforeEvent"/> runs before
+        /// event i is delivered (to set the fake's TF, as the handlers would have); <paramref name="afterContinue"/>
+        /// runs at event i's ContinueDebugEvent, after the reconcile. With <paramref name="detachAt"/> &gt;= 0 a
+        /// detach is pending when event detachAt arrives, and the drain behind it finds nothing queued. Returns
+        /// the INT3s the re-plant wrote, in order. The loop ends at EXIT_PROCESS, at a detach, or after the last
+        /// event.</summary>
+        internal List<uint> RunRearmHoldScriptForTest(ThreadOps ops, uint[] threads, List<byte[]> events,
+                                                      Action<int> beforeEvent, Action<int> afterContinue, int detachAt)
+        {
+            RefuseSeamIfAttached("RunRearmHoldScriptForTest");
+            if (_interactive) throw new InvalidOperationException("RunRearmHoldScriptForTest: needs a NON-interactive engine");
+            _threadOps = ops;
+            foreach (uint t in threads) NoteThreadCreated(t);
+            _seenInitialBreak = true;
+            var trace = _replantTrace = new List<uint>();
+            _detachTrace = new List<string>();
+            int next = 0;
+            _loopWait = (buf, ms) =>
+            {
+                if (DetachBegunForTest) return false;      // nothing queued behind the held event
+                if (next >= events.Count) throw new EventSourceExhausted();
+                if (beforeEvent != null) beforeEvent(next);
+                if (next == detachAt) _detachPending = true;
+                Array.Clear(buf, 0, buf.Length);
+                Array.Copy(events[next], buf, Math.Min(events[next].Length, buf.Length));
+                next++;
+                return true;
+            };
+            _loopContinue = (p, t, st) =>
+            {
+                if (!DetachBegunForTest && afterContinue != null) afterContinue(next - 1);
+                return true;
+            };
+            try { DebugLoop(); }
+            catch (EventSourceExhausted) { }
+            finally
+            {
+                _replantTrace = null; _detachTrace = null;
+                RestoreDebugApi();
+                _threadOps = new Win32ThreadOps();
+            }
+            return trace;
+        }
+
+        /// <summary>How many threads the re-arm hold has suspended right now, and for which thread (0 = none).</summary>
+        internal int HeldCountForTest { get { return _held.Count; } }
+        internal uint HoldForForTest { get { return _holdFor; } }
     }
 }
