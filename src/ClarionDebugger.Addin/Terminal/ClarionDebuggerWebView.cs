@@ -82,6 +82,11 @@ namespace ClarionDebugger.Terminal
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
         private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
+        // What the target bar may claim about _exe (contract C4, 0214f33a), and the one line it shows beside it.
+        // UNCONFIRMED keeps a path for retry that the current solution did NOT confirm: the page must not show it as
+        // the target. Every write of _exe is followed by a PushTarget, so the bar never shows a stale claim.
+        private TargetState _exeState = TargetState.None;
+        private string _exeNote;
 
         // The exact local file URI the WebView is expected to navigate to. Used to (a) gate _ready on the
         // navigation actually being our packaged page and (b) reject web messages from any other origin.
@@ -215,7 +220,7 @@ namespace ClarionDebugger.Terminal
                     // TryAutoResolveExe already announces a changed target and pushes it to the
                     // target bar; a second line here just said the same thing twice.
                     TryAutoResolveExe();
-                    if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
+                    ListProceduresForTarget();
                 }
                 catch (Exception ex)
                 {
@@ -225,7 +230,12 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Drop target/procedure state when the solution closes, so the pad never shows a list
-        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.</summary>
+        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.
+        /// <para>
+        /// A close MID-SESSION is left alone on purpose (0214f33a): the bar then names the binary being debugged,
+        /// which is still the truth about the session, and the procedures list is that binary's. The session's end
+        /// catches up - OnSvcStateChanged(Idle) re-resolves, finds no solution, and clears the target to "none".
+        /// </para></summary>
         private void ClearForClosedSolution()
         {
             UI(() =>
@@ -234,9 +244,8 @@ namespace ClarionDebugger.Terminal
                 {
                     if (CurrentState != DebugSessionState.Idle) return;
                     _exe = null; _exeAuto = false; _exeManualKey = null;
-                    _procGen++;                       // invalidate any in-flight procedure parse
-                    _procIds.Clear();                 // and every id the old list was sent with
-                    Post("{\"type\":\"procedures\",\"procs\":[]}");
+                    _exeState = TargetState.None; _exeNote = ProjectTargetService.NoSolutionNote;
+                    ClearProcedures();
                     PushTarget();                     // blanks the target bar
                     Console("info", "solution closed — target cleared");
                 }
@@ -674,7 +683,7 @@ namespace ClarionDebugger.Terminal
                         PushAbout();
                         PushTarget();
                         if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
-                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
+                        ListProceduresForTarget();   // list procedures before running
                         break;
                     case "start": CmdStart(); break;
                     case "continue": CmdContinue(); break;
@@ -734,8 +743,8 @@ namespace ClarionDebugger.Terminal
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
-                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
-                        else Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
+                        if (!ListProceduresForTarget())
+                            Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
                         break;
                 }
             }
@@ -1295,8 +1304,10 @@ namespace ClarionDebugger.Terminal
             try { ctx = ProjectTargetService.GetActiveContextKey(); } catch { }
 
             // 1) Always re-resolve from the active project first — this is the primary source of truth.
-            string fresh = null;
-            try { fresh = ProjectTargetService.ResolveTargetExe(); } catch { }
+            ProjectTargetService.TargetResolution r = null;
+            try { r = ProjectTargetService.ResolveTarget(); } catch { }
+            string fresh = r != null ? r.Path : null;
+            string why = r != null ? r.Note : null;
             if (!string.IsNullOrEmpty(fresh))
             {
                 if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase) || _exeAuto == false)
@@ -1304,6 +1315,8 @@ namespace ClarionDebugger.Terminal
                 _exe = fresh;
                 _exeAuto = true;
                 _exeManualKey = null;            // an auto-resolve supersedes any prior manual pick
+                _exeState = TargetState.Auto; _exeNote = null;
+                PushTarget();
                 if (File.Exists(_exe)) return true;
                 Console("err", "Resolved target does not exist on disk: " + _exe + " — build the app, or choose one to launch.");
                 return BrowseForContext(ctx);
@@ -1318,11 +1331,17 @@ namespace ClarionDebugger.Terminal
                 // Context changed (or unconfirmable) — never launch a hidden EXE against a different solution.
                 Console("err", "Previously chosen target no longer matches the active solution — choose a target to launch.");
                 _exe = ""; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = why;
+                PushTarget();
                 return BrowseForContext(ctx);
             }
 
-            // 3) Nothing to launch — offer a one-shot Browse.
+            // 3) Nothing to launch — offer a one-shot Browse. An older auto path is kept for the next retry but is
+            //    no longer this solution's target, so the bar stops presenting it as one before the dialog opens.
             Console("err", "Could not auto-detect a Target EXE for the current solution — choose one to launch.");
+            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
+            _exeNote = why;
+            PushTarget();
             return BrowseForContext(ctx);
         }
 
@@ -1332,7 +1351,14 @@ namespace ClarionDebugger.Terminal
         {
             if (!Browse()) return false;
             _exeManualKey = ctx;               // one-shot: only valid while the active context stays this
-            if (!File.Exists(_exe)) { Console("err", "Chosen target does not exist: " + _exe); _exe = ""; _exeManualKey = null; return false; }
+            if (!File.Exists(_exe))
+            {
+                Console("err", "Chosen target does not exist: " + _exe);
+                _exe = ""; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = "The chosen EXE does not exist";
+                PushTarget();
+                return false;
+            }
             return true;
         }
 
@@ -1345,20 +1371,71 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
-                string result = ProjectTargetService.ResolveTargetExe();
-                if (!string.IsNullOrEmpty(result))
+                var r = ProjectTargetService.ResolveTarget();
+                if (!string.IsNullOrEmpty(r.Path))
                 {
                     // Log only on an actual change. This runs on every IDE context event, and
                     // re-announcing the same unchanged target each time was pure console noise.
-                    bool changed = !string.Equals(_exe, result, StringComparison.OrdinalIgnoreCase);
-                    _exe = result;
+                    bool changed = !string.Equals(_exe, r.Path, StringComparison.OrdinalIgnoreCase);
+                    _exe = r.Path;
                     _exeAuto = true;
                     _exeManualKey = null;
+                    _exeState = TargetState.Auto; _exeNote = null;
                     if (changed) Console("info", "auto-detected target: " + Path.GetFileName(_exe));
                     PushTarget();
+                    return;
                 }
+                // NO TARGET FROM THE SOLUTION (0214f33a). This returned silently, and whatever path the bar held -
+                // an older solution's auto target - went on looking like this solution's. Now the bar says so.
+                ApplyNoTarget(r.Outcome, r.Note, SafeContextKey());
+                PushTarget();
             }
             catch { }
+        }
+
+        /// <summary>What a resolve that found no target does to the one the pad holds. No solution open: the target
+        /// is gone ("none"). Otherwise a manual pick made for THIS solution context stays manual; any other path is
+        /// kept for a retry but UNCONFIRMED; with no path at all the state is "none". The note says why.</summary>
+        private void ApplyNoTarget(ProjectTargetService.TargetOutcome outcome, string note, string ctx)
+        {
+            if (outcome == ProjectTargetService.TargetOutcome.NoSolution)
+            {
+                _exe = ""; _exeAuto = false; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = note;
+                return;
+            }
+            bool manualHere = !_exeAuto && !string.IsNullOrEmpty(_exe) && ctx != null
+                              && string.Equals(ctx, _exeManualKey, StringComparison.OrdinalIgnoreCase);
+            if (manualHere) { _exeState = TargetState.Manual; _exeNote = null; return; }
+            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
+            _exeNote = note;
+        }
+
+        private static string SafeContextKey()
+        {
+            try { return ProjectTargetService.GetActiveContextKey(); } catch { return null; }
+        }
+
+        /// <summary>List the procedures of the target, but only of one the solution CONFIRMED (auto or manual): an
+        /// unconfirmed path is not this solution's target, and neither is its procedure list. Otherwise the list is
+        /// emptied. True when a list was asked for.</summary>
+        private bool ListProceduresForTarget()
+        {
+            if (!string.IsNullOrEmpty(_exe) && (_exeState == TargetState.Auto || _exeState == TargetState.Manual))
+            {
+                PushProcedures(_exe);
+                return true;
+            }
+            ClearProcedures();
+            return false;
+        }
+
+        /// <summary>Empty the Procedures list, retiring every id the old one was sent with.</summary>
+        private void ClearProcedures()
+        {
+            _procGen++;                       // invalidate any in-flight procedure parse
+            _procIds.Clear();                 // and every id the old list was sent with
+            Post("{\"type\":\"procedures\",\"procs\":[]}");
         }
 
         /// <summary>
@@ -1371,7 +1448,28 @@ namespace ClarionDebugger.Terminal
             string path = _exe ?? string.Empty;
             bool exists = false;
             try { exists = path.Length > 0 && File.Exists(path); } catch { }
-            Post("{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false") + "}");
+            Post(TargetJson(path, exists, _exeState, _exeNote));
+        }
+
+        /// <summary>What the target bar may claim (contract C4). None is not a pad state of its own: it is exactly
+        /// "no path", so a path is never sent as "none" and no path is ever sent as anything else.</summary>
+        internal enum TargetState { None, Auto, Manual, Unconfirmed }
+
+        internal const int TargetNoteMax = 200;
+
+        /// <summary>The page's <c>target</c> message (contract C4): <c>state</c> always, <c>note</c> LAST and only when
+        /// there is one - a single plain-text line of at most <see cref="TargetNoteMax"/> characters.</summary>
+        internal static string TargetJson(string path, bool exists, TargetState state, string note)
+        {
+            path = path ?? "";
+            string s = path.Length == 0 ? "none"
+                     : state == TargetState.Auto ? "auto"
+                     : state == TargetState.Manual ? "manual"
+                     : "unconfirmed";   // a path whose state says None was never confirmed either
+            string n = note == null ? null : note.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (n != null && n.Length > TargetNoteMax) n = n.Substring(0, TargetNoteMax);
+            return "{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false")
+                 + ",\"state\":\"" + s + "\"" + (string.IsNullOrEmpty(n) ? "" : ",\"note\":" + Str(n)) + "}";
         }
 
         /// <summary>Shows the target EXE in File Explorer, with the file selected.</summary>
@@ -1429,6 +1527,8 @@ namespace ClarionDebugger.Terminal
                 {
                     _exe = dlg.FileName;
                     _exeAuto = false; // a manual pick — re-resolve will still take precedence on the next Start
+                    _exeState = TargetState.Manual; _exeNote = null;
+                    PushTarget();
                     return true;
                 }
             }
