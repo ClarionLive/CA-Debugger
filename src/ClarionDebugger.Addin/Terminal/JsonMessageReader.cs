@@ -325,6 +325,15 @@ namespace ClarionDebugger.Wire
             return tid.HasValue && tid.Value != 0;
         }
 
+        /// <summary>An unsigned decimal, digits only (no sign, no whitespace, invariant culture); null reads as
+        /// "not a number". The page's payloads (PageNumbers.TryUInt) and the engine's process listing read
+        /// pids and ids with this one rule (40a252d0).</summary>
+        internal static bool TryUInt(string s, out uint v)
+        {
+            v = 0;
+            return s != null && uint.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out v);
+        }
+
         /// <summary>The most bytes one Memory-panel read may ask for: the engine's cap (MemMaxLen in
         /// DebugEngine.cs), and the page's MEM_MAX.</summary>
         internal const int MemMaxLen = 4096;

@@ -5,7 +5,6 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using ClarionDebugger.Terminal;   // AttachableProcess (PageMessages.cs), the one Terminal type left here
 using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Services
@@ -1713,7 +1712,7 @@ namespace ClarionDebugger.Services
                 {
                     uint pid;
                     if (list.Count >= MaxListedProcesses) return;
-                    if (!PageNumbers.TryUInt(JsonMessageReader.ReadField(o, "pid"), out pid) || pid == 0) return;
+                    if (!WireRules.TryUInt(JsonMessageReader.ReadField(o, "pid"), out pid) || pid == 0) return;
                     // A listed entry carries "tswd"; a --verbose SKIP entry ({pid,name,reason}) does not, and must
                     // never become an attachable process.
                     string tswd = JsonMessageReader.ReadField(o, "tswd");

@@ -37,6 +37,8 @@ param(
   [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
   # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
   [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
+  # the attach picker's listed process, which the pid table in PageMessages.cs holds (moved to Wire, 40a252d0)
+  [string] $AttachableProcessPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\AttachableProcess.cs'),
   # the host-issued id and grant tables, split out of PageMessages.cs (6ac29815 #4)
   [string] $HostGrantsPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\HostGrants.cs'),
   # the engine's Variables-row writer, whose edit members the host grants on the way out
@@ -1073,6 +1075,7 @@ Write-Host 'the page hands back only what the host ISSUED: procedure ids and edi
 $pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $hostGrantsBody = ($hostGrants -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
+$attachableBody = (Get-Content -Raw -LiteralPath $AttachableProcessPath) -replace '(?m)^using [^;]+;\r?\n', ''
 # Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
 # `);` that closes UI( is put back here.
 function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
@@ -1089,6 +1092,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using ClarionDebugger.Wire;
 $readerBody
+$attachableBody
 $pageMsgsBody
 $hostGrantsBody
 namespace ClarionDebugger.Terminal {
@@ -1593,7 +1597,8 @@ Check 'every stack request carries a recorded id: the page''s and the stop''s go
    ([regex]::Matches($webCode, '_svc\.RequestStack\(').Count -eq 1) -and `
    ((Get-CSharpCodeOnly (Get-Method 'private void RequestStack()' $web)) -match 'string id = _editGrants\.NewStackRequestId\(\);\s*if \(_svc\.RequestStack\(id\)\) _editGrants\.StackRequested\(id\);')) ''
 # The service hands the reply's echo to the stack event. What it SENDS is run in the version-skew section below.
-$svcCode = Get-CSharpCodeOnly (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'))
+# -ServicePath's text, not a fixed path: a mutated copy handed to this suite has to be the one read here.
+$svcCode = Get-CSharpCodeOnly $src
 Check 'the service passes the stack reply''s reqId on' `
   ($svcCode -match 'StackReceived\?\.Invoke\(frames, GetUIntOrNull\(json, "tid"\), GetStr\(json, "reqId"\)\);') ''
 Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
@@ -2763,6 +2768,30 @@ Check 'OnSvcHover is subscribed and unsubscribed, once each' `
 Check 'SetHover sends the engine''s verb' `
   ((Get-Method 'public bool SetHover(bool on)') -match 'SendCommand\(on \? "hover on" : "hover off"\)') ''
 
+Write-Host ''
+Write-Host 'the service needs nothing from Terminal (40a252d0)'
+# AttachableProcess was the one Terminal type the Services layer imported, and the using it kept also carried
+# PageNumbers into the process-listing parse unseen. Both now live in Wire (AttachableProcess, WireRules.TryUInt).
+$terminalRef = '\bClarionDebugger\.Terminal\b'
+Check 'the service names no ClarionDebugger.Terminal, as a using or a qualified name' `
+  ([regex]::Matches($svcCode, $terminalRef).Count -eq 0) "$([regex]::Matches($svcCode, $terminalRef).Count) reference(s)"
+Check 'CONTROL: that scan finds the using this ticket removed' `
+  ([regex]::Matches((Get-CSharpCodeOnly "using ClarionDebugger.Terminal;`nnamespace X {}"), $terminalRef).Count -eq 1) ''
+# The one uint rule, run: digits only, invariant, no sign or padding, null is not a number.
+$tryU = @(@('4812', $true, 4812), @('4294967295', $true, 4294967295), @('0', $true, 0), @('4294967296', $false, 0),
+  @('-1', $false, 0), @('+1', $false, 0), @(' 1', $false, 0), @('0x10', $false, 0), @('', $false, 0), @($null, $false, 0))
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Globalization;
+public static class TryUIntProbe {
+$wireRules
+  public static bool Run(string s, out uint v) { return WireRules.TryUInt(s, out v); }
+}
+"@ | Out-Null
+$tryUBad = @($tryU | Where-Object { $v = [uint32]0; $ok = [TryUIntProbe]::Run($_[0], [ref] $v); ($ok -ne $_[1]) -or ($ok -and $v -ne $_[2]) } |
+  ForEach-Object { ShowVal $_[0] })
+Check 'WireRules.TryUInt takes plain decimal digits in the DWORD range and nothing else' ($tryUBad.Count -eq 0) ($tryUBad -join ', ')
+
 # THE COUNT, ASSERTED AND PRINTED. This suite ran 222 checks and said only "ALL CHECKS PASSED" - a
 # sentence that is true of 222 checks and equally true of 69, which is what a skipped block actually
 # leaves. cb9324f2 fixed that class in Invoke-CheckSection, and this file - the largest consumer, 192
@@ -2775,7 +2804,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 448
+$EXPECTED_CHECKS = 451
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
