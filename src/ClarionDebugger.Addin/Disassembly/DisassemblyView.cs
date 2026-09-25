@@ -505,10 +505,10 @@ namespace ClarionDebugger.Disassembly
         /// (<see cref="SelectionStep.Stale"/>: it is not newer than the one held), a banner re-read
         /// (Adopted), or a re-seat on its thread (Reseat: a switch or an inventory that moved the selection).
         /// <para>
-        /// NEWER BY EPOCH. The service's epoch rises with every change and never resets for its lifetime, so
-        /// a snapshot that is not newer is one this view already holds or has passed: a duplicate delivered
-        /// both by the event and by a direct read (Bind, a late handle), or an older one queued behind that
-        /// read. A new session's first snapshot is newer than the last one of the session before.
+        /// NEWER BY EPOCH. Epochs come from one counter for the whole process and never reset, so a snapshot
+        /// that is not newer is one this view already holds or has passed: a duplicate delivered both by the
+        /// event and by a direct read (Bind, a late handle), or an older one queued behind that read. A new
+        /// session's first snapshot, or a newly bound service's, is newer than anything before it.
         /// </para>
         /// <para>
         /// A STOP does not re-seat here: OnPaused seats the stop's own address when its event arrives, right
@@ -531,6 +531,9 @@ namespace ClarionDebugger.Disassembly
 
         private void ApplySelection(ThreadSelection s)
         {
+            // Made by a service this view is no longer bound to: queued before a rebind, and delivered after it
+            // (pipeline run 1, debugger L1). It is not this session's selection, whatever its epoch.
+            if (s == null || !ReferenceEquals(s.Source, _svc)) return;
             var step = TakeSelection(ref _selection, s, _seat);
             if (step == SelectionStep.Stale) return;
             UpdateThreadBanner();

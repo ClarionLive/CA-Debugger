@@ -45,11 +45,11 @@ if ($SelfTest) {
        Find = "MoveSelection(pause.Tid, pause.Tid, ThreadSelectionCause.Stop, false);`n                        Paused?.Invoke(pause);";
        Repl = "Paused?.Invoke(pause);`n                        MoveSelection(pause.Tid, pause.Tid, ThreadSelectionCause.Stop, false);" }
     @{ Id = 'S2'; File = 'svc'; Why = 'the epoch resets when a new session launches';
-       Find = "MoveSelection(null, null, ThreadSelectionCause.Ended, true);`n            SetState(DebugSessionState.Launching);";
+       Find = "MoveSelection(null, null, ThreadSelectionCause.Reset, true);`n            SetState(DebugSessionState.Launching);";
        Repl = "lock (_selectionLock) _selection = ThreadSelection.None;`n            SetState(DebugSessionState.Launching);" }
     @{ Id = 'S3'; File = 'svc'; Why = 'the epoch resets when a session ends';
-       Find = 'var candidate = new ThreadSelection(tid, stoppedTid, cur.Epoch + 1, cause);';
-       Repl = 'var candidate = new ThreadSelection(tid, stoppedTid, cause == ThreadSelectionCause.Ended ? 0 : cur.Epoch + 1, cause);' }
+       Find = 'System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);';
+       Repl = 'cause == ThreadSelectionCause.Ended ? 0 : System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);' }
     @{ Id = 'S4'; File = 'svc'; Why = 'a refused switch moves the selection';
        Find = 'if (selOk && WireRules.TidIsKnown(selTid))'; Repl = 'if (WireRules.TidIsKnown(selTid))' }
     @{ Id = 'S5'; File = 'svc'; Why = 'the inventory is ignored';
@@ -61,6 +61,12 @@ if ($SelfTest) {
        Find = 'if (sentEpoch != sel.Epoch) return false;'; Repl = 'if (sentEpoch != sel.Epoch && sentEpoch < 0) return false;' }
     @{ Id = 'S8'; File = 'grants'; Why = 'HostGrants offers for a thread that is not the service''s selection';
        Find = 'if (!WireRules.TidIsKnown(tid) || tid != sel.Tid) return false;'; Repl = 'if (!WireRules.TidIsKnown(tid)) return false;' }
+    @{ Id = 'S10'; File = 'svc'; Why = 'each service counts its own epochs (the counter is per instance)';
+       Find = 'System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);'; Repl = 'cur.Epoch + 1, cause, this);' }
+    @{ Id = 'S11'; File = 'svc'; Why = 'a switch does not keep the stopped thread the selection holds';
+       Find = 'if (cause == ThreadSelectionCause.Switch) stoppedTid = cur.StoppedTid;'; Repl = '' }
+    @{ Id = 'S12'; File = 'svc'; Why = 'a snapshot does not name the service that made it';
+       Find = 'System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);'; Repl = 'System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, null);' }
     @{ Id = 'S9'; File = 'svc'; Why = 'the session end leaves the selection standing';
        Find = "SetState(DebugSessionState.Idle);`n                MoveSelection(null, null, ThreadSelectionCause.Ended, true);";
        Repl = 'SetState(DebugSessionState.Idle);' }
@@ -95,8 +101,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 9 finds + 9 mutations + 1 control
-  Assert-CheckTotal 19
+  # 12 finds + 12 mutations + 1 control
+  Assert-CheckTotal 25
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -229,10 +235,33 @@ $assignRx = '(?<![\w.])_selection\s*=(?!=)'
 $assigns = [regex]::Matches($svcCode, $assignRx)
 $mover = Get-CSharpCodeOnly (Get-Method 'private void MoveSelection(uint? tid, uint? stoppedTid, ThreadSelectionCause cause, bool onlyIfChanged)' (Get-Content -Raw -LiteralPath $ServicePath))
 Check 'the service assigns _selection in exactly two places: its declaration and MoveSelection' `
-  (($assigns.Count -eq 2) -and ($svcCode -match 'private ThreadSelection _selection = ThreadSelection\.None;') -and ($mover -match '_selection = next = candidate;')) `
+  (($assigns.Count -eq 2) -and ($svcCode -match 'private ThreadSelection _selection = ThreadSelection\.None;') -and ($mover -match '_selection = next = new ThreadSelection\(')) `
   "$($assigns.Count) assignment(s)"
 Check 'CONTROL: that scan sees a reset written elsewhere' ([regex]::Matches((Get-CSharpCodeOnly 'lock (_selectionLock) _selection = ThreadSelection.None;'), $assignRx).Count -eq 1) ''
-Check 'and MoveSelection''s epoch is the previous one + 1, whatever the cause' ($mover -match 'new ThreadSelection\(tid, stoppedTid, cur\.Epoch \+ 1, cause\)') ''
+Check 'and MoveSelection draws every epoch from the one process-wide counter, naming itself as the source' `
+  ($mover -match 'new ThreadSelection\(tid, stoppedTid,\s*System\.Threading\.Interlocked\.Increment\(ref s_selectionEpoch\), cause, this\)') ''
+# A NEW SESSION is a Reset, not an End: Launch is not driven here (it starts an engine), so its one call is pinned.
+Check 'Launch clears the selection as a Reset, before it reports Launching' `
+  ((Get-CSharpCodeOnly (Get-Content -Raw -LiteralPath $ServicePath)) -match 'MoveSelection\(null, null, ThreadSelectionCause\.Reset, true\);\s*SetState\(DebugSessionState\.Launching\);') ''
+
+# ONE COUNTER FOR THE PROCESS (pipeline run 1, debugger L1). The Disassembly view outlives a service: when a
+# different one becomes active it is rebound, and a counter per service would start the new one's epochs at 1,
+# below a snapshot the view took from the old one. So a second service's first change is newer than every
+# change the first one made, however many that was.
+$a = New-Object ClarionDebugger.Terminal.SelectionDriver
+foreach ($i in 1..5) { $a.Line((Paused 4812)); $a.Line((Picked 9001 $true)) }
+$aLast = $a.Snaps[$a.Snaps.Count - 1].Epoch
+$b2 = New-Object ClarionDebugger.Terminal.SelectionDriver
+$b2.Line((Paused 7000))
+$bFirst = $b2.Snaps[0]
+Check 'a second service''s first change has a higher epoch than the first service''s last' ($bFirst.Epoch -gt $aLast) "first service last #$aLast, second service first #$($bFirst.Epoch)"
+Check 'and each snapshot names the service that made it' `
+  ([object]::ReferenceEquals($bFirst.Source, $b2.Svc) -and [object]::ReferenceEquals($a.Snaps[0].Source, $a.Svc)) ''
+# A SWITCH KEEPS THE STOPPED THREAD it finds under the lock (code-reviewer NIT): the caller no longer passes one
+# in, read outside the lock, where a concurrent end could have cleared it a moment before.
+Check 'the threadselected arm passes no stopped thread; MoveSelection keeps it, first thing under the lock' `
+  (((Get-CSharpCodeOnly (Get-Content -Raw -LiteralPath $ServicePath)) -match 'MoveSelection\(selTid, null, ThreadSelectionCause\.Switch, false\);') -and `
+   ($mover -match 'lock \(_selectionLock\)\s*\{\s*var cur = _selection;\s*if \(cause == ThreadSelectionCause\.Switch\) stoppedTid = cur\.StoppedTid;')) ''
 
 # ------------------------------------------------------------------------------------------------------------
 Write-Host ''
@@ -255,7 +284,7 @@ Check 'a selection that moved away and BACK retires the request: same thread, sa
 $idD = $g.AskStack()
 Check 'CONTROL: a request sent under the current selection offers' ($g.Offer(7000, $idD)) ''
 
-Assert-CheckTotal 23
+Assert-CheckTotal 27
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"
