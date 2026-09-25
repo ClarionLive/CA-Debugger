@@ -113,7 +113,6 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
-            _svc.SelectionChanged      += OnSvcSelectionChanged;
             _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
@@ -266,7 +265,6 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
-            _svc.SelectionChanged       -= OnSvcSelectionChanged;
             _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
@@ -314,7 +312,9 @@ namespace ClarionDebugger.Terminal
         // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
         // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
         // emit 'resumed', so they leave the marker alone.
-        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        // The selection epoch is read HERE, on the thread that raised the event, so the clear retires what was issued
+        // before this resume and spares anything a newer stop has issued by the time the marshalled clear runs.
+        private void OnSvcResumed(string mode) { int epoch = _svc.Selection.Epoch; UI(() => { _editGrants.Resumed(epoch); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); }); }
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames, uint? tid, string reqId) => UI(() => OnStack(frames, tid, reqId));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
@@ -323,9 +323,11 @@ namespace ClarionDebugger.Terminal
         // Each of the three row replies GRANTS its editable rows before it posts them (afbc68c7): these are the
         // rows whose address/type tuple the page may later send back in an edit, and EditVar honours only a
         // tuple issued here. An expanded reference carries no tid, so its rows are granted unscoped.
-        private void OnSvcModuleData(string module, string itemsJson, uint? tid) => UI(() =>
+        // Only a reply to a moduledata the host sent in the current epoch may grant (3517fd15): one delayed past
+        // a resume and a new stop, or from an engine that echoes no id, is posted for display and grants nothing.
+        private void OnSvcModuleData(string module, string itemsJson, uint? tid, string reqId) => UI(() =>
         {
-            _editGrants.GrantRows(itemsJson, tid);
+            if (_editGrants.ReadAnswered(reqId)) _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
         });
 
@@ -356,13 +358,9 @@ namespace ClarionDebugger.Terminal
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
-        // A stop and a switch clear the grants in their own handlers. An inventory that MOVED the selection (the
-        // engine's selection was not the one the host held) has no handler of its own that clears, and every row
-        // on screen is then the old thread's.
-        private void OnSvcSelectionChanged(ThreadSelection s) => UI(() =>
-        {
-            if (s.Cause == ThreadSelectionCause.Inventory) _editGrants.Clear();
-        });
+        // No handler clears the grants when the selection moves (a stop, a switch, an inventory that disagreed):
+        // the grant table observes the service's epoch on every call and retires itself (EditGrants.Sync, 3517fd15).
+        // The clears it replaced ran marshalled, behind a request the UI thread could bind first (debugger L2).
         // The tid here is the thread that was ASKED FOR, and a malformed request carries none — so it is
         // forwarded through TidJson, which OMITS the member rather than writing a 0 the page would read as
         // a real thread id. On a refusal the engine's selection is unchanged; the page keeps the selection
@@ -370,8 +368,8 @@ namespace ClarionDebugger.Terminal
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
             // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
-            // Only the new thread's stack replies may offer frames from here on (the service moved the selection).
-            if (ok) _editGrants.Clear();
+            // The grant table has retired the old thread's rows by itself: the service moved the selection's epoch
+            // before raising this, and the table checks it on every call (EditGrants.Sync).
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
@@ -716,7 +714,7 @@ namespace ClarionDebugger.Terminal
                     // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
                     case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
                     case "stack": if (_svc.State == DebugSessionState.Paused) RequestStack(); break;
-                    case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
+                    case "moduledata": if (_svc.State == DebugSessionState.Paused) RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;
                     case "rewatch":
                         // Re-resolve EVERY watched name against the newly selected thread. Host-side rather
@@ -1553,8 +1551,9 @@ namespace ClarionDebugger.Terminal
             {
                 // A new stop: nothing on screen is current any more, and the replies requested below re-grant
                 // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
-                // the selected one; the service has already moved its selection there.
-                _editGrants.Clear();
+                // the selected one; the service has already moved its selection there, with a new epoch - and
+                // that retires every old grant, offer and outstanding request the moment the table is next
+                // touched, which is the first request below at the latest (EditGrants.Sync, 3517fd15).
 
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
@@ -1596,7 +1595,7 @@ namespace ClarionDebugger.Terminal
                 NoteStopSource(p);
                 SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
                 RequestStack();               // per-frame locals now load lazily from the Call Stack (frame 0 auto)
-                _svc.RequestModuleData();
+                RequestModuleData();
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
                 // so this also tells the page which thread the panels it is about to receive belong to.
                 _svc.RequestThreads();
@@ -1746,9 +1745,14 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(name)) return;
             string why = null;
             if (!ClarionDebuggerService.IsValidWatchName(name))
-                why = "not a data name the debugger can read — letters, digits and _ : $ . ! @ only, up to 128 characters";
-            else if (!_svc.Watch(name))
-                why = "the engine did not accept the request";
+                why = "not a data name the debugger can read — letters, digits and _ : $ . ! @ - only, up to 128 characters";
+            else
+            {
+                // Under a fresh id, recorded once sent: only a reply echoing it may grant its row (OnWatch).
+                string id = _editGrants.NewRequestId();
+                if (_svc.Watch(name, id)) _editGrants.ReadRequested(id);
+                else why = "the engine did not accept the request";
+            }
             if (why == null) return;
             Post("{\"type\":\"watch\",\"name\":" + Str(name) + ",\"found\":false,\"outOfScope\":false,\"error\":"
                 + Str(why) + "}");
@@ -1758,8 +1762,16 @@ namespace ClarionDebugger.Terminal
         /// current epoch once sent: only a reply echoing a recorded id may offer frames (EditGrants.OfferFrames).</summary>
         private void RequestStack()
         {
-            string id = _editGrants.NewStackRequestId();
+            string id = _editGrants.NewRequestId();
             if (_svc.RequestStack(id)) _editGrants.StackRequested(id);
+        }
+
+        /// <summary>Ask the engine for the module-scope data under a fresh request id, recorded for the current epoch
+        /// once sent: only a reply echoing a recorded id may grant its rows (OnSvcModuleData, 3517fd15).</summary>
+        private void RequestModuleData()
+        {
+            string id = _editGrants.NewRequestId();
+            if (_svc.RequestModuleData(id)) _editGrants.ReadRequested(id);
         }
 
         private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)
@@ -1792,8 +1804,11 @@ namespace ClarionDebugger.Terminal
         {
             var sb = new StringBuilder("{\"type\":\"watch\",\"name\":").Append(Str(w.Name))
                 .Append(",\"found\":").Append(w.Found ? "true" : "false");
-            // The one row reply the host builds itself; it grants its tuple the way the engine-row replies do.
-            if (w.Found) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
+            // The one row reply the host builds itself; it grants its tuple the way the engine-row replies do, and
+            // only when it answers a watch this host sent in the current epoch (3517fd15). A miss answers its
+            // request too, so the id is spent on either outcome; a reply with no id is shown and grants nothing.
+            bool mayGrant = _editGrants.ReadAnswered(w.ReqId);
+            if (w.Found && mayGrant) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
             if (w.Found)
                 sb.Append(",\"value\":").Append(Str(w.Value))
                   .Append(",\"typeName\":").Append(Str(w.TypeName))

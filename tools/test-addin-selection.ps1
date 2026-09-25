@@ -1,6 +1,7 @@
 # The host's ONE selected thread (49538b78 item 8b, Owner decision 3, 2026-09-24).
 #
 #   pwsh -NoProfile -File tools\test-addin-selection.ps1 [-ServicePath <ClarionDebuggerService.cs>] [-HostGrantsPath <HostGrants.cs>]
+#        [-WebViewPath <ClarionDebuggerWebView.cs>]
 #   pwsh -NoProfile -File tools\test-addin-selection.ps1 -SelfTest
 # Exit code 0 = all checks passed.
 #
@@ -15,6 +16,11 @@
 # reads the real service's Selection. The Disassembly view's half (TakeSelection, ApplySelection) is run in
 # tools/test-disasm-seat.ps1 section 6.
 #
+# Section 4 (3517fd15, contract C1) is the grant table's other half: a watch or moduledata reply GRANTS an edit
+# only when it echoes a request id the pad sent in the current selection epoch. The pad's real request writers and
+# reply handlers are lifted out of ClarionDebuggerWebView.cs and run over the real service's OnLine, fed the
+# engine's reply in the contract's literal shape.
+#
 # NOT COVERED: Launch itself (it starts an engine process). Its selection reset is pinned by the single-writer
 # scan below, which a reset written anywhere in the service fails. Anything live.
 #
@@ -24,6 +30,7 @@ param(
   # Defaulted in the body: Windows PowerShell 5.1 leaves $PSScriptRoot empty in this block.
   [string] $ServicePath = '',
   [string] $HostGrantsPath = '',
+  [string] $WebViewPath = '',
   [switch] $SelfTest
 )
 
@@ -32,6 +39,7 @@ $ErrorActionPreference = 'Stop'
 $root = Join-Path $PSScriptRoot '..'
 if (-not $ServicePath) { $ServicePath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs' }
 if (-not $HostGrantsPath) { $HostGrantsPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\HostGrants.cs' }
+if (-not $WebViewPath) { $WebViewPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs' }
 $others = @('Services\RedFileService.cs', 'Services\ClarionVersionService.cs', 'Wire\JsonMessageReader.cs', 'Wire\WireRules.cs',
   'Wire\AttachableProcess.cs', 'Terminal\PageMessages.cs') | ForEach-Object { Join-Path $root ('src\ClarionDebugger.Addin\' + $_) }
 
@@ -57,8 +65,8 @@ if ($SelfTest) {
     @{ Id = 'S6'; File = 'svc'; Why = 'an agreeing inventory still raises a change';
        Find = 'MoveSelection(InventorySelection(tl), tl.StoppedTid, ThreadSelectionCause.Inventory, true);';
        Repl = 'MoveSelection(InventorySelection(tl), tl.StoppedTid, ThreadSelectionCause.Inventory, false);' }
-    @{ Id = 'S7'; File = 'grants'; Why = 'HostGrants offers on a stale selection epoch';
-       Find = 'if (sentEpoch != sel.Epoch) return false;'; Repl = 'if (sentEpoch != sel.Epoch && sentEpoch < 0) return false;' }
+    @{ Id = 'S7'; File = 'grants'; Why = 'the grant table does not retire itself when the selection moves (Sync)';
+       Find = 'if (now == _epoch) return;'; Repl = 'if (now == _epoch || now > 0) return;' }
     @{ Id = 'S8'; File = 'grants'; Why = 'HostGrants offers for a thread that is not the service''s selection';
        Find = 'if (!WireRules.TidIsKnown(tid) || tid != sel.Tid) return false;'; Repl = 'if (!WireRules.TidIsKnown(tid)) return false;' }
     @{ Id = 'S10'; File = 'svc'; Why = 'each service counts its own epochs (the counter is per instance)';
@@ -67,6 +75,28 @@ if ($SelfTest) {
        Find = 'if (cause == ThreadSelectionCause.Switch) stoppedTid = cur.StoppedTid;'; Repl = '' }
     @{ Id = 'S12'; File = 'svc'; Why = 'a snapshot does not name the service that made it';
        Find = 'System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);'; Repl = 'System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, null);' }
+    @{ Id = 'G1'; File = 'grants'; Why = 'a watch/moduledata reply grants for an id the pad never sent, or already spent';
+       Find = 'return reqId != null && _readIds.Remove(reqId);'; Repl = 'return reqId != null;' }
+    @{ Id = 'G2'; File = 'grants'; Why = 'a reply with no reqId (an older engine) grants';
+       Find = 'return reqId != null && _readIds.Remove(reqId);'; Repl = 'return reqId == null || _readIds.Remove(reqId);' }
+    @{ Id = 'G3'; File = 'grants'; Why = 'a resume spares what its own epoch issued';
+       Find = 'if (epoch < _epoch) return;'; Repl = 'if (epoch <= _epoch) return;' }
+    @{ Id = 'G4'; File = 'grants'; Why = 'a resume retires what a NEWER epoch has already issued';
+       Find = 'if (epoch < _epoch) return;'; Repl = 'if (epoch < _epoch && epoch < 0) return;' }
+    @{ Id = 'W1'; File = 'web'; Why = 'OnWatch grants a found reply whatever request it answers';
+       Find = 'if (w.Found && mayGrant)'; Repl = 'if (w.Found)' }
+    @{ Id = 'W2'; File = 'web'; Why = 'OnSvcModuleData grants whatever request it answers';
+       Find = 'if (_editGrants.ReadAnswered(reqId)) _editGrants.GrantRows(itemsJson, tid);'; Repl = '_editGrants.ReadAnswered(reqId); _editGrants.GrantRows(itemsJson, tid);' }
+    @{ Id = 'W3'; File = 'web'; Why = 'WatchOrExplain does not record the id it sent';
+       Find = 'if (_svc.Watch(name, id)) _editGrants.ReadRequested(id);'; Repl = 'if (_svc.Watch(name, id)) { }' }
+    @{ Id = 'W4'; File = 'web'; Why = 'RequestModuleData does not record the id it sent';
+       Find = 'if (_svc.RequestModuleData(id)) _editGrants.ReadRequested(id);'; Repl = 'if (_svc.RequestModuleData(id)) { }' }
+    @{ Id = 'W5'; File = 'web'; Why = 'the resume reads its epoch inside the marshal, where a newer stop''s can already be';
+       Find = 'int epoch = _svc.Selection.Epoch; UI(() => { _editGrants.Resumed(epoch);'; Repl = 'UI(() => { int epoch = _svc.Selection.Epoch; _editGrants.Resumed(epoch);' }
+    @{ Id = 'V1'; File = 'svc'; Why = 'the service drops the moduledata reply''s reqId';
+       Find = "GetUIntOrNull(json, `"tid`"),`n                                               GetStr(json, `"reqId`"));"; Repl = 'GetUIntOrNull(json, "tid"), null);' }
+    @{ Id = 'V2'; File = 'svc'; Why = 'ParseWatch drops the watch reply''s reqId';
+       Find = 'w.ReqId = GetStr(json, "reqId");'; Repl = '' }
     @{ Id = 'S9'; File = 'svc'; Why = 'the session end leaves the selection standing';
        Find = "SetState(DebugSessionState.Idle);`n                MoveSelection(null, null, ThreadSelectionCause.Ended, true);";
        Repl = 'SetState(DebugSessionState.Idle);' }
@@ -74,7 +104,7 @@ if ($SelfTest) {
   $base = Join-Path ([IO.Path]::GetTempPath()) ('selection-selftest-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $base | Out-Null
   try {
-    $src = @{ svc = $ServicePath; grants = $HostGrantsPath }
+    $src = @{ svc = $ServicePath; grants = $HostGrantsPath; web = $WebViewPath }
     $runs = @()
     foreach ($m in $M) {
       $dir = Join-Path $base $m.Id; New-Item -ItemType Directory -Path $dir | Out-Null
@@ -92,7 +122,8 @@ if ($SelfTest) {
     $runs += @{ Id = 'CONTROL'; Why = 'unmutated copies' }
     foreach ($r in $runs) {
       $d = Join-Path $base $r.Id
-      $out = & pwsh -NoProfile -File $PSCommandPath -ServicePath (Join-Path $d 'ClarionDebuggerService.cs') -HostGrantsPath (Join-Path $d 'HostGrants.cs') 2>&1
+      $out = & pwsh -NoProfile -File $PSCommandPath -ServicePath (Join-Path $d 'ClarionDebuggerService.cs') -HostGrantsPath (Join-Path $d 'HostGrants.cs') `
+        -WebViewPath (Join-Path $d 'ClarionDebuggerWebView.cs') 2>&1
       $code = $LASTEXITCODE
       $passed = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
       $compiled = [bool](@($out) -match '^compiled the service and the grant table$')
@@ -101,8 +132,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 12 finds + 12 mutations + 1 control
-  Assert-CheckTotal 25
+  # 23 finds + 23 mutations + 1 control
+  Assert-CheckTotal 47
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -110,10 +141,30 @@ if ($SelfTest) {
 }
 
 # ================================================================================================ compile
+# The pad's grant half, lifted out of the WebView as it ships (section 4). An arrow handler brace-matches to its
+# lambda's closing brace; the `);` that closes UI( is put back.
+$web = Get-Content -Raw -LiteralPath $WebViewPath
+$liftTidNames = @('private const string TidMemberTid', 'private const string TidMemberStopped', 'private const string TidMemberSelected',
+  'private static readonly string[] TidValuedMemberNames') | ForEach-Object { Get-Statement $_ $web }
+$lifted = @(
+  (Get-Method 'private static string Str(string s)' $web),
+  (Get-Method 'private static string TidJson(uint? tid)' $web),
+  (Get-Method 'private static string TidMember(string name, uint? tid)' $web),
+  (($liftTidNames) -join "`n"),
+  ((Get-Method 'private void WatchOrExplain(string name)' $web) -replace '^private void', 'public void'),
+  ((Get-Method 'private void RequestModuleData()' $web) -replace '^private void', 'public void'),
+  ((Get-Method 'private void RequestStack()' $web) -replace '^private void', 'public void'),
+  (Get-Method 'private void OnWatch(DebugWatch w)' $web),
+  ((Get-Method 'private void OnSvcModuleData(' $web) + ');'),
+  (Get-Method 'private void OnSvcResumed(string mode)' $web)
+) -join "`n"
 $probe = @"
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
 using ClarionDebugger.Services;
+using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Terminal
 {
@@ -136,10 +187,51 @@ namespace ClarionDebugger.Terminal
     public void Line(string json) { _onLine.Invoke(Svc, new object[] { null, "@JSON " + json }); }
     public string Current { get { var s = Svc.Selection; return s.Cause + ":" + T(s.Tid) + "/" + T(s.StoppedTid) + "#" + s.Epoch; } }
     // The grant table, reading this service's selection.
-    public string AskStack() { string id = _grants.NewStackRequestId(); _grants.StackRequested(id); return id; }
+    public string AskStack() { string id = _grants.NewRequestId(); _grants.StackRequested(id); return id; }
     public bool Offer(uint tid, string id) {
       return _grants.OfferFrames(tid, id, new[] { new KeyValuePair<string, string>("0x402000", "0x19FF40") });
     }
+  }
+
+  // What the lifted request writers call as _svc: the service's SENDING side, recorded (SendCommand needs an engine
+  // process), and its selection, read from the real service. Every reply comes through the real service's OnLine.
+  public sealed class PadSvc {
+    private readonly ClarionDebuggerService _real;
+    public PadSvc(ClarionDebuggerService real) { _real = real; }
+    public ThreadSelection Selection { get { return _real.Selection; } }
+    public string LastWatchId, LastModuleDataId, LastStackId;
+    public bool Watch(string name, string reqId) { LastWatchId = reqId; return true; }
+    public bool RequestModuleData(string reqId) { LastModuleDataId = reqId; return true; }
+    public bool RequestStack(string reqId) { LastStackId = reqId; return true; }
+  }
+
+  // The pad's grant half over the real service and the real EditGrants. UI() runs at once, or - with Hold - waits
+  // in Queue, as a BeginInvoke waits behind whatever the UI thread is doing.
+  public sealed class GrantPad {
+    public readonly SelectionDriver D = new SelectionDriver();
+    public readonly PadSvc _svc;
+    private readonly EditGrants _editGrants;
+    public readonly List<string> Posts = new List<string>();
+    public bool Hold;
+    public readonly List<Action> Queue = new List<Action>();
+    private DebugPause _stopSource;
+    public GrantPad() {
+      _svc = new PadSvc(D.Svc);
+      _editGrants = new EditGrants(() => D.Svc.Selection);
+      D.Svc.WatchReceived += w => UI(() => OnWatch(w));   // OnSvcWatch, whose one line is pinned below
+      D.Svc.ModuleDataReceived += OnSvcModuleData;
+      D.Svc.Resumed += OnSvcResumed;
+    }
+    public void Drain() { var q = new List<Action>(Queue); Queue.Clear(); foreach (var a in q) a(); }
+    private void UI(Action a) { if (Hold) Queue.Add(a); else a(); }
+    private void Post(string s) { Posts.Add(s); }
+    private void Console(string level, string text) { }
+    private void ClearExecutionLineIfHooked() { }
+    public bool Granted(string va, uint tid) { return _editGrants.IsGranted(va, "0x03", 4, 0, tid); }
+    public bool Offer(uint tid, string id) {
+      return _editGrants.OfferFrames(tid, id, new[] { new KeyValuePair<string, string>("0x402000", "0x19FF40") });
+    }
+    $lifted
   }
 }
 "@
@@ -150,7 +242,7 @@ try {
   Add-Type -Path ($paths + $tmp) -IgnoreWarnings -WarningAction SilentlyContinue -ReferencedAssemblies @(
     'System.Xml', 'System.Xml.ReaderWriter', 'System.Diagnostics.Process', 'System.Diagnostics.FileVersionInfo',
     'System.ComponentModel.Primitives', 'System.Text.RegularExpressions', 'System.Collections', 'System.Linq',
-    'System.Threading', 'System.Threading.Thread', 'System.Runtime.InteropServices') | Out-Null
+    'System.Threading', 'System.Threading.Thread', 'System.Runtime.InteropServices', 'System.Diagnostics.Debug') | Out-Null
 } finally { Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue }
 # Printed so the self-test can tell "a check caught the mutant" from "the mutant never compiled".
 Write-Host 'compiled the service and the grant table'
@@ -162,6 +254,17 @@ function Threads { param($stopped, $selected)
 function Picked { param($tid, [bool] $ok) '{"event":"threadselected","tid":' + $tid + ',"ok":' + $(if ($ok) { 'true' } else { 'false' }) + ',"error":null}' }
 function Events { param($d) $d.Events -join ' , ' }
 function Since { param($d, [int] $from) @($d.Events | Select-Object -Skip $from) -join ' , ' }
+# The engine's watch and moduledata replies, in the contract's literal shape (C1): "reqId" is a STRING member,
+# present only when the request carried reqid=N.
+function IdMember { param($reqId) if ($null -ne $reqId) { ',"reqId":"' + $reqId + '"' } else { '' } }
+function WatchHit { param($tid, $reqId, [string] $va = '0x4A10F0')
+  '{"event":"watch","name":"GLO:X","found":true,"threaded":false,"typeName":"LONG","value":"5","va":"' + $va + '","type":"0x03","size":4,"places":0,"tid":' + $tid + (IdMember $reqId) + '}'
+}
+function WatchMiss { param($tid, $reqId) '{"event":"watch","name":"GLO:X","found":false,"outOfScope":false,"error":null,"tid":' + $tid + (IdMember $reqId) + '}' }
+function ModData { param($tid, $reqId, [string] $va = '0x4A2200')
+  '{"event":"moduledata","module":"clbrws011.clw","items":[{"name":"G:X","type":"LONG","value":"1","va":"' + $va + '","typeCode":"0x03","size":4,"places":0}],"tid":' + $tid + (IdMember $reqId) + '}'
+}
+function Resumed { '{"event":"resumed","mode":"continue"}' }
 
 # ------------------------------------------------------------------------------------------------------------
 Write-Host ''
@@ -284,7 +387,111 @@ Check 'a selection that moved away and BACK retires the request: same thread, sa
 $idD = $g.AskStack()
 Check 'CONTROL: a request sent under the current selection offers' ($g.Offer(7000, $idD)) ''
 
-Assert-CheckTotal 27
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '4. a watch or moduledata reply grants only for a request the pad sent in this epoch (3517fd15, contract C1)'
+$p = New-Object ClarionDebugger.Terminal.GrantPad
+$p.D.Line((Paused 4812))
+$p.WatchOrExplain('GLO:X'); $w1 = $p._svc.LastWatchId
+$p.D.Line((WatchHit 4812 $w1))
+Check 'CONTROL: the reply to the watch the pad sent in this epoch grants its row' ($p.Granted('0x4A10F0', 4812)) "id=$w1"
+$p.D.Line((WatchHit 4812 $w1 '0x4A10F4'))
+Check 'the same id answered twice grants once: an answered id is spent' (-not $p.Granted('0x4A10F4', 4812)) ''
+$p.D.Line((WatchHit 4812 '999999' '0x4A10F8'))
+Check 'an id the pad never sent grants nothing' (-not $p.Granted('0x4A10F8', 4812)) ''
+$n = $p.Posts.Count
+$p.D.Line((WatchHit 4812 $null '0x4A10FC'))
+Check 'a reply with NO reqId (an engine older than the echo) grants nothing' (-not $p.Granted('0x4A10FC', 4812)) ''
+Check '...and is still shown: the value is posted, read-only' (($p.Posts.Count -eq $n + 1) -and ($p.Posts[$n] -cmatch '"found":true,"value":"5"')) (($p.Posts | Select-Object -Skip $n) -join ' / ')
+$p.WatchOrExplain('GLO:X'); $wMiss = $p._svc.LastWatchId
+$p.D.Line((WatchMiss 4812 $wMiss))
+$p.D.Line((WatchHit 4812 $wMiss '0x4A1100'))
+Check 'a MISS answers its request too: a hit echoing that id afterwards grants nothing' (-not $p.Granted('0x4A1100', 4812)) ''
+
+# THE CODEX SCENARIO: a watch reply delayed past a resume and the next stop, on the same thread.
+$r = New-Object ClarionDebugger.Terminal.GrantPad
+$r.D.Line((Paused 4812))
+$r.WatchOrExplain('GLO:X'); $old = $r._svc.LastWatchId
+$r.D.Line((Resumed))
+$r.D.Line((Paused 4812))
+$r.WatchOrExplain('GLO:X'); $new = $r._svc.LastWatchId
+$r.D.Line((WatchHit 4812 $old))
+Check 'an OLD watch reply, after a resume and a new stop on the same thread, grants nothing' (-not $r.Granted('0x4A10F0', 4812)) "old=$old new=$new"
+$r.D.Line((WatchHit 4812 $new))
+Check 'CONTROL: the new stop''s own reply grants' ($r.Granted('0x4A10F0', 4812)) "new=$new"
+
+# An id from an OLDER epoch of the same stop: the selection moved under it, with no resume.
+$e = New-Object ClarionDebugger.Terminal.GrantPad
+$e.D.Line((Paused 4812))
+$e.WatchOrExplain('GLO:X'); $pre = $e._svc.LastWatchId
+$e.D.Line((Threads 4812 9001))
+$e.D.Line((WatchHit 9001 $pre))
+Check 'an id from before an inventory moved the selection grants nothing, whatever thread its reply names' (-not $e.Granted('0x4A10F0', 9001)) "id=$pre"
+$e.WatchOrExplain('GLO:X'); $pre2 = $e._svc.LastWatchId
+$e.D.Line((Picked 7000 $true))
+$e.D.Line((WatchHit 7000 $pre2))
+Check 'and so does one from before an accepted switch' (-not $e.Granted('0x4A10F0', 7000)) "id=$pre2"
+
+# moduledata: the same rule, through the real request writer and the real reply handler.
+$m = New-Object ClarionDebugger.Terminal.GrantPad
+$m.D.Line((Paused 4812))
+$m.RequestModuleData(); $m1 = $m._svc.LastModuleDataId
+$m.D.Line((ModData 4812 $m1))
+Check 'CONTROL: the moduledata reply to this epoch''s request grants its rows' ($m.Granted('0x4A2200', 4812)) "id=$m1"
+$m.RequestModuleData(); $mOld = $m._svc.LastModuleDataId
+$m.D.Line((Resumed)); $m.D.Line((Paused 4812))
+$m.D.Line((ModData 4812 $mOld '0x4A2204'))
+Check 'an OLD moduledata reply, after a resume and a new stop, grants nothing' (-not $m.Granted('0x4A2204', 4812)) "id=$mOld"
+$n = $m.Posts.Count
+$m.D.Line((ModData 4812 $null '0x4A2208'))
+Check 'a moduledata reply with no reqId grants nothing, and is still posted' `
+  ((-not $m.Granted('0x4A2208', 4812)) -and ($m.Posts.Count -eq $n + 1) -and ($m.Posts[$n] -cmatch '"type":"moduledata"')) (($m.Posts | Select-Object -Skip $n) -join ' / ')
+
+# A RESUME moves no selection, so the table cannot see it; the pad's resume handler retires it - including what
+# was issued in the epoch it resumed from.
+$s = New-Object ClarionDebugger.Terminal.GrantPad
+$s.D.Line((Paused 4812))
+$s.WatchOrExplain('GLO:X'); $sw = $s._svc.LastWatchId
+$s.D.Line((WatchHit 4812 $sw))
+$s.WatchOrExplain('GLO:X'); $late = $s._svc.LastWatchId
+$s.D.Line((Resumed))
+Check 'a resume retires the grants its own stop issued' (-not $s.Granted('0x4A10F0', 4812)) ''
+$s.D.Line((WatchHit 4812 $late '0x4A1200'))
+Check 'and a reply arriving after the resume, before any stop, grants nothing' (-not $s.Granted('0x4A1200', 4812)) "id=$late"
+
+# ORDER (debugger L2, wave 6): a marshalled clear must not wipe what the UI thread recorded before it ran. The
+# resume's clear is the one marshalled clear left, so it names the epoch it was raised in: a stop that followed
+# it, and a request bound under that stop before the clear ran, survive it.
+$o = New-Object ClarionDebugger.Terminal.GrantPad
+$o.D.Line((Paused 4812))
+$o.Hold = $true
+$o.D.Line((Resumed))                    # the resume's clear waits behind the UI thread...
+$o.D.Line((Paused 4812))                # ...the next stop arrives...
+$o.Hold = $false
+$o.RequestModuleData(); $oid = $o._svc.LastModuleDataId   # ...and the page's request runs first
+$o.WatchOrExplain('GLO:X'); $owid = $o._svc.LastWatchId
+$o.RequestStack(); $osid = $o._svc.LastStackId
+$o.Drain()
+$o.D.Line((ModData 4812 $oid)); $o.D.Line((WatchHit 4812 $owid))
+Check 'a resume''s queued clear does not retire requests the NEXT stop bound before it ran' `
+  ($o.Granted('0x4A2200', 4812) -and $o.Granted('0x4A10F0', 4812)) "moduledata=$oid watch=$owid"
+Check '...stack included: its reply still offers frames' ($o.Offer(4812, $osid)) "id=$osid"
+# The selection moves (a stop, a switch, an inventory) have no marshalled clear at all: the table sees the move.
+$l = New-Object ClarionDebugger.Terminal.GrantPad
+$l.D.Line((Paused 4812))
+$l.Hold = $true
+$l.D.Line((Threads 4812 9001))          # an inventory moves the selection while the UI thread is busy
+$l.Hold = $false
+$l.RequestStack(); $lid = $l._svc.LastStackId
+$l.RequestModuleData(); $lmid = $l._svc.LastModuleDataId
+$l.Drain()
+$l.D.Line((ModData 9001 $lmid))
+Check 'a request bound after an inventory moved the selection is answered, with nothing queued to wipe it' `
+  ($l.Offer(9001, $lid) -and $l.Granted('0x4A2200', 9001)) "stack=$lid moduledata=$lmid"
+Check 'the pad wires the watch reply exactly as OnSvcWatch does: marshal, then OnWatch' `
+  ((Get-CSharpCodeOnly $web) -match 'private void OnSvcWatch\(DebugWatch w\) => UI\(\(\) => OnWatch\(w\)\);') ''
+
+Assert-CheckTotal 46
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"
