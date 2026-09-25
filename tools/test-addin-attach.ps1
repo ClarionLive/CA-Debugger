@@ -35,6 +35,7 @@ param(
   [string] $AttachableProcessPath = '',
   [string] $HostGrantsPath = '',
   [string] $ReaderPath = '',
+  [string] $WireRulesPath = '',
   [string] $RedPath = '',
   [string] $VersionPath = '',
   [string] $EngineJsonPath = '',
@@ -57,7 +58,8 @@ if (-not $WebViewPath) { $WebViewPath = Join-Path $root 'src\ClarionDebugger.Add
 if (-not $PageMessagesPath) { $PageMessagesPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\PageMessages.cs' }
 if (-not $AttachableProcessPath) { $AttachableProcessPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\AttachableProcess.cs' }
 if (-not $HostGrantsPath) { $HostGrantsPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\HostGrants.cs' }
-if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs' }
+if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\JsonMessageReader.cs' }
+if (-not $WireRulesPath) { $WireRulesPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\WireRules.cs' }
 if (-not $RedPath) { $RedPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\RedFileService.cs' }
 if (-not $VersionPath) { $VersionPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionVersionService.cs' }
 if (-not $EngineJsonPath) { $EngineJsonPath = Join-Path $root 'src\ClarionDbg.Cli\Json.cs' }
@@ -73,7 +75,7 @@ if (-not $PagePath) { $PagePath = Join-Path $root 'src\ClarionDebugger.Addin\Ter
 # unmutated copies and must pass, which is what makes a red run mean the mutation and not the harness.
 if ($SelfTest) {
   $sources = [ordered]@{
-    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; attproc = $AttachableProcessPath; grants = $HostGrantsPath; reader = $ReaderPath; red = $RedPath
+    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; attproc = $AttachableProcessPath; grants = $HostGrantsPath; reader = $ReaderPath; wirerules = $WireRulesPath; red = $RedPath
     version = $VersionPath; json = $EngineJsonPath; procs = $ProcsCommandPath; pcheck = $ProtocolCheckPath; page = $PagePath
   }
   $M = @(
@@ -175,7 +177,7 @@ if ($SelfTest) {
         $f = { param($name) Join-Path $dir ([IO.Path]::GetFileName(($using:sources)[$name])) }
         if ($r.Suite -eq 'ps') {
           $out = & pwsh -NoProfile -File $using:self -ServicePath (& $f 'service') -WebViewPath (& $f 'web') `
-            -PageMessagesPath (& $f 'msgs') -AttachableProcessPath (& $f 'attproc') -HostGrantsPath (& $f 'grants') -ReaderPath (& $f 'reader') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
+            -PageMessagesPath (& $f 'msgs') -AttachableProcessPath (& $f 'attproc') -HostGrantsPath (& $f 'grants') -ReaderPath (& $f 'reader') -WireRulesPath (& $f 'wirerules') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
             -EngineJsonPath (& $f 'json') -ProcsCommandPath (& $f 'procs') -ProtocolCheckPath (& $f 'pcheck') -PagePath (& $f 'page') -PendingStartedOk 2>&1
           $ok = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
         } else {
@@ -364,7 +366,7 @@ namespace ClarionDebugger.Terminal
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('attach-probe-' + [guid]::NewGuid().ToString('N') + '.cs')
 [IO.File]::WriteAllText($tmp, $padProbe)
 try {
-  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $PageMessagesPath, $AttachableProcessPath, $HostGrantsPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
+  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $WireRulesPath, $PageMessagesPath, $AttachableProcessPath, $HostGrantsPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
   Add-Type -Path ($paths + $tmp) -IgnoreWarnings -WarningAction SilentlyContinue -ReferencedAssemblies @(
     'System.Xml', 'System.Xml.ReaderWriter', 'System.Diagnostics.Process', 'System.Diagnostics.FileVersionInfo',
     'System.ComponentModel.Primitives', 'System.Text.RegularExpressions', 'System.Collections', 'System.Linq',

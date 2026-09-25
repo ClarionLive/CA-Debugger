@@ -25,7 +25,7 @@
 #      around a variable - which is how TidMember itself works, so it is how a copy of it would look. Allowed
 #      only inside TidMember (2) and RegsJson (1, register names out of a fixed list).
 #   4. BY PREDICATE (6ac29815 #1). The absent-tid TEST - present and not 0 - is stated once, in
-#      WireRules.TidIsKnown (Terminal\JsonMessageReader.cs). A nullable's .Value (or GetValueOrDefault())
+#      WireRules.TidIsKnown (Wire\WireRules.cs). A nullable's .Value (or GetValueOrDefault())
 #      compared with 0 anywhere else in CODE is an inline copy of it; there were four, in the WebView, the
 #      service, EditGrants and DisassemblyView, and one had already drifted to a different spelling.
 #
@@ -168,7 +168,7 @@ function Invoke-Scan([hashtable] $Sources, [string[]] $Names) {
 }
 
 # Rule 4. Comments are stripped first (Get-CSharpCodeOnly), so a comment explaining the rule is not a copy.
-$predicateRel = 'Terminal\JsonMessageReader.cs'
+$predicateRel = 'Wire\WireRules.cs'
 $predicateSig = 'internal static bool TidIsKnown(uint? tid)'
 $predicateRx = '\.(Value|GetValueOrDefault\(\))\s*(?:[!=]=|>)\s*0u?\b'
 function Invoke-PredicateScan([hashtable] $Sources) {
@@ -332,7 +332,7 @@ Invoke-CheckSection 'the scan of every host source file' {
 }
 
 Invoke-CheckSection 'the absent-tid test is stated once (6ac29815 #1)' {
-  Check 'the host defines TidIsKnown exactly once (WireRules, Terminal\JsonMessageReader.cs)' ($scan.PredicateDefs -eq 1) "$($scan.PredicateDefs) definition(s)"
+  Check 'the host defines TidIsKnown exactly once (WireRules, Wire\WireRules.cs)' ($scan.PredicateDefs -eq 1) "$($scan.PredicateDefs) definition(s)"
   Check 'no host file compares a nullable''s Value with 0 outside it (an inline copy of the test)' (@($scan.Predicate).Count -eq 0) `
     (Show $scan.Predicate { "$($_.File):$($_.Line) $($_.Text)" })
   # CONTROL: the scan still FINDS the test where it is allowed, or the check above passes because it sees nothing.

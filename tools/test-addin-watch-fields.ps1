@@ -17,7 +17,8 @@
 param(
   [string] $ServicePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'),
   [string] $WebViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs'),
-  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
+  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\JsonMessageReader.cs'),
+  [string] $WireRulesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\WireRules.cs'),
   [string] $EngineJsonPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\Json.cs'),
   [string] $EngineWatchPath = (Join-Path $PSScriptRoot '..\src\ClarionDbg.Cli\DebugEngine.Watch.cs'),
   [string] $PagePath    = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\debugger.html')
@@ -38,7 +39,7 @@ $tidNameDecls = (@('private const string TidMemberTid', 'private const string Ti
 # Signatures with an unbalanced '(' are hoisted: inside $() in a here-string they end the subexpression.
 $sigWatch = Get-Method 'public static string Watch(string name, bool found' $ejson
 # TidJson asks WireRules.TidIsKnown for the absent-tid rule (6ac29815 #1), so the probe carries that class too.
-$wireRules = (Get-Method 'internal static class WireRules' $reader) -replace 'internal static class', 'public static class'
+$wireRules = (Get-Method 'internal static class WireRules' (Get-Content -Raw -LiteralPath $WireRulesPath)) -replace 'internal static class', 'public static class'
 $probeSrc = @"
 using System;
 using System.Collections.Generic;

@@ -34,7 +34,9 @@ param(
   # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
-  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
+  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\JsonMessageReader.cs'),
+  # the host's wire rules (TidIsKnown, TryUInt, IsHexAddr), in their own file beside the reader (730ef328)
+  [string] $WireRulesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\WireRules.cs'),
   # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
   [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
   # the attach picker's listed process, which the pid table in PageMessages.cs holds (moved to Wire, 40a252d0)
@@ -73,7 +75,8 @@ $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 $readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
 # The host's absent-tid rule lives in WireRules.TidIsKnown since 6ac29815, so every probe compiling a tid
 # reader or writer (TidMember, TidOf) carries the real class beside it.
-$wireRules = (Get-Method 'internal static class WireRules' $readerEarly) -replace 'internal static class', 'public static class'
+$wireRulesText = Get-Content -Raw -LiteralPath $WireRulesPath
+$wireRules = (Get-Method 'internal static class WireRules' $wireRulesText) -replace 'internal static class', 'public static class'
 
 # Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
 # lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
@@ -1075,6 +1078,7 @@ Write-Host 'the page hands back only what the host ISSUED: procedure ids and edi
 $pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $hostGrantsBody = ($hostGrants -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
+$wireRulesBody = ($wireRulesText -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
 $attachableBody = (Get-Content -Raw -LiteralPath $AttachableProcessPath) -replace '(?m)^using [^;]+;\r?\n', ''
 # Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
 # `);` that closes UI( is put back here.
@@ -1092,6 +1096,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using ClarionDebugger.Wire;
 $readerBody
+$wireRulesBody
 $attachableBody
 $pageMsgsBody
 $hostGrantsBody
@@ -2025,7 +2030,7 @@ public class MemRequestProbe {
   public string Sent;
   private bool SendCommand(string c) { Sent = c; return true; }
   $(Get-Method 'public bool RequestMem(int reqId, string addrHex, int len)')
-  $(Get-Method 'internal static class WireRules' $reader)
+  $(Get-Method 'internal static class WireRules' $wireRulesText)
 }
 "@
 Add-Type -TypeDefinition $memProbeSrc -Language CSharp | Out-Null

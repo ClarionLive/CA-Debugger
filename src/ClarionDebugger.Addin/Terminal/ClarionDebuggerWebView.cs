@@ -1776,7 +1776,7 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"note\":").Append(Str(w.Note))
                   // "View memory" address (own storage only) and the caller frame a local resolved in
                   .Append(",\"addr\":").Append(Str(w.Addr))
-                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null")
+                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(CultureInfo.InvariantCulture) : "null")
                   .Append(",\"frameProc\":").Append(Str(w.FrameProc));
             else
                 // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and
