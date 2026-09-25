@@ -34,9 +34,13 @@ param(
   # the toolbar/pad controller: the teardown checks run its real NotifyStopped decision table
   [string] $ControllerPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\DebugSessionController.cs'),
   # the inbound reader and the page that builds the payloads it parses
-  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs'),
+  [string] $ReaderPath  = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\JsonMessageReader.cs'),
+  # the host's wire rules (TidIsKnown, TryUInt, IsHexAddr), in their own file beside the reader (730ef328)
+  [string] $WireRulesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\WireRules.cs'),
   # the typed request DTOs and the host-issued id/grant tables the bridge checks page requests against
   [string] $PageMessagesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\PageMessages.cs'),
+  # the attach picker's listed process, which the pid table in PageMessages.cs holds (moved to Wire, 40a252d0)
+  [string] $AttachableProcessPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\AttachableProcess.cs'),
   # the host-issued id and grant tables, split out of PageMessages.cs (6ac29815 #4)
   [string] $HostGrantsPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\HostGrants.cs'),
   # the engine's Variables-row writer, whose edit members the host grants on the way out
@@ -71,7 +75,8 @@ $disasmView = Get-Content -Raw -LiteralPath $DisasmViewPath
 $readerEarly = Get-Content -Raw -LiteralPath $ReaderPath
 # The host's absent-tid rule lives in WireRules.TidIsKnown since 6ac29815, so every probe compiling a tid
 # reader or writer (TidMember, TidOf) carries the real class beside it.
-$wireRules = (Get-Method 'internal static class WireRules' $readerEarly) -replace 'internal static class', 'public static class'
+$wireRulesText = Get-Content -Raw -LiteralPath $WireRulesPath
+$wireRules = (Get-Method 'internal static class WireRules' $wireRulesText) -replace 'internal static class', 'public static class'
 
 # Get-Method and Set-ExtractSource come from lib-extract.ps1 (dot-sourced above); Check and ShowVal from
 # lib-check.ps1, which lib-extract dot-sources in turn. Naming the right file matters here: this suite
@@ -1173,13 +1178,17 @@ Write-Host 'the page hands back only what the host ISSUED: procedure ids and edi
 $pageMsgsBody = ($pageMsgs -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $hostGrantsBody = ($hostGrants -replace '(?m)^using [^;]+;\r?\n', '') -replace '\binternal (sealed |static )?class\b', 'public $1class'
 $readerBody = ($reader -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
+$wireRulesBody = ($wireRulesText -replace '(?m)^using [^;]+;\r?\n', '') -replace 'internal static class', 'public static class'
+$attachableBody = (Get-Content -Raw -LiteralPath $AttachableProcessPath) -replace '(?m)^using [^;]+;\r?\n', ''
 # Expression-bodied handlers (`=> UI(() => { ... });`) brace-match to their lambda's closing brace; the
 # `);` that closes UI( is put back here.
 function Get-ArrowHandler { param([string] $Sig) (Get-Method $Sig $web) + ');' }
 $pushProcs = (Get-Method 'private void PushProcedures(string exe)' $web) -replace 'System\.Threading\.ThreadPool\.QueueUserWorkItem\(', 'RunNow('
-$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(', 'private void OnSvcExpanded(', 'private void OnSvcFrameLocals(' |
+$arrowHandlers = @('private void OnSvcVariableSet(', 'private void OnSvcModuleData(', 'private void OnSvcThreadSelected(', 'private void OnSvcExpanded(', 'private void OnSvcFrameLocals(',
+  'private void OnSvcSelectionChanged(' |
   ForEach-Object { (Get-ArrowHandler $_) -replace '^private void', 'public void' }) -join "`n"
 
+$selectionTypes = (Get-Method 'public enum ThreadSelectionCause') + "`n" + (Get-Method 'public sealed class ThreadSelection')
 $bridgeSrc = @"
 using System;
 using System.Collections.Generic;
@@ -1189,6 +1198,8 @@ using System.Text;
 using System.Text.RegularExpressions;
 using ClarionDebugger.Wire;
 $readerBody
+$wireRulesBody
+$attachableBody
 $pageMsgsBody
 $hostGrantsBody
 namespace ClarionDebugger.Terminal {
@@ -1225,11 +1236,23 @@ public sealed class FakeSvc {
     return AcceptSet;
   }
 }
+$selectionTypes
+// The service's selection, as EditGrants reads it: a Func over the current snapshot (49538b78 8b). The service's
+// real writer (MoveSelection) is run in tools/test-addin-selection.ps1; here each step a test takes names the
+// change the service would have made before raising the event the test then delivers.
+public sealed class SelectionSource {
+  public ThreadSelection Current = ThreadSelection.None;
+  public readonly EditGrants Grants;
+  public SelectionSource() { Grants = new EditGrants(() => Current); }
+  public void Stop(uint tid) { Current = new ThreadSelection(tid, tid, Current.Epoch + 1, ThreadSelectionCause.Stop); }
+  public void Switch(uint tid) { Current = new ThreadSelection(tid, Current.StoppedTid, Current.Epoch + 1, ThreadSelectionCause.Switch); }
+}
 public sealed class BridgePad {
   public FakeSvc _svc = new FakeSvc();
   public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
   public ProcedureIds _procIds = new ProcedureIds();
-  public EditGrants _editGrants = new EditGrants();
+  public SelectionSource _sel = new SelectionSource();
+  public EditGrants _editGrants { get { return _sel.Grants; } }
   public List<string> Lines = new List<string>();
   public List<string> Posts = new List<string>();
   public int BpPushes;
@@ -1270,6 +1293,8 @@ public sealed class BridgePad {
 Add-Type -TypeDefinition $bridgeSrc -Language CSharp | Out-Null
 
 function Errs { param($pad) @($pad.Lines | Where-Object { $_ -like 'err|*' }) }
+# An accepted switch, as the service delivers it: its selection moves first, then ThreadSelected is raised.
+function Switched { param($pad, [uint32] $tid) $pad._sel.Switch($tid); $pad.OnSvcThreadSelected($tid, $true, $null) }
 function Proc { param($name, $module, $line, $kind = 'procedure', $endLine = 0, [switch] $ExtentUnknown)
   $p = New-Object ClarionDebugger.Terminal.DebugProcedure; $p.Name = $name; $p.Module = $module; $p.Line = $line; $p.Kind = $kind; $p.EndLine = $endLine
   $p.ExtentUnknown = [bool] $ExtentUnknown; $p
@@ -1701,7 +1726,7 @@ $pad.OnSvcThreadSelected(9001, $false, 'no such thread')
 $pad._svc.Sets.Clear()
 $pad.EditVar($watchData)
 Check 'CONTROL: a switch the engine REFUSED leaves the grants alone' ($pad._svc.Sets.Count -eq 1) (Sets $pad)
-$pad.OnSvcThreadSelected(9001, $true, $null)
+Switched $pad 9001
 $pad._svc.Sets.Clear()
 $pad.EditVar($watchData)
 Check 'after a thread switch the same edit is refused until the row is re-read' ($pad._svc.Sets.Count -eq 0) (Sets $pad)
@@ -1727,27 +1752,40 @@ Check 'and a write that never left keeps its grant, so a retry goes through' ($p
 # UI lambdas with live-editor side effects), so they are pinned by POSITION: the clear must come before the
 # re-reads that re-grant, or the fresh grants are wiped along with the stale ones.
 $onPaused = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $web)
+$webCode0 = Get-CSharpCodeOnly $web
 $iClearP = $onPaused.IndexOf('_editGrants.Clear()'); $iReq = $onPaused.IndexOf('RequestStack();')
-$iSelP = $onPaused.IndexOf('_editGrants.SelectThread(p.Tid);')
 Check 'a new stop clears the grants BEFORE requesting the replies that re-grant' `
   (($iClearP -ge 0) -and ($iReq -gt $iClearP)) "clear=$iClearP request=$iReq"
-# 49538b78 wave 5 run 2: the stopped thread is the selected one, set after the clear and before the stack
-# request, so the stop's own stack reply is the one that may offer frames.
-Check 'a new stop selects the stopped thread after the clear and before the stack request' `
-  (($iSelP -gt $iClearP) -and ($iReq -gt $iSelP)) "clear=$iClearP select=$iSelP request=$iReq"
+# 49538b78 8b: the stopped thread is the selected one, and the SERVICE made it so before raising Paused
+# (tools/test-addin-selection.ps1 runs that order). The pad keeps no selection of its own to set.
 $tsel = Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcThreadSelected(')
-Check 'an accepted thread switch clears, then selects the new thread' `
-  ($tsel -match 'if \(ok\) \{ _editGrants\.Clear\(\); _editGrants\.SelectThread\(tid\); \}') ''
+Check 'an accepted thread switch clears the grants (the service has already moved the selection)' `
+  ($tsel -match 'if \(ok\) _editGrants\.Clear\(\);') ''
+Check 'the pad sets no selection of its own: EditGrants has no SelectThread, and nothing calls one' `
+  (((Get-CSharpCodeOnly $hostGrants) -notmatch '\bSelectThread\s*\(') -and ($webCode0 -notmatch '_editGrants\.SelectThread')) ''
+# An inventory that MOVED the selection has no handler of its own that clears (a stop and a switch do), so the
+# pad's SelectionChanged handler does it: RUN, with the real handler over the real EditGrants.
+$ivPad = New-Object ClarionDebugger.Terminal.BridgePad
+$ivPad._sel.Stop(4812)
+$ivPad._editGrants.Grant('0x4A10F0', '0x03', 4, 0, 4812)
+$ivPad.OnSvcSelectionChanged((New-Object ClarionDebugger.Terminal.ThreadSelection ([Nullable[uint32]]4812), ([Nullable[uint32]]4812), 7, ([ClarionDebugger.Terminal.ThreadSelectionCause]::Stop)))
+Check 'CONTROL: the stop''s own snapshot clears nothing here (OnPaused clears, positioned before its re-reads)' ($ivPad._editGrants.Count -eq 1) "$($ivPad._editGrants.Count) grant(s)"
+$ivPad.OnSvcSelectionChanged((New-Object ClarionDebugger.Terminal.ThreadSelection ([Nullable[uint32]]9001), ([Nullable[uint32]]4812), 8, ([ClarionDebugger.Terminal.ThreadSelectionCause]::Inventory)))
+Check 'an inventory that moved the selection retires every grant' ($ivPad._editGrants.Count -eq 0) "$($ivPad._editGrants.Count) grant(s)"
+Check 'the pad subscribes and unsubscribes SelectionChanged, once each' `
+  ((([regex]::Matches($webCode0, '_svc\.SelectionChanged\s*\+=\s*OnSvcSelectionChanged;')).Count -eq 1) -and `
+   (([regex]::Matches($webCode0, '_svc\.SelectionChanged\s*-=\s*OnSvcSelectionChanged;')).Count -eq 1)) ''
+Check 'the pad''s grant table reads the service''s selection' ($webCode0 -match '_editGrants = new EditGrants\(\(\) => _svc\.Selection\);') ''
 $webCode = Get-CSharpCodeOnly $web
 Check 'every stack request carries a recorded id: the page''s and the stop''s go through RequestStack, the only _svc.RequestStack call' `
   (($webCode -match 'case "stack": if \(_svc\.State == DebugSessionState\.Paused\) RequestStack\(\); break;') -and `
    ([regex]::Matches($webCode, '_svc\.RequestStack\(').Count -eq 1) -and `
    ((Get-CSharpCodeOnly (Get-Method 'private void RequestStack()' $web)) -match 'string id = _editGrants\.NewStackRequestId\(\);\s*if \(_svc\.RequestStack\(id\)\) _editGrants\.StackRequested\(id\);')) ''
-# The service sends the id as reqid=N and hands the reply's echo to the stack event.
-$svcCode = Get-CSharpCodeOnly (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'))
-Check 'the service sends reqid=N with a stack request and passes the reply''s reqId on' `
-  (($svcCode -match 'return SendCommand\(reqId == null \? "stack" : "stack reqid=" \+ reqId\);') -and `
-   ($svcCode -match 'StackReceived\?\.Invoke\(frames, GetUIntOrNull\(json, "tid"\), GetStr\(json, "reqId"\)\);')) ''
+# The service hands the reply's echo to the stack event. What it SENDS is run in the version-skew section below.
+# -ServicePath's text, not a fixed path: a mutated copy handed to this suite has to be the one read here.
+$svcCode = Get-CSharpCodeOnly $src
+Check 'the service passes the stack reply''s reqId on' `
+  ($svcCode -match 'StackReceived\?\.Invoke\(frames, GetUIntOrNull\(json, "tid"\), GetStr\(json, "reqId"\)\);') ''
 Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
 Check 'the frame-locals and expand replies grant their rows only for a request the host verified' `
@@ -1779,7 +1817,7 @@ Check 'and A is refused while B is pending: each reply restored exactly its own 
   (($sp._svc.Sets.Count -eq 2) -and ($sp.Posts[0] -cmatch 'still pending')) ($sp.Posts -join ' / ')
 # The WRITER holds the rule too, not only EditVar: TryConsume itself will not spend a second grant on a
 # pending address.
-$g2 = New-Object ClarionDebugger.Terminal.EditGrants
+$g2 = (New-Object ClarionDebugger.Terminal.SelectionSource).Grants
 $g2.Grant('0x10', '0x03', 4, 0, 5); $g2.Grant('0x10', '0x12', 4, 0, 5)
 $first = $g2.TryConsume('0x10', '0x03', 4, 0, 5)
 Check 'EditGrants.TryConsume refuses a second spend on an address whose write is pending' `
@@ -1815,7 +1853,7 @@ $xp._svc.Sets.Clear()
 $xp.EditVar('{"va":"0x500004","typeCode":"0x03","size":4,"places":0,"tid":4812,"value":"9"}')
 Check 'a reply to an expand the host did not forward creates no edit grant' ($xp._svc.Sets.Count -eq 0) ($xp._svc.Sets -join ' ; ')
 # CURRENT, as for edits: a thread switch retires the issued expandable rows.
-$xp.OnSvcThreadSelected(9001, $true, $null)
+Switched $xp 9001
 $xp._svc.Expands.Clear()
 $xp.Expand($expandData)
 Check 'after a thread switch the old reference row cannot be expanded until re-read' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
@@ -1850,7 +1888,7 @@ function EditAt  { param($va) '{"va":"' + $va + '","typeCode":"0x03","size":4,"p
 $realLocal = LocalAt '0x19FF38'; $editReal = EditAt '0x19FF38'
 
 $fp = New-Object ClarionDebugger.Terminal.BridgePad
-$fp._editGrants.SelectThread(4812)   # the stop's thread (OnPaused)
+$fp._sel.Stop(4812)   # the stop's thread (OnPaused)
 [void](Offer $fp._editGrants $flProbe._editGrants.Frames 4812)
 $fp.FrameLocals($flData)
 Check 'an offered frame''s locals are requested' `
@@ -1907,7 +1945,7 @@ Check 'a thread''s next stack reply replaces its offer: a frame no longer on it 
 # reply grants nothing...
 $fp.FrameLocals('10|0x401000|0x19FF00')
 Check 'CONTROL: the frame still on the stack is forwarded' ($fp._svc.FrameLocalsSent.Count -eq 1) ($fp._svc.FrameLocalsSent -join ',')
-$fp.OnSvcThreadSelected(9001, $true, $null)
+Switched $fp 9001
 $fp._svc.Sets.Clear()
 $fp.OnSvcFrameLocals('10', (LocalAt '0x19FF34'), 4812)
 $fp.EditVar((EditAt '0x19FF34'))
@@ -1917,8 +1955,8 @@ $fp._svc.FrameLocalsSent.Clear()
 $fp.FrameLocals('11|0x401000|0x19FF00')
 Check 'after the switch a frame from the previous offer is refused' ($fp._svc.FrameLocalsSent.Count -eq 0) ($fp._svc.FrameLocalsSent -join ',')
 # EditGrants on its own: Clear retires offers and forwarded requests, whoever calls it (a stop, a resume).
-$gf = New-Object ClarionDebugger.Terminal.EditGrants
-$gf.SelectThread(7)
+$gfSel = New-Object ClarionDebugger.Terminal.SelectionSource; $gf = $gfSel.Grants
+$gfSel.Stop(7)
 [void](Offer $gf @('0x401000|0x19FF00') 7)
 $gf.FrameLocalsForwarded(1)
 $gf.Clear()
@@ -1934,9 +1972,9 @@ Check 'CONTROL: an offered frame matches without regard to hex case' ($gf.IsFram
 # cross-thread stack addresses, editable. Every path real: OnSvcThreadSelected, EditGrants, FrameLocals,
 # OnSvcFrameLocals and EditVar.
 $rp = New-Object ClarionDebugger.Terminal.BridgePad
-$rp._editGrants.SelectThread(4812)                     # stopped on A (4812)
+$rp._sel.Stop(4812)                     # stopped on A (4812)
 $idA = StackAsked $rp._editGrants                      # the page asks for A's stack...
-$rp.OnSvcThreadSelected(9001, $true, $null)            # ...switches to B (9001) before it is answered...
+Switched $rp 9001            # ...switches to B (9001) before it is answered...
 $idB = StackAsked $rp._editGrants                      # ...and asks for B's
 $aLate = Offer $rp._editGrants @('0x402000|0x19FF40') 4812 -ReqId $idA    # A's reply lands after the switch
 Check 'a stale stack reply for the OLD thread, after the switch, offers nothing' (-not $aLate) ''
@@ -1961,10 +1999,10 @@ Check 'CONTROL: the new thread''s own stack reply offers, and its frame''s local
 # SAME thread spend the fresh request. A's stack is asked for, the page switches to B and back to A (each
 # switch a clear), asks again, and the OLD A reply arrives first: same tid, so only its id tells it apart.
 $cx = New-Object ClarionDebugger.Terminal.BridgePad
-$cx._editGrants.SelectThread(4812)
+$cx._sel.Stop(4812)
 $old = StackAsked $cx._editGrants
-$cx.OnSvcThreadSelected(9001, $true, $null)
-$cx.OnSvcThreadSelected(4812, $true, $null)
+Switched $cx 9001
+Switched $cx 4812
 $new = StackAsked $cx._editGrants
 $stale = Offer $cx._editGrants @('0x402000|0x19FF40') 4812 -ReqId $old
 Check 'THE REGRESSION: an old reply for the SAME thread, arriving before the fresh one, offers nothing' (-not $stale) ''
@@ -1982,8 +2020,8 @@ Check 'CONTROL: the fresh reply then offers, and its frame''s locals are forward
 
 # THE EPOCH: a stack reply to a request sent before a clear (a stop, a resume, a switch) offers nothing, even
 # for the same thread; only a request recorded after the clear can be answered with an offer.
-$ep = New-Object ClarionDebugger.Terminal.EditGrants
-$ep.SelectThread(4812)
+$epSel = New-Object ClarionDebugger.Terminal.SelectionSource; $ep = $epSel.Grants
+$epSel.Stop(4812)
 $before = StackAsked $ep
 $ep.Clear()
 $preBump = Offer $ep @('0x402000|0x19FF40') 4812 -ReqId $before
@@ -2010,10 +2048,87 @@ Check 'a reply echoing a live request id but stamped for another thread offers n
 Check 'request ids are never reused, across clears too' `
   (($before -cne $after) -and ($after -cne $pending) -and ($before -cne $pending)) "$before,$after,$pending"
 
+# THE SELECTION EPOCH (49538b78 8b). A stack request remembers the service's selection epoch it was sent
+# under, so a selection that moved and came back - A, B, A with no clear between, which is what an inventory
+# that disagreed and then a switch back can do - leaves the old request unable to offer, though its id is live
+# and its stamp is the selected thread. Only the epoch tells it apart.
+$seS = New-Object ClarionDebugger.Terminal.SelectionSource; $se = $seS.Grants
+$seS.Stop(4812)
+$seOld = StackAsked $se
+$seS.Switch(9001); $seS.Switch(4812)
+$seStale = Offer $se @('0x402000|0x19FF40') 4812 -ReqId $seOld
+Check 'a stack request sent under an earlier selection epoch offers nothing, even for the same thread and with no clear between' `
+  ((-not $seStale) -and (-not $se.IsFrameOffered('0x402000', '0x19FF40'))) "offered=$seStale"
+$seNew = StackAsked $se
+$seFresh = Offer $se @('0x402000|0x19FF40') 4812 -ReqId $seNew
+Check 'CONTROL: one sent under the current selection offers' ($seFresh -and $se.IsFrameOffered('0x402000', '0x19FF40')) "offered=$seFresh"
+
+# ---- version skew: a new add-in on an engine from before wave 5 (97f23f5d) ------------------------------
+# cb2fcea sent `stack reqid=N`. An engine from before wave 5 reads the FIRST argument as the frame count, so it
+# refused that request and a new add-in on an old engine showed no call stack at all. The host now names the
+# count first, `stack 32 reqid=N`, and the old engine ignores the trailing token. Run: the REAL RequestStack
+# over a recording SendCommand, and the REAL ParseStack / GetStr on the reply each engine sends.
+$skewReader = (Get-Method 'internal static class JsonMessageReader' $readerEarly) -replace 'internal static class', 'public static class'
+$skewSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+namespace StackSkew {
+$(Get-Method 'public sealed class DebugStackFrame')
+public class StackSkewProbe {
+  public string Sent;
+  private bool SendCommand(string c) { Sent = c; return true; }
+  $((Get-Statement 'internal const int StackFrameCount') -replace '^internal', 'public')
+  $(Get-Method 'public bool RequestStack(string reqId = null)')
+  $((Get-Method 'private static List<DebugStackFrame> ParseStack(string json)') -replace '^private static', 'public static')
+  $((Get-Method 'private static string GetStr(string json, string key)') -replace '^private static', 'public static')
+  $(Get-Method 'private static int GetInt(string json, string key)')
+  $(Get-Method 'private static bool GetBool(string json, string key)')
+  $skewReader
+}
+}
+"@
+Add-Type -TypeDefinition $skewSrc -Language CSharp | Out-Null
+$sk = New-Object StackSkew.StackSkewProbe
+Check 'the host''s stack frame count is 32, the engine default protocolcheck pins (CheckStackFrameCountSkew)' `
+  ([StackSkew.StackSkewProbe]::StackFrameCount -eq 32) "$([StackSkew.StackSkewProbe]::StackFrameCount)"
+[void]$sk.RequestStack('7')
+Check 'a stack request with an id names the count FIRST: `stack 32 reqid=7`' ($sk.Sent -ceq 'stack 32 reqid=7') (ShowVal $sk.Sent)
+$skNoId = New-Object StackSkew.StackSkewProbe
+[void]$skNoId.RequestStack()
+Check 'and one without an id names the count alone' ($skNoId.Sent -ceq 'stack 32') (ShowVal $skNoId.Sent)
+# The pre-wave-5 argument rule, as it stood before cb2fcea (DebugEngine.StackWalker.cs HandleStackCommand):
+#   if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX)) refuse;
+# and nothing read parts[2]. Applied here to the text the host now sends, and to what cb2fcea sent.
+function OldEngineTakes { param([string] $line)
+  $parts = $line.Split(' '); $n = 0
+  ($parts.Length -le 1) -or ([int]::TryParse($parts[1], [ref] $n) -and $n -ge 1 -and $n -le 256)
+}
+Check 'CONTROL: the old engine refused what cb2fcea sent (`stack reqid=7`)' (-not (OldEngineTakes 'stack reqid=7')) ''
+Check 'the old engine takes what the host sends now' (OldEngineTakes $sk.Sent) (ShowVal $sk.Sent)
+# The old engine's reply carries no reqId; the new one echoes the id (the engine side is protocolcheck's).
+$oldReply = '{"tid":4812,"event":"stack","frames":[{"frame":0,"proc":"MAIN","module":"main.clw","line":88,"va":"0x402000","ebp":"0x19FF40"}]}'
+$newReply = '{"tid":4812,"event":"stack","reqId":"7","frames":[{"frame":0,"proc":"MAIN","module":"main.clw","line":88,"va":"0x402000","ebp":"0x19FF40"}]}'
+$oldFrames = [StackSkew.StackSkewProbe]::ParseStack($oldReply)
+$oldId = [StackSkew.StackSkewProbe]::GetStr($oldReply, 'reqId')
+Check 'an old engine''s reply (no reqId) still yields its stack' (($oldFrames.Count -eq 1) -and ($oldFrames[0].Proc -ceq 'MAIN')) "$($oldFrames.Count) frame(s)"
+$sgSel = New-Object ClarionDebugger.Terminal.SelectionSource; $sg = $sgSel.Grants
+$sgSel.Stop(4812)
+[void](StackAsked $sg)
+$oldOffered = Offer $sg @('0x402000|0x19FF40') 4812 -ReqId $oldId
+Check 'and offers no frames: degraded, not dead' ((-not $oldOffered) -and (-not $sg.IsFrameOffered('0x402000', '0x19FF40'))) "reqId=$(ShowVal $oldId) offered=$oldOffered"
+$newId = StackAsked $sg
+$newEcho = $newReply -replace '"reqId":"7"', ('"reqId":"' + $newId + '"')
+$newGot = [StackSkew.StackSkewProbe]::GetStr($newEcho, 'reqId')
+$newOffered = Offer $sg @('0x402000|0x19FF40') 4812 -ReqId $newGot
+Check 'CONTROL: a current engine''s reply echoes the id, and offers' (($newGot -ceq $newId) -and $newOffered -and $sg.IsFrameOffered('0x402000', '0x19FF40')) "reqId=$(ShowVal $newGot) offered=$newOffered"
+
 # THE REPLY'S THREAD: a forwarded request grants only a reply stamped for the thread of the offer it was
 # checked against; any other thread's stamp grants nothing.
 $tp = New-Object ClarionDebugger.Terminal.BridgePad
-$tp._editGrants.SelectThread(4812)
+$tp._sel.Stop(4812)
 [void](Offer $tp._editGrants @('0x402000|0x19FF40') 4812)
 $tp.FrameLocals('30|0x402000|0x19FF40')
 $tp.OnSvcFrameLocals('30', (LocalAt '0x19FF2C'), 9001)
@@ -2027,14 +2142,14 @@ Check 'the bridge routes framelocals through the checked FrameLocals, not straig
    ([regex]::Matches((Get-CSharpCodeOnly $web), '_svc\.RequestFrameLocals\(').Count -eq 1)) ''
 
 # ---- the grant walker on its own ----------------------------------------------------------------------
-$g = New-Object ClarionDebugger.Terminal.EditGrants
+$g = (New-Object ClarionDebugger.Terminal.SelectionSource).Grants
 $g.GrantRows('{"va":"0x10","typeCode":"0x03","size":4,"places":0},{"name":"x","children":[{"va":"0x20","typeCode":"0x03","size":4}]}', $null)
 Check 'unscoped rows (an expanded reference) grant for any thread' `
   ($g.IsGranted('0x10', '0x03', 4, 0, 77) -and $g.IsGranted('0x20', '0x03', 4, 0, $null)) "$($g.Count) grant(s)"
-$g2 = New-Object ClarionDebugger.Terminal.EditGrants
+$g2 = (New-Object ClarionDebugger.Terminal.SelectionSource).Grants
 $g2.GrantRows('{"va":"0x10","typeCode":"0x03","size":4,"places":0},{"va":"0x20",', 5)
 Check 'a malformed reply grants NOTHING, not the rows before the fault' ($g2.Count -eq 0) "$($g2.Count) grant(s)"
-$g3 = New-Object ClarionDebugger.Terminal.EditGrants
+$g3 = (New-Object ClarionDebugger.Terminal.SelectionSource).Grants
 $g3.Grant('0x10', '0x03', 4, 0, 5)
 Check 'a thread-scoped grant does not answer a page with no thread selection' (-not $g3.IsGranted('0x10', '0x03', 4, 0, $null)) ''
 Check 'CONTROL: ...and does answer its own thread' ($g3.IsGranted('0x10', '0x03', 4, 0, 5)) ''
@@ -2043,7 +2158,7 @@ Check 'CONTROL: ...and does answer its own thread' ($g3.IsGranted('0x10', '0x03'
 # shape: grant the row, then parse the page's edit carrying the same members.
 foreach ($t in @('"size":4,"places":2', '"size":4', '"places":2', '"size":"4","places":"x"', '"size":4,"places":null', '')) {
   $sep = if ($t) { ',' } else { '' }
-  $gt = New-Object ClarionDebugger.Terminal.EditGrants
+  $gt = (New-Object ClarionDebugger.Terminal.SelectionSource).Grants
   $gt.GrantRows('{"va":"0x30","typeCode":"0x03"' + $sep + $t + '}', 5)
   $er = [ClarionDebugger.Terminal.EditVarRequest]::Parse('{"va":"0x30","typeCode":"0x03"' + $sep + $t + ',"tid":5,"value":"1"}')
   Check "edit tuple {$t}: the grant and the page's echo of it read the same size and places" `
@@ -2110,7 +2225,7 @@ public class MemRequestProbe {
   public string Sent;
   private bool SendCommand(string c) { Sent = c; return true; }
   $(Get-Method 'public bool RequestMem(int reqId, string addrHex, int len)')
-  $(Get-Method 'internal static class WireRules' $reader)
+  $(Get-Method 'internal static class WireRules' $wireRulesText)
 }
 "@
 Add-Type -TypeDefinition $memProbeSrc -Language CSharp | Out-Null
@@ -2143,7 +2258,7 @@ Check 'the service raises MemReceived from a mem event' `
 
 # A var row's read-only `addr` is NOT a grant. Only a ref:true row's addr is an EXPAND grant, and no addr is
 # ever an EDIT grant: that is what keeps "View memory" on a group from minting pencils.
-$ga = New-Object ClarionDebugger.Terminal.EditGrants
+$ga = (New-Object ClarionDebugger.Terminal.SelectionSource).Grants
 $ga.GrantRows('{"name":"G","type":"","value":"{}","children":[{"name":"F","addr":"0x400004"}],"addr":"0x400000"},{"name":"S","type":"LONG","addr":"0x400010"}', 5)
 Check 'rows carrying only addr grant no edit and no expand' ($ga.Count -eq 0 -and $ga.ExpandableCount -eq 0) "$($ga.Count) edit, $($ga.ExpandableCount) expand"
 $ga.GrantRows('{"name":"R","ref":true,"addr":"0x12345678","module":"m.clw","typeRef":7}', 5)
@@ -2710,16 +2825,20 @@ Check 'CONTROL: a real tid survives TidOf unchanged' ([DisasmTagProbe]::TidOf([u
 # `tid ?? _selTid`" - the better the comment, the more likely it quotes the exact idiom being banned. Third
 # time this trap has caught a check in this repo, so the walker now lives in lib-extract.ps1.
 $disasmCode = Get-CSharpCodeOnly $disasmView
-$seatIdiom = [regex]::Matches($disasmCode, '\?\?\s*_selTid\b')
-Check 'no tid is unwrapped with `?? _selTid`, the idiom the seat and the gate disagreed on' `
+# The view's selected thread is SelTid since 49538b78 8b (the service's snapshot, read through TidOf); the idiom is
+# banned under either name.
+$seatIdiomRx = '\?\?\s*(_selTid|SelTid)\b'
+$seatIdiom = [regex]::Matches($disasmCode, $seatIdiomRx)
+Check 'no tid is unwrapped with `?? SelTid` (or the old `?? _selTid`), the idiom the seat and the gate disagreed on' `
   ($seatIdiom.Count -eq 0) "$($seatIdiom.Count) site(s) in code"
 # CONTROL: the scan can see that idiom at all - otherwise the zero above is a zero nobody looked for.
-Check 'CONTROL: the idiom scan matches it in code' `
-  ([regex]::Matches((Get-CSharpCodeOnly 'uint x = tid ?? _selTid;'), '\?\?\s*_selTid\b').Count -eq 1) ''
+Check 'CONTROL: the idiom scan matches it in code, under both names' `
+  (([regex]::Matches((Get-CSharpCodeOnly 'uint x = tid ?? _selTid;'), $seatIdiomRx).Count -eq 1) -and `
+   ([regex]::Matches((Get-CSharpCodeOnly 'uint x = tid ?? SelTid;'), $seatIdiomRx).Count -eq 1)) ''
 # ...and the stripper is what makes the zero mean something: the same idiom in a COMMENT must not count,
 # which is precisely the two hits the raw scan produced.
 Check 'CONTROL: ...and does NOT match it in a comment' `
-  ([regex]::Matches((Get-CSharpCodeOnly '// not `tid ?? _selTid` here'), '\?\?\s*_selTid\b').Count -eq 0) ''
+  ([regex]::Matches((Get-CSharpCodeOnly '// not `tid ?? _selTid` here'), $seatIdiomRx).Count -eq 0) ''
 
 # ---- the SEAT lifecycle: moved to tools\test-disasm-seat.ps1 by 8f352618 --------------------------------
 #
@@ -2853,6 +2972,56 @@ Check 'OnSvcHover is subscribed and unsubscribed, once each' `
 Check 'SetHover sends the engine''s verb' `
   ((Get-Method 'public bool SetHover(bool on)') -match 'SendCommand\(on \? "hover on" : "hover off"\)') ''
 
+Write-Host ''
+Write-Host 'a qualified watch name, [image!][module!]name, reaches the engine whole (04d7b4c8)'
+# '!' starts a comment in Clarion, so it is in no label, and the engine now reads it as the qualifier separator.
+# RUN: the real IsValidWatchName and Watch over a recording SendCommand. The command is one line split on
+# spaces, so what the name must still never carry is a space, a quote, a ';' or a line break.
+$watchProbeSrc = @"
+using System;
+using System.Text.RegularExpressions;
+public class WatchNameProbe {
+  public string Sent;
+  private bool SendCommand(string c) { Sent = c; return true; }
+  $(Get-Method 'public static bool IsValidWatchName(string name)')
+  $(Get-Method 'public bool Watch(string name)')
+}
+"@
+Add-Type -TypeDefinition $watchProbeSrc -Language CSharp | Out-Null
+$wn = New-Object WatchNameProbe
+# The last three are names the engine prints for paste-back (Enzo, report d6a07e24); '@' is in the third.
+$qualified = @('CLBRWS.EXE!CUS:RECORD', 'clbrws011.clw!LOC:Count', 'CLBRWS.EXE!clbrws011.clw!Glo:Name', 'GLO:X',
+  'filescope_a.clw!ORD:ITEM', 'filescope_b.clw!ORDERS$ORD:RECORD.ORD:ITEM', 'CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER')
+$wnBad = @($qualified | Where-Object { $wn.Sent = $null; -not ($wn.Watch($_) -and $wn.Sent -ceq ('watch ' + $_)) })
+Check 'a qualified name is accepted and sent whole: `watch CLBRWS.EXE!CUS:RECORD`' ($wnBad.Count -eq 0) ($wnBad -join ', ')
+$refused = @('A B', "A`n", 'OUTFILE@ X', "OUTFILE@`n", 'OUTFILE@"', 'OUTFILE@;quit', "A!`n", "A`r", "A!`r`nquit", 'A;B', 'A"B', "A'B", 'A!B C', '', ('A' * 129), 'A..B')
+$wnLet = @($refused | Where-Object { $wn.Sent = $null; $wn.Watch($_) -or -not [string]::IsNullOrEmpty($wn.Sent) } | ForEach-Object { ShowVal ($_ -replace "`r", '\r' -replace "`n", '\n') })
+Check 'a space, a line break (a trailing one included), a quote or a ; is still refused, and nothing is sent' ($wnLet.Count -eq 0) ($wnLet -join ', ')
+
+Write-Host ''
+Write-Host 'the service needs nothing from Terminal (40a252d0)'
+# AttachableProcess was the one Terminal type the Services layer imported, and the using it kept also carried
+# PageNumbers into the process-listing parse unseen. Both now live in Wire (AttachableProcess, WireRules.TryUInt).
+$terminalRef = '\bClarionDebugger\.Terminal\b'
+Check 'the service names no ClarionDebugger.Terminal, as a using or a qualified name' `
+  ([regex]::Matches($svcCode, $terminalRef).Count -eq 0) "$([regex]::Matches($svcCode, $terminalRef).Count) reference(s)"
+Check 'CONTROL: that scan finds the using this ticket removed' `
+  ([regex]::Matches((Get-CSharpCodeOnly "using ClarionDebugger.Terminal;`nnamespace X {}"), $terminalRef).Count -eq 1) ''
+# The one uint rule, run: digits only, invariant, no sign or padding, null is not a number.
+$tryU = @(@('4812', $true, 4812), @('4294967295', $true, 4294967295), @('0', $true, 0), @('4294967296', $false, 0),
+  @('-1', $false, 0), @('+1', $false, 0), @(' 1', $false, 0), @('0x10', $false, 0), @('', $false, 0), @($null, $false, 0))
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Globalization;
+public static class TryUIntProbe {
+$wireRules
+  public static bool Run(string s, out uint v) { return WireRules.TryUInt(s, out v); }
+}
+"@ | Out-Null
+$tryUBad = @($tryU | Where-Object { $v = [uint32]0; $ok = [TryUIntProbe]::Run($_[0], [ref] $v); ($ok -ne $_[1]) -or ($ok -and $v -ne $_[2]) } |
+  ForEach-Object { ShowVal $_[0] })
+Check 'WireRules.TryUInt takes plain decimal digits in the DWORD range and nothing else' ($tryUBad.Count -eq 0) ($tryUBad -join ', ')
+
 # THE COUNT, ASSERTED AND PRINTED. This suite ran 222 checks and said only "ALL CHECKS PASSED" - a
 # sentence that is true of 222 checks and equally true of 69, which is what a skipped block actually
 # leaves. cb9324f2 fixed that class in Invoke-CheckSection, and this file - the largest consumer, 192
@@ -2865,7 +3034,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 471
+$EXPECTED_CHECKS = 490
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

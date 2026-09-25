@@ -114,6 +114,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 namespace Race {
 $(Get-Method 'public enum DebugSessionState')
+$(Get-Method 'public enum ThreadSelectionCause')
 public sealed class RaceProbe {
   public Process _proc;
   public List<DebugSessionState> States = new List<DebugSessionState>();
@@ -134,6 +135,9 @@ public sealed class RaceProbe {
   // routed through these. The substitution is textual and names the same events; nothing else is edited.
   private void RaiseLog(string s) { var h = LogReceived; if (h != null) h(s); }
   private void RaiseExited(int c) { var h = Exited; if (h != null) h(c); }
+  // Both handlers end the host's thread selection (49538b78 8b); tools/test-addin-selection.ps1 runs that.
+  public int SelectionEnds;
+  private void MoveSelection(uint? tid, uint? stoppedTid, ThreadSelectionCause cause, bool onlyIfChanged) { SelectionEnds++; }
 }
 }
 "@

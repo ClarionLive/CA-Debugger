@@ -60,6 +60,8 @@ $Suites = @(
   @{ File = 'test-addin-lifecycle.ps1' }
   @{ File = 'test-addin-attach.ps1' }
   @{ File = 'test-addin-attach.ps1'; Args = @('-SelfTest') }
+  @{ File = 'test-addin-selection.ps1' }
+  @{ File = 'test-addin-selection.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-host-tid-members.ps1' }
   @{ File = 'test-host-tid-members.ps1'; Args = @('-SelfTest') }
   @{ File = 'test-disasm-seat.ps1' }
@@ -91,10 +93,12 @@ $Suites = @(
   @{ File = 'test-pad-threads.js' }
   @{ File = 'test-pad-frames.js' }
   @{ File = 'test-pad-xss.js' }
+  @{ File = 'test-pad-csp.js' }
   @{ File = 'test-pad-watch-persist.js' }
   @{ File = 'test-bp-threaded.ps1'; Live = $true }
   @{ File = 'test-watch-threaded.ps1'; Live = $true }
   @{ File = 'test-setip.ps1'; Live = $true }
+  @{ File = 'test-engine-filescope.ps1'; Live = $true }
   @{ File = 'test-interactive.ps1'; Live = $true; Success = '^=== exit code: 0 ===$'
      NoTotal = 'a paced step/stepover/stepout smoke run with no Check calls; its verdict is the engine exit code' }
 )

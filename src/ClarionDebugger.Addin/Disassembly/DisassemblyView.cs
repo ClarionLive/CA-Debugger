@@ -80,8 +80,15 @@ namespace ClarionDebugger.Disassembly
         // another. What IS per-thread is where the window was SEATED (the thread's EIP) and which row is
         // flagged `current`. A late reply therefore does not paint foreign code — it moves the view to a
         // thread you are no longer looking at and marks that thread's instruction as the current one.
-        private uint _stoppedTid;    // the thread the engine stopped on (0 = unknown)
-        private uint _selTid;        // the thread every panel is currently reading (0 = unknown)
+        //
+        // WHOSE SELECTION (49538b78 8b, Owner decision 3): the service's. It is the one owner of the host's
+        // selected thread, and this view holds only the last snapshot the service DELIVERED to it, in the
+        // order the events that made them arrive here (see TakeSelection). The view never works a thread out
+        // for itself, so it cannot disagree with the grant table or the pad about which thread is selected.
+        // SelTid / StoppedTid read that snapshot in the view's local `0 = unknown` convention, through TidOf.
+        private ThreadSelection _selection = ThreadSelection.None;
+        private uint SelTid { get { return TidOf(_selection.Tid); } }           // the thread every panel reads
+        private uint StoppedTid { get { return TidOf(_selection.StoppedTid); } } // the thread execution stopped on
         private List<DebugThread> _threads = new List<DebugThread>();   // for naming a thread in the banner
         private ToolStripLabel _thread;   // "viewing Thread N — not the stopped thread", or blank
         // THE SEAT LIFECYCLE - painted, in flight, awaiting registers, decoded-to-nothing, the epoch, the
@@ -145,18 +152,19 @@ namespace ClarionDebugger.Disassembly
             _svc = svc;
             // A different session (or none) knows nothing about the thread the old one was showing.
             _seat.Rebound();
-            _stoppedTid = _selTid = 0;
+            _selection = ThreadSelection.None;
             _threads = new List<DebugThread>();
             if (_svc != null)
             {
+                // Subscribed BEFORE the current selection is read below, so no change falls between the two;
+                // one that arrives twice is not newer than itself and is dropped (TakeSelection).
+                _svc.SelectionChanged += OnSelectionChanged;
                 _svc.Paused += OnPaused;
                 _svc.DisasmReceived += OnDisasm;
                 _svc.Exited += OnExited;
                 _svc.StateChanged += OnState;
-                // The pad owns the thread selection; this view reads it rather than keeping its own, so the
-                // window and the Call Stack cannot disagree about whose execution point is on screen.
+                // The inventory names the threads for the banner; the selection itself comes from the service.
                 _svc.ThreadsReceived += OnThreads;
-                _svc.ThreadSelected += OnThreadSelected;
                 // How the view learns the NEW thread's EIP after a switch: the inventory names threads but
                 // carries no EIP, so the seat comes from the registers, which are already tid-stamped.
                 _svc.RegsReceived += OnRegs;
@@ -165,6 +173,7 @@ namespace ClarionDebugger.Disassembly
                 // this the seat latch is held by a reply that is never coming, which is the same
                 // never-painted state an empty reply used to produce, reached by a quieter route.
                 _svc.EngineError += OnEngineError;
+                _selection = _svc.Selection;
             }
             UpdateThreadBanner();
             UpdateButtons(_svc?.State ?? DebugSessionState.Idle);
@@ -173,12 +182,12 @@ namespace ClarionDebugger.Disassembly
         private void Unbind()
         {
             if (_svc == null) return;
+            _svc.SelectionChanged -= OnSelectionChanged;
             _svc.Paused -= OnPaused;
             _svc.DisasmReceived -= OnDisasm;
             _svc.Exited -= OnExited;
             _svc.StateChanged -= OnState;
             _svc.ThreadsReceived -= OnThreads;
-            _svc.ThreadSelected -= OnThreadSelected;
             _svc.RegsReceived -= OnRegs;
             _svc.EngineError -= OnEngineError;
             _svc = null;
@@ -218,7 +227,7 @@ namespace ClarionDebugger.Disassembly
         /// re-derived on every selection, inventory, stop and seat change.</summary>
         private void UpdateStepTips()
         {
-            string stopped = SeatState.IsOtherThread(_selTid, _stoppedTid) ? ThreadName(_stoppedTid) : null;
+            string stopped = SeatState.IsOtherThread(SelTid, StoppedTid) ? ThreadName(StoppedTid) : null;
             if (_bOver != null) _bOver.ToolTipText = StepTip(TipOver, stopped);
             if (_bInto != null) _bInto.ToolTipText = StepTip(TipInto, stopped);
             if (_bOut  != null) _bOut.ToolTipText  = StepTip(TipOut,  stopped);
@@ -272,7 +281,7 @@ namespace ClarionDebugger.Disassembly
             {
                 // The stop's symbol only while the strip's subject IS the stopped thread: it is per STOP,
                 // so beside another thread's listing it would name the wrong thread's location.
-                string sym = _seat.SymbolFor(_selTid, _stoppedTid);
+                string sym = _seat.SymbolFor(SelTid, StoppedTid);
                 _loc.Text = _curLine > 0 && !string.IsNullOrEmpty(_curModule) ? _curModule + ":" + _curLine
                           : !string.IsNullOrEmpty(sym) ? sym
                           : "";
@@ -314,14 +323,14 @@ namespace ClarionDebugger.Disassembly
         private void Recentre()
         {
             if (_svc == null || _svc.State != DebugSessionState.Paused) return;
-            if (_seat.BeginRecentre(_selTid)) _svc.RequestRegs();
+            if (_seat.BeginRecentre(SelTid)) _svc.RequestRegs();
         }
 
         /// <summary>Recentre needs a paused session and a thread to recentre ON: the seat goes through that
         /// thread's registers, which are tid-stamped.</summary>
         private void UpdateRecentre()
         {
-            if (_bCur != null) _bCur.Enabled = _svc?.State == DebugSessionState.Paused && _selTid != 0;
+            if (_bCur != null) _bCur.Enabled = _svc?.State == DebugSessionState.Paused && SelTid != 0;
         }
 
         // ----- engine session (events arrive on the reader thread → marshal to the UI thread) -----
@@ -359,13 +368,17 @@ namespace ClarionDebugger.Disassembly
         private void SeatOnLateOpen()
         {
             if (_svc == null || _svc.State != DebugSessionState.Paused) return;
+            // A handle created late missed every SelectionChanged before it (UI drops them without one): take
+            // the service's current selection, if it is newer than the one held. A stop taken this way had no
+            // seat from OnPaused; the inventory asked for next seats it (OnThreads -> SeatOnSelectedThread).
+            if (TakeSelection(ref _selection, _svc.Selection, _seat) != SelectionStep.Stale) UpdateThreadBanner();
             _svc.RequestThreads();            // FIRST: the only thing that reports a pre-existing selection
             // THE DEGRADATION SEAT STATES ITS OWN PRECONDITION rather than trusting a caller to establish
             // it. It is only safe while the view knows NOTHING — no selection, nothing painted, nothing in
             // flight — because CurrentVa is the STOPPED thread's address.
             //
             // Quinn-2 attacked this and judged it dead, reasoning that a wrongly-seated reply would need a
-            // stamp matching a stale _selTid, which would mean the view already believed the right thread.
+            // stamp matching a stale SelTid, which would mean the view already believed the right thread.
             // The hole: THE ENGINE STAMPS WITH THE SELECTED THREAD REGARDLESS OF THE VA IT WAS ASKED FOR.
             // A matching stamp proves which THREAD the engine answered about, not which ADDRESS it answered
             // with — and this request is entirely about an address. So the reply passes BOTH gates and
@@ -376,7 +389,7 @@ namespace ClarionDebugger.Disassembly
             // and unlike OnActiveChanged nothing resets the painted thread first — while viewing a non-stopped
             // thread. Relying on a caller to bump the epoch is the assumption that failed; this tests the
             // condition itself.
-            if (!_seat.KnowsNothing(_selTid)) return;
+            if (!_seat.KnowsNothing(SelTid)) return;
             if (!string.IsNullOrEmpty(_svc.CurrentVa))
                 _svc.RequestDisasmAt(_svc.CurrentVa, WindowCount, MakeTag(WinTag), Context);   // degradation path
         }
@@ -386,21 +399,21 @@ namespace ClarionDebugger.Disassembly
             if (string.IsNullOrEmpty(p.Va)) return;
             UI(() =>
             {
-                // Taken from the STOP, not from the `threads` reply that follows it — that reply can fail
-                // or be overtaken. It is also what stops the inventory triggering a second, pointless
-                // reseat on every stop when the selection is (as it almost always is) the stopped thread.
-                // A null Tid means an engine that does not name it: fall back to knowing nothing, where the
-                // banner stays blank rather than naming a thread we would be guessing at.
-                _selTid = _stoppedTid = TidOf(p.Tid);
+                // The service moved its selection to the stopped thread BEFORE raising Paused, and handed that
+                // snapshot here first (OnSelectionChanged, Cause Stop), so SelTid is this stop's thread. It is
+                // the STOP's, not the `threads` reply's that follows - that reply can fail or be overtaken, and
+                // an inventory that agrees moves nothing, so it cannot trigger a second, pointless reseat. A
+                // null Tid means an engine that does not name it: SelTid is 0, knowing nothing, and the banner
+                // stays blank rather than naming a thread we would be guessing at.
                 // A new stop resets the engine's selection to the stopped thread, so any request still in
                 // flight was asked under a selection that no longer exists: SeatState.Stopped retires it,
                 // records this stop's own request as the seat in flight (not painted until it lands), and
                 // keeps the stop's symbol — the runtime location for non-TSWD stops.
-                _seat.Stopped(_selTid, p.Sym);
+                _seat.Stopped(SelTid, p.Sym);
                 UpdateThreadBanner();
-                // ASK, like the other two entry points. This was the only path that set _selTid from what
-                // it happened to be told and never requested the inventory. If p.Tid is ABSENT while the
-                // disasm reply IS stamped, _selTid stays 0 and the (now fail-closed) tid gate drops the
+                // ASK, like the other two entry points. This was the only path that set the selection from
+                // what it happened to be told and never requested the inventory. If p.Tid is ABSENT while the
+                // disasm reply IS stamped, SelTid stays 0 and the (now fail-closed) tid gate drops the
                 // reply — and nothing on this path would recover, where before the gate changed it simply
                 // painted. Reachability is UNPROVEN: the stop event and the disasm reply are stamped
                 // through the same writer, so producing the mismatch needs a live engine and neither
@@ -446,12 +459,12 @@ namespace ClarionDebugger.Disassembly
         /// as the only gate, which is the correct pre-381aabd7 fallback. Treating absent as a mismatch
         /// would blank the view against an older engine — absent-means-unknown broken from the other side.
         ///
-        /// A view that does not yet know its own thread (_selTid == 0) is the case that USED to fail open
+        /// A view that does not yet know its own thread (SelTid == 0) is the case that USED to fail open
         /// too, and that was wrong. A STAMPED reply arriving at such a view is not an absence of
         /// information — it is information the view would be DISCARDING in order to paint something it
         /// cannot label. That is how a late-opened window painted the stopped thread's VA, decoded for a
         /// different selected thread, with no current row and no banner. The two cases are not symmetric:
-        /// an absent tid means the ENGINE said nothing, an unknown _selTid means WE have not asked yet —
+        /// an absent tid means the ENGINE said nothing, an unknown SelTid means WE have not asked yet —
         /// and the fix for not having asked is to ask, which the view now does (RequestThreads on late
         /// open and rebind), not to accept whatever turns up in the meantime.</summary>
         /// <summary>THE view's ONE uint? -> uint conversion, and the ONE definition of "unstamped".
@@ -470,7 +483,7 @@ namespace ClarionDebugger.Disassembly
         /// can check outlives a claim a reader has to honour.</summary>
         private static uint TidOf(uint? t) { return WireRules.TidIsKnown(t) ? t.Value : 0u; }
 
-        private bool TidMatchesView(uint? tid) { return TidMatches(tid, _selTid); }
+        private bool TidMatchesView(uint? tid) { return TidMatches(tid, SelTid); }
 
         /// <summary>The tid gate's whole rule, as a pure function of the reply's stamp and the thread the
         /// view believes it is showing — so `protocolcheck`'s add-in counterpart can assert the shipped
@@ -483,35 +496,59 @@ namespace ClarionDebugger.Disassembly
             return t == selTid;
         }
 
-        // ----- following the pad's thread selection -----
+        // ----- following the service's thread selection -----
 
-        /// <summary>The thread inventory for this stop. It names the threads (a bare tid is useless in a
-        /// banner) and reports who is stopped and who is selected — the engine's answer, not our guess.</summary>
+        /// <summary>What a delivered selection snapshot means for this view.</summary>
+        internal enum SelectionStep { Stale, Adopted, Reseat }
+
+        /// <summary>TAKE a snapshot the service delivered, and say what it asks of the view: nothing
+        /// (<see cref="SelectionStep.Stale"/>: it is not newer than the one held), a banner re-read
+        /// (Adopted), or a re-seat on its thread (Reseat: a switch or an inventory that moved the selection).
+        /// <para>
+        /// NEWER BY EPOCH. The service's epoch rises with every change and never resets for its lifetime, so
+        /// a snapshot that is not newer is one this view already holds or has passed: a duplicate delivered
+        /// both by the event and by a direct read (Bind, a late handle), or an older one queued behind that
+        /// read. A new session's first snapshot is newer than the last one of the session before.
+        /// </para>
+        /// <para>
+        /// A STOP does not re-seat here: OnPaused seats the stop's own address when its event arrives, right
+        /// behind this snapshot. Moving the selection is what lets a thread that decoded to nothing be tried
+        /// again (SeatState.SelectionMoving).
+        /// </para></summary>
+        internal static SelectionStep TakeSelection(ref ThreadSelection held, ThreadSelection s, SeatState seat)
+        {
+            if (s == null || (held != null && s.Epoch <= held.Epoch)) return SelectionStep.Stale;
+            uint from = held == null ? 0u : TidOf(held.Tid);
+            held = s;
+            if (s.Cause != ThreadSelectionCause.Switch && s.Cause != ThreadSelectionCause.Inventory) return SelectionStep.Adopted;
+            seat.SelectionMoving(from, TidOf(s.Tid));
+            return SelectionStep.Reseat;
+        }
+
+        /// <summary>The service moved the host's selected thread. Raised before the event that moved it, so
+        /// by the time a stop's or a switch's own handler runs here, the view already holds its selection.</summary>
+        private void OnSelectionChanged(ThreadSelection s) => UI(() => ApplySelection(s));
+
+        private void ApplySelection(ThreadSelection s)
+        {
+            var step = TakeSelection(ref _selection, s, _seat);
+            if (step == SelectionStep.Stale) return;
+            UpdateThreadBanner();
+            if (step == SelectionStep.Reseat) SeatOnSelectedThread();
+        }
+
+        /// <summary>The thread inventory for this stop. It NAMES the threads (a bare tid is useless in a
+        /// banner). Which one is selected is the service's to decide from it: when the inventory moves the
+        /// selection, the snapshot for that arrived just before this.</summary>
         private void OnThreads(DebugThreadList list) => UI(() =>
         {
             if (list == null) return;
             _threads = list.Threads ?? new List<DebugThread>();
-            // StoppedTid/SelectedTid are uint? (task 3b043dfc): on the WIRE and in the host's model, "the
-            // engine did not say" is ABSENT, never 0. This view keeps its own uint fields with the local
-            // `0 = unknown` convention documented at their declaration, and THE CONVERSION HAPPENS IN
-            // TidOf AND NOWHERE ELSE — a claim a grep can check, which is why it replaced the sentence
-            // that used to sit here saying the conversion happened "once, at the boundary". It said that
-            // while already naming a second site in its own next clause, and by the time four authors had
-            // been through this file there were four, one of which disagreed with the others.
-            // Selected-else-stopped is preserved: show the selected thread if there is one, else the
-            // stopped one.
-            _stoppedTid = TidOf(list.StoppedTid);
-            // A SelectedTid of literal 0 is a sentinel, not a selection, so it falls back to the stopped
-            // thread exactly as an absent one does — which `?? 0` did not do.
-            uint sel = TidOf(list.SelectedTid);
-            uint nextSel = sel != 0 ? sel : _stoppedTid;
-            _seat.SelectionMoving(_selTid, nextSel);
-            _selTid = nextSel;
             UpdateThreadBanner();
             // THE WINDOW-OPENED-LATE CASE. A selection made before this view existed (or before it was
-            // rebound) is reported here and nowhere else: without this the listing would sit on the stopped
-            // thread showing no banner, while the pad's own banner says you are viewing another thread —
-            // the exact mismatch this view is supposed to have stopped being capable of.
+            // rebound) reaches it with the service's selection at Bind; the seat on it is started here, by the
+            // inventory the late open asks for. This is also the retry after a seat the engine failed: an
+            // inventory that agrees moves no selection, so nothing else would try again.
             SeatOnSelectedThread();
         });
 
@@ -522,24 +559,8 @@ namespace ClarionDebugger.Disassembly
         private void SeatOnSelectedThread()
         {
             if (_svc == null) return;
-            if (_seat.TryBeginSeat(_selTid)) _svc.RequestRegs();
+            if (_seat.TryBeginSeat(SelTid)) _svc.RequestRegs();
         }
-
-        /// <summary>The engine's answer to a `thread N` request. <paramref name="tid"/> is the thread that
-        /// was ASKED FOR and is null when the request was malformed, so a failure is never read as thread 0.
-        /// On success the view re-seats on the new thread — but it does not yet know where that thread is,
-        /// so it asks for its registers and seats on the reply.</summary>
-        private void OnThreadSelected(uint? tid, bool ok, string error) => UI(() =>
-        {
-            // A refused or malformed select leaves the view exactly where it was. Re-rendering the banner
-            // from unchanged state is deliberate: it must not start naming a thread the engine declined.
-            uint chosen = TidOf(tid);
-            if (!ok || chosen == 0) { UpdateThreadBanner(); return; }
-            _seat.SelectionMoving(_selTid, chosen);   // deliberate switch: allow that thread a fresh try
-            _selTid = chosen;
-            UpdateThreadBanner();
-            SeatOnSelectedThread();
-        });
 
         /// <summary>Registers for a thread. Used ONLY to learn where a thread this view is currently
         /// seating is frozen — never as a reason to move the window on its own.
@@ -598,20 +619,20 @@ namespace ClarionDebugger.Disassembly
         {
             if (_thread == null) return;
             string text = "";
-            // DERIVED FROM THE PAINTED THREAD — never from _selTid, the one we INTEND to show. The rule is
+            // DERIVED FROM THE PAINTED THREAD — never from SelTid, the one we INTEND to show. The rule is
             // SeatState.ForeignSeatedTid's, next to the only code that writes the painted thread: blank while
             // nothing is painted, or while what IS painted is not what we are now selecting.
-            uint foreign = _seat.ForeignSeatedTid(_selTid, _stoppedTid);
+            uint foreign = _seat.ForeignSeatedTid(SelTid, StoppedTid);
             // The second clause says the step buttons' consequence in the one place that is always visible
             // (375d463b): pressing Step here runs the STOPPED thread and the view snaps back to it, and that
             // snap-back is only readable if it was announced.
             if (foreign != 0)
                 text = "viewing " + ThreadName(foreign) + " — not the stopped thread · Step runs "
-                     + ThreadName(_stoppedTid);
+                     + ThreadName(StoppedTid);
             _thread.Text = text;
             _thread.Visible = text.Length > 0;
             UpdateStepTips();
-            UpdateRecentre();   // _selTid moves with the banner's inputs
+            UpdateRecentre();   // SelTid moves with the banner's inputs
         }
 
         /// <summary>Name a thread the way the pad names it: its Clarion thread number when the RTL gave one,
@@ -673,8 +694,8 @@ namespace ClarionDebugger.Disassembly
                     // paints, that an empty one UN-paints (the listing below is about to erase whatever the
                     // painted flag described), and that only an empty SEAT may claim "this thread's code
                     // could not be decoded". The reply's stamp goes in through TidOf; the tid gate above has
-                    // already proved it agrees with _selTid.
-                    var outcome = _seat.WindowLanded(TidOf(tid), _selTid, instrs.Count);
+                    // already proved it agrees with SelTid.
+                    var outcome = _seat.WindowLanded(TidOf(tid), SelTid, instrs.Count);
                     if (outcome == SeatState.WindowOutcome.EmptySeat)
                     {
                         // THE LOCATION STRIP IS A THREAD CLAIM TOO. The fields below describe the instruction
@@ -736,7 +757,7 @@ namespace ClarionDebugger.Disassembly
             // answered: SeatState.Exited retires the outstanding replies, clears every seat field and the
             // stop's symbol.
             _seat.Exited();
-            _stoppedTid = _selTid = 0;
+            // The selection needs nothing here: the service ended it (Cause Ended) before raising Exited.
             _threads = new List<DebugThread>();
             UpdateThreadBanner();
             UpdateLocation();
