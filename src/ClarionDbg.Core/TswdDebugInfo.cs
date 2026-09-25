@@ -51,8 +51,9 @@ namespace ClarionDbg.Core
     /// {u32 nameRef, u32 entryRVA, u32 moduleBackref}, byte-granular (NOT aligned), scattered
     /// after the +0x28 backref array. The {nameRef, entryRVA} pair also appears at CALL SITES,
     /// so definitions are selected by requiring the 3rd field to be a valid +0x28 backref value
-    /// (whose array index IS the moduleIdx) and skipping __thunk.* names (a thunk lives in the
-    /// caller's module). See docs/TSWD-format.md and spikes/tswd-procsym-decode.ps1.
+    /// and skipping __thunk.* names (a thunk lives in the caller's module). The backref's array
+    /// index is NOT a module index: see <see cref="BackrefSlot"/> and <see cref="ModuleIdx"/>.
+    /// See docs/TSWD-format.md and spikes/tswd-procsym-decode.ps1.
     /// </summary>
     public sealed class ProcSymbol
     {
@@ -60,7 +61,14 @@ namespace ClarionDbg.Core
         public string Name;       // demangled, e.g. SELECTJOBS, BRW1::SELECTSORT, INICLASS.UPDATE
         public SymbolKind Kind;
         public uint EntryRva;     // canonical proc start (may sit ABOVE the module's +0x1C floor)
-        public int ModuleIdx;     // == +0x08 name-array index == +0x1C moduleIdx
+        /// <summary>The +0x28 backref-array index of the definition's 3rd field. Symbols of one compiland
+        /// share it, but it is NOT an index into <see cref="TswdDebugInfo.ModuleNames"/>: on QuickChat.exe
+        /// (measured 2026-09-25) 24 module names sit beside slots up to 339 (52458d89).</summary>
+        public int BackrefSlot;
+        /// <summary>The +0x1C line-table module (a <see cref="TswdDebugInfo.ModuleNames"/> index) this
+        /// symbol's code belongs to, or -1 when the line table cannot prove one. Set by
+        /// <see cref="TswdDebugInfo"/>'s attribution pass, never copied from <see cref="BackrefSlot"/>.</summary>
+        public int ModuleIdx;
     }
 
     /// <summary>
@@ -105,6 +113,10 @@ namespace ClarionDbg.Core
     {
         public string Name;      // pool name, e.g. SAVEPATH or JOBS$JOB:RECORD
         public uint Rva;
+        /// <summary>The +0x28 backref-array index; see <see cref="ProcSymbol.BackrefSlot"/>.</summary>
+        public int BackrefSlot;
+        /// <summary>The line-table module the CODE symbols sharing <see cref="BackrefSlot"/> agree on, or -1
+        /// when they disagree or there are none (52458d89).</summary>
         public int ModuleIdx;
         public byte TypeCode;    // 0x08 = GROUP/RECORD; 0 = unknown
         public uint Size;        // 0 = unknown
@@ -631,7 +643,7 @@ namespace ClarionDbg.Core
 
                 if (inText)
                 {
-                    var sym = new ProcSymbol { RawName = raw, EntryRva = rva, ModuleIdx = modIdx };
+                    var sym = new ProcSymbol { RawName = raw, EntryRva = rva, BackrefSlot = modIdx, ModuleIdx = -1 };
                     Demangle(raw, sym);
                     Symbols.Add(sym);
                 }
@@ -642,7 +654,95 @@ namespace ClarionDbg.Core
             }
             Symbols.Sort((a, b) => a.EntryRva.CompareTo(b.EntryRva));
             DataSymbols.Sort((a, b) => a.Rva.CompareTo(b.Rva));
+            AttributeModules();
             BuildDataNameIndex();
+        }
+
+        /// <summary>
+        /// Give every symbol its +0x1C line-table module (52458d89). The line table is the truth: a backref
+        /// slot is not a module index, and reading it as one named the wrong .clw, or none, on any image
+        /// whose slots run past the name array (QuickChat.exe, measured 2026-09-25: 24 names, slots to 339).
+        ///
+        /// CODE: two line records bracket a symbol's entry: A, the last record at or below it, and B, the
+        /// first record at or above it, if B lies before the next symbol's entry (the symbol's own code).
+        ///  - A and B agree, or B sits AT the entry, or there is no A: the module is B's. Confident.
+        ///  - A and B disagree: the entry sits on a compiland boundary. Either can be wrong: a prologue can
+        ///    precede its own first record (A is then the previous compiland's tail), and a compiland can
+        ///    emit glue before its first symbol (B is then the next compiland's). The slot's agreed module
+        ///    (below) picks between them; if it is neither, the module is unproven.
+        ///  - No record of its own (DLL glue such as NAME$$$__attach_process, laid out away from its
+        ///    compiland): the slot's agreed module, else unproven.
+        /// DATA: the slot's agreed module, else unproven.
+        /// A slot's AGREED module comes only from CODE symbols with a line record exactly AT their entry; if
+        /// they name two modules there is none. Merely confident symbols do not vote, because the definition
+        /// scan's stray hits land mid-procedure: on clbrws.exe a FIRSTSORTFIELD "definition" at 0x66C8 sits
+        /// inside ABERROR.CLW's code under ABBROWSE's slot, and on QuickChat.exe a second _main at 0x213A
+        /// does the same under ABEIP's (measured 2026-09-25). Kind is no filter: a PROGRAM module's only
+        /// code symbols are _main and its $$$ glue, all Kind Other. Unproven is -1, never the raw slot: a
+        /// module we cannot prove is shown as none, not guessed.
+        /// </summary>
+        private void AttributeModules()
+        {
+            int n = Symbols.Count;
+            var addr = AddrTable ?? new List<AddrRec>();
+            var aMod = new int[n];
+            var bMod = new int[n];
+            var agreed = new Dictionary<int, int>();   // slot -> module, or -2 when its voters disagree
+            for (int i = 0; i < n; i++)
+            {
+                var s = Symbols[i];
+                uint entry = s.EntryRva;
+                // The next symbol with a HIGHER entry bounds this one's own code; duplicates share it.
+                uint next = uint.MaxValue;
+                for (int j = i + 1; j < n; j++)
+                    if (Symbols[j].EntryRva > entry) { next = Symbols[j].EntryRva; break; }
+                int ai = LastRecordAtOrBelow(addr, entry);
+                int bi = FirstRecordAtOrAbove(addr, entry);
+                aMod[i] = ai >= 0 ? addr[ai].ModuleIdx : -1;
+                bMod[i] = (bi >= 0 && addr[bi].Rva < next) ? addr[bi].ModuleIdx : -1;
+                s.ModuleIdx = -1;
+                if (bMod[i] < 0) continue;
+                if (addr[bi].Rva == entry || aMod[i] < 0 || aMod[i] == bMod[i])
+                {
+                    s.ModuleIdx = bMod[i];
+                    if (addr[bi].Rva == entry)
+                    {
+                        int held;
+                        if (!agreed.TryGetValue(s.BackrefSlot, out held)) agreed[s.BackrefSlot] = s.ModuleIdx;
+                        else if (held != s.ModuleIdx) agreed[s.BackrefSlot] = -2;
+                    }
+                }
+            }
+            for (int i = 0; i < n; i++)
+            {
+                var s = Symbols[i];
+                if (s.ModuleIdx >= 0) continue;
+                int slotMod = AgreedModule(agreed, s.BackrefSlot);
+                if (slotMod < 0) continue;
+                if (bMod[i] < 0 || slotMod == aMod[i] || slotMod == bMod[i]) s.ModuleIdx = slotMod;
+            }
+            foreach (var ds in DataSymbols)
+                ds.ModuleIdx = AgreedModule(agreed, ds.BackrefSlot);
+        }
+
+        private static int AgreedModule(Dictionary<int, int> agreed, int slot)
+        {
+            int m;
+            return agreed.TryGetValue(slot, out m) && m >= 0 ? m : -1;
+        }
+
+        private static int LastRecordAtOrBelow(List<AddrRec> addr, uint rva)
+        {
+            int lo = 0, hi = addr.Count - 1, ans = -1;
+            while (lo <= hi) { int mid = (lo + hi) >> 1; if (addr[mid].Rva <= rva) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+            return ans;
+        }
+
+        private static int FirstRecordAtOrAbove(List<AddrRec> addr, uint rva)
+        {
+            int lo = 0, hi = addr.Count - 1, ans = -1;
+            while (lo <= hi) { int mid = (lo + hi) >> 1; if (addr[mid].Rva >= rva) { ans = mid; hi = mid - 1; } else lo = mid + 1; }
+            return ans;
         }
 
         /// <summary>DIAGNOSTIC (temporary): re-run BuildSymbols' scan for any 12-byte window whose
@@ -840,7 +940,7 @@ namespace ClarionDbg.Core
         /// </summary>
         private DataSymbol BuildDataSymbol(int o, string name, uint rva, int modIdx, int poolLen)
         {
-            var ds = new DataSymbol { Name = name, Rva = rva, ModuleIdx = modIdx };
+            var ds = new DataSymbol { Name = name, Rva = rva, BackrefSlot = modIdx, ModuleIdx = -1 };
             if (_base + o + 22 > _b.Length) return ds;
 
             // The u32 at tag+1 (here o-4 — the "link" the legacy field-scan below only used as a match key)
@@ -1501,7 +1601,7 @@ namespace ClarionDbg.Core
         /// <summary>
         /// <see cref="ResolveSymbol"/>, but verified against the +0x1C line table so cold/init "glue"
         /// code (unnamed at the symbol level) doesn't get mislabeled with an unrelated PRECEDING symbol
-        /// from a different compiland. <see cref="ProcSymbol.ModuleIdx"/> can't be used for this
+        /// from a different compiland. <see cref="ProcSymbol.BackrefSlot"/> can't be used for this
         /// cross-check — it's a +0x28 backref-array position, a different, non-linearly-related index
         /// space from the +0x1C table's moduleIdx (confirmed live: comparing them vetoed 100% of frames
         /// on a 134-module binary). The verification rule: the FIRST +0x1C record in the candidate's own
@@ -1623,8 +1723,9 @@ namespace ClarionDbg.Core
 
         /// <summary>
         /// The +0x1C moduleIdx for a .clw module name. The +0x08 module-name-array index IS the
-        /// moduleIdx (== the symbol moduleBackref index) — verified deterministically — so this is a
-        /// direct index match against <see cref="ModuleNames"/>, NOT a content bind. Accepts the name
+        /// +0x1C moduleIdx, so this is a direct index match against <see cref="ModuleNames"/>, NOT a
+        /// content bind. A symbol's backref slot is a different space (<see cref="ProcSymbol.BackrefSlot"/>);
+        /// compare the result with <see cref="ProcSymbol.ModuleIdx"/>. Accepts the name
         /// with or without extension, case-insensitive. Returns -1 if not found.
         /// </summary>
         public int FindModuleIdx(string name)
