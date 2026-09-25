@@ -69,7 +69,8 @@ namespace ClarionDbg.Cli
                          + "that a qualifier then resolves; a HISTORY:: copy, a static, or one file record among other "
                          + "names still resolves to one, EXE first. Through the real handlers on a parsed image: a watch "
                          + "of the name or of a path through it is an error with no value, address or edit metadata; "
-                         + "`sym` gives no address, a condition reads it as unreadable, a thread scan records the message.");
+                         + "`sym` gives no address and lists the watchable forms, a condition reads it as unreadable, a "
+                         + "thread scan records the message.");
 
             // ---- the index keeps both FILE records, and only them ----
             var fileA = new TswdDebugInfo.DataLocation { Rva = 0x30B4, Container = "ORDERS$ORD:RECORD", ModuleIdx = 1 };
@@ -188,8 +189,10 @@ namespace ClarionDbg.Cli
                 if (outp != null)
                 {
                     if (outp.IndexOf("  sym ORDERS$ORD:RECORD: " + amb, StringComparison.Ordinal) < 0
-                        || outp.IndexOf(Json.Sym("ORDERS$ORD:RECORD", false, 0, 0, 0, null, 0, null), StringComparison.Ordinal) < 0)
-                        failures.Add("ambiguous callers: sym did not answer not-found with the message: " + outp.Trim());
+                        || outp.IndexOf(Json.Sym("ORDERS$ORD:RECORD", false, 0, 0, 0, null, 0, null).TrimEnd('}')
+                                        + ",\"ambiguous\":[\"A.CLW!ORDERS$ORD:RECORD\",\"C.CLW!ORDERS$ORD:RECORD\"]}", StringComparison.Ordinal) < 0)
+                        failures.Add("ambiguous callers: sym did not answer not-found, with the message and the forms listed "
+                                     + "last as \"ambiguous\" (3517fd15 #8): " + outp.Trim());
                     if (outp.IndexOf("condition: 0", StringComparison.Ordinal) < 0)
                         failures.Add("ambiguous callers: a condition did not read the name as unreadable (0): " + outp.Trim());
                     if (outp.IndexOf("probe: (" + amb + ")", StringComparison.Ordinal) < 0)

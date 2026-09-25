@@ -254,7 +254,17 @@ namespace ClarionDbg.Cli
         internal static DataResolve ChooseData(string name, string q1, string q2, IList<DataCandidate> cands,
                                                out DataCandidate chosen, out string message)
         {
-            chosen = null; message = null;
+            List<string> forms;
+            return ChooseData(name, q1, q2, cands, out chosen, out message, out forms);
+        }
+
+        /// <summary><see cref="ChooseData(string, string, string, IList{DataCandidate}, out DataCandidate, out string)"/>,
+        /// with, on <see cref="DataResolve.Ambiguous"/>, the candidate forms a user can watch instead
+        /// (<see cref="PasteableForms"/>); null otherwise.</summary>
+        internal static DataResolve ChooseData(string name, string q1, string q2, IList<DataCandidate> cands,
+                                               out DataCandidate chosen, out string message, out List<string> forms)
+        {
+            chosen = null; message = null; forms = null;
             string image = null, module = null;
             if (q2 != null) { image = q1; module = q2; }
             else if (q1 != null)
@@ -271,19 +281,25 @@ namespace ClarionDbg.Cli
             var files = kept.FindAll(c => c.FileRecord);
             if (files.Count >= 2)
             {
-                message = AmbiguityMessage(name, image != null, files);
+                string note;
+                var all = AmbiguityForms(name, image != null, files, out note);
+                message = "ambiguous: " + string.Join(", ", all) + " - watch one of these" + (note != null ? " (" + note + ")" : "");
+                forms = PasteableForms(all);
                 return DataResolve.Ambiguous;
             }
             chosen = kept[0];
             return DataResolve.Found;
         }
 
-        /// <summary>"ambiguous: A, B - watch one of these". See <see cref="AmbiguityForms"/> for the forms.</summary>
-        private static string AmbiguityMessage(string name, bool imageNamed, List<DataCandidate> files)
+        /// <summary>The forms a watch can actually take: pasteable, and not shared with another candidate (a
+        /// shared form would only answer "ambiguous" again). The `sym` reply lists these (3517fd15 item 8).</summary>
+        internal static List<string> PasteableForms(List<string> forms)
         {
-            string note;
-            var forms = AmbiguityForms(name, imageNamed, files, out note);
-            return "ambiguous: " + string.Join(", ", forms) + " - watch one of these" + (note != null ? " (" + note + ")" : "");
+            var once = new List<string>();
+            foreach (var f in forms)
+                if (IsPasteableWatchName(f) && forms.FindAll(x => string.Equals(x, f, StringComparison.OrdinalIgnoreCase)).Count == 1)
+                    once.Add(f);
+            return once;
         }
 
         /// <summary>The characters a watch name may hold (3517fd15 item 4; the host's IsValidWatchName accepts
@@ -380,10 +396,18 @@ namespace ClarionDbg.Cli
         private DataResolve ResolveDataAcrossModules(string spec, out LoadedModule owner, out TswdDebugInfo.DataLocation loc,
                                                      out string ambiguity)
         {
+            List<string> forms;
+            return ResolveDataAcrossModules(spec, out owner, out loc, out ambiguity, out forms);
+        }
+
+        /// <summary>The same, with the watchable forms of an ambiguous name (see <see cref="PasteableForms"/>).</summary>
+        private DataResolve ResolveDataAcrossModules(string spec, out LoadedModule owner, out TswdDebugInfo.DataLocation loc,
+                                                     out string ambiguity, out List<string> forms)
+        {
             loc = default(TswdDebugInfo.DataLocation);
             owner = null; ambiguity = null;
             DataCandidate c;
-            var r = ResolveData(ImagesExeFirst(), spec, out c, out ambiguity);
+            var r = ResolveData(ImagesExeFirst(), spec, out c, out ambiguity, out forms);
             if (r == DataResolve.Found) { owner = c.Owner; loc = c.Loc; }
             return r;
         }
@@ -394,7 +418,14 @@ namespace ClarionDbg.Cli
         internal static DataResolve ResolveData(IEnumerable<LoadedModule> images, string spec, out DataCandidate chosen,
                                                 out string ambiguity)
         {
-            chosen = null; ambiguity = null;
+            List<string> forms;
+            return ResolveData(images, spec, out chosen, out ambiguity, out forms);
+        }
+
+        internal static DataResolve ResolveData(IEnumerable<LoadedModule> images, string spec, out DataCandidate chosen,
+                                                out string ambiguity, out List<string> forms)
+        {
+            chosen = null; ambiguity = null; forms = null;
             string q1, q2, name;
             if (!ParseQualified(spec, out q1, out q2, out name)) return DataResolve.NotFound;
             var cands = new List<DataCandidate>();
@@ -408,7 +439,7 @@ namespace ClarionDbg.Cli
                         FileRecord = TswdDebugInfo.IsFileRecordLocation(name, l), Owner = m, Loc = l,
                     });
             }
-            return ChooseData(name, q1, q2, cands, out chosen, out ambiguity);
+            return ChooseData(name, q1, q2, cands, out chosen, out ambiguity, out forms);
         }
 
         /// <summary>The data SYMBOL a watch path's head names, by the same rule: qualifiers from

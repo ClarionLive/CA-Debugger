@@ -421,6 +421,18 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Resolved data symbol for watch-by-name. typeName null = unproven code (render hex).</summary>
+        /// <summary>A `sym` for a name several FILE records answer to (3517fd15 item 8): the not-found reply, plus
+        /// "ambiguous", the forms that resolve to one each (possibly empty, when no form can be typed). Added last,
+        /// so a reader of the not-found shape reads it unchanged.</summary>
+        public static string SymAmbiguous(string name, List<string> forms)
+        {
+            var sb = new StringBuilder(Sym(name, false, 0, 0, 0, null, 0, null));
+            sb.Length--;
+            sb.Append(",\"ambiguous\":[");
+            for (int i = 0; i < forms.Count; i++) sb.Append(i > 0 ? "," : "").Append(Str(forms[i]));
+            return sb.Append("]}").ToString();
+        }
+
         public static string Sym(string name, bool found, uint rva, uint va, byte typeCode, string typeName, uint size, string container)
         {
             if (!found)

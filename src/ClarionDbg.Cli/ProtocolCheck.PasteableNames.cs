@@ -17,7 +17,8 @@ namespace ClarionDbg.Cli
             claims.Claim("an ambiguity message names each candidate by its module when the modules tell them apart, by "
                          + "its image when only that does, and by both otherwise; it never suggests a form holding a "
                          + "character outside [A-Za-z0-9_:$.!@-] without saying no such form exists, and every form it "
-                         + "does suggest resolves back to the candidate it names.");
+                         + "does suggest resolves back to the candidate it names; `sym` lists only forms that can be typed "
+                         + "and name one candidate.");
 
             Func<string, string, string, uint, DebugEngine.DataCandidate> cand = (image, module, container, rva) =>
                 new DebugEngine.DataCandidate
@@ -81,6 +82,11 @@ namespace ClarionDbg.Cli
                    "ambiguous: My App.exe!ORD:ITEM, My Other.dll!ORD:ITEM - watch one of these (some have no form a watch name can hold)");
             expect("one module name with a parenthesis, two images: the image", new[] { paren, parenDll },
                    "ambiguous: app.exe!ORD:ITEM, orders.dll!ORD:ITEM - watch one of these");
+
+            // What `sym` lists: only forms that can be typed AND name one candidate.
+            var listed = DebugEngine.PasteableForms(new List<string> { "a.clw!X", "My App.exe!X", "b.clw!R.X", "B.CLW!R.X", "c.clw!X" });
+            if (string.Join(",", listed) != "a.clw!X,c.clw!X")
+                failures.Add("pasteable names: sym's list kept [" + string.Join(",", listed) + "], expected [a.clw!X,c.clw!X]");
 
             foreach (var ok in new[] { "A.CLW!ORD:ITEM", "order-entry.clw!X", "OUTFILE$OUTFILE@:RECORD.BUFFER", "x_1" })
                 if (!DebugEngine.IsPasteableWatchName(ok)) failures.Add("pasteable names: " + ok + " was refused");
