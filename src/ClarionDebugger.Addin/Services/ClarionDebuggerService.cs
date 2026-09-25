@@ -1044,11 +1044,12 @@ namespace ClarionDebugger.Services
         /// <c>CLBRWS.EXE!CUS:RECORD</c>. It starts a comment in Clarion, so it is in no label, and it is not a
         /// separator on the engine's line- and space-split stdin. Nothing else is added: no space, quote,
         /// ';' or line break. The pattern ends in <c>\z</c>, not <c>$</c>: .NET's <c>$</c> also matches
-        /// before a trailing newline, which on that stdin is a second command.</remarks>
+        /// before a trailing newline, which on that stdin is a second command. '@' is in the names the engine
+        /// itself prints for paste-back, e.g. <c>CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER</c>; it is no separator either.</remarks>
         public static bool IsValidWatchName(string name)
         {
             return !string.IsNullOrEmpty(name) && name.Length <= 128
-                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!]+\z") && !name.Contains("..");
+                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!@]+\z") && !name.Contains("..");
         }
 
         /// <summary>Watch a data symbol by name (global, file record buffer, or field). Resolves the

@@ -2838,10 +2838,12 @@ public class WatchNameProbe {
 "@
 Add-Type -TypeDefinition $watchProbeSrc -Language CSharp | Out-Null
 $wn = New-Object WatchNameProbe
-$qualified = @('CLBRWS.EXE!CUS:RECORD', 'clbrws011.clw!LOC:Count', 'CLBRWS.EXE!clbrws011.clw!Glo:Name', 'GLO:X')
+# The last three are names the engine prints for paste-back (Enzo, report d6a07e24); '@' is in the third.
+$qualified = @('CLBRWS.EXE!CUS:RECORD', 'clbrws011.clw!LOC:Count', 'CLBRWS.EXE!clbrws011.clw!Glo:Name', 'GLO:X',
+  'filescope_a.clw!ORD:ITEM', 'filescope_b.clw!ORDERS$ORD:RECORD.ORD:ITEM', 'CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER')
 $wnBad = @($qualified | Where-Object { $wn.Sent = $null; -not ($wn.Watch($_) -and $wn.Sent -ceq ('watch ' + $_)) })
 Check 'a qualified name is accepted and sent whole: `watch CLBRWS.EXE!CUS:RECORD`' ($wnBad.Count -eq 0) ($wnBad -join ', ')
-$refused = @('A B', "A`n", "A!`n", "A`r", "A!`r`nquit", 'A;B', 'A"B', "A'B", 'A!B C', '', ('A' * 129), 'A..B')
+$refused = @('A B', "A`n", 'OUTFILE@ X', "OUTFILE@`n", 'OUTFILE@"', 'OUTFILE@;quit', "A!`n", "A`r", "A!`r`nquit", 'A;B', 'A"B', "A'B", 'A!B C', '', ('A' * 129), 'A..B')
 $wnLet = @($refused | Where-Object { $wn.Sent = $null; $wn.Watch($_) -or -not [string]::IsNullOrEmpty($wn.Sent) } | ForEach-Object { ShowVal ($_ -replace "`r", '\r' -replace "`n", '\n') })
 Check 'a space, a line break (a trailing one included), a quote or a ; is still refused, and nothing is sent' ($wnLet.Count -eq 0) ($wnLet -join ', ')
 
