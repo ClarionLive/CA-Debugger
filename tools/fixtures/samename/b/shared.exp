@@ -1,0 +1,3 @@
+LIBRARY shared GUI
+EXPORTS
+  SHAREDPROC @?

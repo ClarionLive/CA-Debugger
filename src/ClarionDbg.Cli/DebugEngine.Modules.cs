@@ -30,20 +30,81 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Pre-parse a solution DLL off disk so its breakpoints resolve before launch.
-        /// Failures are non-fatal (the DLL may be rebuilt/absent); it will re-parse at LOAD_DLL.</summary>
+        /// Failures are non-fatal (the DLL may be rebuilt/absent); it will re-parse at LOAD_DLL.
+        /// <para>
+        /// KEYED ON THE CANONICAL FULL PATH, not the file name (1be3b82e item 2). Two projects can each build a
+        /// <c>shared.dll</c>, and a name key skipped the second one as "already known", so it had no entry of its
+        /// own and, once loaded, took the first one's PE and TSWD.
+        /// </para></summary>
         private void TryPreloadSolutionDll(string path)
         {
             try
             {
                 if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return;
-                string name = System.IO.Path.GetFileName(path).ToLowerInvariant();
-                foreach (var m in _modules) if (m.Name == name) return; // already known
+                path = CanonicalImagePath(path);
+                foreach (var m in _modules) if (SamePath(m.Path, path)) return; // already known
                 var pe = PeImage.Load(path);
                 var dbg = TswdDebugInfo.TryFromPe(pe);
                 RegisterImageFromPe(path, pe, dbg, preloaded: true);
             }
             catch { /* best-effort pre-load */ }
         }
+
+        /// <summary>A file's path spelled the way <see cref="OnDllLoaded"/> learns a loaded image's path: the
+        /// final path of an open handle (<see cref="GetPathFromHandle"/>), so a short 8.3 name, a different case
+        /// or a relative path from the host compares equal to what the loader reports. Falls back to the full
+        /// path when the file cannot be opened, and passes null through.</summary>
+        internal static string CanonicalImagePath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                               FileShare.ReadWrite | FileShare.Delete))
+                {
+                    string final = GetPathFromHandle((uint)fs.SafeFileHandle.DangerousGetHandle().ToInt64());
+                    if (!string.IsNullOrEmpty(final)) return final;
+                }
+            }
+            catch { /* unreadable: the full path is the best spelling left */ }
+            try { return System.IO.Path.GetFullPath(path); } catch { return path; }
+        }
+
+        private static bool SamePath(string a, string b)
+        {
+            return !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b) && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// The unmapped entry a DLL that just mapped at <paramref name="path"/> takes over, or null for a new entry
+        /// (1be3b82e item 2). The PATH decides: an entry whose canonical path is the one loaded. The file name
+        /// alone decided before, so <c>C:\B\shared.dll</c> claimed <c>C:\A\shared.dll</c>'s preloaded entry and
+        /// read its TSWD against B's code.
+        /// <para>
+        /// ONE FALLBACK, on build identity rather than name: an output copied beside the EXE loads from a path the
+        /// host never named. A same-name PRELOADED entry is still that image when its PE link time and size equal
+        /// the mapped image's (<paramref name="mappedStamp"/>, <paramref name="mappedSize"/>), and only when
+        /// exactly one entry does; two builds of <c>shared.dll</c> differ in both, so neither is claimed.
+        /// </para>
+        /// </summary>
+        internal static LoadedModule ClaimUnmapped(IList<LoadedModule> modules, string path, string name,
+                                                   uint mappedStamp, uint mappedSize)
+        {
+            foreach (var im in modules)
+                if (im.LoadBase == 0 && SamePath(im.Path, path)) return im;
+            LoadedModule same = null;
+            foreach (var im in modules)
+            {
+                if (im.LoadBase != 0 || !im.Preloaded || im.Pe == null || im.Name != name) continue;
+                if (mappedStamp == 0 || im.Pe.TimeDateStamp != mappedStamp || im.Pe.SizeOfImage != mappedSize) continue;
+                if (same != null) return null;   // two builds answer: neither is provably this one
+                same = im;
+            }
+            return same;
+        }
+
+        /// <summary>Test seam: the module table as it stands (a copy), for protocolcheck's preload assertions.</summary>
+        internal List<LoadedModule> ModulesForTest() { return new List<LoadedModule>(_modules); }
 
         /// <summary>The mapped module whose [LoadBase, LoadBase+Size) contains <paramref name="va"/>,
         /// or null. Only mapped modules (LoadBase != 0) are candidates.</summary>
@@ -193,7 +254,17 @@ namespace ClarionDbg.Cli
         internal static DataResolve ChooseData(string name, string q1, string q2, IList<DataCandidate> cands,
                                                out DataCandidate chosen, out string message)
         {
-            chosen = null; message = null;
+            List<string> forms;
+            return ChooseData(name, q1, q2, cands, out chosen, out message, out forms);
+        }
+
+        /// <summary><see cref="ChooseData(string, string, string, IList{DataCandidate}, out DataCandidate, out string)"/>,
+        /// with, on <see cref="DataResolve.Ambiguous"/>, the candidate forms a user can watch instead
+        /// (<see cref="PasteableForms"/>); null otherwise.</summary>
+        internal static DataResolve ChooseData(string name, string q1, string q2, IList<DataCandidate> cands,
+                                               out DataCandidate chosen, out string message, out List<string> forms)
+        {
+            chosen = null; message = null; forms = null;
             string image = null, module = null;
             if (q2 != null) { image = q1; module = q2; }
             else if (q1 != null)
@@ -210,32 +281,72 @@ namespace ClarionDbg.Cli
             var files = kept.FindAll(c => c.FileRecord);
             if (files.Count >= 2)
             {
-                message = AmbiguityMessage(name, image != null, files);
+                string note;
+                var all = AmbiguityForms(name, image != null, files, out note);
+                message = "ambiguous: " + string.Join(", ", all) + " - watch one of these" + (note != null ? " (" + note + ")" : "");
+                forms = PasteableForms(all);
                 return DataResolve.Ambiguous;
             }
             chosen = kept[0];
             return DataResolve.Found;
         }
 
-        /// <summary>"ambiguous: A, B - watch one of these", each form as short as tells the candidates apart:
-        /// the image when they span images (or the user named one), the module when one image holds two.</summary>
-        private static string AmbiguityMessage(string name, bool imageNamed, List<DataCandidate> files)
+        /// <summary>The forms a watch can actually take: pasteable, and not shared with another candidate (a
+        /// shared form would only answer "ambiguous" again). The `sym` reply lists these (3517fd15 item 8).</summary>
+        internal static List<string> PasteableForms(List<string> forms)
         {
-            var images = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var perImage = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var c in files)
-            {
-                string key = c.Image ?? "";
-                images.Add(key);
-                int n; perImage.TryGetValue(key, out n); perImage[key] = n + 1;
-            }
-            bool withImage = imageNamed || images.Count > 1;
-            bool withModule = false;
-            foreach (var n in perImage.Values) if (n > 1) withModule = true;
+            var once = new List<string>();
+            foreach (var f in forms)
+                if (IsPasteableWatchName(f) && forms.FindAll(x => string.Equals(x, f, StringComparison.OrdinalIgnoreCase)).Count == 1)
+                    once.Add(f);
+            return once;
+        }
 
-            // A field whose image and module do not set it apart is named through its own record instead, as a
-            // watch path: clbrws.exe's CWUTIL.CLW holds OUTFILE$OUTFILE@:RECORD and INFILE$INFILE@:RECORD, and
-            // both answer to BUFFER (measured 2026-09-25).
+        /// <summary>The characters a watch name may hold (3517fd15 item 4; the host's IsValidWatchName accepts
+        /// these, '-' included from wave 7). A suggested form with any other character cannot be pasted back.</summary>
+        internal const string WatchNamePunctuation = "_:$.!@-";
+
+        internal static bool IsPasteableWatchName(string form)
+        {
+            if (string.IsNullOrEmpty(form)) return false;
+            foreach (char c in form)
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                      || WatchNamePunctuation.IndexOf(c) >= 0)) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// One form per candidate that a watch resolves back to it, each as short as tells the candidates apart.
+        /// Qualifier schemes are tried in order: the MODULE alone, then the image alone, then both (3517fd15 item
+        /// 4). A module name is the source file the user is looking at, and an image name is the one that tends
+        /// to hold characters a watch name cannot (a space in "My App.exe"). A user who NAMED an image keeps it.
+        /// Within a scheme, candidates the qualifiers do not set apart are named through their own record, as a
+        /// watch path: clbrws.exe's CWUTIL.CLW holds OUTFILE$OUTFILE@:RECORD and INFILE$INFILE@:RECORD, and both
+        /// answer to BUFFER (measured 2026-09-25). The first scheme whose forms are all distinct and all pasteable
+        /// wins; failing that, <paramref name="note"/> says why the forms given cannot all be used.
+        /// </summary>
+        internal static List<string> AmbiguityForms(string name, bool imageNamed, List<DataCandidate> files, out string note)
+        {
+            var schemes = imageNamed
+                ? new[] { new[] { true, false }, new[] { true, true } }
+                : new[] { new[] { false, true }, new[] { true, false }, new[] { true, true } };
+            List<string> best = null; bool bestApart = false;
+            foreach (var sc in schemes)
+            {
+                bool apart;
+                var forms = FormsUnder(name, files, sc[0], sc[1], out apart);
+                if (apart && forms.TrueForAll(IsPasteableWatchName)) { note = null; return forms; }
+                if (best == null || (apart && !bestApart)) { best = forms; bestApart = apart; }
+            }
+            note = bestApart ? "some have no form a watch name can hold" : "some cannot be told apart by name";
+            return best;
+        }
+
+        /// <summary>The forms under one qualifier scheme; <paramref name="apart"/> is false when two coincide or
+        /// a module qualifier is needed for a candidate the line table gives no module.</summary>
+        private static List<string> FormsUnder(string name, List<DataCandidate> files, bool withImage, bool withModule,
+                                               out bool apart)
+        {
             Func<DataCandidate, bool, string> form = (c, viaRecord) =>
                 (withImage ? c.Image + "!" : "") + (withModule ? (c.Module ?? "?") + "!" : "")
                 + (viaRecord ? c.Loc.Container + "." : "") + name;
@@ -244,16 +355,15 @@ namespace ClarionDbg.Cli
 
             var forms = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            bool unclear = false;
+            apart = true;
             foreach (var c in files)
             {
-                bool apart = count[form(c, false)] == 1 && !(withModule && c.Module == null);
-                string f = form(c, !apart && c.Loc.Container != null);
-                if ((withModule && c.Module == null) || !seen.Add(f)) unclear = true;
+                bool alone = count[form(c, false)] == 1 && !(withModule && c.Module == null);
+                string f = form(c, !alone && c.Loc.Container != null);
+                if ((withModule && c.Module == null) || !seen.Add(f)) apart = false;
                 forms.Add(f);
             }
-            return "ambiguous: " + string.Join(", ", forms) + " - watch one of these"
-                   + (unclear ? " (some cannot be told apart by name)" : "");
+            return forms;
         }
 
         private static bool NameMatches(string actual, string asked)
@@ -264,12 +374,18 @@ namespace ClarionDbg.Cli
             return dot > 0 && string.Equals(actual.Substring(0, dot), asked, StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>Every debuggable image, the EXE first.</summary>
+        /// <summary>Every debuggable image, the EXE first; a DLL only once it has mapped.
+        /// <para>
+        /// A preloaded solution DLL that has not mapped (not loaded yet, or never) is left out: it has no live
+        /// address, so a name it holds would be read at its bare RVA, and as a second candidate it made a FILE
+        /// record that the mapped image holds alone read as ambiguous. Two same-named DLLs are two preloads since
+        /// 1be3b82e, so one of them loading before the other is the ordinary case, not a rarity.
+        /// </para></summary>
         private IEnumerable<LoadedModule> ImagesExeFirst()
         {
             if (_exe != null && _exe.Dbg != null) yield return _exe;
             foreach (var m in _modules)
-                if (m != _exe && m.Dbg != null) yield return m;
+                if (m != _exe && m.Dbg != null && m.LoadBase != 0) yield return m;
         }
 
         /// <summary>Resolve a data name (global / record buffer / field), optionally qualified
@@ -280,10 +396,18 @@ namespace ClarionDbg.Cli
         private DataResolve ResolveDataAcrossModules(string spec, out LoadedModule owner, out TswdDebugInfo.DataLocation loc,
                                                      out string ambiguity)
         {
+            List<string> forms;
+            return ResolveDataAcrossModules(spec, out owner, out loc, out ambiguity, out forms);
+        }
+
+        /// <summary>The same, with the watchable forms of an ambiguous name (see <see cref="PasteableForms"/>).</summary>
+        private DataResolve ResolveDataAcrossModules(string spec, out LoadedModule owner, out TswdDebugInfo.DataLocation loc,
+                                                     out string ambiguity, out List<string> forms)
+        {
             loc = default(TswdDebugInfo.DataLocation);
             owner = null; ambiguity = null;
             DataCandidate c;
-            var r = ResolveData(ImagesExeFirst(), spec, out c, out ambiguity);
+            var r = ResolveData(ImagesExeFirst(), spec, out c, out ambiguity, out forms);
             if (r == DataResolve.Found) { owner = c.Owner; loc = c.Loc; }
             return r;
         }
@@ -294,7 +418,14 @@ namespace ClarionDbg.Cli
         internal static DataResolve ResolveData(IEnumerable<LoadedModule> images, string spec, out DataCandidate chosen,
                                                 out string ambiguity)
         {
-            chosen = null; ambiguity = null;
+            List<string> forms;
+            return ResolveData(images, spec, out chosen, out ambiguity, out forms);
+        }
+
+        internal static DataResolve ResolveData(IEnumerable<LoadedModule> images, string spec, out DataCandidate chosen,
+                                                out string ambiguity, out List<string> forms)
+        {
+            chosen = null; ambiguity = null; forms = null;
             string q1, q2, name;
             if (!ParseQualified(spec, out q1, out q2, out name)) return DataResolve.NotFound;
             var cands = new List<DataCandidate>();
@@ -308,7 +439,7 @@ namespace ClarionDbg.Cli
                         FileRecord = TswdDebugInfo.IsFileRecordLocation(name, l), Owner = m, Loc = l,
                     });
             }
-            return ChooseData(name, q1, q2, cands, out chosen, out ambiguity);
+            return ChooseData(name, q1, q2, cands, out chosen, out ambiguity, out forms);
         }
 
         /// <summary>The data SYMBOL a watch path's head names, by the same rule: qualifiers from
@@ -368,21 +499,27 @@ namespace ClarionDbg.Cli
             try
             {
                 // An attach's synthetic LOAD_DLL events may carry no file handle (and never an image name), so
-                // fall back to asking the target's memory (DebugEngine.Attach.cs).
-                string path = GetPathFromHandle(hFile) ?? PathFromMappedImage(baseVa);
+                // fall back to asking the target's memory (DebugEngine.Attach.cs). That answer is the loader's
+                // spelling, so it is canonicalized like a preloaded path before anything compares it.
+                string path = GetPathFromHandle(hFile) ?? CanonicalImagePath(PathFromMappedImage(baseVa));
                 string name = !string.IsNullOrEmpty(path)
                     ? System.IO.Path.GetFileName(path).ToLowerInvariant()
                     : $"(0x{baseVa:x})";
 
-                // reuse a pre-loaded solution DLL entry (already has Pe/Dbg parsed) if names match
-                LoadedModule m = null;
-                foreach (var im in _modules)
-                    if (im.LoadBase == 0 && im.Name == name) { m = im; break; }
+                // reuse a pre-loaded solution DLL entry (already has Pe/Dbg parsed): the same file, by path
+                LoadedModule m = ClaimUnmapped(_modules, path, name, ReadRemoteTimeDateStamp(baseVa), ReadRemoteSizeOfImage(baseVa));
 
                 if (m != null)
                 {
                     m.LoadBase = baseVa;
                     if (m.Path == null && path != null) m.Path = path;
+                    // A same-build claim from another copy KEEPS the preloaded Path. The host has already learned
+                    // that path as the owner of every breakpoint bound here, and learns an owner once
+                    // (ClarionDebuggerService.LearnBpOwner), so renaming it now would split a row from its later
+                    // bp-del. That is sound only because ClaimUnmapped proved the SAME build (link time and size,
+                    // exactly one match): the preload's TSWD and symbols describe the image that mapped.
+                    else if (path != null && !SamePath(m.Path, path))
+                        Console.WriteLine($"  module: {path} is the same build as preloaded {m.Path}; using that entry");
                 }
                 else
                 {
@@ -447,6 +584,14 @@ namespace ClarionDbg.Cli
             if (m.Preloaded && m.Pe != null) m.LoadBase = 0;
             else _modules.Remove(m);
             _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
+        }
+
+        /// <summary>The mapped image's PE link time (file header +8), or 0 when the header does not read.</summary>
+        private uint ReadRemoteTimeDateStamp(uint baseVa)
+        {
+            uint eLfanew = ReadU32(baseVa + 0x3C);
+            if (eLfanew == 0 || eLfanew > 0x1000) return 0;
+            return ReadU32(baseVa + eLfanew + 8);
         }
 
         /// <summary>Read SizeOfImage straight from the target's mapped PE header (fallback when the

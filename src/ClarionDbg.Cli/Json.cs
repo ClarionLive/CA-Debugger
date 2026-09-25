@@ -309,6 +309,15 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
+        /// <summary>An event answering a request that carried <c>reqid=N</c> (C1, wave 7) names it: "reqId" is
+        /// appended as the LAST member. With no id the event is returned unchanged, byte for byte, so a host that
+        /// sends none sees exactly what it saw before.</summary>
+        public static string WithReqId(string json, string reqId)
+        {
+            if (reqId == null || string.IsNullOrEmpty(json) || json[json.Length - 1] != '}') return json;
+            return json.Substring(0, json.Length - 1) + ",\"reqId\":" + Str(reqId) + "}";
+        }
+
         /// <summary>The stack reply. <paramref name="reqId"/>, when the request carried one, is echoed as
         /// "reqId" ahead of the frames; with none, the member is absent.</summary>
         public static string Stack(List<StackFrame> frames, string reqId = null)
@@ -412,6 +421,18 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Resolved data symbol for watch-by-name. typeName null = unproven code (render hex).</summary>
+        /// <summary>A `sym` for a name several FILE records answer to (3517fd15 item 8): the not-found reply, plus
+        /// "ambiguous", the forms that resolve to one each (possibly empty, when no form can be typed). Added last,
+        /// so a reader of the not-found shape reads it unchanged.</summary>
+        public static string SymAmbiguous(string name, List<string> forms)
+        {
+            var sb = new StringBuilder(Sym(name, false, 0, 0, 0, null, 0, null));
+            sb.Length--;
+            sb.Append(",\"ambiguous\":[");
+            for (int i = 0; i < forms.Count; i++) sb.Append(i > 0 ? "," : "").Append(Str(forms[i]));
+            return sb.Append("]}").ToString();
+        }
+
         public static string Sym(string name, bool found, uint rva, uint va, byte typeCode, string typeName, uint size, string container)
         {
             if (!found)

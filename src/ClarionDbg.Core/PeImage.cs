@@ -28,6 +28,7 @@ namespace ClarionDbg.Core
         public ushort Machine { get; private set; }
         public uint ImageBase { get; private set; }
         public uint SizeOfImage { get; private set; }
+        public uint TimeDateStamp { get; private set; }   // file header +8: the link time, which tells two builds apart
         public uint EntryPointRva { get; private set; }
         public uint DebugDirRva { get; private set; }
         public uint DebugDirSize { get; private set; }
@@ -51,6 +52,7 @@ namespace ClarionDbg.Core
 
             Machine = BitConverter.ToUInt16(bytes, peOff + 4);
             ushort numSec = BitConverter.ToUInt16(bytes, peOff + 6);
+            TimeDateStamp = BitConverter.ToUInt32(bytes, peOff + 8);
             ushort optSize = BitConverter.ToUInt16(bytes, peOff + 20);
             int optOff = peOff + 24;
             ushort magic = BitConverter.ToUInt16(bytes, optOff);
