@@ -837,12 +837,22 @@ namespace ClarionDebugger.Services
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
 
+        /// <summary>The frame count every stack request names. It equals the engine's default
+        /// (STACK_FRAMES_DEFAULT; protocolcheck's CheckStackFrameCountSkew pins that at 32), so on a current
+        /// engine naming it changes nothing; it is sent so that the count, not the id, is the first
+        /// argument (97f23f5d).</summary>
+        internal const int StackFrameCount = 32;
+
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived. A
         /// <paramref name="reqId"/> (digits only) is sent as <c>reqid=N</c> and echoed on the reply, so the
-        /// host can tell which request a reply answers (49538b78 wave 5 run 3).</summary>
+        /// host can tell which request a reply answers (49538b78 wave 5 run 3). The count always goes first:
+        /// an engine from before wave 5 reads the first argument as the count, so it refused <c>reqid=N</c>
+        /// there, and it ignores a trailing token. An older engine therefore still answers, without the id,
+        /// and that reply offers no frames: degraded, not dead (97f23f5d).</summary>
         public bool RequestStack(string reqId = null)
         {
-            return SendCommand(reqId == null ? "stack" : "stack reqid=" + reqId);
+            string count = StackFrameCount.ToString(CultureInfo.InvariantCulture);
+            return SendCommand(reqId == null ? "stack " + count : "stack " + count + " reqid=" + reqId);
         }
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>

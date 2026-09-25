@@ -1592,11 +1592,10 @@ Check 'every stack request carries a recorded id: the page''s and the stop''s go
   (($webCode -match 'case "stack": if \(_svc\.State == DebugSessionState\.Paused\) RequestStack\(\); break;') -and `
    ([regex]::Matches($webCode, '_svc\.RequestStack\(').Count -eq 1) -and `
    ((Get-CSharpCodeOnly (Get-Method 'private void RequestStack()' $web)) -match 'string id = _editGrants\.NewStackRequestId\(\);\s*if \(_svc\.RequestStack\(id\)\) _editGrants\.StackRequested\(id\);')) ''
-# The service sends the id as reqid=N and hands the reply's echo to the stack event.
+# The service hands the reply's echo to the stack event. What it SENDS is run in the version-skew section below.
 $svcCode = Get-CSharpCodeOnly (Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'))
-Check 'the service sends reqid=N with a stack request and passes the reply''s reqId on' `
-  (($svcCode -match 'return SendCommand\(reqId == null \? "stack" : "stack reqid=" \+ reqId\);') -and `
-   ($svcCode -match 'StackReceived\?\.Invoke\(frames, GetUIntOrNull\(json, "tid"\), GetStr\(json, "reqId"\)\);')) ''
+Check 'the service passes the stack reply''s reqId on' `
+  ($svcCode -match 'StackReceived\?\.Invoke\(frames, GetUIntOrNull\(json, "tid"\), GetStr\(json, "reqId"\)\);') ''
 Check 'a resume clears them' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcResumed(')) -match '_editGrants\.Clear\(\)') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
 Check 'the frame-locals and expand replies grant their rows only for a request the host verified' `
@@ -1858,6 +1857,68 @@ Check 'a reply echoing a live request id but stamped for another thread offers n
   ((-not $wrongTid) -and (-not $ep.IsFrameOffered('0x405000', '0x19FFE0'))) "offered=$wrongTid"
 Check 'request ids are never reused, across clears too' `
   (($before -cne $after) -and ($after -cne $pending) -and ($before -cne $pending)) "$before,$after,$pending"
+
+# ---- version skew: a new add-in on an engine from before wave 5 (97f23f5d) ------------------------------
+# cb2fcea sent `stack reqid=N`. An engine from before wave 5 reads the FIRST argument as the frame count, so it
+# refused that request and a new add-in on an old engine showed no call stack at all. The host now names the
+# count first, `stack 32 reqid=N`, and the old engine ignores the trailing token. Run: the REAL RequestStack
+# over a recording SendCommand, and the REAL ParseStack / GetStr on the reply each engine sends.
+$skewReader = (Get-Method 'internal static class JsonMessageReader' $readerEarly) -replace 'internal static class', 'public static class'
+$skewSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+namespace StackSkew {
+$(Get-Method 'public sealed class DebugStackFrame')
+public class StackSkewProbe {
+  public string Sent;
+  private bool SendCommand(string c) { Sent = c; return true; }
+  $((Get-Statement 'internal const int StackFrameCount') -replace '^internal', 'public')
+  $(Get-Method 'public bool RequestStack(string reqId = null)')
+  $((Get-Method 'private static List<DebugStackFrame> ParseStack(string json)') -replace '^private static', 'public static')
+  $((Get-Method 'private static string GetStr(string json, string key)') -replace '^private static', 'public static')
+  $(Get-Method 'private static int GetInt(string json, string key)')
+  $(Get-Method 'private static bool GetBool(string json, string key)')
+  $skewReader
+}
+}
+"@
+Add-Type -TypeDefinition $skewSrc -Language CSharp | Out-Null
+$sk = New-Object StackSkew.StackSkewProbe
+Check 'the host''s stack frame count is 32, the engine default protocolcheck pins (CheckStackFrameCountSkew)' `
+  ([StackSkew.StackSkewProbe]::StackFrameCount -eq 32) "$([StackSkew.StackSkewProbe]::StackFrameCount)"
+[void]$sk.RequestStack('7')
+Check 'a stack request with an id names the count FIRST: `stack 32 reqid=7`' ($sk.Sent -ceq 'stack 32 reqid=7') (ShowVal $sk.Sent)
+$skNoId = New-Object StackSkew.StackSkewProbe
+[void]$skNoId.RequestStack()
+Check 'and one without an id names the count alone' ($skNoId.Sent -ceq 'stack 32') (ShowVal $skNoId.Sent)
+# The pre-wave-5 argument rule, as it stood before cb2fcea (DebugEngine.StackWalker.cs HandleStackCommand):
+#   if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX)) refuse;
+# and nothing read parts[2]. Applied here to the text the host now sends, and to what cb2fcea sent.
+function OldEngineTakes { param([string] $line)
+  $parts = $line.Split(' '); $n = 0
+  ($parts.Length -le 1) -or ([int]::TryParse($parts[1], [ref] $n) -and $n -ge 1 -and $n -le 256)
+}
+Check 'CONTROL: the old engine refused what cb2fcea sent (`stack reqid=7`)' (-not (OldEngineTakes 'stack reqid=7')) ''
+Check 'the old engine takes what the host sends now' (OldEngineTakes $sk.Sent) (ShowVal $sk.Sent)
+# The old engine's reply carries no reqId; the new one echoes the id (the engine side is protocolcheck's).
+$oldReply = '{"tid":4812,"event":"stack","frames":[{"frame":0,"proc":"MAIN","module":"main.clw","line":88,"va":"0x402000","ebp":"0x19FF40"}]}'
+$newReply = '{"tid":4812,"event":"stack","reqId":"7","frames":[{"frame":0,"proc":"MAIN","module":"main.clw","line":88,"va":"0x402000","ebp":"0x19FF40"}]}'
+$oldFrames = [StackSkew.StackSkewProbe]::ParseStack($oldReply)
+$oldId = [StackSkew.StackSkewProbe]::GetStr($oldReply, 'reqId')
+Check 'an old engine''s reply (no reqId) still yields its stack' (($oldFrames.Count -eq 1) -and ($oldFrames[0].Proc -ceq 'MAIN')) "$($oldFrames.Count) frame(s)"
+$sg = New-Object ClarionDebugger.Terminal.EditGrants
+$sg.SelectThread(4812)
+[void](StackAsked $sg)
+$oldOffered = Offer $sg @('0x402000|0x19FF40') 4812 -ReqId $oldId
+Check 'and offers no frames: degraded, not dead' ((-not $oldOffered) -and (-not $sg.IsFrameOffered('0x402000', '0x19FF40'))) "reqId=$(ShowVal $oldId) offered=$oldOffered"
+$newId = StackAsked $sg
+$newEcho = $newReply -replace '"reqId":"7"', ('"reqId":"' + $newId + '"')
+$newGot = [StackSkew.StackSkewProbe]::GetStr($newEcho, 'reqId')
+$newOffered = Offer $sg @('0x402000|0x19FF40') 4812 -ReqId $newGot
+Check 'CONTROL: a current engine''s reply echoes the id, and offers' (($newGot -ceq $newId) -and $newOffered -and $sg.IsFrameOffered('0x402000', '0x19FF40')) "reqId=$(ShowVal $newGot) offered=$newOffered"
 
 # THE REPLY'S THREAD: a forwarded request grants only a reply stamped for the thread of the offer it was
 # checked against; any other thread's stamp grants nothing.
@@ -2714,7 +2775,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 440
+$EXPECTED_CHECKS = 448
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
