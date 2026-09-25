@@ -951,10 +951,11 @@ namespace ClarionDebugger.Terminal
             // a "ran to cursor" that silently didn't. So: track the key now (filtered from the pane immediately,
             // and always cleaned up on pause/exit even if confirmation never comes), then defer Continue() to
             // OnSvcBreakpointSet; OnSvcBreakpointError aborts and stays paused.
-            // singleTarget: this is a transient "run to cursor", not a user breakpoint. Several loaded
-            // images can carry a same-named .clw, and an unqualified add now arms in ALL of them - which
-            // would stop us somewhere on the way to where the user actually pointed.
-            if (!_svc.AddBreakpoint(module, line, true))
+            // ARMED IN EVERY IMAGE (contract C3, 1be3b82e): a plain unqualified add, like a gutter dot. Several
+            // loaded images can carry a same-named .clw, and the host cannot tell which one the caret's file
+            // is compiled into; arming only the engine's first pick could run straight past the line the
+            // user pointed at. The stop - in whichever image - removes every copy (`bp del`, OnPaused).
+            if (!_svc.AddBreakpoint(module, line))
             {
                 Console("err", "run to cursor: could not set a breakpoint at " + module + ":" + line + " — staying paused.");
                 return;
@@ -1979,7 +1980,11 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"hitMode\":").Append(Str(b.HitMode))
                   .Append(",\"hitValue\":").Append(b.HitValue)
                   .Append(",\"trace\":").Append(Str(b.Trace))
-                  .Append(",\"hitCount\":").Append(b.HitCount).Append('}');
+                  .Append(",\"hitCount\":").Append(b.HitCount)
+                  // The image the engine armed this row in (its ownerPath), or null when it has not said: a pending
+                  // or pre-launch row (contract C2, 1be3b82e). With arm-all, one module:line can be one row per
+                  // image, and the page labels such rows by this. LAST, as the contract freezes it.
+                  .Append(",\"image\":").Append(Str(b.OwnerPath)).Append('}');
             }
             sb.Append("]}");
             Post(sb.ToString());

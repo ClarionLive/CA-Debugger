@@ -345,11 +345,72 @@ Invoke-CheckSection 'ownerPath is LEARNED on the bp-set merge, so a pending row 
     ($learn -match 'known\.OwnerPath == null && echo\.OwnerPath != null') ''
 }
 
+Write-Host ''
+Invoke-CheckSection 'image: every bplist row names the image it is armed in, LAST (1be3b82e, contract C2)' {
+  # With arm-all an unqualified breakpoint is one engine row per image, so two rows can share module+line. The
+  # page labels those by "image": the engine's ownerPath for the row, or null while pending / pre-launch. RUN: the
+  # real SendBps (and every helper it calls) over stub collaborators, checked against the contract's literal row.
+  $bpl = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+namespace BpList {
+$(Get-Method 'public sealed class DebugBreakpoint' $svc)
+public sealed class FakeSvc { public bool IsRunning; public DebugBreakpoint[] Breakpoints = new DebugBreakpoint[0]; }
+public sealed class FakeGutter { public List<DebugBreakpoint> Marks = new List<DebugBreakpoint>(); public List<DebugBreakpoint> Snapshot() { return Marks; } }
+public sealed class Pad {
+  public FakeSvc _svc = new FakeSvc();
+  public FakeGutter _gutter = new FakeGutter();
+  public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+  public List<string> Posts = new List<string>();
+  private void Post(string s) { Posts.Add(s); }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $(Get-Method 'private static string TransientKey(string module, int line)' $web)
+  $pathStateEnum
+  $mapMethods
+  $(Get-Method 'private Dictionary<string, string> GutterPathsByModuleLine()' $web)
+  $((Get-Method 'private void SendBps()' $web) -replace '^private void', 'public void')
+}
+}
+"@
+  Add-Type -TypeDefinition $bpl -Language CSharp | Out-Null
+  function Row { param($owner, [int] $ln = 50)
+    $b = New-Object BpList.DebugBreakpoint; $b.Module = 'clbrws011.clw'; $b.RequestedLineOrNull = $ln; $b.Line = $ln
+    # Only when there is one: PowerShell's $null assigned to a C# string field arrives as "", not null.
+    if ($null -ne $owner) { $b.OwnerPath = $owner }
+    $b
+  }
+  $p = New-Object BpList.Pad
+  $p._svc.IsRunning = $true
+  $p._svc.Breakpoints = @((Row 'C:\App\a.dll'), (Row 'C:\App\b.dll'), (Row $null 60))
+  $p.SendBps()
+  $msg = $p.Posts[$p.Posts.Count - 1]
+  $expect = '{"type":"bplist","bps":[' +
+    '{"module":"clbrws011.clw","line":50,"requested":50,"path":null,"pathState":"unknown","condition":null,"hitMode":null,"hitValue":0,"trace":null,"hitCount":0,"image":"C:\\App\\a.dll"},' +
+    '{"module":"clbrws011.clw","line":50,"requested":50,"path":null,"pathState":"unknown","condition":null,"hitMode":null,"hitValue":0,"trace":null,"hitCount":0,"image":"C:\\App\\b.dll"},' +
+    '{"module":"clbrws011.clw","line":60,"requested":60,"path":null,"pathState":"unknown","condition":null,"hitMode":null,"hitValue":0,"trace":null,"hitCount":0,"image":null}]}'
+  Check 'a live bplist is exactly the contract''s rows: each image by its full path, a pending row null, "image" last' ($msg -ceq $expect) $msg
+  $q = New-Object BpList.Pad
+  $q._pending.Add((Row $null 70))
+  $q.SendBps()
+  Check 'a pre-launch (staged) row carries "image":null, last' ($q.Posts[0] -cmatch '"hitCount":0,"image":null\}\]\}$') $q.Posts[0]
+  # The transient filter is unchanged: a run-to-cursor row, in any image, is never in the pane.
+  $t = New-Object BpList.Pad
+  $t._svc.IsRunning = $true
+  $t._svc.Breakpoints = @((Row 'C:\App\a.dll' 80), (Row 'C:\App\b.dll' 80), (Row 'C:\App\a.dll'))
+  [void]$t._transientBps.Add('clbrws011.clw:80')
+  $t.SendBps()
+  Check 'a run-to-cursor transient armed in two images shows in neither row' `
+    (($t.Posts[0] -notmatch '"line":80') -and ($t.Posts[0] -cmatch '"line":50')) $t.Posts[0]
+}
+
 # THE COUNT, ASSERTED AND PRINTED (60344b78). Invoke-CheckSection above closes a section that throws or
 # breaks out of the script; this closes one that returns early or is skipped. COUNTING RULE: the RUNTIME
 # count of Check calls ($script:checks before this line) on a clean run, measured 2026-09-22 - not a count
 # of `Check` lines, which differs wherever a Check sits in a loop. Update it deliberately with the checks.
-$EXPECTED_CHECKS = 37
+$EXPECTED_CHECKS = 40
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
