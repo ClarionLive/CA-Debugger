@@ -507,6 +507,7 @@ $selTypes
 public class ViewSelectionProbe {
   public ThreadSelection _selection = ThreadSelection.None;
   public SeatState _seat = new SeatState();
+  public object _svc;   // the bound service; null here, and so is every snapshot's Source unless a test names one
   public int Banners, Seats;
   private void UpdateThreadBanner() { Banners++; }
   private void SeatOnSelectedThread() { Seats++; }
@@ -520,8 +521,8 @@ public class ViewSelectionProbe {
 "@
 Add-Type -TypeDefinition $selSrc -Language CSharp | Out-Null
 Write-Host 'compiled the view''s selection steps'
-function Snap { param($tid, $stopped, [int] $epoch, $cause)
-  New-Object SelProbe.ThreadSelection ([Nullable[uint32]]$tid), ([Nullable[uint32]]$stopped), $epoch, ([Enum]::Parse([SelProbe.ThreadSelectionCause], $cause))
+function Snap { param($tid, $stopped, [int] $epoch, $cause, $source = $null)
+  New-Object SelProbe.ThreadSelection ([Nullable[uint32]]$tid), ([Nullable[uint32]]$stopped), $epoch, ([Enum]::Parse([SelProbe.ThreadSelectionCause], $cause)), $source
 }
 
 $v = New-Object SelProbe.ViewSelectionProbe
@@ -550,6 +551,19 @@ $r = New-Object SelProbe.ViewSelectionProbe
 $r.ApplySelection((Snap $A $A 9 'Stop'))
 $r.ApplySelection((Snap $B $B 1 'Stop'))
 Check 'CONTROL: a snapshot whose epoch went BACKWARDS is ignored (why the service must never reset it)' ($r.SelTid -eq $A) "sel=$($r.SelTid)"
+# A REBIND (pipeline run 1, debugger L1). The view outlives a service: bound to A, a snapshot of A's is queued,
+# the view is rebound to B (Bind: SeatState.Rebound, the selection back to None), and A's snapshot is delivered
+# after. It is not B's selection whatever its epoch, and B's own first snapshot must seat.
+$svcA = New-Object object; $svcB = New-Object object
+$rb = New-Object SelProbe.ViewSelectionProbe
+$rb._svc = $svcA
+$rb.ApplySelection((Snap $A $A 50 'Stop' $svcA))
+$queuedA = Snap $B $A 51 'Switch' $svcA
+$rb._svc = $svcB; $rb._seat.Rebound(); $rb._selection = [SelProbe.ThreadSelection]::None
+$rb.ApplySelection($queuedA)
+Check 'after a rebind, a snapshot the OLD service made is dropped' (($rb.SelTid -eq 0) -and ($rb.Seats -eq 0)) "sel=$($rb.SelTid) seats=$($rb.Seats)"
+$rb.ApplySelection((Snap $C $C 52 'Switch' $svcB))
+Check '...and the new service''s first snapshot is taken, and seats' (($rb.SelTid -eq $C) -and ($rb.Seats -eq 1)) "sel=$($rb.SelTid) seats=$($rb.Seats)"
 # A switch lets a thread that decoded to nothing be tried again: TakeSelection hands the move to SeatState.
 $m = New-Object SelProbe.ViewSelectionProbe
 $m.ApplySelection((Snap $A $A 1 'Stop'))
@@ -579,7 +593,7 @@ Check 'the view declares no thread-id field of its own' ([regex]::Matches($viewC
 Check 'CONTROL: that scan finds the field this ticket removed' ([regex]::Matches((Get-CSharpCodeOnly "        private uint _selTid;        // x`n"), $tidFieldRx).Count -eq 1) ''
 
 # The count, asserted: "ALL CHECKS PASSED" is equally true of a run that silently skipped a section.
-$EXPECTED_CHECKS = 148
+$EXPECTED_CHECKS = 150
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

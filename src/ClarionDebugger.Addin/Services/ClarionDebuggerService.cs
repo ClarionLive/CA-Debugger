@@ -216,7 +216,8 @@ namespace ClarionDebugger.Services
     }
 
     /// <summary>Why the host's selected thread changed.</summary>
-    public enum ThreadSelectionCause { None, Stop, Switch, Inventory, Ended }
+    /// <remarks>Ended: a session is over. Reset: a new session is starting and has selected nothing yet.</remarks>
+    public enum ThreadSelectionCause { None, Stop, Switch, Inventory, Ended, Reset }
 
     /// <summary>The host's ONE copy of which thread is selected (49538b78 item 8b, Owner decision 3,
     /// 2026-09-24): ClarionDebuggerService owns it and is its only writer, and every host consumer reads what
@@ -229,9 +230,12 @@ namespace ClarionDebugger.Services
     /// <see cref="ClarionDebuggerService.SelectionChanged"/> hands each consumer the snapshot that event made.
     /// </para>
     /// <para>
-    /// <see cref="Epoch"/> rises by one with every change and is never reset for the life of the service
-    /// instance: one pad's service runs session after session, and a consumer that drops a snapshot older
-    /// than the one it holds must never meet a new session's epochs starting again from zero.
+    /// <see cref="Epoch"/> comes from ONE counter for the whole process, rising with every change of any
+    /// service and never reset: a pad's service runs session after session, and the Disassembly view outlives
+    /// a service when a different one becomes active (pipeline run 1, debugger L1). A consumer that drops a
+    /// snapshot older than the one it holds must never meet epochs that start again from zero.
+    /// <see cref="Source"/> names the service that made it, so a consumer can drop one from a service it is no
+    /// longer bound to.
     /// </para></summary>
     public sealed class ThreadSelection
     {
@@ -244,13 +248,19 @@ namespace ClarionDebugger.Services
         public readonly uint? StoppedTid;
         public readonly int Epoch;
         public readonly ThreadSelectionCause Cause;
+        /// <summary>The service that made this snapshot (null for <see cref="None"/>).</summary>
+        public readonly object Source;
 
         public ThreadSelection(uint? tid, uint? stoppedTid, int epoch, ThreadSelectionCause cause)
+            : this(tid, stoppedTid, epoch, cause, null) { }
+
+        public ThreadSelection(uint? tid, uint? stoppedTid, int epoch, ThreadSelectionCause cause, object source)
         {
             Tid = WireRules.TidIsKnown(tid) ? tid : null;
             StoppedTid = WireRules.TidIsKnown(stoppedTid) ? stoppedTid : null;
             Epoch = epoch;
             Cause = cause;
+            Source = source;
         }
     }
 
@@ -407,6 +417,8 @@ namespace ClarionDebugger.Services
 
         private readonly object _selectionLock = new object();
         private ThreadSelection _selection = ThreadSelection.None;
+        // Every service's epochs come from this one counter (see ThreadSelection.Epoch).
+        private static int s_selectionEpoch;
 
         /// <summary>The host's selected thread NOW (see <see cref="ThreadSelection"/>). A handler of an event
         /// marshalled to the UI thread reads the snapshot SelectionChanged handed it instead: this one can
@@ -418,16 +430,20 @@ namespace ClarionDebugger.Services
 
         /// <summary>The ONE writer of the host's selected thread. A move to the same threads is no change when
         /// <paramref name="onlyIfChanged"/> (an inventory repeating what the host knows, a second end); every
-        /// other call is a change, with the next epoch, and is raised.</summary>
+        /// other call is a change, with the next epoch, and is raised. A Switch keeps the stopped thread the
+        /// selection holds when the lock is taken, and <paramref name="stoppedTid"/> is ignored for it: read
+        /// before the lock, it could restore a stopped thread a concurrent end had just cleared.</summary>
         private void MoveSelection(uint? tid, uint? stoppedTid, ThreadSelectionCause cause, bool onlyIfChanged)
         {
             ThreadSelection next;
             lock (_selectionLock)
             {
                 var cur = _selection;
-                var candidate = new ThreadSelection(tid, stoppedTid, cur.Epoch + 1, cause);
-                if (onlyIfChanged && candidate.Tid == cur.Tid && candidate.StoppedTid == cur.StoppedTid) return;
-                _selection = next = candidate;
+                if (cause == ThreadSelectionCause.Switch) stoppedTid = cur.StoppedTid;
+                var probe = new ThreadSelection(tid, stoppedTid, cur.Epoch, cause);
+                if (onlyIfChanged && probe.Tid == cur.Tid && probe.StoppedTid == cur.StoppedTid) return;
+                _selection = next = new ThreadSelection(tid, stoppedTid,
+                    System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);
             }
             SelectionChanged?.Invoke(next);
         }
@@ -664,7 +680,7 @@ namespace ClarionDebugger.Services
             _attachTarget = attachTo;
 
             // A new session has no thread selected yet. The epoch carries on from the last session's.
-            MoveSelection(null, null, ThreadSelectionCause.Ended, true);
+            MoveSelection(null, null, ThreadSelectionCause.Reset, true);
             SetState(DebugSessionState.Launching);
             p.Start();
             p.BeginOutputReadLine();
@@ -1364,7 +1380,7 @@ namespace ClarionDebugger.Services
                     bool selOk = GetBool(json, "ok");
                     // Only an accepted switch to a real thread moves it; a refusal leaves the engine's unchanged.
                     if (selOk && WireRules.TidIsKnown(selTid))
-                        MoveSelection(selTid, Selection.StoppedTid, ThreadSelectionCause.Switch, false);
+                        MoveSelection(selTid, null, ThreadSelectionCause.Switch, false);   // stopped: kept under the lock
                     ThreadSelected?.Invoke(selTid, selOk, GetStr(json, "error"));
                     break;
 
