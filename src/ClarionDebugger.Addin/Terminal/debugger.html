@@ -2,6 +2,11 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<!-- Content-Security-Policy (1797b13a). The page's one inline script block runs because script-src names the
+     sha256 of its exact text, so ANY edit to that script must re-hash it here: tools/test-pad-csp.js fails
+     until it does and prints the hash to paste. There are no inline on*= handlers (CSP blocks them): wire
+     events from the script. Styles stay 'unsafe-inline' for the style= attributes and runtime styles. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-XgDDoM4uHZZgiL3scPBbSs5Gi8IW7tHp35gwxkrfLVM='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
 <title>CA Debugger</title>
 <style>
   :root {
@@ -335,6 +340,9 @@
   /* the paused line number, moved here when the redundant run-state band was removed (87c66af6).
      Same token the other two places the page prints a line number use (.frame .ln, .bp .ln). */
   .srchdr .ln { color:var(--num); }
+  /* "(Thread 2)" after the location when the listing is another thread's (buildSource). The warn token the
+     thread picker's own "not the stopped thread" state uses. */
+  .srchdr .srcthread { color:var(--warn); }
   #srchdrText { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .src { flex:1; overflow:auto; padding:6px 0; background:var(--bg); min-height:0; }
   .sline { display:flex; font-size:12.5px; line-height:1.55; padding:0 12px; white-space:pre; }
@@ -426,9 +434,9 @@
     <!-- Run to cursor, sourced from the ACTIVE Monaco editor's live caret: no data = "wherever my caret
          actually is" (the mini source view's own right-click still sends an explicit module:line). Interim
          surface until a Monaco-side context-menu / gutter trigger exists — that one sends this same message. -->
-    <button class="tbtn" id="btnRtc" title="Run to Cursor — run to the active editor's cursor line (while paused)" style="margin-left:8px;padding:0 8px" onclick="send('runtocursor')">▶| Run to Cursor</button>
+    <button class="tbtn" id="btnRtc" title="Run to Cursor — run to the active editor's cursor line (while paused)" style="margin-left:8px;padding:0 8px">▶| Run to Cursor</button>
     <!-- Attach to a running process (3f2d747f); only while no session is running. -->
-    <button class="tbtn" id="btnAttach" title="Attach… — debug a Clarion app that is already running" style="margin-left:2px;padding:0 8px" onclick="openAttach()">⇲ Attach…</button>
+    <button class="tbtn" id="btnAttach" title="Attach… — debug a Clarion app that is already running" style="margin-left:2px;padding:0 8px">⇲ Attach…</button>
     <button class="tbtn" id="btnSettings" title="Settings — keyboard shortcuts &amp; more" style="margin-left:8px;padding:0 8px">
       <svg viewBox="0 0 24 24" width="15" height="15" style="display:block" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
@@ -760,6 +768,7 @@
   }
   $('exePath').onclick=function(){ if(targetPath) send('revealexe'); };
 
+  $('btnRtc').onclick=function(){ send('runtocursor'); };
   $('btnDocs').onclick=function(){ send('opendocs'); };
   $('btnAbout').onclick=openAbout;
   $('aboutClose').onclick=closeAbout;
@@ -819,6 +828,7 @@
       : shown ? shown+' running app(s) with Clarion debug info. Pick one and press Attach.'
       : 'No running app with Clarion debug info was found. Start the app, then press Refresh.';
   }
+  $('btnAttach').onclick=function(){ openAttach(); };
   $('attachClose').onclick=closeAttach;
   $('attachCancel').onclick=closeAttach;
   $('attachRefresh').onclick=()=>{ $('attachStatus').textContent='Looking for running Clarion apps…'; send('procs'); };
@@ -2757,7 +2767,11 @@
     // which thread that is, so the header says it here: the page knows both tids. Here and not in
     // setSrcLocation, whose other caller (the 'paused' arm) runs before this stop's tids are adopted.
     const otherThread=viewingOtherThread();
-    if(otherThread) $('srchdrText').innerHTML+=' <span class="srcthread">('+esc(threadName(threadRowFor(selTid), selTid))+')</span>';
+    if(otherThread){
+      const th=document.createElement('span'); th.className='srcthread';
+      th.textContent='('+threadName(threadRowFor(selTid), selTid)+')';
+      $('srchdrText').append(' ', th);
+    }
     const src=$('src'); src.innerHTML='';
     if(!lines || !lines.length){
       // No listing => no file to act on. Everything keyed off curFile (run-to-cursor, the source

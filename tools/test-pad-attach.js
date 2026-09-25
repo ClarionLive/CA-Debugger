@@ -78,8 +78,11 @@ function rows() { return $('attachList').querySelectorAll('.ap-row'); }
 function subtree(el) { const out = []; el.walk(c => out.push(c)); return out; }
 
 // ---- markup and dispatch: the pieces exist and are wired where the functions assume
+// Wired from the script, not by an inline onclick= the page's CSP would refuse to run (1797b13a;
+// tools/test-pad-csp.js checks no inline handler is left anywhere).
 check('the toolbar carries an Attach… button wired to openAttach',
-      /<button class="tbtn" id="btnAttach"[^\n]*onclick="openAttach\(\)"[^\n]*Attach…<\/button>/.test(html));
+      /<button class="tbtn" id="btnAttach"[^\n]*Attach…<\/button>/.test(html)
+      && /\$\('btnAttach'\)\.onclick=function\(\)\{ openAttach\(\); \};/.test(html));
 check('the button is gated on body.idle (greyed and unclickable otherwise)',
       /#btnAttach \{ opacity:\.4; pointer-events:none; \}/.test(html) && /body\.idle #btnAttach \{ opacity:1; pointer-events:auto; \}/.test(html));
 check('the picker markup has its list, status, Refresh and Attach controls',
