@@ -15,6 +15,7 @@ namespace ClarionDbg.Cli
             public readonly Dictionary<uint, int> Count = new Dictionary<uint, int>();
             public readonly HashSet<uint> Ours = new HashSet<uint>();
             public readonly HashSet<uint> Tf = new HashSet<uint>();
+            public readonly HashSet<uint> Exited = new HashSet<uint>();
             public readonly List<string> Errors = new List<string>();
             public int Suspends;
 
@@ -31,6 +32,7 @@ namespace ClarionDbg.Cli
             public override void Resume(uint tid)
             {
                 if (!Ours.Remove(tid)) { Errors.Add("resumed 0x" + tid.ToString("X") + " with no suspend of ours outstanding"); return; }
+                if (Exited.Contains(tid)) Errors.Add("resumed 0x" + tid.ToString("X") + " after it exited - its handle was not let go at the exit");
                 Count[tid] = Get(tid) - 1;
             }
 
@@ -99,7 +101,12 @@ namespace ClarionDbg.Cli
                     try
                     {
                         trace = eng.RunRearmHoldScriptForTest(ops, new[] { T1, T2, T3 }, steps.ConvertAll(s => s.Ev),
-                            i => { ops.Tf.Clear(); foreach (var t in steps[i].Tf) ops.Tf.Add(t); },
+                            i =>
+                            {
+                                ops.Tf.Clear(); foreach (var t in steps[i].Tf) ops.Tf.Add(t);
+                                if (BitConverter.ToUInt32(steps[i].Ev, 0) == Native.EXIT_THREAD_DEBUG_EVENT)
+                                    ops.Exited.Add(BitConverter.ToUInt32(steps[i].Ev, 8));
+                            },
                             i =>
                             {
                                 if (steps[i].Want != null && counts() != steps[i].Want)
@@ -202,6 +209,14 @@ namespace ClarionDbg.Cli
                 failures.Add("rearm hold (queued hit on a held thread): the re-plant wrote [" + Hex(r.Item2) + "], expected [0x"
                              + Va.ToString("X") + "] once, at the last owed step");
 
+            // A HELD thread exits (killed from outside, say): nothing is left to resume, and the release skips it.
+            run("held thread exits", null, new List<HoldStep>
+            {
+                new HoldStep(bp(T1, Va), new[] { T1 }, "0,1,2"),
+                new HoldStep(bare(Native.EXIT_THREAD_DEBUG_EVENT, T2), new[] { T1 }, null),
+                new HoldStep(ss(T1), none, null),
+            }, -1, new[] { T1, T3 });
+
             // A thread created during the hold is held too, and released with the rest.
             run("thread created during the hold", null, new List<HoldStep>
             {
@@ -222,7 +237,7 @@ namespace ClarionDbg.Cli
                          + "table: a thread stepping off a restored INT3 runs alone, every other thread suspended exactly "
                          + "once; the hold ends at its single-step, when its event is passed to the app, when it exits (the "
                          + "owed INT3 then paid), at the process's exit and at a detach; it is never taken for a step trap, "
-                         + "a call-skip or a clear TF; a thread created during it is held; a queued hit on a held thread takes "
+                         + "a call-skip or a clear TF; a held thread that exits is not resumed; a thread created during it is held; a queued hit on a held thread takes "
                          + "the hold over at the first stepper's trap and the INT3 goes back once, at the last; every count "
                          + "ends where it began, including an app-suspended thread's.");
         }

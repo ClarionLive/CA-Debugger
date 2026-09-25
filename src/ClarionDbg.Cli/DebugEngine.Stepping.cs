@@ -138,7 +138,6 @@ namespace ClarionDbg.Cli
 
             public override bool Suspend(uint tid)
             {
-                if (_handles.ContainsKey(tid)) return false;
                 IntPtr h = OpenThread(Native.THREAD_SUSPEND_RESUME, false, tid);
                 if (h == IntPtr.Zero) return false;
                 if (Native.SuspendThread(h) == uint.MaxValue) { Native.CloseHandle(h); return false; }
@@ -227,7 +226,6 @@ namespace ClarionDbg.Cli
         {
             ReplantPending(tid);
             if (_held.Remove(tid)) _threadOps.Forget(tid);
-            if (_holdFor == tid) _holdFor = 0;
         }
 
         private void StepMachine(uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx)
