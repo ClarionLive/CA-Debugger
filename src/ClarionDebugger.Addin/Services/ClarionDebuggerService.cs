@@ -303,6 +303,9 @@ namespace ClarionDebugger.Services
         /// <summary>The thread this value was read on, or null from an engine that doesn't stamp replies.
         /// The pad drops a reply whose Tid isn't the thread it is currently showing.</summary>
         public uint? Tid;
+        /// <summary>The request id the engine echoed (<c>"reqId"</c>), or null when the request carried none or the
+        /// engine predates the echo (3517fd15). Only a reply echoing an id the host recorded may grant an edit.</summary>
+        public string ReqId;
     }
 
     /// <summary>One procedure/method definition for the Procedures list: demangled name + owning module
@@ -371,7 +374,7 @@ namespace ClarionDebugger.Services
         // switch leaves the previous thread's replies in flight, and painting one into the new thread's
         // panels would show one thread's values under another thread's name.
         public event Action<List<DebugStackFrame>, uint?, string> StackReceived;  // resolved call stack (frames, tid, reqId)
-        public event Action<string, string, uint?> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid)
+        public event Action<string, string, uint?, string> ModuleDataReceived; // current module's module-scope data (module, raw items JSON, tid, reqId)
         public event Action<string, string> ExpandedReceived;   // lazy reference expansion (reqId, raw items JSON)
         public event Action<string, string, uint?> FrameLocalsReceived; // one call-stack frame's locals (reqId, raw items JSON, tid)
         public event Action<string, string, string, uint?> LibStateReceived; // per-thread Library State (reqId, error-or-null, raw items JSON, tid)
@@ -881,31 +884,18 @@ namespace ClarionDebugger.Services
                 && !module.Contains("..");
         }
 
-        /// <summary>Add a breakpoint (engine snaps to the nearest code-record line and replies bp-set).</summary>
+        /// <summary>Add a breakpoint (engine snaps to the nearest code-record line and replies bp-set).
+        /// <para>
+        /// UNQUALIFIED, ALWAYS. A .clw name is a bare BASENAME, so in a multi-DLL app several loaded images
+        /// can carry a compiland of that name, and an unqualified add arms in ALL of them (task af81c054),
+        /// including images that load later. Run-to-cursor sends exactly this too (contract C3, 1be3b82e):
+        /// the host cannot name the image the caret's file is compiled into, and arming only the engine's
+        /// first pick could run past the line the user meant. The engine still parses <c>|one=1</c>; nothing
+        /// here sends it.
+        /// </para></summary>
         public bool AddBreakpoint(string module, int line)
         {
-            return AddBreakpoint(module, line, false);
-        }
-
-        /// <summary>Add a breakpoint, optionally demanding that the engine resolve it to a SINGLE image.
-        /// <para>
-        /// A .clw name is a bare BASENAME, so in a multi-DLL app several loaded images can carry a
-        /// compiland of that name. An unqualified add arms in ALL of them, which is what makes a gutter dot
-        /// in the second DLL fire at all (task af81c054). That is wrong for RUN-TO-CURSOR, which means
-        /// "get me to HERE and stop once": arming it everywhere turns it into "stop somewhere on the way",
-        /// defeating the feature rather than widening it.
-        /// </para>
-        /// <para>
-        /// The engine cannot tell the two apart by itself - run-to-cursor is composed here as
-        /// <c>bp add</c> + <c>continue</c> and reaches it as an ordinary add - so the caller says which it
-        /// is. <paramref name="singleTarget"/> DEFAULTS FALSE, and that default is the point: every caller
-        /// that does not think about this gets the fixed behaviour, and an engine older than the
-        /// <c>one=</c> segment ignores it and behaves as it always did.
-        /// </para></summary>
-        public bool AddBreakpoint(string module, int line, bool singleTarget)
-        {
-            return IsValidModuleName(module)
-                && SendCommand("bp add " + module + ":" + line + (singleTarget ? "|one=1" : ""));
+            return IsValidModuleName(module) && SendCommand("bp add " + module + ":" + line);
         }
 
         /// <summary>Set next statement: move the stopped thread's instruction pointer to module:line within
@@ -947,12 +937,28 @@ namespace ClarionDebugger.Services
         /// and that reply offers no frames: degraded, not dead (97f23f5d).</summary>
         public bool RequestStack(string reqId = null)
         {
-            string count = StackFrameCount.ToString(CultureInfo.InvariantCulture);
-            return SendCommand(reqId == null ? "stack " + count : "stack " + count + " reqid=" + reqId);
+            string id = ReqIdSuffix(reqId);
+            return id != null && SendCommand("stack " + StackFrameCount.ToString(CultureInfo.InvariantCulture) + id);
         }
 
-        /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
-        public bool RequestModuleData() { return SendCommand("moduledata"); }
+        /// <summary>The trailing <c> reqid=N</c> a read request ends with (stack, watch, moduledata), or "" for no
+        /// id; null when <paramref name="reqId"/> is not 1-10 digits, and the request is then not sent. The ONE
+        /// writer of the token, so the three requests cannot drift apart, and the same grammar the engine parses
+        /// (contract C1, 3517fd15): the LAST token, digits only, which also keeps it one word on the space-split
+        /// stdin.</summary>
+        internal static string ReqIdSuffix(string reqId)
+        {
+            if (reqId == null) return "";
+            return Regex.IsMatch(reqId, @"^[0-9]{1,10}\z") ? " reqid=" + reqId : null;
+        }
+
+        /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived,
+        /// which echoes <paramref name="reqId"/> (sent as <c>reqid=N</c>) as the reply's reqId.</summary>
+        public bool RequestModuleData(string reqId = null)
+        {
+            string id = ReqIdSuffix(reqId);
+            return id != null && SendCommand("moduledata" + id);
+        }
 
         /// <summary>Request the thread inventory for the current stop (paused only); via ThreadsReceived.</summary>
         public bool RequestThreads() { return SendCommand("threads"); }
@@ -1061,16 +1067,23 @@ namespace ClarionDebugger.Services
         /// separator on the engine's line- and space-split stdin. Nothing else is added: no space, quote,
         /// ';' or line break. The pattern ends in <c>\z</c>, not <c>$</c>: .NET's <c>$</c> also matches
         /// before a trailing newline, which on that stdin is a second command. '@' is in the names the engine
-        /// itself prints for paste-back, e.g. <c>CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER</c>; it is no separator either.</remarks>
+        /// itself prints for paste-back, e.g. <c>CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER</c>; it is no separator either.
+        /// '-' is in image file names, and so in a name qualified by one (<c>A-B.DLL!X</c>, 3517fd15): it is no
+        /// separator on that stdin either, and the engine suggests no qualified name outside this set.</remarks>
         public static bool IsValidWatchName(string name)
         {
             return !string.IsNullOrEmpty(name) && name.Length <= 128
-                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!@]+\z") && !name.Contains("..");
+                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!@-]+\z") && !name.Contains("..");
         }
 
         /// <summary>Watch a data symbol by name (global, file record buffer, or field). Resolves the
-        /// current thread's live value (incl. THREADed); result arrives via WatchReceived.</summary>
-        public bool Watch(string name) { return IsValidWatchName(name) && SendCommand("watch " + name); }
+        /// current thread's live value (incl. THREADed); result arrives via WatchReceived, echoing
+        /// <paramref name="reqId"/> (sent as <c>reqid=N</c>, after the name) as its ReqId.</summary>
+        public bool Watch(string name, string reqId = null)
+        {
+            string id = ReqIdSuffix(reqId);
+            return IsValidWatchName(name) && id != null && SendCommand("watch " + name + id);
+        }
 
         /// <summary>Edit-variable-value: write <paramref name="value"/> into the live variable at
         /// <paramref name="vaHex"/> (interpreted per <paramref name="typeCodeHex"/>/<paramref name="size"/>/
@@ -1343,7 +1356,8 @@ namespace ClarionDebugger.Services
                     break;
 
                 case "moduledata":
-                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"));
+                    ModuleDataReceived?.Invoke(GetStr(json, "module"), ExtractArrayBalanced(json, "items"), GetUIntOrNull(json, "tid"),
+                                               GetStr(json, "reqId"));
                     break;
 
                 case "expanded":
@@ -1724,6 +1738,8 @@ namespace ClarionDebugger.Services
                 // pad has stopped showing must be dropped just as firmly as a hit, or a late "(not found)"
                 // from the previous thread wipes a row that the new thread answered correctly.
                 w.Tid = GetUIntOrNull(json, "tid");
+                // The request it answers, on both outcomes: a miss answers its request as surely as a hit does.
+                w.ReqId = GetStr(json, "reqId");
                 if (!w.Found)
                 {
                     w.OutOfScope = GetBool(json, "outOfScope");

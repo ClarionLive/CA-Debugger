@@ -74,7 +74,10 @@ public static class Service {
 }
 // Not under test: OnWatch grants the edit tuple, which tools/test-addin-json.ps1 covers.
 $wireRules
-public sealed class FakeGrants { public void Grant(string va, string typeCode, int size, int places, uint? tid) { } }
+public sealed class FakeGrants {
+  public void Grant(string va, string typeCode, int size, int places, uint? tid) { }
+  public bool ReadAnswered(string reqId) { return true; }
+}
 public sealed class Pad {
   public FakeGrants _editGrants = new FakeGrants();
   public List<string> Posts = new List<string>();

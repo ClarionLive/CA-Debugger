@@ -82,6 +82,11 @@ namespace ClarionDebugger.Terminal
         private string _exe = "";
         private bool _exeAuto;          // _exe came from auto-resolve (re-resolvable)
         private string _exeManualKey;   // when _exe is a manual Browse pick, the solution/project context it was chosen for (one-shot)
+        // What the target bar may claim about _exe (contract C4, 0214f33a), and the one line it shows beside it.
+        // UNCONFIRMED keeps a path for retry that the current solution did NOT confirm: the page must not show it as
+        // the target. Every write of _exe is followed by a PushTarget, so the bar never shows a stale claim.
+        private TargetState _exeState = TargetState.None;
+        private string _exeNote;
 
         // The exact local file URI the WebView is expected to navigate to. Used to (a) gate _ready on the
         // navigation actually being our packaged page and (b) reject web messages from any other origin.
@@ -113,7 +118,6 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
-            _svc.SelectionChanged      += OnSvcSelectionChanged;
             _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
@@ -216,7 +220,7 @@ namespace ClarionDebugger.Terminal
                     // TryAutoResolveExe already announces a changed target and pushes it to the
                     // target bar; a second line here just said the same thing twice.
                     TryAutoResolveExe();
-                    if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
+                    ListProceduresForTarget();
                 }
                 catch (Exception ex)
                 {
@@ -226,7 +230,12 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Drop target/procedure state when the solution closes, so the pad never shows a list
-        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.</summary>
+        /// belonging to a solution that is no longer open. Idle-guarded for the same reason as above.
+        /// <para>
+        /// A close MID-SESSION is left alone on purpose (0214f33a): the bar then names the binary being debugged,
+        /// which is still the truth about the session, and the procedures list is that binary's. The session's end
+        /// catches up - OnSvcStateChanged(Idle) re-resolves, finds no solution, and clears the target to "none".
+        /// </para></summary>
         private void ClearForClosedSolution()
         {
             UI(() =>
@@ -235,9 +244,8 @@ namespace ClarionDebugger.Terminal
                 {
                     if (CurrentState != DebugSessionState.Idle) return;
                     _exe = null; _exeAuto = false; _exeManualKey = null;
-                    _procGen++;                       // invalidate any in-flight procedure parse
-                    _procIds.Clear();                 // and every id the old list was sent with
-                    Post("{\"type\":\"procedures\",\"procs\":[]}");
+                    _exeState = TargetState.None; _exeNote = ProjectTargetService.NoSolutionNote;
+                    ClearProcedures();
                     PushTarget();                     // blanks the target bar
                     Console("info", "solution closed — target cleared");
                 }
@@ -266,7 +274,6 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
-            _svc.SelectionChanged       -= OnSvcSelectionChanged;
             _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
@@ -314,7 +321,9 @@ namespace ClarionDebugger.Terminal
         // Every resume (continue, step in/over/out, stepi, run-to-cursor's deferred Continue) arrives here:
         // the target is running again, so the paused-line marker no longer applies. Watch func-evals don't
         // emit 'resumed', so they leave the marker alone.
-        private void OnSvcResumed(string mode) => UI(() => { _editGrants.Clear(); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); });
+        // The selection epoch is read HERE, on the thread that raised the event, so the clear retires what was issued
+        // before this resume and spares anything a newer stop has issued by the time the marshalled clear runs.
+        private void OnSvcResumed(string mode) { int epoch = _svc.Selection.Epoch; UI(() => { _editGrants.Resumed(epoch); _stopSource = null; ClearExecutionLineIfHooked(); Post("{\"type\":\"resumed\",\"mode\":" + Str(mode) + "}"); Console("info", "resumed (" + mode + ")"); }); }
         private void OnSvcHit(DebugHit hit) => UI(() => Console("hit", "*** HIT  " + (hit.Resolved ? hit.Module + " line " + hit.Line : hit.Va)));
         private void OnSvcStack(List<DebugStackFrame> frames, uint? tid, string reqId) => UI(() => OnStack(frames, tid, reqId));
         // The engine already produces display-ready, escaped JSON rows (with nested children + lazy ref
@@ -323,9 +332,11 @@ namespace ClarionDebugger.Terminal
         // Each of the three row replies GRANTS its editable rows before it posts them (afbc68c7): these are the
         // rows whose address/type tuple the page may later send back in an edit, and EditVar honours only a
         // tuple issued here. An expanded reference carries no tid, so its rows are granted unscoped.
-        private void OnSvcModuleData(string module, string itemsJson, uint? tid) => UI(() =>
+        // Only a reply to a moduledata the host sent in the current epoch may grant (3517fd15): one delayed past
+        // a resume and a new stop, or from an engine that echoes no id, is posted for display and grants nothing.
+        private void OnSvcModuleData(string module, string itemsJson, uint? tid, string reqId) => UI(() =>
         {
-            _editGrants.GrantRows(itemsJson, tid);
+            if (_editGrants.ReadAnswered(reqId)) _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
         });
 
@@ -356,13 +367,9 @@ namespace ClarionDebugger.Terminal
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
-        // A stop and a switch clear the grants in their own handlers. An inventory that MOVED the selection (the
-        // engine's selection was not the one the host held) has no handler of its own that clears, and every row
-        // on screen is then the old thread's.
-        private void OnSvcSelectionChanged(ThreadSelection s) => UI(() =>
-        {
-            if (s.Cause == ThreadSelectionCause.Inventory) _editGrants.Clear();
-        });
+        // No handler clears the grants when the selection moves (a stop, a switch, an inventory that disagreed):
+        // the grant table observes the service's epoch on every call and retires itself (EditGrants.Sync, 3517fd15).
+        // The clears it replaced ran marshalled, behind a request the UI thread could bind first (debugger L2).
         // The tid here is the thread that was ASKED FOR, and a malformed request carries none — so it is
         // forwarded through TidJson, which OMITS the member rather than writing a 0 the page would read as
         // a real thread id. On a refusal the engine's selection is unchanged; the page keeps the selection
@@ -370,8 +377,8 @@ namespace ClarionDebugger.Terminal
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
             // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
-            // Only the new thread's stack replies may offer frames from here on (the service moved the selection).
-            if (ok) _editGrants.Clear();
+            // The grant table has retired the old thread's rows by itself: the service moved the selection's epoch
+            // before raising this, and the table checks it on every call (EditGrants.Sync).
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
@@ -676,7 +683,7 @@ namespace ClarionDebugger.Terminal
                         PushAbout();
                         PushTarget();
                         if (string.IsNullOrEmpty(_exe)) TryAutoResolveExe();
-                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);   // list procedures before running
+                        ListProceduresForTarget();   // list procedures before running
                         break;
                     case "start": CmdStart(); break;
                     case "continue": CmdContinue(); break;
@@ -716,7 +723,7 @@ namespace ClarionDebugger.Terminal
                     // Hover mode: NOT paused-gated. The engine polls while running too, and reports only.
                     case "hover": if (data == "on" || data == "off") _svc.SetHover(data == "on"); break;
                     case "stack": if (_svc.State == DebugSessionState.Paused) RequestStack(); break;
-                    case "moduledata": if (_svc.State == DebugSessionState.Paused) _svc.RequestModuleData(); break;
+                    case "moduledata": if (_svc.State == DebugSessionState.Paused) RequestModuleData(); break;
                     case "regs": if (_svc.State == DebugSessionState.Paused) _svc.RequestRegs(); break;
                     case "rewatch":
                         // Re-resolve EVERY watched name against the newly selected thread. Host-side rather
@@ -736,8 +743,8 @@ namespace ClarionDebugger.Terminal
                     case "breakonprocentry": CmdBreakOnProcEntry(data); break;   // persistent bp at a procedure's entry line
                     case "proclist":   // user pressed ↻ — re-resolve FRESH so the list tracks a project/solution switch
                         TryAutoResolveExe();   // (re-resolves against the active project even if _exe was already set)
-                        if (!string.IsNullOrEmpty(_exe)) PushProcedures(_exe);
-                        else Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
+                        if (!ListProceduresForTarget())
+                            Console("info", "(no target EXE resolved yet — build the app, or open its solution)");
                         break;
                 }
             }
@@ -953,10 +960,11 @@ namespace ClarionDebugger.Terminal
             // a "ran to cursor" that silently didn't. So: track the key now (filtered from the pane immediately,
             // and always cleaned up on pause/exit even if confirmation never comes), then defer Continue() to
             // OnSvcBreakpointSet; OnSvcBreakpointError aborts and stays paused.
-            // singleTarget: this is a transient "run to cursor", not a user breakpoint. Several loaded
-            // images can carry a same-named .clw, and an unqualified add now arms in ALL of them - which
-            // would stop us somewhere on the way to where the user actually pointed.
-            if (!_svc.AddBreakpoint(module, line, true))
+            // ARMED IN EVERY IMAGE (contract C3, 1be3b82e): a plain unqualified add, like a gutter dot. Several
+            // loaded images can carry a same-named .clw, and the host cannot tell which one the caret's file
+            // is compiled into; arming only the engine's first pick could run straight past the line the
+            // user pointed at. The stop - in whichever image - removes every copy (`bp del`, OnPaused).
+            if (!_svc.AddBreakpoint(module, line))
             {
                 Console("err", "run to cursor: could not set a breakpoint at " + module + ":" + line + " — staying paused.");
                 return;
@@ -1296,8 +1304,10 @@ namespace ClarionDebugger.Terminal
             try { ctx = ProjectTargetService.GetActiveContextKey(); } catch { }
 
             // 1) Always re-resolve from the active project first — this is the primary source of truth.
-            string fresh = null;
-            try { fresh = ProjectTargetService.ResolveTargetExe(); } catch { }
+            ProjectTargetService.TargetResolution r = null;
+            try { r = ProjectTargetService.ResolveTarget(); } catch { }
+            string fresh = r != null ? r.Path : null;
+            string why = r != null ? r.Note : null;
             if (!string.IsNullOrEmpty(fresh))
             {
                 if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase) || _exeAuto == false)
@@ -1305,6 +1315,8 @@ namespace ClarionDebugger.Terminal
                 _exe = fresh;
                 _exeAuto = true;
                 _exeManualKey = null;            // an auto-resolve supersedes any prior manual pick
+                _exeState = TargetState.Auto; _exeNote = null;
+                PushTarget();
                 if (File.Exists(_exe)) return true;
                 Console("err", "Resolved target does not exist on disk: " + _exe + " — build the app, or choose one to launch.");
                 return BrowseForContext(ctx);
@@ -1319,11 +1331,17 @@ namespace ClarionDebugger.Terminal
                 // Context changed (or unconfirmable) — never launch a hidden EXE against a different solution.
                 Console("err", "Previously chosen target no longer matches the active solution — choose a target to launch.");
                 _exe = ""; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = why;
+                PushTarget();
                 return BrowseForContext(ctx);
             }
 
-            // 3) Nothing to launch — offer a one-shot Browse.
+            // 3) Nothing to launch — offer a one-shot Browse. An older auto path is kept for the next retry but is
+            //    no longer this solution's target, so the bar stops presenting it as one before the dialog opens.
             Console("err", "Could not auto-detect a Target EXE for the current solution — choose one to launch.");
+            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
+            _exeNote = why;
+            PushTarget();
             return BrowseForContext(ctx);
         }
 
@@ -1333,7 +1351,14 @@ namespace ClarionDebugger.Terminal
         {
             if (!Browse()) return false;
             _exeManualKey = ctx;               // one-shot: only valid while the active context stays this
-            if (!File.Exists(_exe)) { Console("err", "Chosen target does not exist: " + _exe); _exe = ""; _exeManualKey = null; return false; }
+            if (!File.Exists(_exe))
+            {
+                Console("err", "Chosen target does not exist: " + _exe);
+                _exe = ""; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = "The chosen EXE does not exist";
+                PushTarget();
+                return false;
+            }
             return true;
         }
 
@@ -1346,20 +1371,71 @@ namespace ClarionDebugger.Terminal
         {
             try
             {
-                string result = ProjectTargetService.ResolveTargetExe();
-                if (!string.IsNullOrEmpty(result))
+                var r = ProjectTargetService.ResolveTarget();
+                if (!string.IsNullOrEmpty(r.Path))
                 {
                     // Log only on an actual change. This runs on every IDE context event, and
                     // re-announcing the same unchanged target each time was pure console noise.
-                    bool changed = !string.Equals(_exe, result, StringComparison.OrdinalIgnoreCase);
-                    _exe = result;
+                    bool changed = !string.Equals(_exe, r.Path, StringComparison.OrdinalIgnoreCase);
+                    _exe = r.Path;
                     _exeAuto = true;
                     _exeManualKey = null;
+                    _exeState = TargetState.Auto; _exeNote = null;
                     if (changed) Console("info", "auto-detected target: " + Path.GetFileName(_exe));
                     PushTarget();
+                    return;
                 }
+                // NO TARGET FROM THE SOLUTION (0214f33a). This returned silently, and whatever path the bar held -
+                // an older solution's auto target - went on looking like this solution's. Now the bar says so.
+                ApplyNoTarget(r.Outcome, r.Note, SafeContextKey());
+                PushTarget();
             }
             catch { }
+        }
+
+        /// <summary>What a resolve that found no target does to the one the pad holds. No solution open: the target
+        /// is gone ("none"). Otherwise a manual pick made for THIS solution context stays manual; any other path is
+        /// kept for a retry but UNCONFIRMED; with no path at all the state is "none". The note says why.</summary>
+        private void ApplyNoTarget(ProjectTargetService.TargetOutcome outcome, string note, string ctx)
+        {
+            if (outcome == ProjectTargetService.TargetOutcome.NoSolution)
+            {
+                _exe = ""; _exeAuto = false; _exeManualKey = null;
+                _exeState = TargetState.None; _exeNote = note;
+                return;
+            }
+            bool manualHere = !_exeAuto && !string.IsNullOrEmpty(_exe) && ctx != null
+                              && string.Equals(ctx, _exeManualKey, StringComparison.OrdinalIgnoreCase);
+            if (manualHere) { _exeState = TargetState.Manual; _exeNote = null; return; }
+            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
+            _exeNote = note;
+        }
+
+        private static string SafeContextKey()
+        {
+            try { return ProjectTargetService.GetActiveContextKey(); } catch { return null; }
+        }
+
+        /// <summary>List the procedures of the target, but only of one the solution CONFIRMED (auto or manual): an
+        /// unconfirmed path is not this solution's target, and neither is its procedure list. Otherwise the list is
+        /// emptied. True when a list was asked for.</summary>
+        private bool ListProceduresForTarget()
+        {
+            if (!string.IsNullOrEmpty(_exe) && (_exeState == TargetState.Auto || _exeState == TargetState.Manual))
+            {
+                PushProcedures(_exe);
+                return true;
+            }
+            ClearProcedures();
+            return false;
+        }
+
+        /// <summary>Empty the Procedures list, retiring every id the old one was sent with.</summary>
+        private void ClearProcedures()
+        {
+            _procGen++;                       // invalidate any in-flight procedure parse
+            _procIds.Clear();                 // and every id the old list was sent with
+            Post("{\"type\":\"procedures\",\"procs\":[]}");
         }
 
         /// <summary>
@@ -1372,7 +1448,28 @@ namespace ClarionDebugger.Terminal
             string path = _exe ?? string.Empty;
             bool exists = false;
             try { exists = path.Length > 0 && File.Exists(path); } catch { }
-            Post("{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false") + "}");
+            Post(TargetJson(path, exists, _exeState, _exeNote));
+        }
+
+        /// <summary>What the target bar may claim (contract C4). None is not a pad state of its own: it is exactly
+        /// "no path", so a path is never sent as "none" and no path is ever sent as anything else.</summary>
+        internal enum TargetState { None, Auto, Manual, Unconfirmed }
+
+        internal const int TargetNoteMax = 200;
+
+        /// <summary>The page's <c>target</c> message (contract C4): <c>state</c> always, <c>note</c> LAST and only when
+        /// there is one - a single plain-text line of at most <see cref="TargetNoteMax"/> characters.</summary>
+        internal static string TargetJson(string path, bool exists, TargetState state, string note)
+        {
+            path = path ?? "";
+            string s = path.Length == 0 ? "none"
+                     : state == TargetState.Auto ? "auto"
+                     : state == TargetState.Manual ? "manual"
+                     : "unconfirmed";   // a path whose state says None was never confirmed either
+            string n = note == null ? null : note.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (n != null && n.Length > TargetNoteMax) n = n.Substring(0, TargetNoteMax);
+            return "{\"type\":\"target\",\"path\":" + Str(path) + ",\"exists\":" + (exists ? "true" : "false")
+                 + ",\"state\":\"" + s + "\"" + (string.IsNullOrEmpty(n) ? "" : ",\"note\":" + Str(n)) + "}";
         }
 
         /// <summary>Shows the target EXE in File Explorer, with the file selected.</summary>
@@ -1430,6 +1527,8 @@ namespace ClarionDebugger.Terminal
                 {
                     _exe = dlg.FileName;
                     _exeAuto = false; // a manual pick — re-resolve will still take precedence on the next Start
+                    _exeState = TargetState.Manual; _exeNote = null;
+                    PushTarget();
                     return true;
                 }
             }
@@ -1553,8 +1652,9 @@ namespace ClarionDebugger.Terminal
             {
                 // A new stop: nothing on screen is current any more, and the replies requested below re-grant
                 // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
-                // the selected one; the service has already moved its selection there.
-                _editGrants.Clear();
+                // the selected one; the service has already moved its selection there, with a new epoch - and
+                // that retires every old grant, offer and outstanding request the moment the table is next
+                // touched, which is the first request below at the latest (EditGrants.Sync, 3517fd15).
 
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
@@ -1596,7 +1696,7 @@ namespace ClarionDebugger.Terminal
                 NoteStopSource(p);
                 SendSource(p.Module, p.ResolvedPath, p.Proc, p.Line);
                 RequestStack();               // per-frame locals now load lazily from the Call Stack (frame 0 auto)
-                _svc.RequestModuleData();
+                RequestModuleData();
                 // The thread inventory for THIS stop. The engine drops any previous selection at every stop,
                 // so this also tells the page which thread the panels it is about to receive belong to.
                 _svc.RequestThreads();
@@ -1746,9 +1846,14 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(name)) return;
             string why = null;
             if (!ClarionDebuggerService.IsValidWatchName(name))
-                why = "not a data name the debugger can read — letters, digits and _ : $ . ! @ only, up to 128 characters";
-            else if (!_svc.Watch(name))
-                why = "the engine did not accept the request";
+                why = "not a data name the debugger can read — letters, digits and _ : $ . ! @ - only, up to 128 characters";
+            else
+            {
+                // Under a fresh id, recorded once sent: only a reply echoing it may grant its row (OnWatch).
+                string id = _editGrants.NewRequestId();
+                if (_svc.Watch(name, id)) _editGrants.ReadRequested(id);
+                else why = "the engine did not accept the request";
+            }
             if (why == null) return;
             Post("{\"type\":\"watch\",\"name\":" + Str(name) + ",\"found\":false,\"outOfScope\":false,\"error\":"
                 + Str(why) + "}");
@@ -1758,8 +1863,16 @@ namespace ClarionDebugger.Terminal
         /// current epoch once sent: only a reply echoing a recorded id may offer frames (EditGrants.OfferFrames).</summary>
         private void RequestStack()
         {
-            string id = _editGrants.NewStackRequestId();
+            string id = _editGrants.NewRequestId();
             if (_svc.RequestStack(id)) _editGrants.StackRequested(id);
+        }
+
+        /// <summary>Ask the engine for the module-scope data under a fresh request id, recorded for the current epoch
+        /// once sent: only a reply echoing a recorded id may grant its rows (OnSvcModuleData, 3517fd15).</summary>
+        private void RequestModuleData()
+        {
+            string id = _editGrants.NewRequestId();
+            if (_svc.RequestModuleData(id)) _editGrants.ReadRequested(id);
         }
 
         private void OnStack(List<DebugStackFrame> frames, uint? tid, string reqId)
@@ -1792,8 +1905,11 @@ namespace ClarionDebugger.Terminal
         {
             var sb = new StringBuilder("{\"type\":\"watch\",\"name\":").Append(Str(w.Name))
                 .Append(",\"found\":").Append(w.Found ? "true" : "false");
-            // The one row reply the host builds itself; it grants its tuple the way the engine-row replies do.
-            if (w.Found) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
+            // The one row reply the host builds itself; it grants its tuple the way the engine-row replies do, and
+            // only when it answers a watch this host sent in the current epoch (3517fd15). A miss answers its
+            // request too, so the id is spent on either outcome; a reply with no id is shown and grants nothing.
+            bool mayGrant = _editGrants.ReadAnswered(w.ReqId);
+            if (w.Found && mayGrant) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
             if (w.Found)
                 sb.Append(",\"value\":").Append(Str(w.Value))
                   .Append(",\"typeName\":").Append(Str(w.TypeName))
@@ -1964,7 +2080,11 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"hitMode\":").Append(Str(b.HitMode))
                   .Append(",\"hitValue\":").Append(b.HitValue)
                   .Append(",\"trace\":").Append(Str(b.Trace))
-                  .Append(",\"hitCount\":").Append(b.HitCount).Append('}');
+                  .Append(",\"hitCount\":").Append(b.HitCount)
+                  // The image the engine armed this row in (its ownerPath), or null when it has not said: a pending
+                  // or pre-launch row (contract C2, 1be3b82e). With arm-all, one module:line can be one row per
+                  // image, and the page labels such rows by this. LAST, as the contract freezes it.
+                  .Append(",\"image\":").Append(Str(b.OwnerPath)).Append('}');
             }
             sb.Append("]}");
             Post(sb.ToString());
