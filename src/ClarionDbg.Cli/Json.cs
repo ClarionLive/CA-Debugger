@@ -309,6 +309,15 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Resolved call stack (frame 0 = current EIP). proc/module are null when unknown.</summary>
+        /// <summary>An event answering a request that carried <c>reqid=N</c> (C1, wave 7) names it: "reqId" is
+        /// appended as the LAST member. With no id the event is returned unchanged, byte for byte, so a host that
+        /// sends none sees exactly what it saw before.</summary>
+        public static string WithReqId(string json, string reqId)
+        {
+            if (reqId == null || string.IsNullOrEmpty(json) || json[json.Length - 1] != '}') return json;
+            return json.Substring(0, json.Length - 1) + ",\"reqId\":" + Str(reqId) + "}";
+        }
+
         /// <summary>The stack reply. <paramref name="reqId"/>, when the request carried one, is echoed as
         /// "reqId" ahead of the frames; with none, the member is absent.</summary>
         public static string Stack(List<StackFrame> frames, string reqId = null)

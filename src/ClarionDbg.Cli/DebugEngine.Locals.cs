@@ -728,10 +728,14 @@ namespace ClarionDbg.Cli
 
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
         /// in this module's DATA section), read live. Excludes file record buffers (FILE$PRE:RECORD) which already
-        /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
+        /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel, which names the
+        /// request as "reqId" when `moduledata reqid=N` asked (C1, wave 7): its rows can be edited, and the host
+        /// grants that only on a reply to a request it still holds.</summary>
         private void HandleModuleDataCommand(string[] parts, ref Native.CONTEXT_X86 ctx, bool haveCtx, uint tid,
                                              IntPtr hThread)
         {
+            string reqId, error;
+            if (!TryTakeReqId(parts, "moduledata: expected moduledata [reqid=N]", out parts, out reqId, out error)) { EmitError(error); return; }
             var rows = new List<string>();
             string module = null;
 
@@ -815,10 +819,18 @@ namespace ClarionDbg.Cli
                 }
             }
 
-            EmitThreadEvent(tid, "{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
-                + ",\"items\":[" + string.Join(",", rows) + "]}");
+            EmitThreadEvent(tid, Json.WithReqId("{\"event\":\"moduledata\",\"module\":" + Json.Str(module)
+                + ",\"items\":[" + string.Join(",", rows) + "]}", reqId));
             if (!EmitJson)
                 Console.WriteLine($"  module data ({rows.Count}) in {module ?? "(unknown)"} on thread {TidText(tid)}");
+        }
+
+        /// <summary>Test seam (C1, wave 7): the REAL moduledata handler for <paramref name="line"/> with no thread
+        /// context, so the reply is the empty one; protocolcheck reads what it names.</summary>
+        internal void ModuleDataForTest(string line, uint tid)
+        {
+            var ctx = default(Native.CONTEXT_X86);
+            HandleModuleDataCommand(line.Split(' '), ref ctx, false, tid, IntPtr.Zero);
         }
 
         /// <summary>The single Clarion type-label authority (e.g. LONG, STRING(20), DECIMAL(7,2)). Shared by
