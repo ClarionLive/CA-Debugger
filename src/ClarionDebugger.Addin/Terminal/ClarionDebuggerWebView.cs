@@ -1725,7 +1725,7 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(name)) return;
             string why = null;
             if (!ClarionDebuggerService.IsValidWatchName(name))
-                why = "not a data name the debugger can read — letters, digits and _ : $ . only, up to 128 characters";
+                why = "not a data name the debugger can read — letters, digits and _ : $ . ! only, up to 128 characters";
             else if (!_svc.Watch(name))
                 why = "the engine did not accept the request";
             if (why == null) return;

@@ -2822,6 +2822,30 @@ Check 'SetHover sends the engine''s verb' `
   ((Get-Method 'public bool SetHover(bool on)') -match 'SendCommand\(on \? "hover on" : "hover off"\)') ''
 
 Write-Host ''
+Write-Host 'a qualified watch name, [image!][module!]name, reaches the engine whole (04d7b4c8)'
+# '!' starts a comment in Clarion, so it is in no label, and the engine now reads it as the qualifier separator.
+# RUN: the real IsValidWatchName and Watch over a recording SendCommand. The command is one line split on
+# spaces, so what the name must still never carry is a space, a quote, a ';' or a line break.
+$watchProbeSrc = @"
+using System;
+using System.Text.RegularExpressions;
+public class WatchNameProbe {
+  public string Sent;
+  private bool SendCommand(string c) { Sent = c; return true; }
+  $(Get-Method 'public static bool IsValidWatchName(string name)')
+  $(Get-Method 'public bool Watch(string name)')
+}
+"@
+Add-Type -TypeDefinition $watchProbeSrc -Language CSharp | Out-Null
+$wn = New-Object WatchNameProbe
+$qualified = @('CLBRWS.EXE!CUS:RECORD', 'clbrws011.clw!LOC:Count', 'CLBRWS.EXE!clbrws011.clw!Glo:Name', 'GLO:X')
+$wnBad = @($qualified | Where-Object { $wn.Sent = $null; -not ($wn.Watch($_) -and $wn.Sent -ceq ('watch ' + $_)) })
+Check 'a qualified name is accepted and sent whole: `watch CLBRWS.EXE!CUS:RECORD`' ($wnBad.Count -eq 0) ($wnBad -join ', ')
+$refused = @('A B', "A`n", "A!`n", "A`r", "A!`r`nquit", 'A;B', 'A"B', "A'B", 'A!B C', '', ('A' * 129), 'A..B')
+$wnLet = @($refused | Where-Object { $wn.Sent = $null; $wn.Watch($_) -or -not [string]::IsNullOrEmpty($wn.Sent) } | ForEach-Object { ShowVal ($_ -replace "`r", '\r' -replace "`n", '\n') })
+Check 'a space, a line break (a trailing one included), a quote or a ; is still refused, and nothing is sent' ($wnLet.Count -eq 0) ($wnLet -join ', ')
+
+Write-Host ''
 Write-Host 'the service needs nothing from Terminal (40a252d0)'
 # AttachableProcess was the one Terminal type the Services layer imported, and the using it kept also carried
 # PageNumbers into the process-listing parse unseen. Both now live in Wire (AttachableProcess, WireRules.TryUInt).
@@ -2857,7 +2881,7 @@ Check 'WireRules.TryUInt takes plain decimal digits in the DWORD range and nothi
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 457
+$EXPECTED_CHECKS = 459
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

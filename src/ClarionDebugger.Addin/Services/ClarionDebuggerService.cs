@@ -1040,10 +1040,15 @@ namespace ClarionDebugger.Services
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
         /// BRW1::LastSortOrder, JOBS$JOB:RECORD). No spaces/newlines — the protocol is line/space-split.</summary>
+        /// <remarks>'!' separates a QUALIFIED name, <c>[image!][module!]name</c> (04d7b4c8), e.g.
+        /// <c>CLBRWS.EXE!CUS:RECORD</c>. It starts a comment in Clarion, so it is in no label, and it is not a
+        /// separator on the engine's line- and space-split stdin. Nothing else is added: no space, quote,
+        /// ';' or line break. The pattern ends in <c>\z</c>, not <c>$</c>: .NET's <c>$</c> also matches
+        /// before a trailing newline, which on that stdin is a second command.</remarks>
         public static bool IsValidWatchName(string name)
         {
             return !string.IsNullOrEmpty(name) && name.Length <= 128
-                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.]+$") && !name.Contains("..");
+                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!]+\z") && !name.Contains("..");
         }
 
         /// <summary>Watch a data symbol by name (global, file record buffer, or field). Resolves the
