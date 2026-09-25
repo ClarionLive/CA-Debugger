@@ -215,15 +215,10 @@ namespace ClarionDbg.Cli
         /// <summary>Read a data name's CURRENT value synchronously at hit time, on the thread that hit.
         /// Returns 0 = not found / unreadable, 1 = numeric (num set), 2 = string (str set). Reuses the Watch
         /// panel's name resolution AND its THREADed instance resolution; numeric scalars are decoded raw
-        /// (locale/quote-proof), everything else falls back to the shared display formatter.</summary>
-        private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str)
-        {
-            string ambiguity;
-            return ReadVarValue(name, tid, hThread, out num, out str, out ambiguity);
-        }
-
-        /// <summary><see cref="ReadVarValue(string, uint, IntPtr, out double, out string)"/>, with the ambiguity
-        /// message when that is why the name could not be read (null otherwise).</summary>
+        /// (locale/quote-proof), everything else falls back to the shared display formatter.
+        /// <para><paramref name="ambiguity"/> is the message when an ambiguous name is why it could not be read
+        /// (null otherwise). This overload comes FIRST: tools/test-threaded-template-rule.ps1 extracts the body by
+        /// its signature's first match.</para></summary>
         private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str, out string ambiguity)
         {
             num = 0; str = null;
@@ -287,6 +282,12 @@ namespace ClarionDbg.Cli
                     str = StripQuotes(FormatValueAt(code, 0, loc.Size, 0, va));
                     return 2;
             }
+        }
+
+        private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str)
+        {
+            string ambiguity;
+            return ReadVarValue(name, tid, hThread, out num, out str, out ambiguity);
         }
 
         /// <summary>Decode a scalar numeric type (LONG/ULONG/SHORT/BYTE/SREAL/REAL) to a double.</summary>

@@ -371,17 +371,7 @@ namespace ClarionDbg.Cli
             if (!TryTakeReqId(parts, "watch: expected watch NAME [reqid=N]", out parts, out reqId, out error)) { EmitError(error); return; }
             if (parts.Length < 2) { EmitError("watch expects: watch NAME [reqid=N]"); return; }
             _watchReqId = reqId;   // null too: every watch sets it, so an id never outlives its own request
-            WatchName(parts[1], tid, hThread, ref ctx, haveCtx);
-        }
-
-        /// <summary>Emit a watch event, naming the request it answers when that carried an id.</summary>
-        private void EmitWatchEvent(uint tid, string json)
-        {
-            EmitThreadEvent(tid, Json.WithReqId(json, _watchReqId));
-        }
-
-        private void WatchName(string name, uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
-        {
+            string name = parts[1];
 
             // What the rest reads: a global's template address and type, or a global-headed watch PATH's
             // member. target/places stay 0 for a plain global, whose DataLocation does not carry them.
@@ -683,6 +673,12 @@ namespace ClarionDbg.Cli
                 Console.WriteLine($"  watch {name}: not found");
             }
             else EmitWatchError(tid, name, error);
+        }
+
+        /// <summary>Emit a watch event, naming the request it answers when that carried an id.</summary>
+        private void EmitWatchEvent(uint tid, string json)
+        {
+            EmitThreadEvent(tid, Json.WithReqId(json, _watchReqId));
         }
 
         /// <summary>A watch that could not be read. Emitted against the NAME so the host can resolve that row
