@@ -293,14 +293,20 @@ namespace ClarionDbg.Cli
             NoteThreadedEmulation(owner, reasonKey, what, null, emu);
         }
 
+        /// <summary>The two seams below: replace the EXE with an unmapped image whose debug info is <paramref name="dbg"/>.</summary>
+        private void UseImageForTest(TswdDebugInfo dbg, string imageName)
+        {
+            _modules.Remove(_exe);
+            _exe = new LoadedModule { Name = imageName, Dbg = dbg, LoadBase = 0x400000, Size = 0x100000 };
+            _modules.Insert(0, _exe);
+        }
+
         /// <summary>Test seam (04d7b4c8): make <paramref name="dbg"/> the EXE's debug info and run the REAL watch handler
         /// for <paramref name="name"/> with no thread context, so no local can answer. For names that never read
         /// target memory (an ambiguous one); there is no process behind it.</summary>
         internal void WatchWithImageForTest(TswdDebugInfo dbg, string imageName, string name)
         {
-            _modules.Remove(_exe);
-            _exe = new LoadedModule { Name = imageName, Dbg = dbg, LoadBase = 0x400000, Size = 0x100000 };
-            _modules.Insert(0, _exe);
+            UseImageForTest(dbg, imageName);
             var ctx = default(Native.CONTEXT_X86);
             HandleWatchCommand(new[] { "watch", name }, 1, IntPtr.Zero, ref ctx, false);
         }
@@ -310,9 +316,7 @@ namespace ClarionDbg.Cli
         /// kind&gt;" and "probe: &lt;what a thread scan records&gt;".</summary>
         internal void DataCallersWithImageForTest(TswdDebugInfo dbg, string imageName, string name)
         {
-            _modules.Remove(_exe);
-            _exe = new LoadedModule { Name = imageName, Dbg = dbg, LoadBase = 0x400000, Size = 0x100000 };
-            _modules.Insert(0, _exe);
+            UseImageForTest(dbg, imageName);
             HandleSymCommand(new[] { "sym", name });
             double num; string str;
             Console.WriteLine("condition: " + ReadVarValue(name, 1, IntPtr.Zero, out num, out str));
