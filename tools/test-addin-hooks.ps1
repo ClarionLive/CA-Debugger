@@ -391,7 +391,13 @@ public class PadStub : Control, IDebugSessionTarget {
         RanOnThread = Thread.CurrentThread.ManagedThreadId;
         Calls++;
     }
-    public void CmdBreakOnProcEntryAt(string filePath, int line) { }
+    public bool BoeOk; public int BoeCalls; public int BoeRanOnThread;
+    public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message) {
+        BoeRanOnThread = Thread.CurrentThread.ManagedThreadId;
+        BoeCalls++;
+        message = "pad answered " + (BoeOk ? "set" : "missed") + " for " + filePath + ":" + line;
+        return BoeOk;
+    }
 }
 
 public static class Program {
@@ -405,6 +411,13 @@ $((Get-Method 'private static void Invoke(Action<IDebugSessionTarget> action, bo
 $((Get-Method 'private static bool SafeIsReady(IDebugSessionTarget t)' $ctrl))
 
 $((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
+
+    // BreakOnProcEntry marshals for itself, synchronously (e61e4f92): lifted verbatim with what it calls.
+$((Get-Method 'public static bool BreakOnProcEntry(string filePath, int line, out string message)' $ctrl))
+    $((Get-CSharpStatement 'internal const string NoPad' $ctrl))
+    $((Get-CSharpStatement 'internal const int MaxMessage' $ctrl))
+$((Get-Method 'private static bool BreakOnProcEntryHere(IDebugSessionTarget readBy, string filePath, int line, out string message)' $ctrl))
+$((Get-Method 'private static string OneLine(string text, bool ok)' $ctrl))
 
     private static int _failures;
     private static void Check(string label, bool ok, string detail) {
@@ -472,6 +485,20 @@ $((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
         Check("an on-thread caller still runs synchronously, with no extra hop",
               _pad.Calls == 2, _pad.Calls + " call(s)");
 
+        // 3b. BreakOnProcEntry has an ANSWER, so from this thread it must BLOCK on the pad's thread and hand
+        //     back what the pad said - a post would return before the pad ran. Nothing is drained first: the
+        //     result has to be there when the call returns.
+        string boeMsg;
+        _pad.BoeOk = false;
+        bool boeOk = BreakOnProcEntry(@"C:\src\clbrws011.clw", 50, out boeMsg);
+        Check("an off-thread BreakOnProcEntry ran on the pad's thread before it returned",
+              _pad.BoeCalls == 1 && _pad.BoeRanOnThread == _uiThreadId, _pad.BoeCalls + " call(s), ran on " + _pad.BoeRanOnThread);
+        Check("and returned the pad's own miss, with its message",
+              !boeOk && boeMsg == @"pad answered missed for C:\src\clbrws011.clw:50", boeOk + " / " + boeMsg);
+        _pad.BoeOk = true;
+        boeOk = BreakOnProcEntry(@"C:\src\clbrws011.clw", 50, out boeMsg);
+        Check("and the pad's own hit", boeOk && _pad.BoeCalls == 2 && boeMsg.StartsWith("pad answered set"), boeOk + " / " + boeMsg);
+
         // 4. a target that is not a Control at all. Since fc8d63f5 the interface requires ISynchronizeInvoke,
         //    and the claim is no longer "forwarded on the caller's thread" but "posted through its OWN marshal".
         _target = new PlainTarget();
@@ -506,7 +533,7 @@ $((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
         public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
         public void CmdStop() { }
         public void CmdRunToCursor(string spec) { Calls++; RanPosted = _inPost; }
-        public void CmdBreakOnProcEntryAt(string filePath, int line) { }
+        public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message) { message = ""; return false; }
     }
 }
 "@
@@ -522,12 +549,12 @@ $((Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctrl))
 
       # The probe counts its own checks in C#, so neither its exit code nor its PASS lines alone say it ran
       # them all: an exit 0 from a probe that asserted nothing is the vacuous pass this file is guarded
-      # against. Both are asserted, and the count is the probe's seven Check calls in Main.
+      # against. Both are asserted, and the count is the probe's ten Check calls in Main.
       $probeOut = @(& $exe 2>&1 | ForEach-Object { "$_" })
       $probeExit = $LASTEXITCODE
       $probeOut | ForEach-Object { Write-Host $_ }
       $probeRan = @($probeOut | Where-Object { $_ -cmatch '^  (PASS|FAIL)  ' }).Count
-      Check 'the probe exited 0 and ran all 7 of its checks' ($probeExit -eq 0 -and $probeRan -eq 7) `
+      Check 'the probe exited 0 and ran all 10 of its checks' ($probeExit -eq 0 -and $probeRan -eq 10) `
         "exit $probeExit, $probeRan check(s) reported"
       try { Remove-Item -Recurse -Force $proj -ErrorAction SilentlyContinue } catch { }
     }
