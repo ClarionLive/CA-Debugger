@@ -24,7 +24,7 @@ namespace ClarionDbg.Cli
             claims.Claim("a parsed TSWD blob whose backref slots all fall inside the module-name range attributes "
                          + "each code symbol to the line-table module at its entry (a prologue before its first record, "
                          + "and glue with no record, through its slot's agreed module, which only symbols with a record AT their "
-                         + "entry set, so a mid-procedure stray hit does not vote), a boundary symbol its slot cannot settle "
+                         + "entry set, so a mid-procedure stray hit does not vote, or failing those its boundary symbols), a boundary symbol its slot cannot settle "
                          + "to none (-1), each data symbol to its slot's agreed module or to none when the slot names two; "
                          + "the definition line follows it, and the module-data filter never matches an unproven module.");
 
@@ -82,6 +82,10 @@ namespace ClarionDbg.Cli
             // would name A and C and P5 would lose A.CLW.
             expectCode("STRAY", 0, "C.CLW", -1);
             expectCode("P6", 1, null, -1);           // on a boundary (A below, B above) its slot's C is neither
+            // A PROGRAM module's _main: a prologue with no record, alone in its slot. Its boundary vote is
+            // the slot's only one, so it and the slot's data take its own first record's module.
+            expectCode("PM", 3, "C.CLW", 60);
+            expectData("G3", 3, "C.CLW");
             expectData("G1", 1, "C.CLW");
             expectData("G2", 2, null);               // slot 2 names A and B: fail closed
 
@@ -91,8 +95,8 @@ namespace ClarionDbg.Cli
             foreach (var s in dbg.Symbols) if (s.ModuleIdx == c) kept.Add(s.Name);
             kept.Sort(StringComparer.Ordinal);
             string got = string.Join(",", kept);
-            if (got != "GLUE$$$__attach_process,P1,STRAY")
-                failures.Add("module attribution: the --module C filter keeps [" + got + "], expected [GLUE$$$__attach_process,P1,STRAY]");
+            if (got != "GLUE$$$__attach_process,P1,PM,STRAY")
+                failures.Add("module attribution: the --module C filter keeps [" + got + "], expected [GLUE$$$__attach_process,P1,PM,STRAY]");
 
             // The module-data panel's filter: a data symbol with no proven module is in no frame's module, and
             // a frame whose module is unknown shows nothing, even though -1 == -1.
@@ -109,7 +113,7 @@ namespace ClarionDbg.Cli
         /// +0x2C stream, which holds the scalar type and the 12-byte definitions. Text is RVA 0x0F00..0x2000.
         ///
         /// Modules: 0 A.CLW, 1 B.CLW, 2 C.CLW. Backref slots: 0 -> A's code, 1 -> C's code, 2 -> code of both
-        /// A and B. Code, in address order:
+        /// A and B, 3 -> only a boundary symbol. Code, in address order:
         ///   P0 @0x0F80 slot 2: first record 0x0F90 (A, line 1), none below it
         ///   P1 @0x1000 slot 1: records 0x1000 (C, line 10), 0x1010 (C, 11)
         ///   STRAY @0x1008 slot 0: a definition in the middle of P1's code, with no record at its entry
@@ -119,14 +123,15 @@ namespace ClarionDbg.Cli
         ///   P5 @0x1400 slot 0: first record 0x1408 (A, 40), so the record below its entry is B's 0x13F0
         ///   GLUE$$$__attach_process @0x1500 slot 1: no record in [0x1500, 0x1600)
         ///   P6 @0x1600 slot 1: first record 0x1608 (B, 50); the record below its entry is A's 0x1408
-        /// Data at 0x3000 (G1, slot 1) and 0x3004 (G2, slot 2).
+        ///   PM @0x1700 slot 3, the slot's only code: first record 0x1710 (C, 60), B's 0x1608 below it
+        /// Data at 0x3000 (G1, slot 1), 0x3004 (G2, slot 2) and 0x3008 (G3, slot 3).
         /// </summary>
         private static byte[] BuildAttributionBlob()
         {
             var modules = new[] { "A.CLW", "B.CLW", "C.CLW" };
-            uint[] backref = { 0xB0000A00, 0xB0000C00, 0xB00AB000 };   // slot i's value, distinct from any other field
+            uint[] backref = { 0xB0000A00, 0xB0000C00, 0xB00AB000, 0xB0000C03 };   // slot i's value, distinct from any other field
 
-            var names = new[] { "P0@F", "P1@F", "P2@F", "P3@F", "P4@F", "P5@F", "GLUE$$$__attach_process", "STRAY", "P6@F", "G1", "G2" };
+            var names = new[] { "P0@F", "P1@F", "P2@F", "P3@F", "P4@F", "P5@F", "GLUE$$$__attach_process", "STRAY", "P6@F", "PM", "G1", "G2", "G3" };
             var pool = new List<byte> { 0 };                  // leading NUL: every name NUL-preceded
             var nameRef = new Dictionary<string, uint>();
             foreach (var n in names) { nameRef[n] = (uint)pool.Count; pool.AddRange(Encoding.ASCII.GetBytes(n)); pool.Add(0); }
@@ -148,6 +153,7 @@ namespace ClarionDbg.Cli
                 new[] { 0x1300u, 30u, 1u }, new[] { 0x13F0u, 31u, 1u },
                 new[] { 0x1408u, 40u, 0u },
                 new[] { 0x1608u, 50u, 1u },
+                new[] { 0x1710u, 60u, 2u },
             };
 
             const int modArray = 0x40;
@@ -200,6 +206,7 @@ namespace ClarionDbg.Cli
             def("GLUE$$$__attach_process", 0x1500, 1);
             def("STRAY", 0x1008, 0);
             def("P6@F", 0x1600, 1);
+            def("PM", 0x1700, 3);
             Action<string, uint, int> dataDef = (name, rva, slot) =>
             {
                 b[p] = 0x04; u32(p + 1, tLong);
@@ -210,6 +217,7 @@ namespace ClarionDbg.Cli
             };
             dataDef("G1", 0x3000, 1);
             dataDef("G2", 0x3004, 2);
+            dataDef("G3", 0x3008, 3);
             return b;
         }
     }

@@ -673,13 +673,16 @@ namespace ClarionDbg.Core
         ///  - No record of its own (DLL glue such as NAME$$$__attach_process, laid out away from its
         ///    compiland): the slot's agreed module, else unproven.
         /// DATA: the slot's agreed module, else unproven.
-        /// A slot's AGREED module comes only from CODE symbols with a line record exactly AT their entry; if
-        /// they name two modules there is none. Merely confident symbols do not vote, because the definition
-        /// scan's stray hits land mid-procedure: on clbrws.exe a FIRSTSORTFIELD "definition" at 0x66C8 sits
-        /// inside ABERROR.CLW's code under ABBROWSE's slot, and on QuickChat.exe a second _main at 0x213A
-        /// does the same under ABEIP's (measured 2026-09-25). Kind is no filter: a PROGRAM module's only
-        /// code symbols are _main and its $$$ glue, all Kind Other. Unproven is -1, never the raw slot: a
-        /// module we cannot prove is shown as none, not guessed.
+        /// A slot's AGREED module comes from its STRONG voters, the CODE symbols with a line record exactly AT
+        /// their entry. A slot with none takes its WEAK voters, the boundary symbols, each voting its own B.
+        /// Either way, voters that name two modules leave the slot with none. Weak votes exist for the
+        /// PROGRAM module: its _main has a prologue with no record, and nothing else in its slot may have a
+        /// record at all (tools/fixtures/filescope, measured 2026-09-25). Merely confident symbols never
+        /// vote, because the definition scan's stray hits land mid-procedure: on clbrws.exe a FIRSTSORTFIELD
+        /// "definition" at 0x66C8 sits inside ABERROR.CLW's code under ABBROWSE's slot, and on QuickChat.exe
+        /// a second _main at 0x213A does the same under ABEIP's (measured 2026-09-25). Kind is no filter:
+        /// _main and the $$$ glue are Kind Other. Unproven is -1, never the raw slot: a module we cannot
+        /// prove is shown as none, not guessed.
         /// </summary>
         private void AttributeModules()
         {
@@ -687,7 +690,8 @@ namespace ClarionDbg.Core
             var addr = AddrTable ?? new List<AddrRec>();
             var aMod = new int[n];
             var bMod = new int[n];
-            var agreed = new Dictionary<int, int>();   // slot -> module, or -2 when its voters disagree
+            var strong = new Dictionary<int, int>();   // slot -> module, or -2 when its voters disagree
+            var weak = new Dictionary<int, int>();
             for (int i = 0; i < n; i++)
             {
                 var s = Symbols[i];
@@ -705,30 +709,35 @@ namespace ClarionDbg.Core
                 if (addr[bi].Rva == entry || aMod[i] < 0 || aMod[i] == bMod[i])
                 {
                     s.ModuleIdx = bMod[i];
-                    if (addr[bi].Rva == entry)
-                    {
-                        int held;
-                        if (!agreed.TryGetValue(s.BackrefSlot, out held)) agreed[s.BackrefSlot] = s.ModuleIdx;
-                        else if (held != s.ModuleIdx) agreed[s.BackrefSlot] = -2;
-                    }
+                    if (addr[bi].Rva == entry) Vote(strong, s.BackrefSlot, s.ModuleIdx);
                 }
+                else Vote(weak, s.BackrefSlot, bMod[i]);
             }
             for (int i = 0; i < n; i++)
             {
                 var s = Symbols[i];
                 if (s.ModuleIdx >= 0) continue;
-                int slotMod = AgreedModule(agreed, s.BackrefSlot);
+                int slotMod = AgreedModule(strong, weak, s.BackrefSlot);
                 if (slotMod < 0) continue;
                 if (bMod[i] < 0 || slotMod == aMod[i] || slotMod == bMod[i]) s.ModuleIdx = slotMod;
             }
             foreach (var ds in DataSymbols)
-                ds.ModuleIdx = AgreedModule(agreed, ds.BackrefSlot);
+                ds.ModuleIdx = AgreedModule(strong, weak, ds.BackrefSlot);
         }
 
-        private static int AgreedModule(Dictionary<int, int> agreed, int slot)
+        private static void Vote(Dictionary<int, int> votes, int slot, int module)
+        {
+            int held;
+            if (!votes.TryGetValue(slot, out held)) votes[slot] = module;
+            else if (held != module) votes[slot] = -2;
+        }
+
+        /// <summary>The slot's strong verdict if it has strong voters, else its weak one; -1 for none or split.</summary>
+        private static int AgreedModule(Dictionary<int, int> strong, Dictionary<int, int> weak, int slot)
         {
             int m;
-            return agreed.TryGetValue(slot, out m) && m >= 0 ? m : -1;
+            if (!strong.TryGetValue(slot, out m) && !weak.TryGetValue(slot, out m)) return -1;
+            return m >= 0 ? m : -1;
         }
 
         private static int LastRecordAtOrBelow(List<AddrRec> addr, uint rva)
