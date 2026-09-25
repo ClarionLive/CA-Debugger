@@ -114,7 +114,7 @@ if ($SelfTest) {
     @{ Id = 'M15'; Suite = 'ps';   File = 'web';     Why = 'process paths are written into the procs JSON unescaped';
        Find = '.Append(",\"path\":").Append(Str(p.Path)).Append(''}'');'; Repl = '.Append(",\"path\":\"").Append(p.Path).Append("\"}");' }
     @{ Id = 'M22'; Suite = 'ps';   File = 'service'; Why = 'attached state outlives a failed attach''s engine';
-       Find = "_attachTarget = null;`n            SetState(DebugSessionState.Idle);`n            Exited?.Invoke(code);"; Repl = "SetState(DebugSessionState.Idle);`n            Exited?.Invoke(code);" }
+       Find = "_attachTarget = null;`n            SetState(DebugSessionState.Idle);`n            MoveSelection(null, null, ThreadSelectionCause.Ended, true);`n            Exited?.Invoke(code);"; Repl = "SetState(DebugSessionState.Idle);`n            MoveSelection(null, null, ThreadSelectionCause.Ended, true);`n            Exited?.Invoke(code);" }
     @{ Id = 'M23'; Suite = 'ps';   File = 'web';     Why = 'the Detached line loses the app name when the exit came first';
        Find = ': !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";'; Repl = ': "the app";' }
     @{ Id = 'M26'; Suite = 'ps';   File = 'web';     Why = 'a closing pad stops observing BEFORE Stop (detach errors and kills lost on close)';
@@ -277,7 +277,7 @@ namespace ClarionDebugger.Terminal
     private int _procsGen;
     private AttachContext _attach;
     private string _lastAttachName;
-    private readonly EditGrants _editGrants = new EditGrants();
+    private readonly EditGrants _editGrants = new EditGrants(() => ThreadSelection.None);
     public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public string _pendingRtcKey;
     // Posts and console lines in ONE ordered list, because the order is the point: `clear` empties the

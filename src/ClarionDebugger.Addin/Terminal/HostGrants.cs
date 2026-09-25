@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using ClarionDebugger.Services;
 using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Terminal
@@ -187,7 +188,7 @@ namespace ClarionDebugger.Terminal
         // a late reply for thread A, landing after a switch to B, re-offered A's (va, ebp); the page's request
         // for it was forwarded, and the engine rendered A's locals at A's EBP in a reply stamped and granted
         // for B. Now a stack reply offers only when it answers a stack request made in the CURRENT epoch (a
-        // clear - stop, resume, thread switch - starts a new one) and is for the thread the host last
+        // clear - stop, resume, thread switch - starts a new one) and is for the thread the host has
         // selected. WHICH request it answers is proven by the id the engine echoes (run 3, codex security +
         // adversary): a count of requests could be spent by a stale reply for the same thread - A's stack,
         // a switch to B and back to A, a new request, and the OLD reply arriving first - which carries the
@@ -195,13 +196,26 @@ namespace ClarionDebugger.Terminal
         // reply grants only when stamped for that thread; the clear that ends an epoch retires every
         // forwarded request, so a reply after it grants nothing (the epoch is not stored with the request as
         // well: with the clear in front of it, that comparison could never fail).
+        //
+        // THE SELECTED THREAD IS THE SERVICE'S (49538b78 8b). This table kept its own copy, set by the pad at
+        // a stop and a switch and by nothing else, so an inventory that moved the selection left it behind.
+        // It now reads the service's selection when a reply arrives, and a stack request remembers the
+        // selection EPOCH it was sent in: a reply offers only while that epoch is still current. The read is
+        // on the UI thread and may be AHEAD of the event being handled there; ahead can only mean a newer
+        // epoch or another thread, so it refuses an offer and never makes one.
         private readonly HashSet<string> _framesOffered = new HashSet<string>(StringComparer.Ordinal);
         private uint? _framesTid;          // the thread the current offer came from
-        private uint? _selectedTid;        // the thread the host last selected (a stop's thread, or a switch)
-        private readonly HashSet<string> _stackIds = new HashSet<string>(StringComparer.Ordinal);  // sent this epoch, unanswered
+        private readonly Func<ThreadSelection> _selection;   // the service's selected thread, read, never kept
+        private readonly Dictionary<string, int> _stackIds = new Dictionary<string, int>(StringComparer.Ordinal);  // sent this clear, unanswered: id -> selection epoch
         private uint _nextStackId;         // never reset: an id is unique for the session
         private readonly Dictionary<string, uint?> _frameLocalsInFlight =
             new Dictionary<string, uint?>(StringComparer.Ordinal);
+
+        /// <param name="selection">The service's current selected thread (ClarionDebuggerService.Selection).</param>
+        public EditGrants(Func<ThreadSelection> selection)
+        {
+            _selection = selection ?? (() => ThreadSelection.None);
+        }
 
         /// <summary>The number of EDIT tuples granted.</summary>
         public int Count { get { return _keys.Count; } }
@@ -219,10 +233,6 @@ namespace ClarionDebugger.Terminal
             _stackIds.Clear();
         }
 
-        /// <summary>The host selected <paramref name="tid"/>: a stop's thread, or a thread switch the engine
-        /// accepted. Only a stack reply for this thread offers frames.</summary>
-        public void SelectThread(uint? tid) { _selectedTid = tid; }
-
         /// <summary>A fresh stack request id, never issued before in this session.</summary>
         public string NewStackRequestId()
         {
@@ -230,8 +240,8 @@ namespace ClarionDebugger.Terminal
             return _nextStackId.ToString(CultureInfo.InvariantCulture);
         }
 
-        /// <summary>The host sent stack request <paramref name="id"/> in the current epoch.</summary>
-        public void StackRequested(string id) { if (!string.IsNullOrEmpty(id)) _stackIds.Add(id); }
+        /// <summary>The host sent stack request <paramref name="id"/> under the service's current selection.</summary>
+        public void StackRequested(string id) { if (!string.IsNullOrEmpty(id)) _stackIds[id] = _selection().Epoch; }
 
         // A grant is CONSUMED by the write it authorises (afbc68c7, codex security gate): otherwise one grant
         // let the same write be replayed for the rest of the pause. The consumed key waits here, by address,
@@ -307,18 +317,24 @@ namespace ClarionDebugger.Terminal
 
         /// <summary>A stack reply for <paramref name="tid"/>, echoing request <paramref name="reqId"/>, carried
         /// exactly these frames, each a (va, ebp) pair. They are OFFERED, replacing the previous offer, only when
-        /// <paramref name="reqId"/> is a request sent in this epoch and not yet answered (it is answered now,
-        /// and cannot offer again) and <paramref name="tid"/> is the selected thread; otherwise nothing is
+        /// <paramref name="reqId"/> is a request sent since the last clear and not yet answered (it is answered
+        /// now, and cannot offer again), the service's selection is still the one it was sent under (same
+        /// epoch), and <paramref name="tid"/> is that selection's thread; otherwise nothing is
         /// offered and false is returned. A frame with no VA, or with the engine's "unknown" EBP (0x0), offers
         /// nothing: the page never asks about one.</summary>
         public bool OfferFrames(uint? tid, string reqId, IEnumerable<KeyValuePair<string, string>> vaEbp)
         {
-            // An id from before the last clear, one never sent, one already answered, or none at all (a null
-            // is in no set). It is answered either way: a live id stamped for another thread spends it too.
-            if (!_stackIds.Remove(reqId)) return false;
-            // A live id is always the selected thread's request, so a reply stamped otherwise comes from an
-            // engine that does not agree about the selection: its frames are not the ones asked for.
-            if (!WireRules.TidIsKnown(tid) || tid != _selectedTid) return false;
+            // An id from before the last clear, one never sent, one already answered, or none at all. It is
+            // answered either way: a live id stamped for another thread spends it too.
+            int sentEpoch;
+            if (reqId == null || !_stackIds.TryGetValue(reqId, out sentEpoch)) return false;
+            _stackIds.Remove(reqId);
+            // Sent under a selection that has since moved (a stop, a switch, an inventory that disagreed).
+            var sel = _selection();
+            if (sentEpoch != sel.Epoch) return false;
+            // A live id is the selected thread's request, so a reply stamped otherwise comes from an engine
+            // that does not agree about the selection: its frames are not the ones asked for.
+            if (!WireRules.TidIsKnown(tid) || tid != sel.Tid) return false;
             _framesOffered.Clear();
             _framesTid = tid;
             if (vaEbp != null)

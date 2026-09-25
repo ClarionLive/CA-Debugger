@@ -68,7 +68,8 @@ namespace ClarionDebugger.Terminal
         // the id it was sent with, and an edit by the row's own tuple; both are checked here rather than
         // trusted. UI-thread only, like every other piece of pad state.
         private readonly ProcedureIds _procIds = new ProcedureIds();
-        private readonly EditGrants _editGrants = new EditGrants();
+        // It reads the thread selection from the service, the one owner of it (49538b78 8b); set in the constructor.
+        private readonly EditGrants _editGrants;
         // The attach picker's pids, as the HOST listed them (3f2d747f): `attach` is honoured only for one of these.
         private readonly ListedProcesses _listedProcs = new ListedProcesses();
         private int _procsGen;   // generation of the newest process listing; an older one arriving late is dropped
@@ -92,6 +93,7 @@ namespace ClarionDebugger.Terminal
         {
             BackColor = Color.FromArgb(30, 30, 30);
             Dock = DockStyle.Fill;
+            _editGrants = new EditGrants(() => _svc.Selection);
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
 
@@ -111,6 +113,7 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
+            _svc.SelectionChanged      += OnSvcSelectionChanged;
             _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
@@ -263,6 +266,7 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
+            _svc.SelectionChanged       -= OnSvcSelectionChanged;
             _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
@@ -352,6 +356,13 @@ namespace ClarionDebugger.Terminal
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
+        // A stop and a switch clear the grants in their own handlers. An inventory that MOVED the selection (the
+        // engine's selection was not the one the host held) has no handler of its own that clears, and every row
+        // on screen is then the old thread's.
+        private void OnSvcSelectionChanged(ThreadSelection s) => UI(() =>
+        {
+            if (s.Cause == ThreadSelectionCause.Inventory) _editGrants.Clear();
+        });
         // The tid here is the thread that was ASKED FOR, and a malformed request carries none — so it is
         // forwarded through TidJson, which OMITS the member rather than writing a 0 the page would read as
         // a real thread id. On a refusal the engine's selection is unchanged; the page keeps the selection
@@ -359,8 +370,8 @@ namespace ClarionDebugger.Terminal
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
             // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
-            // Only the new thread's stack replies may offer frames from here on.
-            if (ok) { _editGrants.Clear(); _editGrants.SelectThread(tid); }
+            // Only the new thread's stack replies may offer frames from here on (the service moved the selection).
+            if (ok) _editGrants.Clear();
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
@@ -1521,9 +1532,8 @@ namespace ClarionDebugger.Terminal
             {
                 // A new stop: nothing on screen is current any more, and the replies requested below re-grant
                 // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
-                // the selected one.
+                // the selected one; the service has already moved its selection there.
                 _editGrants.Clear();
-                _editGrants.SelectThread(p.Tid);
 
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
