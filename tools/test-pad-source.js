@@ -106,7 +106,14 @@ function check(label, cond, detail) {
   if (!cond) failures++;
 }
 function slines() { return $('src').querySelectorAll('.sline'); }
-function headerText() { return $('srchdrText').innerHTML || $('srchdrText').textContent; }
+// The header as markup: the location setSrcLocation writes as innerHTML, then what buildSource appends with
+// DOM APIs (the thread label, 730ef328), serialised the way a browser would read it back.
+function headerText() {
+  const h = $('srchdrText');
+  const tail = h.children.map(c => c.tag === '#text' ? esc(c.textContent)
+    : '<' + c.tag + (c.className ? ' class="' + c.className + '"' : '') + '>' + esc(c.textContent) + '</' + c.tag + '>').join('');
+  return (h.innerHTML || h.textContent) + tail;
+}
 
 // ---- fixtures: what the host really posts -----------------------------------------------------------
 // Read out of the captured host messages rather than declared here, so nothing below can assert against a
@@ -268,6 +275,14 @@ console.log('\n6) after a thread switch the header names the thread the source b
   at(100, 100); hostSource('noSource');
   check('no source on the stopped thread keeps "No source for this stop"',
         /^No source for this stop( \(.*\))?\.$/.test(empty()), empty());
+
+  // 730ef328: the label is a DOM node, not markup concatenated onto innerHTML, and it has a style rule.
+  at(200, 100, [{ tid: 200, clarionThread: 2 }]); hostSource('withSource');
+  const lbl = $('srchdrText').querySelector('.srcthread');
+  check('the label is an appended element whose textContent is the name', !!lbl && lbl.textContent === '(Thread 2)',
+        lbl ? JSON.stringify(lbl.textContent) : 'no .srcthread child');
+  check('...and nothing appends markup to the header', !/srchdrText'\)\.innerHTML\s*\+=/.test(html));
+  check('.srcthread has a CSS rule', /\.srchdr \.srcthread \{[^}]*color:/.test(html));
 }
 
 console.log('');
