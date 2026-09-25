@@ -325,6 +325,19 @@ namespace ClarionDbg.Cli
             HandleWatchCommand(("watch " + name).Split(' '), 1, IntPtr.Zero, ref ctx, false);
         }
 
+        /// <summary>Test seam (3517fd15 item 4): the REAL condition gate for a breakpoint whose condition is
+        /// <paramref name="condition"/>, on the same kind of image as <see cref="WatchWithImageForTest"/>. Prints
+        /// "pause: &lt;its answer&gt;" after whatever the gate printed.</summary>
+        internal void ConditionWithImageForTest(TswdDebugInfo dbg, string imageName, string condition)
+        {
+            UseImageForTest(dbg, imageName);
+            var bp = new UserBreakpoint { Module = "a.clw", Line = 1, Condition = condition };
+            Console.WriteLine("pause: " + ShouldPauseAtBp(bp, 1, IntPtr.Zero));
+        }
+
+        /// <summary>Test seam (3517fd15 item 7): how many times a watch asked the stack for a local.</summary>
+        internal int LocalLookupsForTest { get { return _localLookups; } }
+
         /// <summary>Test seam (04d7b4c8): the other three callers of the data lookup, on the same kind of image as
         /// <see cref="WatchWithImageForTest"/>. Prints `sym`'s own lines, then "condition: &lt;ReadVarValue's
         /// kind&gt;" and "probe: &lt;what a thread scan records&gt;".</summary>
@@ -384,9 +397,13 @@ namespace ClarionDbg.Cli
             // frame's local. Locals live on the stack (never .cwtls), so this is a direct read. A local found in
             // a caller's frame says which one (bae5f46d). An AMBIGUOUS global still sits in that order: the
             // stopped frame's local wins over it, and a caller's local does not.
+            // A qualifier (image!, module!) names where DATA lives, and no local holds one, so a qualified name
+            // skips the local lookup outright (3517fd15 item 7), as the path form already did (q1 == null).
             uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
-            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, global != DataResolve.NotFound,
-                                       out slotVa, out lsym, out lowner, out fIdx, out fProc))
+            string q1, q2, bare;
+            bool qualified = ParseQualified(name, out q1, out q2, out bare) && q1 != null;
+            if (!qualified && TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, global != DataResolve.NotFound,
+                                                     out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
                 EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places,
                                frameIdx: fIdx, frameProc: fProc);

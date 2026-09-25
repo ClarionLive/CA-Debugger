@@ -143,9 +143,9 @@ namespace ClarionDbg.Cli
             choose("image qualifier that does not settle it", "filescope.exe!ORD:ITEM", new[] { inA, inB }, Amb, 0,
                    "ambiguous: filescope.exe!filescope_a.clw!ORD:ITEM, filescope.exe!filescope_b.clw!ORD:ITEM - watch one of these");
             choose("image and module", "filescope.exe!filescope_a.clw!ORD:ITEM", new[] { inA, inB }, Found, 0x30B4, null);
-            // Two images: no longer EXE-first.
+            // Two images: no longer EXE-first. Their modules differ, and the module qualifier is preferred (3517fd15 #4).
             choose("two images", "ORD:ITEM", new[] { inA, inDll }, Amb, 0,
-                   "ambiguous: filescope.exe!ORD:ITEM, orders.dll!ORD:ITEM - watch one of these");
+                   "ambiguous: filescope_a.clw!ORD:ITEM, orders.clw!ORD:ITEM - watch one of these");
             choose("image qualifier", "orders.dll!ORD:ITEM", new[] { inA, inDll }, Found, 0x9000, null);
             // One module, two records: named through each record, as a watch path.
             choose("one module", "BUFFER", new[] { outBuf, inBuf }, Amb, 0,

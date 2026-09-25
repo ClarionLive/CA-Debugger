@@ -176,6 +176,8 @@ namespace ClarionDbg.Cli
             return false;
         }
 
+        private int _localLookups;   // calls of TryResolveLocalOnStack, for protocolcheck (3517fd15 item 7)
+
         /// <summary>Resolve a named local against the stack in Clarion's scope order (bae5f46d; the order is the
         /// Owner's, 2026-09-24, see <see cref="WatchFrameFor"/>): the stopped frame's locals, then global and
         /// module data, then caller frames innermost first. <paramref name="globalExists"/> says whether a
@@ -197,6 +199,7 @@ namespace ClarionDbg.Cli
             out uint slotVa, out LocalSym found, out LoadedModule owner, out int frameIdx, out string frameProc)
         {
             slotVa = 0; found = null; owner = null; frameIdx = -1; frameProc = null;
+            _localLookups++;   // protocolcheck: a qualified watch must never get here
             if (!haveCtx) return false;
             var frames = FramesForStop(ref ctx, hThread);
             uint va = 0; LocalSym l = null; LoadedModule m = null;

@@ -111,6 +111,8 @@ namespace ClarionDbg.Cli
                 CheckSameNameDllsKeepTheirEntries,
                 CheckUnmappedImageIsNoDataCandidate,
                 CheckWatchAndModuleDataReqId,
+                CheckSuggestedNamesArePasteable,
+                CheckConditionAmbiguityAndQualifiedWatch,
             };
 
             foreach (var check in checks)

@@ -278,25 +278,59 @@ namespace ClarionDbg.Cli
             return DataResolve.Found;
         }
 
-        /// <summary>"ambiguous: A, B - watch one of these", each form as short as tells the candidates apart:
-        /// the image when they span images (or the user named one), the module when one image holds two.</summary>
+        /// <summary>"ambiguous: A, B - watch one of these". See <see cref="AmbiguityForms"/> for the forms.</summary>
         private static string AmbiguityMessage(string name, bool imageNamed, List<DataCandidate> files)
         {
-            var images = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var perImage = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var c in files)
-            {
-                string key = c.Image ?? "";
-                images.Add(key);
-                int n; perImage.TryGetValue(key, out n); perImage[key] = n + 1;
-            }
-            bool withImage = imageNamed || images.Count > 1;
-            bool withModule = false;
-            foreach (var n in perImage.Values) if (n > 1) withModule = true;
+            string note;
+            var forms = AmbiguityForms(name, imageNamed, files, out note);
+            return "ambiguous: " + string.Join(", ", forms) + " - watch one of these" + (note != null ? " (" + note + ")" : "");
+        }
 
-            // A field whose image and module do not set it apart is named through its own record instead, as a
-            // watch path: clbrws.exe's CWUTIL.CLW holds OUTFILE$OUTFILE@:RECORD and INFILE$INFILE@:RECORD, and
-            // both answer to BUFFER (measured 2026-09-25).
+        /// <summary>The characters a watch name may hold (3517fd15 item 4; the host's IsValidWatchName accepts
+        /// these, '-' included from wave 7). A suggested form with any other character cannot be pasted back.</summary>
+        internal const string WatchNamePunctuation = "_:$.!@-";
+
+        internal static bool IsPasteableWatchName(string form)
+        {
+            if (string.IsNullOrEmpty(form)) return false;
+            foreach (char c in form)
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                      || WatchNamePunctuation.IndexOf(c) >= 0)) return false;
+            return true;
+        }
+
+        /// <summary>
+        /// One form per candidate that a watch resolves back to it, each as short as tells the candidates apart.
+        /// Qualifier schemes are tried in order: the MODULE alone, then the image alone, then both (3517fd15 item
+        /// 4). A module name is the source file the user is looking at, and an image name is the one that tends
+        /// to hold characters a watch name cannot (a space in "My App.exe"). A user who NAMED an image keeps it.
+        /// Within a scheme, candidates the qualifiers do not set apart are named through their own record, as a
+        /// watch path: clbrws.exe's CWUTIL.CLW holds OUTFILE$OUTFILE@:RECORD and INFILE$INFILE@:RECORD, and both
+        /// answer to BUFFER (measured 2026-09-25). The first scheme whose forms are all distinct and all pasteable
+        /// wins; failing that, <paramref name="note"/> says why the forms given cannot all be used.
+        /// </summary>
+        internal static List<string> AmbiguityForms(string name, bool imageNamed, List<DataCandidate> files, out string note)
+        {
+            var schemes = imageNamed
+                ? new[] { new[] { true, false }, new[] { true, true } }
+                : new[] { new[] { false, true }, new[] { true, false }, new[] { true, true } };
+            List<string> best = null; bool bestApart = false;
+            foreach (var sc in schemes)
+            {
+                bool apart;
+                var forms = FormsUnder(name, files, sc[0], sc[1], out apart);
+                if (apart && forms.TrueForAll(IsPasteableWatchName)) { note = null; return forms; }
+                if (best == null || (apart && !bestApart)) { best = forms; bestApart = apart; }
+            }
+            note = bestApart ? "some have no form a watch name can hold" : "some cannot be told apart by name";
+            return best;
+        }
+
+        /// <summary>The forms under one qualifier scheme; <paramref name="apart"/> is false when two coincide or
+        /// a module qualifier is needed for a candidate the line table gives no module.</summary>
+        private static List<string> FormsUnder(string name, List<DataCandidate> files, bool withImage, bool withModule,
+                                               out bool apart)
+        {
             Func<DataCandidate, bool, string> form = (c, viaRecord) =>
                 (withImage ? c.Image + "!" : "") + (withModule ? (c.Module ?? "?") + "!" : "")
                 + (viaRecord ? c.Loc.Container + "." : "") + name;
@@ -305,16 +339,15 @@ namespace ClarionDbg.Cli
 
             var forms = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            bool unclear = false;
+            apart = true;
             foreach (var c in files)
             {
-                bool apart = count[form(c, false)] == 1 && !(withModule && c.Module == null);
-                string f = form(c, !apart && c.Loc.Container != null);
-                if ((withModule && c.Module == null) || !seen.Add(f)) unclear = true;
+                bool alone = count[form(c, false)] == 1 && !(withModule && c.Module == null);
+                string f = form(c, !alone && c.Loc.Container != null);
+                if ((withModule && c.Module == null) || !seen.Add(f)) apart = false;
                 forms.Add(f);
             }
-            return "ambiguous: " + string.Join(", ", forms) + " - watch one of these"
-                   + (unclear ? " (some cannot be told apart by name)" : "");
+            return forms;
         }
 
         private static bool NameMatches(string actual, string asked)
