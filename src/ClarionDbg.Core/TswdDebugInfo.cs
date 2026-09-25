@@ -1406,16 +1406,6 @@ namespace ClarionDbg.Core
             held.Add(loc);
         }
 
-        /// <summary>The same rank rule over a one-location index: equal ranks keep the first, file records
-        /// included. The engine's index is the list form above; this one is kept for protocolcheck's
-        /// ordering cases (CheckFieldNameResolvesToFileRecord), which exercise the shared rank.</summary>
-        public static void RegisterDataName(IDictionary<string, DataLocation> index, string name, DataLocation loc)
-        {
-            DataLocation held;
-            if (index.TryGetValue(name, out held) && !Outranks(loc, held)) return;
-            index[name] = loc;
-        }
-
         private static bool Outranks(DataLocation a, DataLocation b)
         {
             return DataNameRank(a.Container) < DataNameRank(b.Container);
@@ -1494,37 +1484,31 @@ namespace ClarionDbg.Core
             return all.AsReadOnly();
         }
 
-        // symbol name -> the data symbol itself, built on first use (case-insensitive; first symbol wins)
-        private Dictionary<string, DataSymbol> _dataSymbolsByName;
+        // symbol name -> every data symbol declared with it, in address order; built on first use (case-insensitive)
+        private Dictionary<string, List<DataSymbol>> _dataSymbolsByName;
 
-        /// <summary>The data symbol DECLARED with this exact name (case-insensitive), with its resolved
-        /// <see cref="DataSymbol.Type"/>. Unlike <see cref="DataNameCandidates"/> this never answers with a
-        /// member of some other symbol: a watch path (GROUP.MEMBER) walks from its head's own layout, and
-        /// a <see cref="DataLocation"/> carries no type to walk.</summary>
-        public bool TryGetDataSymbol(string name, out DataSymbol symbol)
+        /// <summary>Every data symbol DECLARED with this exact name (case-insensitive), in address order, with its
+        /// resolved <see cref="DataSymbol.Type"/>; empty when none. Unlike <see cref="DataNameCandidates"/> this
+        /// never answers with a member of some other symbol: a watch path (GROUP.MEMBER) walks from its head's
+        /// own layout, and a <see cref="DataLocation"/> carries no type to walk. There can be several: two
+        /// procedure-local FILEs with one prefix both declare ORDERS$ORD:RECORD (tools/fixtures/filescope).</summary>
+        public IList<DataSymbol> DataSymbolsNamed(string name)
         {
-            symbol = null;
-            if (string.IsNullOrEmpty(name) || DataSymbols == null) return false;
+            if (string.IsNullOrEmpty(name) || DataSymbols == null) return new DataSymbol[0];
             if (_dataSymbolsByName == null)
             {
-                var index = new Dictionary<string, DataSymbol>(StringComparer.OrdinalIgnoreCase);
-                foreach (var ds in DataSymbols)
-                    if (!string.IsNullOrEmpty(ds.Name) && !index.ContainsKey(ds.Name)) index[ds.Name] = ds;
-                _dataSymbolsByName = index;
+                var index = new Dictionary<string, List<DataSymbol>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var ds in DataSymbols)   // DataSymbols is sorted by Rva, so each list is too
+                {
+                    if (string.IsNullOrEmpty(ds.Name)) continue;
+                    List<DataSymbol> l;
+                    if (!index.TryGetValue(ds.Name, out l)) { l = new List<DataSymbol>(); index[ds.Name] = l; }
+                    l.Add(ds);
+                }
+                _dataSymbolsByName = index;   // set last, as EnsureDefIndexes does
             }
-            return _dataSymbolsByName.TryGetValue(name, out symbol);
-        }
-
-        /// <summary>Every data symbol DECLARED with this exact name (case-insensitive), in address order. Two
-        /// procedure-local FILEs with one prefix both declare ORDERS$ORD:RECORD (tools/fixtures/filescope), and
-        /// <see cref="TryGetDataSymbol"/> answers with the first.</summary>
-        public List<DataSymbol> DataSymbolsNamed(string name)
-        {
-            var list = new List<DataSymbol>();
-            if (string.IsNullOrEmpty(name) || DataSymbols == null) return list;
-            foreach (var ds in DataSymbols)
-                if (string.Equals(ds.Name, name, StringComparison.OrdinalIgnoreCase)) list.Add(ds);
-            return list;
+            List<DataSymbol> found;
+            return _dataSymbolsByName.TryGetValue(name, out found) ? (IList<DataSymbol>)found.AsReadOnly() : new DataSymbol[0];
         }
 
         /// <summary>Clarion type name for a TSWD type code — PROVEN codes only (validated against
