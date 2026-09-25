@@ -107,9 +107,10 @@ class El {
     return null;
   }
   querySelectorAll(sel) { const out = []; this.walk(c => { if (c.matches(sel)) out.push(c); }); return out; }
-  // Real appendChild/append, plus the single-arg `append` the older scenarios use.
+  // Real appendChild/append, plus the single-arg `append` the older scenarios use. A string passed to
+  // append becomes a text node, as in a real DOM: an El tagged '#text' whose textContent is the string.
   appendChild(c) { if (c.parentElement) c.remove(); c.parentElement = this; this.children.push(c); return c; }
-  append(...cs) { cs.forEach(c => this.appendChild(c)); }
+  append(...cs) { cs.forEach(c => this.appendChild(typeof c === 'string' ? textNode(c) : c)); }
   insertBefore(node, ref) {
     const i = ref ? this.children.indexOf(ref) : this.children.length;
     this.children.splice(i < 0 ? this.children.length : i, 0, node); node.parentElement = this; return node;
@@ -134,6 +135,8 @@ class El {
   get title() { return this.attrs.title; }
   set title(v) { if (v === undefined) delete this.attrs.title; else this.attrs.title = v; }
 }
+
+function textNode(t) { const n = new El('#text'); n.textContent = t; return n; }
 
 // A document with a real body to search, plus getElementById backed by a registry the test fills with
 // $('someId') — the page reaches most of its fixed furniture that way.

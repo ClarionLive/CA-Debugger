@@ -5,7 +5,6 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using ClarionDebugger.Terminal;   // AttachableProcess (PageMessages.cs), the one Terminal type left here
 using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Services
@@ -216,6 +215,55 @@ namespace ClarionDebugger.Services
         public List<DebugThread> Threads = new List<DebugThread>();
     }
 
+    /// <summary>Why the host's selected thread changed.</summary>
+    /// <remarks>Ended: a session is over. Reset: a new session is starting and has selected nothing yet.</remarks>
+    public enum ThreadSelectionCause { None, Stop, Switch, Inventory, Ended, Reset }
+
+    /// <summary>The host's ONE copy of which thread is selected (49538b78 item 8b, Owner decision 3,
+    /// 2026-09-24): ClarionDebuggerService owns it and is its only writer, and every host consumer reads what
+    /// the service delivered. Before, the Disassembly view and the grant table each kept their own copy, fed
+    /// by their own subset of the events, and nothing made the copies agree.
+    /// <para>
+    /// IMMUTABLE, because the service changes it on the engine's reader thread and the views act on it on the
+    /// UI thread after a BeginInvoke. A view that re-read the service's CURRENT selection there could be
+    /// ahead of the event it is handling (a stop's handler seating the stopped VA under a newer switch), so
+    /// <see cref="ClarionDebuggerService.SelectionChanged"/> hands each consumer the snapshot that event made.
+    /// </para>
+    /// <para>
+    /// <see cref="Epoch"/> comes from ONE counter for the whole process, rising with every change of any
+    /// service and never reset: a pad's service runs session after session, and the Disassembly view outlives
+    /// a service when a different one becomes active (pipeline run 1, debugger L1). A consumer that drops a
+    /// snapshot older than the one it holds must never meet epochs that start again from zero.
+    /// <see cref="Source"/> names the service that made it, so a consumer can drop one from a service it is no
+    /// longer bound to.
+    /// </para></summary>
+    public sealed class ThreadSelection
+    {
+        public static readonly ThreadSelection None = new ThreadSelection(null, null, 0, ThreadSelectionCause.None);
+
+        /// <summary>The selected thread: the thread every thread-scoped read targets. Null when unknown
+        /// (no stop yet, the session ended, or an engine that did not name it); never 0.</summary>
+        public readonly uint? Tid;
+        /// <summary>The thread the engine stopped on, null when unknown.</summary>
+        public readonly uint? StoppedTid;
+        public readonly int Epoch;
+        public readonly ThreadSelectionCause Cause;
+        /// <summary>The service that made this snapshot (null for <see cref="None"/>).</summary>
+        public readonly object Source;
+
+        public ThreadSelection(uint? tid, uint? stoppedTid, int epoch, ThreadSelectionCause cause)
+            : this(tid, stoppedTid, epoch, cause, null) { }
+
+        public ThreadSelection(uint? tid, uint? stoppedTid, int epoch, ThreadSelectionCause cause, object source)
+        {
+            Tid = WireRules.TidIsKnown(tid) ? tid : null;
+            StoppedTid = WireRules.TidIsKnown(stoppedTid) ? stoppedTid : null;
+            Epoch = epoch;
+            Cause = cause;
+            Source = source;
+        }
+    }
+
     /// <summary>The engine left an ATTACHED process running (3f2d747f): its <c>detached</c> event.</summary>
     public sealed class DebugDetach
     {
@@ -334,6 +382,10 @@ namespace ClarionDebugger.Services
         // malformed and named none); on ok:false the engine's selection is UNCHANGED, so a consumer keeps
         // the selection it had and asks 'threads' for the authoritative one.
         public event Action<uint?, bool, string> ThreadSelected;
+        // The host's selected thread moved (49538b78 8b): the new snapshot. Raised BEFORE the event that moved
+        // it (Paused, ThreadSelected, ThreadsReceived, Exited), so a consumer handling that event has already
+        // been handed the selection it made.
+        public event Action<ThreadSelection> SelectionChanged;
         // Hover mode (f6e547ce): (thread owning the window under the cursor, or null for none; on; paused).
         public event Action<uint?, bool, bool> HoverChanged;
         // Disassembly listing (tag, instrs, tid). The tid is the thread the engine actually DECODED, and it
@@ -361,6 +413,46 @@ namespace ClarionDebugger.Services
         public DebugSessionState State
         {
             get { lock (_stateLock) return _state; }
+        }
+
+        private readonly object _selectionLock = new object();
+        private ThreadSelection _selection = ThreadSelection.None;
+        // Every service's epochs come from this one counter (see ThreadSelection.Epoch).
+        private static int s_selectionEpoch;
+
+        /// <summary>The host's selected thread NOW (see <see cref="ThreadSelection"/>). A handler of an event
+        /// marshalled to the UI thread reads the snapshot SelectionChanged handed it instead: this one can
+        /// already be a later event's.</summary>
+        public ThreadSelection Selection
+        {
+            get { lock (_selectionLock) return _selection; }
+        }
+
+        /// <summary>The ONE writer of the host's selected thread. A move to the same threads is no change when
+        /// <paramref name="onlyIfChanged"/> (an inventory repeating what the host knows, a second end); every
+        /// other call is a change, with the next epoch, and is raised. A Switch keeps the stopped thread the
+        /// selection holds when the lock is taken, and <paramref name="stoppedTid"/> is ignored for it: read
+        /// before the lock, it could restore a stopped thread a concurrent end had just cleared.</summary>
+        private void MoveSelection(uint? tid, uint? stoppedTid, ThreadSelectionCause cause, bool onlyIfChanged)
+        {
+            ThreadSelection next;
+            lock (_selectionLock)
+            {
+                var cur = _selection;
+                if (cause == ThreadSelectionCause.Switch) stoppedTid = cur.StoppedTid;
+                var probe = new ThreadSelection(tid, stoppedTid, cur.Epoch, cause);
+                if (onlyIfChanged && probe.Tid == cur.Tid && probe.StoppedTid == cur.StoppedTid) return;
+                _selection = next = new ThreadSelection(tid, stoppedTid,
+                    System.Threading.Interlocked.Increment(ref s_selectionEpoch), cause, this);
+            }
+            SelectionChanged?.Invoke(next);
+        }
+
+        /// <summary>The inventory's selection: the selected thread when it names one, else the stopped one
+        /// (a SelectedTid of literal 0 is a sentinel, not a selection).</summary>
+        internal static uint? InventorySelection(DebugThreadList list)
+        {
+            return WireRules.TidIsKnown(list.SelectedTid) ? list.SelectedTid : list.StoppedTid;
         }
 
         /// <summary>EIP (hex) at the current pause, or null when running/idle. Lets a pad that opens
@@ -587,6 +679,8 @@ namespace ClarionDebugger.Services
             _proc = p;
             _attachTarget = attachTo;
 
+            // A new session has no thread selected yet. The epoch carries on from the last session's.
+            MoveSelection(null, null, ThreadSelectionCause.Reset, true);
             SetState(DebugSessionState.Launching);
             p.Start();
             p.BeginOutputReadLine();
@@ -606,6 +700,7 @@ namespace ClarionDebugger.Services
             // exits 2. Only `loaded` moves a session out of Launching; an error never does.
             _attachTarget = null;
             SetState(DebugSessionState.Idle);
+            MoveSelection(null, null, ThreadSelectionCause.Ended, true);
             Exited?.Invoke(code);
         }
 
@@ -625,6 +720,7 @@ namespace ClarionDebugger.Services
                 CurrentVa = null;
                 _attachTarget = null;   // the session is over, so nothing is attached any more
                 SetState(DebugSessionState.Idle);
+                MoveSelection(null, null, ThreadSelectionCause.Ended, true);
             }
             System.Threading.Tasks.Task.Run(() =>
             {
@@ -837,12 +933,22 @@ namespace ClarionDebugger.Services
 
         public bool RequestBreakpointList() { return SendCommand("bp list"); }
 
+        /// <summary>The frame count every stack request names. It equals the engine's default
+        /// (STACK_FRAMES_DEFAULT; protocolcheck's CheckStackFrameCountSkew pins that at 32), so on a current
+        /// engine naming it changes nothing; it is sent so that the count, not the id, is the first
+        /// argument (97f23f5d).</summary>
+        internal const int StackFrameCount = 32;
+
         /// <summary>Request the resolved call stack (paused only); result arrives via StackReceived. A
         /// <paramref name="reqId"/> (digits only) is sent as <c>reqid=N</c> and echoed on the reply, so the
-        /// host can tell which request a reply answers (49538b78 wave 5 run 3).</summary>
+        /// host can tell which request a reply answers (49538b78 wave 5 run 3). The count always goes first:
+        /// an engine from before wave 5 reads the first argument as the count, so it refused <c>reqid=N</c>
+        /// there, and it ignores a trailing token. An older engine therefore still answers, without the id,
+        /// and that reply offers no frames: degraded, not dead (97f23f5d).</summary>
         public bool RequestStack(string reqId = null)
         {
-            return SendCommand(reqId == null ? "stack" : "stack reqid=" + reqId);
+            string count = StackFrameCount.ToString(CultureInfo.InvariantCulture);
+            return SendCommand(reqId == null ? "stack " + count : "stack " + count + " reqid=" + reqId);
         }
 
         /// <summary>EXPERIMENT: request the current module's module-scope data (paused only); via ModuleDataReceived.</summary>
@@ -950,10 +1056,16 @@ namespace ClarionDebugger.Services
         /// <summary>A valid Clarion data-symbol name for watch-by-name (blocks command/arg injection).
         /// Allows letters, digits, and the Clarion separators _ : $ . (e.g. JOB:JOB_DESC,
         /// BRW1::LastSortOrder, JOBS$JOB:RECORD). No spaces/newlines — the protocol is line/space-split.</summary>
+        /// <remarks>'!' separates a QUALIFIED name, <c>[image!][module!]name</c> (04d7b4c8), e.g.
+        /// <c>CLBRWS.EXE!CUS:RECORD</c>. It starts a comment in Clarion, so it is in no label, and it is not a
+        /// separator on the engine's line- and space-split stdin. Nothing else is added: no space, quote,
+        /// ';' or line break. The pattern ends in <c>\z</c>, not <c>$</c>: .NET's <c>$</c> also matches
+        /// before a trailing newline, which on that stdin is a second command. '@' is in the names the engine
+        /// itself prints for paste-back, e.g. <c>CWUTIL.CLW!OUTFILE$OUTFILE@:RECORD.BUFFER</c>; it is no separator either.</remarks>
         public static bool IsValidWatchName(string name)
         {
             return !string.IsNullOrEmpty(name) && name.Length <= 128
-                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.]+$") && !name.Contains("..");
+                && Regex.IsMatch(name, @"^[A-Za-z0-9_:$.!@]+\z") && !name.Contains("..");
         }
 
         /// <summary>Watch a data symbol by name (global, file record buffer, or field). Resolves the
@@ -1138,6 +1250,8 @@ namespace ClarionDebugger.Services
                         pause.ResolvedPath = ResolveModulePath(pause.Module);
                         CurrentVa = pause.Va;
                         SetState(DebugSessionState.Paused);
+                        // A stop resets the engine's selection to the stopped thread.
+                        MoveSelection(pause.Tid, pause.Tid, ThreadSelectionCause.Stop, false);
                         Paused?.Invoke(pause);
                     }
                     break;
@@ -1250,14 +1364,24 @@ namespace ClarionDebugger.Services
 
                 case "threads":
                     var tl = ParseThreads(json);
-                    if (tl != null) ThreadsReceived?.Invoke(tl);
+                    if (tl != null)
+                    {
+                        // The engine's own answer; it moves the selection only where it differs from ours.
+                        MoveSelection(InventorySelection(tl), tl.StoppedTid, ThreadSelectionCause.Inventory, true);
+                        ThreadsReceived?.Invoke(tl);
+                    }
                     break;
 
                 case "threadselected":
                     // The tid is the thread that was ASKED FOR, and a malformed request carries none at all
                     // — passed through as null rather than 0, because 0 would be a sentinel the pad reads
                     // as a real thread id. Absent is the only way to say "unknown".
-                    ThreadSelected?.Invoke(GetUIntOrNull(json, "tid"), GetBool(json, "ok"), GetStr(json, "error"));
+                    uint? selTid = GetUIntOrNull(json, "tid");
+                    bool selOk = GetBool(json, "ok");
+                    // Only an accepted switch to a real thread moves it; a refusal leaves the engine's unchanged.
+                    if (selOk && WireRules.TidIsKnown(selTid))
+                        MoveSelection(selTid, null, ThreadSelectionCause.Switch, false);   // stopped: kept under the lock
+                    ThreadSelected?.Invoke(selTid, selOk, GetStr(json, "error"));
                     break;
 
                 case "hover":
@@ -1703,7 +1827,7 @@ namespace ClarionDebugger.Services
                 {
                     uint pid;
                     if (list.Count >= MaxListedProcesses) return;
-                    if (!PageNumbers.TryUInt(JsonMessageReader.ReadField(o, "pid"), out pid) || pid == 0) return;
+                    if (!WireRules.TryUInt(JsonMessageReader.ReadField(o, "pid"), out pid) || pid == 0) return;
                     // A listed entry carries "tswd"; a --verbose SKIP entry ({pid,name,reason}) does not, and must
                     // never become an attachable process.
                     string tswd = JsonMessageReader.ReadField(o, "tswd");

@@ -22,8 +22,12 @@ namespace ClarionDbg.Cli
             // ---- wire shapes, exact: Lea's host parses these (3f2d747f part C) ----
             ExpectEqual(failures, "attach wire: loaded (attached)", Json.Loaded(1234, 0x400000, true),
                 "{\"event\":\"loaded\",\"pid\":1234,\"loadBase\":\"0x400000\",\"attached\":true}");
+            // Each overload against the literal: Loaded(pid, base) delegates to Loaded(pid, base, false), so
+            // comparing the two with each other would pass whatever the shared body emitted (730ef328).
             ExpectEqual(failures, "attach wire: loaded (launched) is unchanged", Json.Loaded(1234, 0x400000, false),
-                Json.Loaded(1234, 0x400000));
+                "{\"event\":\"loaded\",\"pid\":1234,\"loadBase\":\"0x400000\"}");
+            ExpectEqual(failures, "attach wire: loaded (two-argument) is the launched shape", Json.Loaded(1234, 0x400000),
+                "{\"event\":\"loaded\",\"pid\":1234,\"loadBase\":\"0x400000\"}");
             ExpectEqual(failures, "attach wire: detached", Json.Detached(1234, 2, 3, null),
                 "{\"event\":\"detached\",\"pid\":1234,\"drained\":2,\"restored\":3}");
             ExpectEqual(failures, "attach wire: detached with an error", Json.Detached(1234, 0, 1, "1 breakpoint byte(s) could not be restored"),

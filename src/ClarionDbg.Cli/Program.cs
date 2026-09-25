@@ -23,6 +23,7 @@ namespace ClarionDbg.Cli
                     case "symbols": return Symbols(args);
                     case "exports": return Exports(args);
                     case "globals": return Globals(args);
+                    case "data": return Data(args);
                     case "locals": return Locals(args);
                     case "break": return Break(args);
                     case "attach": return Attach(args);
@@ -76,6 +77,10 @@ namespace ClarionDbg.Cli
             Console.WriteLine("  ClarionDbg globals <exe> [--module NAME] [--name SUBSTR]");
             Console.WriteLine("      List static data symbols (globals + file record buffers with their fields,");
             Console.WriteLine("      offsets, type codes, and sizes). RVAs are link-time template addresses.");
+            Console.WriteLine();
+            Console.WriteLine("  ClarionDbg data <exe> NAME [--dll PATH ...]");
+            Console.WriteLine("      Resolve a data name as a watch would: [image!][module!]NAME, or a watch path");
+            Console.WriteLine("      [image!][module!]HEAD.MEMBER. Prints the location, not-found, or the ambiguity.");
             Console.WriteLine();
             Console.WriteLine("  ClarionDbg resolve <exe> --addr 0xRVA");
             Console.WriteLine("      Map a code RVA (or VA) to its module + source line (address -> line).");
@@ -564,6 +569,37 @@ namespace ClarionDbg.Cli
                 foreach (var s in syms.OrderBy(s => s.EntryRva))
                     Console.WriteLine($"  0x{s.EntryRva:X6}  {s.Kind,-9}  {s.Name}  [{s.RawName}]");
             }
+            return 0;
+        }
+
+        /// <summary>data &lt;exe&gt; NAME [--dll PATH ...] (04d7b4c8): the watch lookup offline, over the EXE and then each
+        /// --dll in order, through DebugEngine.ResolveData / ResolveDataSymbol. Exit 0 found, 3 not found, 4 ambiguous.</summary>
+        private static int Data(string[] args)
+        {
+            if (args.Length < 3) { Usage(); return 1; }
+            var images = new List<LoadedModule>();
+            Action<string> add = path =>
+            {
+                var (pe, dbg) = LoadDebug(path);
+                images.Add(new LoadedModule { Path = path, Name = System.IO.Path.GetFileName(path).ToLowerInvariant(), Pe = pe, Dbg = dbg });
+            };
+            add(args[1]);
+            for (int i = 3; i + 1 < args.Length; i++)
+                if (string.Equals(args[i], "--dll", StringComparison.OrdinalIgnoreCase)) add(args[++i]);
+            string spec = args[2];
+
+            DebugEngine.DataCandidate c; string ambiguity; DebugEngine.DataResolve r;
+            string q1, q2, head, members;
+            bool path = DebugEngine.SplitWatchPath(spec, out q1, out q2, out head, out members);
+            r = path ? DebugEngine.ResolveDataSymbol(images, head, members, q1, q2, out c, out ambiguity)
+                     : DebugEngine.ResolveData(images, spec, out c, out ambiguity);
+            if (r == DebugEngine.DataResolve.Ambiguous) { Console.WriteLine($"{spec}: {ambiguity}"); return 4; }
+            if (r == DebugEngine.DataResolve.NotFound) { Console.WriteLine($"{spec}: not found"); return 3; }
+            string mod = c.Module ?? "?";
+            if (path)
+                Console.WriteLine($"{spec}: head {c.Symbol.Name} RVA 0x{c.Symbol.Rva:X} in {c.Image} {mod} (members {members.Substring(1)})");
+            else
+                Console.WriteLine($"{spec}: RVA 0x{c.Loc.Rva:X} in {c.Image} {mod}{(c.Loc.Container != null ? " container " + c.Loc.Container : "")}");
             return 0;
         }
 

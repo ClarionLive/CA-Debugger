@@ -83,6 +83,9 @@ namespace ClarionDbg.Cli
                 CheckTemplateSpanDiscriminator,
                 CheckFileRecordShape,
                 CheckDataNameIndexFromParsedBlob,
+                CheckModuleAttributionFromParsedBlob,
+                CheckQualifiedNameParsing,
+                CheckAmbiguousFileRecordsFailClosed,
                 CheckEmulationFaultBranches,
                 CheckEmulatorImportsPerImage,
                 CheckStackWindowRevalidated,
@@ -103,6 +106,7 @@ namespace ClarionDbg.Cli
                 CheckFrameBoundWatch,
                 CheckRoutineOwnerWalk,
                 CheckStackReqIdEcho,
+                CheckStackFrameCountSkew,
                 CheckWatchAddrIsOwnStorage,
             };
 
@@ -1056,9 +1060,9 @@ namespace ClarionDbg.Cli
             claims.Claim("a field name repeated by several groups resolves to the FILE record buffer "
                          + "(FILE$PRE:RECORD) in EITHER registration order, ahead of a form's HISTORY:: copy and of "
                          + "an unscoped GROUP; a '$' without the record shape, or the record shape under a :: scope, "
-                         + "buys no priority; every other collision keeps its first registration, in both orders. "
-                         + "Driven through the index's own RegisterDataName; the call sites that feed it are NOT "
-                         + "covered here.");
+                         + "buys no priority; two FILE records keep BOTH (04d7b4c8), and every other collision keeps "
+                         + "its first registration, in both orders. Driven through the list index's own "
+                         + "RegisterDataName, the one the engine builds; the call sites that feed it are NOT covered here.");
 
             var file    = new TswdDebugInfo.DataLocation { Rva = 0x3C3AC0, Container = "COUNTRIES$COU:RECORD" };
             var history = new TswdDebugInfo.DataLocation { Rva = 0x049D10, Container = "HISTORY::COU:RECORD" };
@@ -1067,11 +1071,18 @@ namespace ClarionDbg.Cli
             var scopedFile = new TswdDebugInfo.DataLocation { Rva = 0x400000, Container = "UPDATE::LOCAL$COU:RECORD" };
             var stat    = new TswdDebugInfo.DataLocation { Rva = 0x500000, Container = null };
 
+            // What the index holds for the name, in order: the winner alone, or every FILE record of equal rank.
+            Func<TswdDebugInfo.DataLocation[], List<TswdDebugInfo.DataLocation>> heldFor = order =>
+            {
+                var index = new Dictionary<string, List<TswdDebugInfo.DataLocation>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var loc in order) TswdDebugInfo.RegisterDataName(index, "COU:COUNTRY", loc);
+                return index["cou:country"];
+            };
+            // The one location the name resolves to; 0 when the index holds more than one (ambiguous).
             Func<TswdDebugInfo.DataLocation[], uint> winner = order =>
             {
-                var index = new Dictionary<string, TswdDebugInfo.DataLocation>(StringComparer.OrdinalIgnoreCase);
-                foreach (var loc in order) TswdDebugInfo.RegisterDataName(index, "COU:COUNTRY", loc);
-                return index["cou:country"].Rva;
+                var held = heldFor(order);
+                return held.Count == 1 ? held[0].Rva : 0u;
             };
 
             // The reported order: the history copy registers FIRST. This is the one first-wins got wrong.
@@ -1092,13 +1103,23 @@ namespace ClarionDbg.Cli
             var ties = new[]
             {
                 new[] { history, plain }, new[] { dollar, plain }, new[] { scopedFile, history },
-                new[] { file, new TswdDebugInfo.DataLocation { Rva = 0x200000, Container = "OTHER$COU:RECORD" } },
                 new[] { stat, file },
             };
             foreach (var pair in ties)
                 if (winner(new[] { pair[0], pair[1] }) != pair[0].Rva || winner(new[] { pair[1], pair[0] }) != pair[1].Rva)
                     failures.Add("field name: equal-rank registrations (" + (pair[0].Container ?? "static") + " / "
                                  + (pair[1].Container ?? "static") + ") did not keep the FIRST");
+
+            // Two FILE records: BOTH kept, in registration order, so the lookup answers "ambiguous" (04d7b4c8)
+            // instead of silently picking whichever registered first.
+            var other = new TswdDebugInfo.DataLocation { Rva = 0x200000, Container = "OTHER$COU:RECORD" };
+            foreach (var order in new[] { new[] { file, other }, new[] { other, file } })
+            {
+                var held = heldFor(order);
+                if (held.Count != 2 || held[0].Rva != order[0].Rva || held[1].Rva != order[1].Rva)
+                    failures.Add("field name: two FILE records (" + order[0].Container + " then " + order[1].Container
+                                 + ") left " + held.Count + " location(s) in the index, expected both, in that order");
+            }
         }
 
         /// <summary>

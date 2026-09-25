@@ -68,7 +68,8 @@ namespace ClarionDebugger.Terminal
         // the id it was sent with, and an edit by the row's own tuple; both are checked here rather than
         // trusted. UI-thread only, like every other piece of pad state.
         private readonly ProcedureIds _procIds = new ProcedureIds();
-        private readonly EditGrants _editGrants = new EditGrants();
+        // It reads the thread selection from the service, the one owner of it (49538b78 8b); set in the constructor.
+        private readonly EditGrants _editGrants;
         // The attach picker's pids, as the HOST listed them (3f2d747f): `attach` is honoured only for one of these.
         private readonly ListedProcesses _listedProcs = new ListedProcesses();
         private int _procsGen;   // generation of the newest process listing; an older one arriving late is dropped
@@ -92,6 +93,7 @@ namespace ClarionDebugger.Terminal
         {
             BackColor = Color.FromArgb(30, 30, 30);
             Dock = DockStyle.Fill;
+            _editGrants = new EditGrants(() => _svc.Selection);
             _webView = new WebView2 { Dock = DockStyle.Fill };
             Controls.Add(_webView);
 
@@ -111,6 +113,7 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived          += OnSvcRegs;
             _svc.ThreadsReceived       += OnSvcThreads;
             _svc.ThreadSelected        += OnSvcThreadSelected;
+            _svc.SelectionChanged      += OnSvcSelectionChanged;
             _svc.HoverChanged          += OnSvcHover;
             _svc.VariableSet           += OnSvcVariableSet;
             _svc.BreakpointSet         += OnSvcBreakpointSet;
@@ -263,6 +266,7 @@ namespace ClarionDebugger.Terminal
             _svc.RegsReceived           -= OnSvcRegs;
             _svc.ThreadsReceived        -= OnSvcThreads;
             _svc.ThreadSelected         -= OnSvcThreadSelected;
+            _svc.SelectionChanged       -= OnSvcSelectionChanged;
             _svc.HoverChanged           -= OnSvcHover;
             _svc.VariableSet            -= OnSvcVariableSet;
             _svc.BreakpointSet          -= OnSvcBreakpointSet;
@@ -352,6 +356,13 @@ namespace ClarionDebugger.Terminal
         private void OnSvcRegs(Dictionary<string, string> regs, uint? tid) => UI(() =>
             Post("{\"type\":\"regs\",\"regs\":" + RegsJson(regs) + TidJson(tid) + "}"));
         private void OnSvcThreads(DebugThreadList list) => UI(() => OnThreads(list));
+        // A stop and a switch clear the grants in their own handlers. An inventory that MOVED the selection (the
+        // engine's selection was not the one the host held) has no handler of its own that clears, and every row
+        // on screen is then the old thread's.
+        private void OnSvcSelectionChanged(ThreadSelection s) => UI(() =>
+        {
+            if (s.Cause == ThreadSelectionCause.Inventory) _editGrants.Clear();
+        });
         // The tid here is the thread that was ASKED FOR, and a malformed request carries none — so it is
         // forwarded through TidJson, which OMITS the member rather than writing a 0 the page would read as
         // a real thread id. On a refusal the engine's selection is unchanged; the page keeps the selection
@@ -359,8 +370,8 @@ namespace ClarionDebugger.Terminal
         private void OnSvcThreadSelected(uint? tid, bool ok, string error) => UI(() =>
         {
             // A switch makes every row on screen another thread's; the page re-reads, and the replies re-grant.
-            // Only the new thread's stack replies may offer frames from here on.
-            if (ok) { _editGrants.Clear(); _editGrants.SelectThread(tid); }
+            // Only the new thread's stack replies may offer frames from here on (the service moved the selection).
+            if (ok) _editGrants.Clear();
             Post("{\"type\":\"threadselected\"" + TidJson(tid) + ",\"ok\":" + (ok ? "true" : "false")
                 + ",\"error\":" + Str(error) + "}");
             if (!ok) Console("err", "thread " + (tid.HasValue ? tid.Value.ToString(CultureInfo.InvariantCulture) : "?")
@@ -1048,7 +1059,8 @@ namespace ClarionDebugger.Terminal
                 Console("err", "break on entry: that procedure is not in the current list — refresh the Procedures pane and try again.");
                 return;
             }
-            BreakOnEntry(proc);
+            string ignored;
+            BreakOnEntry(proc, out ignored);   // the pane's own Debug Console line is its whole answer
         }
 
         /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
@@ -1056,8 +1068,10 @@ namespace ClarionDebugger.Terminal
         /// <see cref="DebugSessionController.BreakOnProcEntry"/> (e61e4f92). The position is ONLY a lookup key
         /// into the list <see cref="PushProcedures"/> issued; which procedure it falls in, and where that one
         /// starts, are the list's answer, exactly as with an id. The module is the file's name, the same
-        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).</summary>
-        public void CmdBreakOnProcEntryAt(string filePath, int line)
+        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).
+        /// Returns the outcome and a one-line message for ClarionAssistant's toast; the Debug Console gets
+        /// its line either way.</summary>
+        public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message)
         {
             string module = null;
             try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
@@ -1067,24 +1081,26 @@ namespace ClarionDebugger.Terminal
             if (proc == null)
             {
                 // A visible refusal, never a guess at the nearest procedure above (codex adversary gate).
-                Console("err", "break on entry: " + why + " — nothing was set. (If the Procedures pane is empty, open the app's solution or refresh it.)");
-                return;
+                return RefuseBreakOnEntry(why + " — nothing was set.",
+                    " (If the Procedures pane is empty, open the app's solution or refresh it.)", out message);
             }
-            BreakOnEntry(proc);
+            return BreakOnEntry(proc, out message);
         }
 
         /// <summary>The one body both break-on-entry paths share: validate, announce, then arm (live) or stage
-        /// (idle). Everything it knows about the procedure came from the host's own list.</summary>
-        private void BreakOnEntry(ProcRef proc)
+        /// (idle). Everything it knows about the procedure came from the host's own list. True when a
+        /// breakpoint was sent, staged or already staged; <paramref name="message"/> says which, or why
+        /// nothing was set.</summary>
+        private bool BreakOnEntry(ProcRef proc, out string message)
         {
             string module = proc.Module;
             int line = proc.Line;
             string name = proc.Name;
+            string label = (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line;
             if (line <= 0)
             {
-                Console("err", "break on entry: " + (string.IsNullOrEmpty(name) ? "that procedure" : name)
-                    + " has no definition line to break on.");
-                return;
+                return RefuseBreakOnEntry((string.IsNullOrEmpty(name) ? "that procedure" : name)
+                    + " has no definition line to break on.", "", out message);
             }
 
             // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
@@ -1093,11 +1109,10 @@ namespace ClarionDebugger.Terminal
             // invalid module).
             if (!ClarionDebuggerService.IsValidModuleName(module))
             {
-                Console("err", "break on entry: not a module name the debugger can use: " + module);
-                return;
+                return RefuseBreakOnEntry("not a module name the debugger can use: " + module, "", out message);
             }
 
-            Console("info", "break on entry: " + (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line);
+            Console("info", "break on entry: " + label);
 
             if (_svc.IsRunning)
             {
@@ -1106,15 +1121,32 @@ namespace ClarionDebugger.Terminal
                 // ignored, leaving the info line above as the only word on a breakpoint that was never
                 // armed. Say so instead.
                 if (!_svc.AddBreakpoint(module, line))
-                    Console("err", "break on entry: could not set a breakpoint at " + module + ":" + line
-                        + " — the engine did not take the request.");
+                    return RefuseBreakOnEntry("could not set a breakpoint at " + module + ":" + line
+                        + " — the engine did not take the request.", "", out message);
+                // SENT, not confirmed: the bp-set echo is async, and a later refusal shows in the pad.
+                message = "Break on entry: " + label + " (sent to the debugger)";
+                return true;
             }
-            else
-            {
-                foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
-                SendBps();
-            }
+            foreach (var b in _pending)
+                if (SameBp(b, module, line))
+                {
+                    message = "Break on entry: " + label + " (already staged for the next Start)";
+                    return true;
+                }
+            _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
+            SendBps();
+            message = "Break on entry: " + label + " (staged for the next Start)";
+            return true;
+        }
+
+        /// <summary>A break-on-entry refusal: the Debug Console line it always wrote (plus
+        /// <paramref name="consoleTail"/>, a hint only the pad shows), and the same reason as the caller's
+        /// message. Always false.</summary>
+        private bool RefuseBreakOnEntry(string why, string consoleTail, out string message)
+        {
+            Console("err", "break on entry: " + why + consoleTail);
+            message = "Break on entry: " + why;
+            return false;
         }
 
         public void CmdPause()
@@ -1521,9 +1553,8 @@ namespace ClarionDebugger.Terminal
             {
                 // A new stop: nothing on screen is current any more, and the replies requested below re-grant
                 // the rows that are. The engine drops any thread selection at a stop, so the stopped thread is
-                // the selected one.
+                // the selected one; the service has already moved its selection there.
                 _editGrants.Clear();
-                _editGrants.SelectThread(p.Tid);
 
                 // Cancel any "run to cursor" transient breakpoints — execution has genuinely stopped (at the
                 // cursor line, or at a real breakpoint reached first), so the one-shot has served its purpose.
@@ -1715,7 +1746,7 @@ namespace ClarionDebugger.Terminal
             if (string.IsNullOrEmpty(name)) return;
             string why = null;
             if (!ClarionDebuggerService.IsValidWatchName(name))
-                why = "not a data name the debugger can read — letters, digits and _ : $ . only, up to 128 characters";
+                why = "not a data name the debugger can read — letters, digits and _ : $ . ! @ only, up to 128 characters";
             else if (!_svc.Watch(name))
                 why = "the engine did not accept the request";
             if (why == null) return;
@@ -1776,7 +1807,7 @@ namespace ClarionDebugger.Terminal
                   .Append(",\"note\":").Append(Str(w.Note))
                   // "View memory" address (own storage only) and the caller frame a local resolved in
                   .Append(",\"addr\":").Append(Str(w.Addr))
-                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(System.Globalization.CultureInfo.InvariantCulture) : "null")
+                  .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(CultureInfo.InvariantCulture) : "null")
                   .Append(",\"frameProc\":").Append(Str(w.FrameProc));
             else
                 // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and

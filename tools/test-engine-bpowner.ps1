@@ -380,7 +380,7 @@ Invoke-CheckSection 'the host SENDS one=1 for run-to-cursor, and for nothing els
   Check 'a gutter dot is NOT single-target, so it arms in every image carrying the .clw' `
     ($gutterAdd -match '_svc\.AddBreakpoint\(module, line\)') ''
   # Both break-on-entry paths (the page's id, the editor's position) share BreakOnEntry since e61e4f92.
-  $procEntry = Get-CSharpBlock 'private void BreakOnEntry(ProcRef proc)' $web
+  $procEntry = Get-CSharpBlock 'private bool BreakOnEntry(ProcRef proc, out string message)' $web
   Check 'and neither is break-on-proc-entry, which is a persistent breakpoint despite staging like one' `
     ($procEntry -match '_svc\.AddBreakpoint\(module, line\)') ''
   $svcAdd = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line, bool singleTarget)' $svc

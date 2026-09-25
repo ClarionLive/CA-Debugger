@@ -20,7 +20,10 @@
 
 param(
   [string] $SeatStatePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\SeatState.cs'),
-  [string] $ViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs')
+  [string] $ViewPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Disassembly\DisassemblyView.cs'),
+  # the service, whose ThreadSelection snapshot the view holds (49538b78 8b), and the wire rule it is built on
+  [string] $ServicePath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'),
+  [string] $WireRulesPath = (Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Wire\WireRules.cs')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -430,8 +433,8 @@ Check '...and says the view returns to it' ($tip -match 'returns to it') $tip
 
 $updTips = Get-CSharpCodeOnly (Get-Method 'private void UpdateStepTips()' $viewSrc)
 Check 'the tooltips name the STOPPED thread, never the viewed one' `
-  (($updTips -match 'ThreadName\(_stoppedTid\)') -and ($updTips -notmatch 'ThreadName\(_selTid\)')) ''
-Check 'the tooltips speak only when SeatState.IsOtherThread says so' ($updTips -match 'SeatState\.IsOtherThread\(_selTid,\s*_stoppedTid\)') ''
+  (($updTips -match 'ThreadName\(StoppedTid\)') -and ($updTips -notmatch 'ThreadName\(SelTid\)')) ''
+Check 'the tooltips speak only when SeatState.IsOtherThread says so' ($updTips -match 'SeatState\.IsOtherThread\(SelTid,\s*StoppedTid\)') ''
 foreach ($pair in @(@('_bOver', 'TipOver'), @('_bInto', 'TipInto'), @('_bOut', 'TipOut'))) {
   Check "$($pair[0]) gets its own tip through StepTip" `
     ($updTips -match ([regex]::Escape($pair[0]) + '\.ToolTipText\s*=\s*StepTip\(' + $pair[1] + ',\s*stopped\)')) ''
@@ -439,7 +442,7 @@ foreach ($pair in @(@('_bOver', 'TipOver'), @('_bInto', 'TipInto'), @('_bOut', '
 $banner = Get-CSharpCodeOnly (Get-Method 'private void UpdateThreadBanner()' $viewSrc)
 # As a STATEMENT at the start of a line: `if (x) UpdateStepTips();` would disable it and still contain the text.
 Check 'every banner refresh re-words the step tooltips (an unconditional statement)' ($banner -match '(?m)^\s*UpdateStepTips\(\);') ''
-Check 'the visible banner says which thread Step runs' ($banner -match 'Step runs "\s*\+\s*ThreadName\(_stoppedTid\)') ''
+Check 'the visible banner says which thread Step runs' ($banner -match 'Step runs "\s*\+\s*ThreadName\(StoppedTid\)') ''
 # THE DECISION ITSELF: the buttons are not disabled for viewing another thread. Enabled means paused, only.
 $updBtns = Get-CSharpCodeOnly (Get-Method 'private void UpdateButtons(DebugSessionState s)' $viewSrc)
 foreach ($btn in '_bOver', '_bInto', '_bOut') {
@@ -453,17 +456,17 @@ Write-Host '5. the way back to the current instruction, and the scroll that it m
 # BeginRecentre's behaviour is section 2g. These pin the view's entry points to it, by statement.
 $recentre = Get-CSharpCodeOnly (Get-Method 'private void Recentre()' $viewSrc)
 Check 'recentre seats through SeatState and asks for the registers only if a seat began' `
-  ($recentre -match 'if \(_seat\.BeginRecentre\(_selTid\)\) _svc\.RequestRegs\(\);') ''
+  ($recentre -match 'if \(_seat\.BeginRecentre\(SelTid\)\) _svc\.RequestRegs\(\);') ''
 # The SELECTED thread's registers, never the stopped thread's address: CurrentVa while another thread is
 # selected is the blind-seat defect SeatOnLateOpen documents.
-Check 'recentre never seats blind on an address' (($recentre -notmatch 'CurrentVa') -and ($recentre -notmatch 'RequestDisasmAt') -and ($recentre -notmatch '_stoppedTid')) ''
+Check 'recentre never seats blind on an address' (($recentre -notmatch 'CurrentVa') -and ($recentre -notmatch 'RequestDisasmAt') -and ($recentre -notmatch 'StoppedTid')) ''
 Check 'recentre does nothing unless paused' ($recentre -match '_svc\.State != DebugSessionState\.Paused\) return;') ''
 Check 'the toolbar has a Current button wired to Recentre' ($viewCode -match '_bCur\s*=\s*AddButton\("[^"]*Current",\s*"[^"]*",\s*Recentre\);') ''
 $cmdKey = Get-CSharpCodeOnly (Get-Method 'protected override bool ProcessCmdKey(ref Message msg, Keys keyData)' $viewSrc)
 Check 'Alt+* recentres, and is consumed' ($cmdKey -match 'if \(keyData == \(Keys\.Alt \| Keys\.Multiply\)\) \{ Recentre\(\); return true; \}') ''
 $updRec = Get-CSharpCodeOnly (Get-Method 'private void UpdateRecentre()' $viewSrc)
 Check 'Current is enabled only while paused on a known thread' `
-  ($updRec -match '_bCur\.Enabled = _svc\?\.State == DebugSessionState\.Paused && _selTid != 0;') ''
+  ($updRec -match '_bCur\.Enabled = _svc\?\.State == DebugSessionState\.Paused && SelTid != 0;') ''
 Check '...re-evaluated on every state change (an unconditional statement)' ($updBtns -match '(?m)^\s*UpdateRecentre\(\);') ''
 Check '...and on every selection change, with the banner' ($banner -match '(?m)^\s*UpdateRecentre\(\);') ''
 # THE SCROLL WINS (the PM's ruling on 876ddf1d): a seek retires the pending switch seat and nothing in it
@@ -473,8 +476,124 @@ Check 'a coarse seek goes through SeatState.Seek' ($coarse -match '(?m)^\s*_seat
 Check 'a coarse seek never re-asserts a thread seat' `
   ($coarse -notmatch 'BeginRecentre|TryBeginSeat|SeatOnSelectedThread|RequestRegs') ''
 
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '6. ONE selected thread, and it is the service''s (49538b78 8b)'
+# The view kept _selTid and _stoppedTid, fed by its own reading of Paused, threads and threadselected; the grant
+# table kept a third copy. Now the service is the one writer (tools/test-addin-selection.ps1 runs it) and the
+# view holds only the snapshot it was handed. RUN below: the real TakeSelection and ApplySelection, lifted out of
+# the shipped view, over the real SeatState and the real ThreadSelection; the view's two other reactions
+# (UpdateThreadBanner, SeatOnSelectedThread) are recorders. SeatState is compiled again under another namespace:
+# one process cannot define a type twice.
+$svcSrc = Get-Content -Raw -LiteralPath $ServicePath
+$wireSrc = Get-Content -Raw -LiteralPath $WireRulesPath
+$selSeat = ($compiled -replace '(?m)^using [^;]+;
+?
+', '') -replace 'namespace ClarionDebugger\.Disassembly', 'namespace SelProbe'
+$selWire = ($wireSrc -replace '(?m)^using [^;]+;\r?\n', '') -replace 'namespace ClarionDebugger\.Wire', 'namespace SelProbe' -replace 'internal static class', 'public static class'
+$selTypes = (Get-Method 'public enum ThreadSelectionCause' $svcSrc) + "`n" + (Get-Method 'public sealed class ThreadSelection' $svcSrc)
+$selTake = (Get-Method 'internal static SelectionStep TakeSelection(ref ThreadSelection held, ThreadSelection s, SeatState seat)' $viewSrc) -replace '^internal static', 'public static'
+$selApply = (Get-Method 'private void ApplySelection(ThreadSelection s)' $viewSrc) -replace '^private void', 'public void'
+$selStep = (Get-Method 'internal enum SelectionStep' $viewSrc) -replace '^internal', 'public'
+$selTidOf = Get-Method 'private static uint TidOf(uint? t)' $viewSrc
+$selSrc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+$selSeat
+$selWire
+namespace SelProbe {
+$selTypes
+public class ViewSelectionProbe {
+  public ThreadSelection _selection = ThreadSelection.None;
+  public SeatState _seat = new SeatState();
+  public object _svc;   // the bound service; null here, and so is every snapshot's Source unless a test names one
+  public int Banners, Seats;
+  private void UpdateThreadBanner() { Banners++; }
+  private void SeatOnSelectedThread() { Seats++; }
+  $selStep
+  $selTidOf
+  $selTake
+  $selApply
+  public uint SelTid { get { return TidOf(_selection.Tid); } }
+}
+}
+"@
+Add-Type -TypeDefinition $selSrc -Language CSharp | Out-Null
+Write-Host 'compiled the view''s selection steps'
+function Snap { param($tid, $stopped, [int] $epoch, $cause, $source = $null)
+  New-Object SelProbe.ThreadSelection ([Nullable[uint32]]$tid), ([Nullable[uint32]]$stopped), $epoch, ([Enum]::Parse([SelProbe.ThreadSelectionCause], $cause)), $source
+}
+
+$v = New-Object SelProbe.ViewSelectionProbe
+$v.ApplySelection((Snap $A $A 1 'Stop'))
+Check 'a stop''s snapshot is held: SelTid is the stopped thread' (($v.SelTid -eq $A) -and ($v.Banners -eq 1)) "sel=$($v.SelTid) banners=$($v.Banners)"
+Check '...and a stop does not re-seat here: OnPaused seats the stop''s own address' ($v.Seats -eq 0) "seats=$($v.Seats)"
+$v.ApplySelection((Snap $B $A 2 'Switch'))
+Check 'a switch''s snapshot moves the view and re-seats it, once' (($v.SelTid -eq $B) -and ($v.Seats -eq 1)) "sel=$($v.SelTid) seats=$($v.Seats)"
+$v.ApplySelection((Snap $C $A 3 'Inventory'))
+Check 'an inventory that moved the selection re-seats too' (($v.SelTid -eq $C) -and ($v.Seats -eq 2)) "sel=$($v.SelTid) seats=$($v.Seats)"
+$b0 = $v.Banners
+$v.ApplySelection((Snap $B $A 2 'Switch'))
+Check 'an OLDER snapshot, queued behind a newer one, changes nothing' (($v.SelTid -eq $C) -and ($v.Seats -eq 2) -and ($v.Banners -eq $b0)) "sel=$($v.SelTid) seats=$($v.Seats)"
+$v.ApplySelection((Snap $C $A 3 'Inventory'))
+Check 'the SAME snapshot delivered twice (event and direct read) changes nothing' (($v.Seats -eq 2) -and ($v.Banners -eq $b0)) "seats=$($v.Seats)"
+$v.ApplySelection((Snap $null $null 4 'Ended'))
+Check 'a session''s end is held: nothing is selected, and nothing re-seats' (($v.SelTid -eq 0) -and ($v.Seats -eq 2)) "sel=$($v.SelTid) seats=$($v.Seats)"
+# THE NEXT SESSION on the same service carries on from its epoch (never reset: test-addin-selection.ps1), so its
+# first snapshot is newer and is taken, and a switch in it seats.
+$v.ApplySelection((Snap $A $A 5 'Stop'))
+$v.ApplySelection((Snap $B $A 6 'Switch'))
+Check 'the next session''s first snapshot is taken, and its switch seats' (($v.SelTid -eq $B) -and ($v.Seats -eq 3)) "sel=$($v.SelTid) seats=$($v.Seats)"
+# ...where a service that RESET its epoch would have been ignored for the rest of the view's life: this is the
+# failure the never-reset rule prevents, shown on the view's side.
+$r = New-Object SelProbe.ViewSelectionProbe
+$r.ApplySelection((Snap $A $A 9 'Stop'))
+$r.ApplySelection((Snap $B $B 1 'Stop'))
+Check 'CONTROL: a snapshot whose epoch went BACKWARDS is ignored (why the service must never reset it)' ($r.SelTid -eq $A) "sel=$($r.SelTid)"
+# A REBIND (pipeline run 1, debugger L1). The view outlives a service: bound to A, a snapshot of A's is queued,
+# the view is rebound to B (Bind: SeatState.Rebound, the selection back to None), and A's snapshot is delivered
+# after. It is not B's selection whatever its epoch, and B's own first snapshot must seat.
+$svcA = New-Object object; $svcB = New-Object object
+$rb = New-Object SelProbe.ViewSelectionProbe
+$rb._svc = $svcA
+$rb.ApplySelection((Snap $A $A 50 'Stop' $svcA))
+$queuedA = Snap $B $A 51 'Switch' $svcA
+$rb._svc = $svcB; $rb._seat.Rebound(); $rb._selection = [SelProbe.ThreadSelection]::None
+$rb.ApplySelection($queuedA)
+Check 'after a rebind, a snapshot the OLD service made is dropped' (($rb.SelTid -eq 0) -and ($rb.Seats -eq 0)) "sel=$($rb.SelTid) seats=$($rb.Seats)"
+$rb.ApplySelection((Snap $C $C 52 'Switch' $svcB))
+Check '...and the new service''s first snapshot is taken, and seats' (($rb.SelTid -eq $C) -and ($rb.Seats -eq 1)) "sel=$($rb.SelTid) seats=$($rb.Seats)"
+# A switch lets a thread that decoded to nothing be tried again: TakeSelection hands the move to SeatState.
+$m = New-Object SelProbe.ViewSelectionProbe
+$m.ApplySelection((Snap $A $A 1 'Stop'))
+[void]$m._seat.TryBeginSeat($B); [void]$m._seat.TakeRegs($B, $VA); [void]$m._seat.WindowLanded($B, $B, 0)
+$emptyBefore = $m._seat.EmptyTid
+$m.ApplySelection((Snap $B $A 2 'Switch'))
+Check 'a switch to another thread clears the decoded-to-nothing record (SelectionMoving)' (($emptyBefore -eq $B) -and ($m._seat.EmptyTid -eq 0)) "before=$emptyBefore after=$($m._seat.EmptyTid)"
+
+# The wiring, which a WinForms control keeps out of reach: subscribed and unsubscribed once each, handed on
+# whole, and read before the late open asks for the inventory.
+Check 'the view subscribes to SelectionChanged once and unsubscribes once' `
+  (([regex]::Matches($viewCode, '_svc\.SelectionChanged\s*\+=\s*OnSelectionChanged;').Count -eq 1) -and `
+   ([regex]::Matches($viewCode, '_svc\.SelectionChanged\s*-=\s*OnSelectionChanged;').Count -eq 1)) ''
+Check 'OnSelectionChanged hands every snapshot to ApplySelection' `
+  ($viewCode -match 'private void OnSelectionChanged\(ThreadSelection s\) => UI\(\(\) => ApplySelection\(s\)\);') ''
+$lateOpen = Get-CSharpCodeOnly (Get-Method 'private void SeatOnLateOpen()' $viewSrc)
+$iTake = $lateOpen.IndexOf('TakeSelection(ref _selection, _svc.Selection, _seat)'); $iThreads = $lateOpen.IndexOf('_svc.RequestThreads();')
+Check 'a late open takes the service''s selection BEFORE it asks for the inventory' (($iTake -ge 0) -and ($iThreads -gt $iTake)) "take=$iTake threads=$iThreads"
+# NO SELECTION OF ITS OWN: every write of _selection is None, the service's own, or TakeSelection's ref; and no
+# uint field names a thread.
+$selWrites = @([regex]::Matches($viewCode, '(?<![=!<>])_selection\s*=(?!=)\s*([^;]+);') | ForEach-Object { $_.Groups[1].Value.Trim() })
+$badWrites = @($selWrites | Where-Object { $_ -ne 'ThreadSelection.None' -and $_ -ne '_svc.Selection' })
+Check 'the view assigns _selection only from ThreadSelection.None or _svc.Selection' (($selWrites.Count -ge 2) -and ($badWrites.Count -eq 0)) `
+  ("writes: " + ($selWrites -join ' | '))
+$tidFieldRx = '(?m)^\s*private\s+uint\??\s+_\w*[Tt]id\s*[;=]'
+Check 'the view declares no thread-id field of its own' ([regex]::Matches($viewCode, $tidFieldRx).Count -eq 0) (([regex]::Matches($viewCode, $tidFieldRx) | ForEach-Object { $_.Value.Trim() }) -join ', ')
+Check 'CONTROL: that scan finds the field this ticket removed' ([regex]::Matches((Get-CSharpCodeOnly "        private uint _selTid;        // x`n"), $tidFieldRx).Count -eq 1) ''
+
 # The count, asserted: "ALL CHECKS PASSED" is equally true of a run that silently skipped a section.
-$EXPECTED_CHECKS = 132
+$EXPECTED_CHECKS = 150
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

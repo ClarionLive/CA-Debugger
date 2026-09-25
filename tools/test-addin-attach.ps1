@@ -32,8 +32,10 @@ param(
   [string] $ServicePath = '',
   [string] $WebViewPath = '',
   [string] $PageMessagesPath = '',
+  [string] $AttachableProcessPath = '',
   [string] $HostGrantsPath = '',
   [string] $ReaderPath = '',
+  [string] $WireRulesPath = '',
   [string] $RedPath = '',
   [string] $VersionPath = '',
   [string] $EngineJsonPath = '',
@@ -54,8 +56,10 @@ $root = Join-Path $PSScriptRoot '..'
 if (-not $ServicePath) { $ServicePath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs' }
 if (-not $WebViewPath) { $WebViewPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs' }
 if (-not $PageMessagesPath) { $PageMessagesPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\PageMessages.cs' }
+if (-not $AttachableProcessPath) { $AttachableProcessPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\AttachableProcess.cs' }
 if (-not $HostGrantsPath) { $HostGrantsPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\HostGrants.cs' }
-if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\JsonMessageReader.cs' }
+if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\JsonMessageReader.cs' }
+if (-not $WireRulesPath) { $WireRulesPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\WireRules.cs' }
 if (-not $RedPath) { $RedPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\RedFileService.cs' }
 if (-not $VersionPath) { $VersionPath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionVersionService.cs' }
 if (-not $EngineJsonPath) { $EngineJsonPath = Join-Path $root 'src\ClarionDbg.Cli\Json.cs' }
@@ -71,7 +75,7 @@ if (-not $PagePath) { $PagePath = Join-Path $root 'src\ClarionDebugger.Addin\Ter
 # unmutated copies and must pass, which is what makes a red run mean the mutation and not the harness.
 if ($SelfTest) {
   $sources = [ordered]@{
-    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; grants = $HostGrantsPath; reader = $ReaderPath; red = $RedPath
+    service = $ServicePath; web = $WebViewPath; msgs = $PageMessagesPath; attproc = $AttachableProcessPath; grants = $HostGrantsPath; reader = $ReaderPath; wirerules = $WireRulesPath; red = $RedPath
     version = $VersionPath; json = $EngineJsonPath; procs = $ProcsCommandPath; pcheck = $ProtocolCheckPath; page = $PagePath
   }
   $M = @(
@@ -110,7 +114,7 @@ if ($SelfTest) {
     @{ Id = 'M15'; Suite = 'ps';   File = 'web';     Why = 'process paths are written into the procs JSON unescaped';
        Find = '.Append(",\"path\":").Append(Str(p.Path)).Append(''}'');'; Repl = '.Append(",\"path\":\"").Append(p.Path).Append("\"}");' }
     @{ Id = 'M22'; Suite = 'ps';   File = 'service'; Why = 'attached state outlives a failed attach''s engine';
-       Find = "_attachTarget = null;`n            SetState(DebugSessionState.Idle);`n            Exited?.Invoke(code);"; Repl = "SetState(DebugSessionState.Idle);`n            Exited?.Invoke(code);" }
+       Find = "_attachTarget = null;`n            SetState(DebugSessionState.Idle);`n            MoveSelection(null, null, ThreadSelectionCause.Ended, true);`n            Exited?.Invoke(code);"; Repl = "SetState(DebugSessionState.Idle);`n            MoveSelection(null, null, ThreadSelectionCause.Ended, true);`n            Exited?.Invoke(code);" }
     @{ Id = 'M23'; Suite = 'ps';   File = 'web';     Why = 'the Detached line loses the app name when the exit came first';
        Find = ': !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";'; Repl = ': "the app";' }
     @{ Id = 'M26'; Suite = 'ps';   File = 'web';     Why = 'a closing pad stops observing BEFORE Stop (detach errors and kills lost on close)';
@@ -173,7 +177,7 @@ if ($SelfTest) {
         $f = { param($name) Join-Path $dir ([IO.Path]::GetFileName(($using:sources)[$name])) }
         if ($r.Suite -eq 'ps') {
           $out = & pwsh -NoProfile -File $using:self -ServicePath (& $f 'service') -WebViewPath (& $f 'web') `
-            -PageMessagesPath (& $f 'msgs') -HostGrantsPath (& $f 'grants') -ReaderPath (& $f 'reader') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
+            -PageMessagesPath (& $f 'msgs') -AttachableProcessPath (& $f 'attproc') -HostGrantsPath (& $f 'grants') -ReaderPath (& $f 'reader') -WireRulesPath (& $f 'wirerules') -RedPath (& $f 'red') -VersionPath (& $f 'version') `
             -EngineJsonPath (& $f 'json') -ProcsCommandPath (& $f 'procs') -ProtocolCheckPath (& $f 'pcheck') -PagePath (& $f 'page') -PendingStartedOk 2>&1
           $ok = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
         } else {
@@ -237,6 +241,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using ClarionDebugger.Services;
+using ClarionDebugger.Wire;
 
 namespace ClarionDebugger.Terminal
 {
@@ -272,7 +277,7 @@ namespace ClarionDebugger.Terminal
     private int _procsGen;
     private AttachContext _attach;
     private string _lastAttachName;
-    private readonly EditGrants _editGrants = new EditGrants();
+    private readonly EditGrants _editGrants = new EditGrants(() => ThreadSelection.None);
     public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public string _pendingRtcKey;
     // Posts and console lines in ONE ordered list, because the order is the point: `clear` empties the
@@ -361,7 +366,7 @@ namespace ClarionDebugger.Terminal
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('attach-probe-' + [guid]::NewGuid().ToString('N') + '.cs')
 [IO.File]::WriteAllText($tmp, $padProbe)
 try {
-  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $PageMessagesPath, $HostGrantsPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
+  $paths = @($ServicePath, $RedPath, $VersionPath, $ReaderPath, $WireRulesPath, $PageMessagesPath, $AttachableProcessPath, $HostGrantsPath) | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
   Add-Type -Path ($paths + $tmp) -IgnoreWarnings -WarningAction SilentlyContinue -ReferencedAssemblies @(
     'System.Xml', 'System.Xml.ReaderWriter', 'System.Diagnostics.Process', 'System.Diagnostics.FileVersionInfo',
     'System.ComponentModel.Primitives', 'System.Text.RegularExpressions', 'System.Collections', 'System.Linq',
@@ -410,7 +415,7 @@ function Invoke-Static { param([string] $Name, [object[]] $A)
 # A listed process as the host holds it. $Started is the creation FILETIME the listing reported; pass '' for an
 # entry from an engine that did not report one.
 function Proc { param([uint32] $Id, [string] $Name, [string] $Path, [string] $Started = '133987654321098765')
-  $p = New-Object ClarionDebugger.Terminal.AttachableProcess; $p.Pid = $Id; $p.Name = $Name; $p.Path = $Path; $p.Tswd = $true
+  $p = New-Object ClarionDebugger.Wire.AttachableProcess; $p.Pid = $Id; $p.Name = $Name; $p.Path = $Path; $p.Tswd = $true
   $p.Started = if ($Started) { $Started } else { $null }; $p }
 
 # The engine's procs line from ITS OWN writer. The start time is additive (Kit, item 3d): when the compiled
@@ -448,7 +453,7 @@ Invoke-CheckSection '1. the attach request and the host-issued pid table (PageMe
   $LP = $SvcT.Assembly.GetType('ClarionDebugger.Terminal.ListedProcesses', $true)
   $t = [Activator]::CreateInstance($LP, $true)
   $call = { param($name, [object[]] $a) $LP.GetMethod($name).Invoke($t, $a) }
-  $list = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new()
+  $list = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new()
   $list.Add((Proc 10 'a.exe' 'C:\a.exe')); $list.Add((Proc 20 'b.exe' 'C:\b.exe'))
   Check 'CONTROL: an empty table resolves nothing' ($null -eq (& $call 'Take' @([uint32] 10))) ''
   & $call 'Begin' @(1) | Out-Null
@@ -463,7 +468,7 @@ Invoke-CheckSection '1. the attach request and the host-issued pid table (PageMe
   & $call 'Begin' @(3) | Out-Null
   Check 'an OLDER listing arriving late is refused' ((& $call 'Replace' @(2, $list)) -eq $false) ''
   Check 'and installs nothing' ($null -eq (& $call 'Take' @([uint32] 10))) ''
-  $zero = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $zero.Add((Proc 0 'z.exe' 'C:\z.exe'))
+  $zero = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new(); $zero.Add((Proc 0 'z.exe' 'C:\z.exe'))
   & $call 'Replace' @(3, $zero) | Out-Null
   Check 'a pid-0 entry is never listed' (($LP.GetProperty('Count').GetValue($t)) -eq 0) ''
 }
@@ -510,7 +515,7 @@ Invoke-CheckSection '2. the engine''s procs line, read by the host (ParseProcsJs
 # A pad attached to pid 4242 ('app.exe'), holding the state a session end must clear.
 function New-AttachedPad {
   $p = New-Object ClarionDebugger.Terminal.AttachPad
-  $l = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $l.Add((Proc 4242 'app.exe' 'C:\app.exe'))
+  $l = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new(); $l.Add((Proc 4242 'app.exe' 'C:\app.exe'))
   [ClarionDebugger.Terminal.FakeLists]::Next = $l; $p.CmdListProcs(); $p.CmdAttach('4242')
   $p.GrantOne(); $p._transientBps.Add('x.clw:1') | Out-Null; $p._pendingRtcKey = 'x.clw:1'
   $p.Posts.Clear(); $p.ClearedLine = 0
@@ -746,7 +751,7 @@ Invoke-CheckSection '9. a CLOSING pad still warns: Dispose''s TeardownLive obser
 Invoke-CheckSection '5. the pad lists, and attaches only to what it listed' {
   [ClarionDebugger.Terminal.DebugSessionController]::State = 'Idle'
   $pad = New-Object ClarionDebugger.Terminal.AttachPad
-  $next = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new()
+  $next = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new()
   $next.Add((Proc 4242 '<b>"evil"</b>.exe' 'C:\"x"\app.exe')); $next.Add((Proc 77 'ok.exe' 'C:\ok.exe'))
   [ClarionDebugger.Terminal.FakeLists]::Next = $next; [ClarionDebugger.Terminal.FakeLists]::NextError = $null
   $pad.CmdListProcs()
@@ -786,7 +791,7 @@ Invoke-CheckSection '5. the pad lists, and attaches only to what it listed' {
 
   # A pid is not an identity: the listed start time goes with the attach, and without one there is no attach.
   $pS = New-Object ClarionDebugger.Terminal.AttachPad
-  $ls = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new()
+  $ls = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new()
   $ls.Add((Proc 31 'timed.exe' 'C:\timed.exe' '133000000000000001')); $ls.Add((Proc 32 'old.exe' 'C:\old.exe' ''))
   [ClarionDebugger.Terminal.FakeLists]::Next = $ls; $pS.CmdListProcs(); $pS.Posts.Clear()
   $pS.CmdAttach('32')
@@ -808,9 +813,9 @@ Invoke-CheckSection '5. the pad lists, and attaches only to what it listed' {
   # Refresh retires the previous listing's pids at once, and a late older listing never installs.
   $p2 = New-Object ClarionDebugger.Terminal.AttachPad
   $p2.HoldWork = $true
-  $a = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $a.Add((Proc 11 'old.exe' 'C:\old.exe'))
+  $a = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new(); $a.Add((Proc 11 'old.exe' 'C:\old.exe'))
   [ClarionDebugger.Terminal.FakeLists]::Next = $a; $p2.CmdListProcs()
-  $b = [System.Collections.Generic.List[ClarionDebugger.Terminal.AttachableProcess]]::new(); $b.Add((Proc 22 'new.exe' 'C:\new.exe'))
+  $b = [System.Collections.Generic.List[ClarionDebugger.Wire.AttachableProcess]]::new(); $b.Add((Proc 22 'new.exe' 'C:\new.exe'))
   [ClarionDebugger.Terminal.FakeLists]::Next = $b; $p2.CmdListProcs()
   $p2.Release(1); $p2.Release(0)   # the newer listing lands first, the older one late
   $p2.CmdAttach('11')
