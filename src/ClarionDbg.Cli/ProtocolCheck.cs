@@ -109,6 +109,7 @@ namespace ClarionDbg.Cli
                 CheckStackFrameCountSkew,
                 CheckWatchAddrIsOwnStorage,
                 CheckRearmHold,
+                CheckRunToCursorArmsEveryImage,
             };
 
             foreach (var check in checks)
