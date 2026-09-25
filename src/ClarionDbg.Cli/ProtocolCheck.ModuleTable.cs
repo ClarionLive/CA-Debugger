@@ -93,5 +93,39 @@ namespace ClarionDbg.Cli
             catch (Exception ex) { failures.Add("same-name dlls: " + ex.GetType().Name + ": " + ex.Message); }
             finally { try { Directory.Delete(root, true); } catch { } }
         }
+
+        /// <summary>
+        /// A preloaded image that has not mapped is not a data candidate (1be3b82e item 2). Through the REAL watch
+        /// handler on a parsed image (the attribution blob, whose A.CLW holds an ORDERS$ORD:RECORD), with a second,
+        /// unmapped image carrying the same debug info, as a same-named DLL that has not loaded yet does. Counted
+        /// in, it made the record ambiguous; it has no live address to read either.
+        /// </summary>
+        private static void CheckUnmappedImageIsNoDataCandidate(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("a watch of a FILE record the one mapped image holds resolves to that image while a preloaded image "
+                         + "with the same debug info has not mapped, instead of answering ambiguous; the same watch with both "
+                         + "mapped stays ambiguous (the control).");
+
+            TswdDebugInfo dbg;
+            try { dbg = new TswdDebugInfo(BuildAttributionBlob(), 0, 0x0F00, 0x2000, 0x10000); }
+            catch (Exception ex) { failures.Add("unmapped image: the fixture blob did not parse - " + ex.Message); return; }
+
+            const string spec = "A.CLW!ORDERS$ORD:RECORD";
+            var eng = NewEngine();
+            eng.EmitJson = true;
+            eng.AddUnmappedImageForTest(dbg, "ghost.dll");
+            string outp = CaptureConsole(() => eng.WatchWithImageForTest(dbg, "attr.exe", spec));
+            if (outp.IndexOf("ambiguous", StringComparison.Ordinal) >= 0 || outp.IndexOf("\"found\":true", StringComparison.Ordinal) < 0)
+                failures.Add("unmapped image: " + spec + " with an unmapped ghost.dll did not resolve to attr.exe: " + outp.Trim());
+
+            // Control: the same second image, MAPPED, is a real second candidate, so the rule above is about mapping.
+            var both = NewEngine();
+            both.EmitJson = true;
+            both.AddUnmappedImageForTest(dbg, "ghost.dll");
+            both.MapImagesForTest(0x10000000);
+            outp = CaptureConsole(() => both.WatchWithImageForTest(dbg, "attr.exe", spec));
+            if (outp.IndexOf("\"error\":\"ambiguous: ", StringComparison.Ordinal) < 0)
+                failures.Add("unmapped image (control): " + spec + " with ghost.dll MAPPED must be ambiguous: " + outp.Trim());
+        }
     }
 }

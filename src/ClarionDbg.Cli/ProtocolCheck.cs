@@ -109,6 +109,7 @@ namespace ClarionDbg.Cli
                 CheckStackFrameCountSkew,
                 CheckWatchAddrIsOwnStorage,
                 CheckSameNameDllsKeepTheirEntries,
+                CheckUnmappedImageIsNoDataCandidate,
             };
 
             foreach (var check in checks)

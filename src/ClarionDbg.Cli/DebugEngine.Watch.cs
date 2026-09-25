@@ -301,6 +301,19 @@ namespace ClarionDbg.Cli
             _modules.Insert(0, _exe);
         }
 
+        /// <summary>Test seam (1be3b82e): add a preloaded image that has NOT mapped (LoadBase 0), as a solution DLL
+        /// that has not loaded yet is.</summary>
+        internal void AddUnmappedImageForTest(TswdDebugInfo dbg, string imageName)
+        {
+            _modules.Add(new LoadedModule { Name = imageName, Dbg = dbg, Preloaded = true, Size = 0x100000 });
+        }
+
+        /// <summary>Test seam (1be3b82e): map every unmapped image at <paramref name="baseVa"/>, 16 MB apart.</summary>
+        internal void MapImagesForTest(uint baseVa)
+        {
+            foreach (var m in _modules) if (m.LoadBase == 0) { m.LoadBase = baseVa; baseVa += 0x1000000; }
+        }
+
         /// <summary>Test seam (04d7b4c8): make <paramref name="dbg"/> the EXE's debug info and run the REAL watch handler
         /// for <paramref name="name"/> with no thread context, so no local can answer. For names that never read
         /// target memory (an ambiguous one); there is no process behind it.</summary>

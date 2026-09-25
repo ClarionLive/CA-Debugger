@@ -325,12 +325,18 @@ namespace ClarionDbg.Cli
             return dot > 0 && string.Equals(actual.Substring(0, dot), asked, StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>Every debuggable image, the EXE first.</summary>
+        /// <summary>Every debuggable image, the EXE first; a DLL only once it has mapped.
+        /// <para>
+        /// A preloaded solution DLL that has not mapped (not loaded yet, or never) is left out: it has no live
+        /// address, so a name it holds would be read at its bare RVA, and as a second candidate it made a FILE
+        /// record that the mapped image holds alone read as ambiguous. Two same-named DLLs are two preloads since
+        /// 1be3b82e, so one of them loading before the other is the ordinary case, not a rarity.
+        /// </para></summary>
         private IEnumerable<LoadedModule> ImagesExeFirst()
         {
             if (_exe != null && _exe.Dbg != null) yield return _exe;
             foreach (var m in _modules)
-                if (m != _exe && m.Dbg != null) yield return m;
+                if (m != _exe && m.Dbg != null && m.LoadBase != 0) yield return m;
         }
 
         /// <summary>Resolve a data name (global / record buffer / field), optionally qualified
