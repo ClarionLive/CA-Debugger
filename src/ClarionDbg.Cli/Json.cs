@@ -107,7 +107,7 @@ namespace ClarionDbg.Cli
 
         public static string Loaded(uint pid, uint loadBase)
         {
-            return "{\"event\":\"loaded\",\"pid\":" + pid + ",\"loadBase\":\"0x" + loadBase.ToString("X") + "\"}";
+            return Loaded(pid, loadBase, false);
         }
 
         /// <summary>An image (EXE or DLL) mapped into the target. hasDebug = TSWD present (the engine

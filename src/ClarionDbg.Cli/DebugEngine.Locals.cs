@@ -718,6 +718,14 @@ namespace ClarionDbg.Cli
             t.RenderHint(out code, out size, out places);
         }
 
+        /// <summary>Does a data symbol attributed to <paramref name="dataModuleIdx"/> belong in the module-data panel of
+        /// a frame in <paramref name="frameModuleIdx"/>? Both are +0x1C line-table modules, -1 = unproven, and
+        /// unproven matches nothing, not even another unproven (52458d89).</summary>
+        internal static bool InFrameModule(int frameModuleIdx, int dataModuleIdx)
+        {
+            return frameModuleIdx >= 0 && dataModuleIdx == frameModuleIdx;
+        }
+
         /// <summary>EXPERIMENT: moduledata — list the CURRENT module's module-scope data (the data declared
         /// in this module's DATA section), read live. Excludes file record buffers (FILE$PRE:RECORD) which already
         /// show in the file-buffer tree. Emits a `moduledata` event for the host's Variables panel.</summary>
@@ -736,16 +744,17 @@ namespace ClarionDbg.Cli
                 ProcSymbol sym;
                 if (m != null && m.Dbg != null && m.Dbg.ResolveSymbolVerified(f.Va - m.LoadBase, out sym))
                 {
-                    int mi = sym.ModuleIdx;
-                    // The LABEL comes from the +0x1C line table (FrameAt's moduleIdx), the index space
-                    // ModuleNameForIdx takes. sym.ModuleIdx is the +0x28 backref's, a different space, so
-                    // naming the module by it could print another compiland's name (52458d89). The filter
-                    // below still uses it: DataSymbol.ModuleIdx is a backref index too.
+                    // The label and the filter both come from the +0x1C line table at the frame (the label is
+                    // FrameAt's). A data symbol's ModuleIdx is in the same space, or -1 when no module could be
+                    // proven for it, and -1 never matches: an unproven symbol is left out, not shown in the
+                    // wrong module. Filtering by the backref slot showed another compiland's data (52458d89).
+                    int line, mi; uint recRva;
+                    if (!m.Dbg.ResolveAddr(f.Va - m.LoadBase, out line, out mi, out recRva)) mi = -1;
                     module = f.Module;
                     var syms = m.Dbg.DataSymbols;
                     foreach (var ds in syms ?? new List<DataSymbol>())
                     {
-                        if (ds.ModuleIdx != mi) continue;
+                        if (!InFrameModule(mi, ds.ModuleIdx)) continue;
                         // File record buffer: belongs to the file-buffer tree, not module data. The SHAPE test,
                         // shared with the name index. A bare ":RECORD" suffix also hid a form's
                         // HISTORY::COU:RECORD, which is a module GROUP the Tables tree does not show (04d7b4c8).

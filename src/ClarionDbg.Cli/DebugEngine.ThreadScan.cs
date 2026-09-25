@@ -76,10 +76,11 @@ namespace ClarionDbg.Cli
         /// it does not run target code and does not allocate an instance for a thread that has none.</summary>
         private void ProbeNameOnEachThread(string name, List<ThreadProbe> probes)
         {
-            TswdDebugInfo.DataLocation loc; LoadedModule owner;
-            if (!ResolveDataAcrossModules(name, out owner, out loc))
+            TswdDebugInfo.DataLocation loc; LoadedModule owner; string ambiguity;
+            var found = ResolveDataAcrossModules(name, out owner, out loc, out ambiguity);
+            if (found != DataResolve.Found)
             {
-                foreach (var p in probes) p.Probed = "(not found)";
+                foreach (var p in probes) p.Probed = found == DataResolve.Ambiguous ? "(" + ambiguity + ")" : "(not found)";
                 return;
             }
             uint templateVa = owner.LoadBase + loc.Rva;

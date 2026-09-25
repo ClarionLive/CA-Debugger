@@ -251,9 +251,10 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
             ($exeCalls.Count -ge 1 -and $notPc.Count -eq 0) "$($exeCalls.Count) call(s); not protocolcheck: $(($notPc | ForEach-Object { $_.Extent.Text }) -join ' | ')"
     }
     else { Check 'run-all.ps1 exists, so its exemption below is about a real file' $false '' }
-    # The third exclusion is earned the same way: a suite that runs the engine only as the one-shot `procs`
-    # verb (the attach picker's process list, tools\test-procs.ps1) starts no debuggee either. Asserted from
-    # its AST - every call of `$Engine` passes exactly `procs` first - so a real launch there ends the
+    # The third exclusion is earned the same way: a suite that runs the engine only as a one-shot static verb
+    # starts no debuggee either - `procs` (the attach picker's process list, tools\test-procs.ps1), and `data`
+    # and `globals`, which read an image off disk (tools\test-engine-filescope.ps1, 04d7b4c8). Asserted from
+    # its AST - every call of `$Engine` passes one of those verbs first - so a real launch there ends the
     # exemption and puts the file back in the harness count below.
     $oneShot = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and (Test-NamesEngineBinary $_.FullName) } | Where-Object {
         $calls = @((Get-Ast $_.FullName).FindAll({
@@ -262,10 +263,10 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
             $n.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
             $n.CommandElements[0].VariablePath.UserPath -eq 'Engine'
         }, $true))
-        $calls.Count -ge 1 -and @($calls | Where-Object { $_.CommandElements.Count -lt 2 -or $_.CommandElements[1].Extent.Text -cne 'procs' }).Count -eq 0
+        $calls.Count -ge 1 -and @($calls | Where-Object { $_.CommandElements.Count -lt 2 -or @('procs', 'data', 'globals') -cnotcontains $_.CommandElements[1].Extent.Text }).Count -eq 0
     })
-    Check 'exactly 1 script runs the engine only as the one-shot `procs`, so it launches no debuggee' `
-        ($oneShot.Count -eq 1 -and $oneShot[0].Name -eq 'test-procs.ps1') (($oneShot.Name) -join ', ')
+    Check 'exactly 2 scripts run the engine only as a one-shot static verb (procs, data, globals), so they launch no debuggee' `
+        ($oneShot.Count -eq 2 -and (($oneShot.Name | Sort-Object) -join ',') -eq 'test-engine-filescope.ps1,test-procs.ps1') (($oneShot.Name) -join ', ')
     $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and $oneShot.Name -notcontains $_.Name -and (Test-NamesEngineBinary $_.FullName) })
     # A number, not "every": if another harness appears this says so instead of quietly covering the old set.
     # 4 since test-setip.ps1 (a77abd94, 2026-09-23).
