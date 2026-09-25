@@ -30,20 +30,81 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>Pre-parse a solution DLL off disk so its breakpoints resolve before launch.
-        /// Failures are non-fatal (the DLL may be rebuilt/absent); it will re-parse at LOAD_DLL.</summary>
+        /// Failures are non-fatal (the DLL may be rebuilt/absent); it will re-parse at LOAD_DLL.
+        /// <para>
+        /// KEYED ON THE CANONICAL FULL PATH, not the file name (1be3b82e item 2). Two projects can each build a
+        /// <c>shared.dll</c>, and a name key skipped the second one as "already known", so it had no entry of its
+        /// own and, once loaded, took the first one's PE and TSWD.
+        /// </para></summary>
         private void TryPreloadSolutionDll(string path)
         {
             try
             {
                 if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path)) return;
-                string name = System.IO.Path.GetFileName(path).ToLowerInvariant();
-                foreach (var m in _modules) if (m.Name == name) return; // already known
+                path = CanonicalImagePath(path);
+                foreach (var m in _modules) if (SamePath(m.Path, path)) return; // already known
                 var pe = PeImage.Load(path);
                 var dbg = TswdDebugInfo.TryFromPe(pe);
                 RegisterImageFromPe(path, pe, dbg, preloaded: true);
             }
             catch { /* best-effort pre-load */ }
         }
+
+        /// <summary>A file's path spelled the way <see cref="OnDllLoaded"/> learns a loaded image's path: the
+        /// final path of an open handle (<see cref="GetPathFromHandle"/>), so a short 8.3 name, a different case
+        /// or a relative path from the host compares equal to what the loader reports. Falls back to the full
+        /// path when the file cannot be opened, and passes null through.</summary>
+        internal static string CanonicalImagePath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                                               FileShare.ReadWrite | FileShare.Delete))
+                {
+                    string final = GetPathFromHandle((uint)fs.SafeFileHandle.DangerousGetHandle().ToInt64());
+                    if (!string.IsNullOrEmpty(final)) return final;
+                }
+            }
+            catch { /* unreadable: the full path is the best spelling left */ }
+            try { return System.IO.Path.GetFullPath(path); } catch { return path; }
+        }
+
+        private static bool SamePath(string a, string b)
+        {
+            return !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b) && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// The unmapped entry a DLL that just mapped at <paramref name="path"/> takes over, or null for a new entry
+        /// (1be3b82e item 2). The PATH decides: an entry whose canonical path is the one loaded. The file name
+        /// alone decided before, so <c>C:\B\shared.dll</c> claimed <c>C:\A\shared.dll</c>'s preloaded entry and
+        /// read its TSWD against B's code.
+        /// <para>
+        /// ONE FALLBACK, on build identity rather than name: an output copied beside the EXE loads from a path the
+        /// host never named. A same-name PRELOADED entry is still that image when its PE link time and size equal
+        /// the mapped image's (<paramref name="mappedStamp"/>, <paramref name="mappedSize"/>), and only when
+        /// exactly one entry does; two builds of <c>shared.dll</c> differ in both, so neither is claimed.
+        /// </para>
+        /// </summary>
+        internal static LoadedModule ClaimUnmapped(IList<LoadedModule> modules, string path, string name,
+                                                   uint mappedStamp, uint mappedSize)
+        {
+            foreach (var im in modules)
+                if (im.LoadBase == 0 && SamePath(im.Path, path)) return im;
+            LoadedModule same = null;
+            foreach (var im in modules)
+            {
+                if (im.LoadBase != 0 || !im.Preloaded || im.Pe == null || im.Name != name) continue;
+                if (mappedStamp == 0 || im.Pe.TimeDateStamp != mappedStamp || im.Pe.SizeOfImage != mappedSize) continue;
+                if (same != null) return null;   // two builds answer: neither is provably this one
+                same = im;
+            }
+            return same;
+        }
+
+        /// <summary>Test seam: the module table as it stands (a copy), for protocolcheck's preload assertions.</summary>
+        internal List<LoadedModule> ModulesForTest() { return new List<LoadedModule>(_modules); }
 
         /// <summary>The mapped module whose [LoadBase, LoadBase+Size) contains <paramref name="va"/>,
         /// or null. Only mapped modules (LoadBase != 0) are candidates.</summary>
@@ -368,21 +429,27 @@ namespace ClarionDbg.Cli
             try
             {
                 // An attach's synthetic LOAD_DLL events may carry no file handle (and never an image name), so
-                // fall back to asking the target's memory (DebugEngine.Attach.cs).
-                string path = GetPathFromHandle(hFile) ?? PathFromMappedImage(baseVa);
+                // fall back to asking the target's memory (DebugEngine.Attach.cs). That answer is the loader's
+                // spelling, so it is canonicalized like a preloaded path before anything compares it.
+                string path = GetPathFromHandle(hFile) ?? CanonicalImagePath(PathFromMappedImage(baseVa));
                 string name = !string.IsNullOrEmpty(path)
                     ? System.IO.Path.GetFileName(path).ToLowerInvariant()
                     : $"(0x{baseVa:x})";
 
-                // reuse a pre-loaded solution DLL entry (already has Pe/Dbg parsed) if names match
-                LoadedModule m = null;
-                foreach (var im in _modules)
-                    if (im.LoadBase == 0 && im.Name == name) { m = im; break; }
+                // reuse a pre-loaded solution DLL entry (already has Pe/Dbg parsed): the same file, by path
+                LoadedModule m = ClaimUnmapped(_modules, path, name, ReadRemoteTimeDateStamp(baseVa), ReadRemoteSizeOfImage(baseVa));
 
                 if (m != null)
                 {
                     m.LoadBase = baseVa;
                     if (m.Path == null && path != null) m.Path = path;
+                    // A same-build claim from another copy KEEPS the preloaded Path. The host has already learned
+                    // that path as the owner of every breakpoint bound here, and learns an owner once
+                    // (ClarionDebuggerService.LearnBpOwner), so renaming it now would split a row from its later
+                    // bp-del. That is sound only because ClaimUnmapped proved the SAME build (link time and size,
+                    // exactly one match): the preload's TSWD and symbols describe the image that mapped.
+                    else if (path != null && !SamePath(m.Path, path))
+                        Console.WriteLine($"  module: {path} is the same build as preloaded {m.Path}; using that entry");
                 }
                 else
                 {
@@ -447,6 +514,14 @@ namespace ClarionDbg.Cli
             if (m.Preloaded && m.Pe != null) m.LoadBase = 0;
             else _modules.Remove(m);
             _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
+        }
+
+        /// <summary>The mapped image's PE link time (file header +8), or 0 when the header does not read.</summary>
+        private uint ReadRemoteTimeDateStamp(uint baseVa)
+        {
+            uint eLfanew = ReadU32(baseVa + 0x3C);
+            if (eLfanew == 0 || eLfanew > 0x1000) return 0;
+            return ReadU32(baseVa + eLfanew + 8);
         }
 
         /// <summary>Read SizeOfImage straight from the target's mapped PE header (fallback when the
