@@ -1348,8 +1348,9 @@ namespace ClarionDbg.Core
             return t;
         }
 
-        // name -> resolved location for watch-by-name (statics + record fields, case-insensitive)
-        private Dictionary<string, DataLocation> _dataNames;
+        // name -> the best-ranked locations for watch-by-name (statics + record fields, case-insensitive).
+        // One entry, except when several genuine FILE records answer to the name (04d7b4c8).
+        private Dictionary<string, List<DataLocation>> _dataNames;
 
         /// <summary>A resolved data name: absolute (image-relative) RVA + type/size + container.</summary>
         public struct DataLocation
@@ -1363,7 +1364,7 @@ namespace ClarionDbg.Core
 
         private void BuildDataNameIndex()
         {
-            _dataNames = new Dictionary<string, DataLocation>(StringComparer.OrdinalIgnoreCase);
+            _dataNames = new Dictionary<string, List<DataLocation>>(StringComparer.OrdinalIgnoreCase);
             foreach (var ds in DataSymbols)
             {
                 RegisterDataName(ds.Name, new DataLocation { Rva = ds.Rva, TypeCode = ds.TypeCode, Size = ds.Size, Container = null, ModuleIdx = ds.ModuleIdx });
@@ -1382,17 +1383,49 @@ namespace ClarionDbg.Core
         /// first registration picked whichever group the symbol table listed first — on demoleg.exe
         /// (2026-09-22) that was the non-THREADed history buffer, so every table field read as zeros and
         /// offered a pencil that would have written the form's history instead of the record.
-        /// Equal ranks keep the first registration, as before.
+        /// Equal ranks keep the first registration, as before, with one exception: two genuine FILE records
+        /// (<see cref="IsFileRecordLocation"/>) are BOTH kept. Two FILEs can share a prefix, in two modules of
+        /// one image (tools/fixtures/filescope: two procedure-local FILEs, each ORDERS$ORD:RECORD) or in two
+        /// images, and first registration would pick one without saying so (04d7b4c8). The caller reports
+        /// the ambiguity and asks for a qualified name.
         /// </summary>
         private void RegisterDataName(string name, DataLocation loc) { RegisterDataName(_dataNames, name, loc); }
 
         /// <summary>The rule itself, over any index — public so protocolcheck drives the SAME code the
         /// name index is built with, in both registration orders.</summary>
+        public static void RegisterDataName(IDictionary<string, List<DataLocation>> index, string name, DataLocation loc)
+        {
+            List<DataLocation> held;
+            if (!index.TryGetValue(name, out held) || Outranks(loc, held[0]))
+            {
+                index[name] = new List<DataLocation> { loc };
+                return;
+            }
+            if (Outranks(held[0], loc) || !IsFileRecordLocation(name, held[0]) || !IsFileRecordLocation(name, loc)) return;
+            foreach (var h in held) if (h.Rva == loc.Rva) return;
+            held.Add(loc);
+        }
+
+        /// <summary>The same rank rule over a one-location index: equal ranks keep the first, file records
+        /// included. The engine's index is the list form above; this one is kept for protocolcheck's
+        /// ordering cases (CheckFieldNameResolvesToFileRecord), which exercise the shared rank.</summary>
         public static void RegisterDataName(IDictionary<string, DataLocation> index, string name, DataLocation loc)
         {
             DataLocation held;
-            if (index.TryGetValue(name, out held) && DataNameRank(held.Container) <= DataNameRank(loc.Container)) return;
+            if (index.TryGetValue(name, out held) && !Outranks(loc, held)) return;
             index[name] = loc;
+        }
+
+        private static bool Outranks(DataLocation a, DataLocation b)
+        {
+            return DataNameRank(a.Container) < DataNameRank(b.Container);
+        }
+
+        /// <summary>Does <paramref name="name"/>, registered at <paramref name="loc"/>, belong to a genuine FILE
+        /// record: a field whose container has the FILE$PRE:RECORD shape, or that record symbol itself?</summary>
+        public static bool IsFileRecordLocation(string name, DataLocation loc)
+        {
+            return IsFileRecordName(loc.Container ?? name);
         }
 
         /// <summary>Lower wins. 0: a static in its own right (no container), or a FILE record buffer in the
@@ -1447,23 +1480,25 @@ namespace ClarionDbg.Core
         }
 
         /// <summary>
-        /// Resolve a data name (global static, record-buffer symbol, or record field like
-        /// JOB:JOBID) to its template RVA + type/size. Case-insensitive exact match. NOTE:
-        /// THREADed (.cwtls) data resolves to the link-time template instance — the active
-        /// thread's instance may live elsewhere (runtime resolution is a later phase).
-        /// </summary>
-        public bool ResolveDataName(string name, out DataLocation loc)
+        /// Resolve a data name (global static, record-buffer symbol, or record field like JOB:JOBID) to every
+        /// best-ranked location: its template RVA + type/size. Case-insensitive exact match. One, or several when
+        /// genuine FILE records share it (see <see cref="RegisterDataName(string, DataLocation)"/>); empty when
+        /// unknown. Each location's <see cref="DataLocation.ModuleIdx"/> names its module, or is -1. NOTE:
+        /// THREADed (.cwtls) data resolves to the link-time template instance; the active thread's instance
+        /// may live elsewhere.</summary>
+        public IList<DataLocation> DataNameCandidates(string name)
         {
-            loc = default(DataLocation);
-            if (string.IsNullOrEmpty(name) || _dataNames == null) return false;
-            return _dataNames.TryGetValue(name, out loc);
+            List<DataLocation> all;
+            if (string.IsNullOrEmpty(name) || _dataNames == null || !_dataNames.TryGetValue(name, out all))
+                return new DataLocation[0];
+            return all.AsReadOnly();
         }
 
         // symbol name -> the data symbol itself, built on first use (case-insensitive; first symbol wins)
         private Dictionary<string, DataSymbol> _dataSymbolsByName;
 
         /// <summary>The data symbol DECLARED with this exact name (case-insensitive), with its resolved
-        /// <see cref="DataSymbol.Type"/>. Unlike <see cref="ResolveDataName"/> this never answers with a
+        /// <see cref="DataSymbol.Type"/>. Unlike <see cref="DataNameCandidates"/> this never answers with a
         /// member of some other symbol: a watch path (GROUP.MEMBER) walks from its head's own layout, and
         /// a <see cref="DataLocation"/> carries no type to walk.</summary>
         public bool TryGetDataSymbol(string name, out DataSymbol symbol)
@@ -1478,6 +1513,18 @@ namespace ClarionDbg.Core
                 _dataSymbolsByName = index;
             }
             return _dataSymbolsByName.TryGetValue(name, out symbol);
+        }
+
+        /// <summary>Every data symbol DECLARED with this exact name (case-insensitive), in address order. Two
+        /// procedure-local FILEs with one prefix both declare ORDERS$ORD:RECORD (tools/fixtures/filescope), and
+        /// <see cref="TryGetDataSymbol"/> answers with the first.</summary>
+        public List<DataSymbol> DataSymbolsNamed(string name)
+        {
+            var list = new List<DataSymbol>();
+            if (string.IsNullOrEmpty(name) || DataSymbols == null) return list;
+            foreach (var ds in DataSymbols)
+                if (string.Equals(ds.Name, name, StringComparison.OrdinalIgnoreCase)) list.Add(ds);
+            return list;
         }
 
         /// <summary>Clarion type name for a TSWD type code — PROVEN codes only (validated against

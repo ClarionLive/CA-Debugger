@@ -84,6 +84,8 @@ namespace ClarionDbg.Cli
                 CheckFileRecordShape,
                 CheckDataNameIndexFromParsedBlob,
                 CheckModuleAttributionFromParsedBlob,
+                CheckQualifiedNameParsing,
+                CheckAmbiguousFileRecordsFailClosed,
                 CheckEmulationFaultBranches,
                 CheckEmulatorImportsPerImage,
                 CheckStackWindowRevalidated,

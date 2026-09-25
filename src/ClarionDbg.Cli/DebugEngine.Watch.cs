@@ -293,6 +293,34 @@ namespace ClarionDbg.Cli
             NoteThreadedEmulation(owner, reasonKey, what, null, emu);
         }
 
+        /// <summary>Test seam (04d7b4c8): make <paramref name="dbg"/> the EXE's debug info and run the REAL watch handler
+        /// for <paramref name="name"/> with no thread context, so no local can answer. For names that never read
+        /// target memory (an ambiguous one); there is no process behind it.</summary>
+        internal void WatchWithImageForTest(TswdDebugInfo dbg, string imageName, string name)
+        {
+            _modules.Remove(_exe);
+            _exe = new LoadedModule { Name = imageName, Dbg = dbg, LoadBase = 0x400000, Size = 0x100000 };
+            _modules.Insert(0, _exe);
+            var ctx = default(Native.CONTEXT_X86);
+            HandleWatchCommand(new[] { "watch", name }, 1, IntPtr.Zero, ref ctx, false);
+        }
+
+        /// <summary>Test seam (04d7b4c8): the other three callers of the data lookup, on the same kind of image as
+        /// <see cref="WatchWithImageForTest"/>. Prints `sym`'s own lines, then "condition: &lt;ReadVarValue's
+        /// kind&gt;" and "probe: &lt;what a thread scan records&gt;".</summary>
+        internal void DataCallersWithImageForTest(TswdDebugInfo dbg, string imageName, string name)
+        {
+            _modules.Remove(_exe);
+            _exe = new LoadedModule { Name = imageName, Dbg = dbg, LoadBase = 0x400000, Size = 0x100000 };
+            _modules.Insert(0, _exe);
+            HandleSymCommand(new[] { "sym", name });
+            double num; string str;
+            Console.WriteLine("condition: " + ReadVarValue(name, 1, IntPtr.Zero, out num, out str));
+            var probes = new List<ThreadProbe> { new ThreadProbe { Tid = 1 } };
+            ProbeNameOnEachThread(name, probes);
+            Console.WriteLine("probe: " + probes[0].Probed);
+        }
+
         // ------------------------------------------------------------------ watch (by name)
 
         /// <summary>
@@ -312,17 +340,27 @@ namespace ClarionDbg.Cli
             // (a 4-byte pointer that renders its referent's length).
             TswdDebugInfo.DataLocation loc; LoadedModule owner;
             uint templateVa, size, spanSize; byte typeCode, target = 0; int places = 0;
-            bool isGlobal = ResolveDataAcrossModules(name, out owner, out loc);
+            string ambiguity;
+            var global = ResolveDataAcrossModules(name, out owner, out loc, out ambiguity);
+            bool isGlobal = global == DataResolve.Found;
 
             // Clarion's scope order (WatchFrameFor): the stopped frame's local, then the global, then a caller
             // frame's local. Locals live on the stack (never .cwtls), so this is a direct read. A local found in
-            // a caller's frame says which one (bae5f46d).
+            // a caller's frame says which one (bae5f46d). An AMBIGUOUS global still sits in that order: the
+            // stopped frame's local wins over it, and a caller's local does not.
             uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
-            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, isGlobal,
+            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, global != DataResolve.NotFound,
                                        out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
                 EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places,
                                frameIdx: fIdx, frameProc: fProc);
+                return;
+            }
+            if (global == DataResolve.Ambiguous)
+            {
+                // Several genuine FILE records answer to the name (04d7b4c8): an error, so no value, no address
+                // and no edit offer, naming each candidate the way the user can watch it instead.
+                EmitWatchError(tid, name, ambiguity);
                 return;
             }
 
@@ -534,10 +572,11 @@ namespace ClarionDbg.Cli
                                          out uint size, out int places, out uint spanSize)
         {
             owner = null; templateVa = 0; code = 0; target = 0; size = 0; places = 0; spanSize = 0;
-            if (name.IndexOf('.') < 0) return PathResolve.NoHead;   // a plain name is not a path
-            string[] parts = name.Split('.');
-            string head = parts[0];
-            if (head.Length == 0) return PathResolve.NoHead;
+            // Qualifiers first: CLBRWS.EXE!CUS:RECORD.CUS:NAME splits on '.' only after the image is off it.
+            // A plain name is not a path.
+            string q1, q2, head, tail;
+            if (!SplitWatchPath(name, out q1, out q2, out head, out tail)) return PathResolve.NoHead;
+            string[] parts = tail.Split('.');
             var members = new List<string>(parts.Length - 1);
             for (int i = 1; i < parts.Length; i++) members.Add(parts[i]);
             Func<uint, uint?> readPointer = va =>
@@ -549,15 +588,13 @@ namespace ClarionDbg.Cli
             uint leafVa; ClarionType leafType; string error;
             WatchPathOutcome outcome;
 
-            DataSymbol ds = null;
-            if (_exe != null && _exe.Dbg != null && _exe.Dbg.TryGetDataSymbol(head, out ds)) owner = _exe;
-            else
-                foreach (var m in _modules)
-                    if (m != _exe && m.Dbg != null && m.Dbg.TryGetDataSymbol(head, out ds)) { owner = m; break; }
+            DataSymbol ds; string ambiguity;
+            var headResolve = ResolveDataSymbolAcrossModules(head, tail, q1, q2, out owner, out ds, out ambiguity);
 
+            // A qualified head names a global, so no local is looked for.
             uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
-            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, head, owner != null,
-                                       out slotVa, out lsym, out lowner, out fIdx, out fProc))
+            if (q1 == null && TryResolveLocalOnStack(ref ctx, haveCtx, hThread, head, headResolve != DataResolve.NotFound,
+                                                     out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
                 owner = null;
                 outcome = WalkWatchPath(lsym.Type, lsym.TypeCode, true, slotVa, members, readPointer,
@@ -568,7 +605,13 @@ namespace ClarionDbg.Cli
                                frameIdx: fIdx, frameProc: fProc);
                 return PathResolve.Answered;
             }
-            if (owner == null) return PathResolve.NoHead;
+            if (headResolve == DataResolve.Ambiguous)
+            {
+                // The head is two genuine FILE records (04d7b4c8). Each form in the message carries the members.
+                EmitWatchError(tid, name, ambiguity);
+                return PathResolve.Answered;
+            }
+            if (headResolve != DataResolve.Found) return PathResolve.NoHead;
 
             outcome = WalkWatchPath(ds.Type, ds.TypeCode, false, owner.LoadBase + ds.Rva, members, readPointer,
                                     out leafVa, out leafType, out error);

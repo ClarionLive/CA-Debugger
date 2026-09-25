@@ -214,8 +214,9 @@ namespace ClarionDbg.Cli
         private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str)
         {
             num = 0; str = null;
-            TswdDebugInfo.DataLocation loc; LoadedModule owner;
-            if (!ResolveDataAcrossModules(name, out owner, out loc)) return 0;
+            TswdDebugInfo.DataLocation loc; LoadedModule owner; string ambiguity;
+            // An ambiguous name (two FILE records, 04d7b4c8) is unreadable too: a condition pauses and says so.
+            if (ResolveDataAcrossModules(name, out owner, out loc, out ambiguity) != DataResolve.Found) return 0;
 
             uint templateVa = owner.LoadBase + loc.Rva;
             uint va = templateVa;

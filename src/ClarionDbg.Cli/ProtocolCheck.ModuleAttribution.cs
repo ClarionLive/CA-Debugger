@@ -124,14 +124,16 @@ namespace ClarionDbg.Cli
         ///   GLUE$$$__attach_process @0x1500 slot 1: no record in [0x1500, 0x1600)
         ///   P6 @0x1600 slot 1: first record 0x1608 (B, 50); the record below its entry is A's 0x1408
         ///   PM @0x1700 slot 3, the slot's only code: first record 0x1710 (C, 60), B's 0x1608 below it
-        /// Data at 0x3000 (G1, slot 1), 0x3004 (G2, slot 2) and 0x3008 (G3, slot 3).
+        /// Data at 0x3000 (G1, slot 1), 0x3004 (G2, slot 2) and 0x3008 (G3, slot 3), and two symbols both named
+        /// ORDERS$ORD:RECORD, at 0x3010 (slot 0, so A.CLW) and 0x3014 (slot 1, so C.CLW), which
+        /// CheckAmbiguousFileRecordsFailClosed watches through the real handler.
         /// </summary>
         private static byte[] BuildAttributionBlob()
         {
             var modules = new[] { "A.CLW", "B.CLW", "C.CLW" };
             uint[] backref = { 0xB0000A00, 0xB0000C00, 0xB00AB000, 0xB0000C03 };   // slot i's value, distinct from any other field
 
-            var names = new[] { "P0@F", "P1@F", "P2@F", "P3@F", "P4@F", "P5@F", "GLUE$$$__attach_process", "STRAY", "P6@F", "PM", "G1", "G2", "G3" };
+            var names = new[] { "P0@F", "P1@F", "P2@F", "P3@F", "P4@F", "P5@F", "GLUE$$$__attach_process", "STRAY", "P6@F", "PM", "G1", "G2", "G3", "ORDERS$ORD:RECORD" };
             var pool = new List<byte> { 0 };                  // leading NUL: every name NUL-preceded
             var nameRef = new Dictionary<string, uint>();
             foreach (var n in names) { nameRef[n] = (uint)pool.Count; pool.AddRange(Encoding.ASCII.GetBytes(n)); pool.Add(0); }
@@ -164,7 +166,7 @@ namespace ClarionDbg.Cli
             int symPool = addrTable + 8 * recs.Length;
             int symNameArray = symPool + pool.Count;
             int t2c = symNameArray + 4 * backref.Length;
-            const int streamLen = 0x100;
+            const int streamLen = 0x200;   // 0x20 + 10 code definitions x 16 + 5 data definitions x 0x20 = 0x160
             int t34 = t2c + streamLen;
             var b = new byte[t34 + 0x40];
 
@@ -218,6 +220,8 @@ namespace ClarionDbg.Cli
             dataDef("G1", 0x3000, 1);
             dataDef("G2", 0x3004, 2);
             dataDef("G3", 0x3008, 3);
+            dataDef("ORDERS$ORD:RECORD", 0x3010, 0);
+            dataDef("ORDERS$ORD:RECORD", 0x3014, 1);
             return b;
         }
     }

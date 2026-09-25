@@ -34,7 +34,7 @@ namespace ClarionDbg.Cli
         /// The name index built by the PARSER, not by hand (04d7b4c8 item 3). CheckFieldNameResolvesToFileRecord
         /// drives RegisterDataName with hand-built DataLocations; nothing else tested the three places
         /// BuildDataNameIndex feeds it. This builds a minimal TSWD blob (<see cref="BuildNameIndexBlob"/>),
-        /// hands it to the real TswdDebugInfo constructor, and asks ResolveDataName. The three sites:
+        /// hands it to the real TswdDebugInfo constructor, and asks DataNameCandidates for exactly one answer. The three sites:
         ///  (a) every data symbol registers its OWN name, container null (a static and the groups themselves);
         ///  (b) a symbol whose typeRef resolves to a GROUP registers each member through RegisterTypeLeaves;
         ///  (c) a symbol whose typeRef does NOT resolve registers the legacy tag-0C field records.
@@ -80,9 +80,10 @@ namespace ClarionDbg.Cli
 
             Action<string, uint, string> expect = (name, rva, container) =>
             {
-                TswdDebugInfo.DataLocation loc;
-                if (!dbg.ResolveDataName(name, out loc))
-                    failures.Add("parsed name index: " + name + " did not resolve at all");
+                var all = dbg.DataNameCandidates(name);
+                var loc = all.Count == 1 ? all[0] : default(TswdDebugInfo.DataLocation);
+                if (all.Count != 1)
+                    failures.Add("parsed name index: " + name + " resolved to " + all.Count + " location(s), expected one");
                 else if (loc.Rva != rva || !string.Equals(loc.Container, container, StringComparison.Ordinal))
                     failures.Add("parsed name index: " + name + " resolved to 0x" + loc.Rva.ToString("X") + " in "
                                  + (loc.Container ?? "(no container)") + ", expected 0x" + rva.ToString("X") + " in "

@@ -1229,11 +1229,13 @@ namespace ClarionDbg.Cli
         {
             if (parts.Length < 2) { EmitError("sym expects: sym NAME"); return; }
             string name = parts[1];
-            TswdDebugInfo.DataLocation loc; LoadedModule owner;
-            if (!ResolveDataAcrossModules(name, out owner, out loc))
+            TswdDebugInfo.DataLocation loc; LoadedModule owner; string ambiguity;
+            var found = ResolveDataAcrossModules(name, out owner, out loc, out ambiguity);
+            if (found != DataResolve.Found)
             {
+                // Ambiguous (04d7b4c8) goes out as not found: no address for a name that has two.
                 if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, false, 0, 0, 0, null, 0, null));
-                Console.WriteLine($"  sym {name}: not found");
+                Console.WriteLine($"  sym {name}: {(found == DataResolve.Ambiguous ? ambiguity : "not found")}");
                 return;
             }
             uint va = owner.LoadBase + loc.Rva;
