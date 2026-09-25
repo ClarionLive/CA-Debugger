@@ -1048,7 +1048,8 @@ namespace ClarionDebugger.Terminal
                 Console("err", "break on entry: that procedure is not in the current list — refresh the Procedures pane and try again.");
                 return;
             }
-            BreakOnEntry(proc);
+            string ignored;
+            BreakOnEntry(proc, out ignored);   // the pane's own Debug Console line is its whole answer
         }
 
         /// <summary>Break on the entry of the procedure containing <paramref name="filePath"/>:<paramref
@@ -1056,8 +1057,10 @@ namespace ClarionDebugger.Terminal
         /// <see cref="DebugSessionController.BreakOnProcEntry"/> (e61e4f92). The position is ONLY a lookup key
         /// into the list <see cref="PushProcedures"/> issued; which procedure it falls in, and where that one
         /// starts, are the list's answer, exactly as with an id. The module is the file's name, the same
-        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).</summary>
-        public void CmdBreakOnProcEntryAt(string filePath, int line)
+        /// mapping every editor-to-engine path uses (a generated source file's name IS its module name).
+        /// Returns the outcome and a one-line message for ClarionAssistant's toast; the Debug Console gets
+        /// its line either way.</summary>
+        public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message)
         {
             string module = null;
             try { module = string.IsNullOrEmpty(filePath) ? null : Path.GetFileName(filePath); }
@@ -1067,24 +1070,26 @@ namespace ClarionDebugger.Terminal
             if (proc == null)
             {
                 // A visible refusal, never a guess at the nearest procedure above (codex adversary gate).
-                Console("err", "break on entry: " + why + " — nothing was set. (If the Procedures pane is empty, open the app's solution or refresh it.)");
-                return;
+                return RefuseBreakOnEntry(why + " — nothing was set.",
+                    " (If the Procedures pane is empty, open the app's solution or refresh it.)", out message);
             }
-            BreakOnEntry(proc);
+            return BreakOnEntry(proc, out message);
         }
 
         /// <summary>The one body both break-on-entry paths share: validate, announce, then arm (live) or stage
-        /// (idle). Everything it knows about the procedure came from the host's own list.</summary>
-        private void BreakOnEntry(ProcRef proc)
+        /// (idle). Everything it knows about the procedure came from the host's own list. True when a
+        /// breakpoint was sent, staged or already staged; <paramref name="message"/> says which, or why
+        /// nothing was set.</summary>
+        private bool BreakOnEntry(ProcRef proc, out string message)
         {
             string module = proc.Module;
             int line = proc.Line;
             string name = proc.Name;
+            string label = (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line;
             if (line <= 0)
             {
-                Console("err", "break on entry: " + (string.IsNullOrEmpty(name) ? "that procedure" : name)
-                    + " has no definition line to break on.");
-                return;
+                return RefuseBreakOnEntry((string.IsNullOrEmpty(name) ? "that procedure" : name)
+                    + " has no definition line to break on.", "", out message);
             }
 
             // Validated BEFORE either branch. The live branch always had this check, inside AddBreakpoint;
@@ -1093,11 +1098,10 @@ namespace ClarionDebugger.Terminal
             // invalid module).
             if (!ClarionDebuggerService.IsValidModuleName(module))
             {
-                Console("err", "break on entry: not a module name the debugger can use: " + module);
-                return;
+                return RefuseBreakOnEntry("not a module name the debugger can use: " + module, "", out message);
             }
 
-            Console("info", "break on entry: " + (string.IsNullOrEmpty(name) ? "" : name + "  ") + module + ":" + line);
+            Console("info", "break on entry: " + label);
 
             if (_svc.IsRunning)
             {
@@ -1106,15 +1110,32 @@ namespace ClarionDebugger.Terminal
                 // ignored, leaving the info line above as the only word on a breakpoint that was never
                 // armed. Say so instead.
                 if (!_svc.AddBreakpoint(module, line))
-                    Console("err", "break on entry: could not set a breakpoint at " + module + ":" + line
-                        + " — the engine did not take the request.");
+                    return RefuseBreakOnEntry("could not set a breakpoint at " + module + ":" + line
+                        + " — the engine did not take the request.", "", out message);
+                // SENT, not confirmed: the bp-set echo is async, and a later refusal shows in the pad.
+                message = "Break on entry: " + label + " (sent to the debugger)";
+                return true;
             }
-            else
-            {
-                foreach (var b in _pending) if (SameBp(b, module, line)) return;   // already staged
-                _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
-                SendBps();
-            }
+            foreach (var b in _pending)
+                if (SameBp(b, module, line))
+                {
+                    message = "Break on entry: " + label + " (already staged for the next Start)";
+                    return true;
+                }
+            _pending.Add(new DebugBreakpoint { Module = module, RequestedLineOrNull = line, Line = line });
+            SendBps();
+            message = "Break on entry: " + label + " (staged for the next Start)";
+            return true;
+        }
+
+        /// <summary>A break-on-entry refusal: the Debug Console line it always wrote (plus
+        /// <paramref name="consoleTail"/>, a hint only the pad shows), and the same reason as the caller's
+        /// message. Always false.</summary>
+        private bool RefuseBreakOnEntry(string why, string consoleTail, out string message)
+        {
+            Console("err", "break on entry: " + why + consoleTail);
+            message = "Break on entry: " + why;
+            return false;
         }
 
         public void CmdPause()

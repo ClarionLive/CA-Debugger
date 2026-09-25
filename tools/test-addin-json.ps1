@@ -698,7 +698,11 @@ $ctlMethods = @(
   (Get-Method 'public static void SetState(IDebugSessionTarget sender, DebugControllerState state)' $ctl),
   # the forwarders and the ONE marshal they share (fc8d63f5, e61e4f92)
   (Get-Method 'public static void RunToCursor() {' $ctl),
-  (Get-Method 'public static void BreakOnProcEntry(string filePath, int line)' $ctl),
+  (Get-Method 'public static bool BreakOnProcEntry(string filePath, int line, out string message)' $ctl),
+  (Get-CSharpStatement 'internal const string NoPad' $ctl),
+  (Get-CSharpStatement 'internal const int MaxMessage' $ctl),
+  (Get-Method 'private static bool BreakOnProcEntryHere(IDebugSessionTarget readBy, string filePath, int line, out string message)' $ctl),
+  (Get-Method 'private static string OneLine(string text, bool ok)' $ctl),
   (Get-Method 'private static bool IsPaused(DebugControllerState s)' $ctl),
   (Get-Method 'private static void Invoke(Action<IDebugSessionTarget> action, bool requireReady = true, Func<DebugControllerState, bool> allowed = null)' $ctl),
   (Get-Method 'private static bool SafeIsReady(IDebugSessionTarget t)' $ctl)
@@ -719,27 +723,46 @@ $(Get-Method 'public interface IDebugSessionTarget' $ctl)
 // It is deliberately NOT a WinForms Control: since fc8d63f5 the interface requires ISynchronizeInvoke, and
 // this is the implementation the old `t as Control` marshal would have run on the caller's thread.
 // OffThread makes it report "you are on the wrong thread"; its BeginInvoke runs the posted delegate as if
-// on its own thread, and every command records which of the two it ran under.
+// on its own thread, and every command records which of the two it ran under. With DeferPosts a BeginInvoke
+// only QUEUES the delegate, the way a real message loop does, so a caller that posts and returns has no
+// answer yet; its blocking Invoke runs the delegate before returning, and records "invoked".
 public sealed class FakePad : IDebugSessionTarget {
     public bool Idle; public bool Throws;
     public bool OffThread; public int Posts; public List<string> Ran = new List<string>();
-    private bool _onOwnThread;
-    public bool IsReady { get { return true; } }
+    public bool NotReady; public bool InvokeRequiredThrows; public bool InvokeThrows; public bool DeferPosts;
+    public int SyncInvokes; public Action DuringInvoke; public List<Delegate> Deferred = new List<Delegate>();
+    public bool BoeOk = true; public string BoeMsg = "pad: set"; public bool BoeThrows;
+    private string _how;
+    public bool IsReady { get { return !NotReady; } }
     public bool IsSessionIdle { get { if (Throws) throw new InvalidOperationException("disposed"); return Idle; } }
-    public bool InvokeRequired { get { return OffThread && !_onOwnThread; } }
+    public bool InvokeRequired { get {
+        if (InvokeRequiredThrows) throw new InvalidOperationException("handle gone");
+        return OffThread && _how == null; } }
     public IAsyncResult BeginInvoke(Delegate method, object[] args) {
-        Posts++; _onOwnThread = true;
-        try { method.DynamicInvoke(args); } finally { _onOwnThread = false; }
+        Posts++;
+        if (DeferPosts) { Deferred.Add(method); return null; }
+        _how = "posted";
+        try { method.DynamicInvoke(args); } finally { _how = null; }
         return null;
     }
     public object EndInvoke(IAsyncResult result) { return null; }
-    public object Invoke(Delegate method, object[] args) { return method.DynamicInvoke(args); }
-    private string Where() { return OffThread ? (_onOwnThread ? "posted" : "CALLER") : "inline"; }
+    public object Invoke(Delegate method, object[] args) {
+        SyncInvokes++;
+        if (InvokeThrows) throw new InvalidOperationException("marshal refused");
+        if (DuringInvoke != null) DuringInvoke();
+        _how = "invoked";
+        try { return method.DynamicInvoke(args); } finally { _how = null; }
+    }
+    private string Where() { return OffThread ? (_how ?? "CALLER") : "inline"; }
     public void CmdStart() { } public void CmdContinue() { } public void CmdPause() { }
     public void CmdStepOver() { } public void CmdStepInto() { } public void CmdStepOut() { }
     public void CmdStop() { }
     public void CmdRunToCursor(string spec) { Ran.Add("rtc|" + Where()); }
-    public void CmdBreakOnProcEntryAt(string filePath, int line) { Ran.Add("boe|" + filePath + "|" + line + "|" + Where()); }
+    public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message) {
+        Ran.Add("boe|" + filePath + "|" + line + "|" + Where());
+        if (BoeThrows) throw new InvalidOperationException("pad blew up");
+        message = BoeMsg; return BoeOk;
+    }
 }
 
 public static class Ctl {
@@ -823,9 +846,19 @@ $np.OffThread = $true
 [Ctl]::RunToCursor()
 Check 'an off-thread call to a NON-Control target is posted through its own marshal, not run on the caller''s thread' `
   (($np.Posts -eq 1) -and ($np.Ran.Count -eq 1) -and ($np.Ran[0] -ceq 'rtc|posted')) (Ran $np)
-[Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50)
-Check 'BreakOnProcEntry is marshalled the same way, arguments intact' `
-  (($np.Posts -eq 2) -and ($np.Ran.Count -eq 2) -and ($np.Ran[1] -ceq 'boe|C:\src\clbrws011.clw|50|posted')) (Ran $np)
+# BreakOnProcEntry has an ANSWER (frozen contract, Diana 2026-09-25), so it cannot post and return like the
+# void forwarders: it marshals with the target's BLOCKING Invoke. DeferPosts makes a post really asynchronous,
+# so an implementation that posted would return before the pad ran, and fail both checks below.
+$np.DeferPosts = $true; $np.BoeOk = $false; $np.BoeMsg = 'pad: no listed procedure is in x.clw'
+$boeMsg = $null
+$boeOk = [Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50, [ref] $boeMsg)
+Check 'an off-thread BreakOnProcEntry runs on the pad''s thread through its BLOCKING Invoke, arguments intact' `
+  (($np.SyncInvokes -eq 1) -and ($np.Posts -eq 1) -and ($np.Ran.Count -eq 2) -and ($np.Ran[1] -ceq 'boe|C:\src\clbrws011.clw|50|invoked')) (Ran $np)
+Check 'and returns the pad''s own answer from there: a miss, with its reason' `
+  (($boeOk -eq $false) -and ($boeMsg -ceq 'pad: no listed procedure is in x.clw')) "$boeOk / $boeMsg"
+$np.BoeOk = $true; $np.BoeMsg = 'pad: staged'
+$boeOk = [Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50, [ref] $boeMsg)
+Check 'and a hit, with its message' (($boeOk -eq $true) -and ($boeMsg -ceq 'pad: staged') -and ($np.SyncInvokes -eq 2)) "$boeOk / $boeMsg"
 $on = NewPad $true
 [Ctl]::Reset(); [Ctl]::Register($on); [Ctl]::SetState($on, [DebugControllerState]::Paused)
 [Ctl]::RunToCursor()
@@ -834,14 +867,81 @@ Check 'CONTROL: an on-thread caller runs inline, with no post' `
 # Break on entry means something while idle (the pad stages it); run to cursor does not.
 $idl = NewPad $true
 [Ctl]::Reset(); [Ctl]::Register($idl)
-[Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50); [Ctl]::RunToCursor()
+[void][Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50, [ref] $boeMsg); [Ctl]::RunToCursor()
 Check 'BreakOnProcEntry is honoured while IDLE, where RunToCursor is not' `
   (($idl.Ran.Count -eq 1) -and ($idl.Ran[0] -like 'boe|*')) (Ran $idl)
 [Ctl]::Reset()
-# The reflection contract ClarionAssistant binds, pinned by exact signature. PM decision 7: it binds this one
-# OPTIONALLY, so the pair it REQUIRES must not move either.
-Check 'the new entry point is public static void BreakOnProcEntry(string filePath, int line)' `
-  ($ctl -cmatch 'public static void BreakOnProcEntry\(string filePath, int line\)') ''
+
+Write-Host ''
+Write-Host 'BreakOnProcEntry tells its caller what happened, on every path (e61e4f92 frozen contract, 2026-09-25)'
+# ClarionAssistant shows the item whenever the debugger is loaded and toasts a miss verbatim, so: false means
+# nothing was set, true means sent/staged/already staged, and the message is one non-empty line of at most
+# 200 characters whichever it is. Each path below is the REAL controller code against FakePad.
+function BoeCall { $m = $null; $r = [Ctl]::BreakOnProcEntry('C:\src\clbrws011.clw', 50, [ref] $m); [pscustomobject]@{ R = $r; M = $m } }
+function Toastable { param($o) (-not [string]::IsNullOrEmpty($o.M)) -and ($o.M -notmatch '[\r\n]') -and ($o.M.Length -le 200) }
+function Said { param($o) "$($o.R) / '$($o.M)'" }
+function BoePad { param([string] $state = 'Idle')
+  $p = NewPad $true; [Ctl]::Reset(); [Ctl]::Register($p)
+  if ($state -ne 'Idle') { [Ctl]::SetState($p, [DebugControllerState]$state) }
+  $p
+}
+[Ctl]::Reset()
+$o = BoeCall
+Check 'no pad registered: false, "Open the CA Debugger pad first."' (($o.R -eq $false) -and ($o.M -ceq 'Open the CA Debugger pad first.')) (Said $o)
+$p = BoePad; $p.NotReady = $true; $o = BoeCall
+Check 'a pad that is not ready: false, says so, and the pad is not asked' `
+  (($o.R -eq $false) -and (Toastable $o) -and ($o.M -match 'still loading') -and ($p.Ran.Count -eq 0)) "$(Said $o) ran=$(Ran $p)"
+$p = BoePad; $p.BoeOk = $false; $p.BoeMsg = 'Break on entry: clbrws011.clw:10 is above the first listed procedure, nothing was set.'; $o = BoeCall
+Check 'the pad''s miss comes back false, with the pad''s reason verbatim' `
+  (($o.R -eq $false) -and ($o.M -ceq $p.BoeMsg)) (Said $o)
+foreach ($st in 'Idle', 'Launching', 'Running', 'Paused') {
+  $p = BoePad $st; $p.BoeMsg = 'pad: set in ' + $st; $o = BoeCall
+  Check "the pad's hit comes back true with its message, in state $st" `
+    (($o.R -eq $true) -and ($o.M -ceq ('pad: set in ' + $st)) -and ($p.Ran.Count -eq 1)) (Said $o)
+}
+$p = BoePad; $p.BoeOk = $false; $p.BoeMsg = $null; $o = BoeCall
+Check 'a miss with NO message still gives the caller one' (($o.R -eq $false) -and (Toastable $o)) (Said $o)
+$p = BoePad; $p.BoeOk = $true; $p.BoeMsg = '   '; $o = BoeCall
+Check 'so does a hit with a blank one' (($o.R -eq $true) -and (Toastable $o)) (Said $o)
+$p = BoePad; $p.BoeMsg = "line one`r`nline two " + ('x' * 300); $o = BoeCall
+Check 'a multi-line, over-long message is cut to one line of at most 200 characters' `
+  ((Toastable $o) -and ($o.M.StartsWith('line one line two '))) "$($o.M.Length) chars"
+$p = BoePad; $p.BoeThrows = $true; $o = BoeCall
+Check 'a pad that throws: false, the exception''s text, and nothing escapes' (($o.R -eq $false) -and ($o.M -match 'pad blew up')) (Said $o)
+$p = BoePad; $p.InvokeRequiredThrows = $true; $o = BoeCall
+Check 'a target whose InvokeRequired throws: false, not asked, never thrown' `
+  (($o.R -eq $false) -and (Toastable $o) -and ($p.Ran.Count -eq 0)) "$(Said $o) ran=$(Ran $p)"
+$p = BoePad; $p.OffThread = $true; $p.InvokeThrows = $true; $o = BoeCall
+Check 'a marshal that fails: false, with its reason, and the pad is not asked' `
+  (($o.R -eq $false) -and ($o.M -match 'marshal refused') -and ($p.Ran.Count -eq 0)) "$(Said $o) ran=$(Ran $p)"
+# The pad re-read AFTER the marshal: one replaced while the call was in flight is refused, not handed a
+# position meant for its predecessor, and neither pad sets anything.
+$p = BoePad; $p.OffThread = $true; $q = NewPad $true
+$p.DuringInvoke = [Action] { [Ctl]::Register($q) }
+$o = BoeCall
+Check 'a pad replaced during the marshal: false, says so, and neither pad is asked' `
+  (($o.R -eq $false) -and ($o.M -match 'replaced') -and ($p.Ran.Count -eq 0) -and ($q.Ran.Count -eq 0)) "$(Said $o) p=$(Ran $p) q=$(Ran $q)"
+$p = BoePad; $o = BoeCall
+Check 'CONTROL: an on-thread caller runs inline, with no marshal' `
+  (($o.R -eq $true) -and ($p.SyncInvokes -eq 0) -and ($p.Posts -eq 0) -and ($p.Ran.Count -eq 1) -and ($p.Ran[0] -like '*|inline')) "$(Said $o) ran=$(Ran $p)"
+[Ctl]::Reset()
+
+# The reflection contract ClarionAssistant binds, read off the SHIPPED file compiled whole - not the pieces
+# the fakes above were built from. PM decision 7: it binds BreakOnProcEntry OPTIONALLY, by exact signature
+# and a bool return, so the pair it REQUIRES must not move either.
+Add-Type -TypeDefinition $ctl -Language CSharp | Out-Null
+$shippedCtl = [ClarionDebugger.DebugSessionController]
+$pubStatic = [Reflection.BindingFlags]'Public, Static'
+$boeMi = $shippedCtl.GetMethod('BreakOnProcEntry', $pubStatic, $null, [Type[]]@([string], [int], [string].MakeByRefType()), $null)
+Check 'GetMethod("BreakOnProcEntry", Public|Static, {string, int, string&}) binds, returns bool, and its string is out' `
+  (($null -ne $boeMi) -and ($boeMi.ReturnType -eq [bool]) -and $boeMi.GetParameters()[2].IsOut) ''
+Check 'and no (string, int) overload remains, nor any other public BreakOnProcEntry' `
+  (($null -eq $shippedCtl.GetMethod('BreakOnProcEntry', $pubStatic, $null, [Type[]]@([string], [int]), $null)) -and `
+   (@($shippedCtl.GetMethods($pubStatic) | Where-Object { $_.Name -ceq 'BreakOnProcEntry' }).Count -eq 1)) ''
+$rtcMi = $shippedCtl.GetMethod('RunToCursor', $pubStatic, $null, [Type[]]@(), $null)
+$stateProp = $shippedCtl.GetProperty('State', $pubStatic)
+Check 'the members ClarionAssistant requires bind as before: void RunToCursor(), a static State property' `
+  (($null -ne $rtcMi) -and ($rtcMi.ReturnType -eq [void]) -and ($null -ne $stateProp) -and $stateProp.CanRead) ''
 Check 'and the two members ClarionAssistant already requires are untouched' `
   (($ctl -cmatch 'public static DebugControllerState State\s*\r?\n\s*\{') -and ($ctl -cmatch 'public static void RunToCursor\(\) \{')) ''
 Check 'the interface itself requires the marshal' `
@@ -1152,8 +1252,9 @@ public sealed class BridgePad {
   $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
   $pushProcs
   $((Get-Method 'public void CmdBreakOnProcEntry(string data)' $web) -replace '^public void', 'public void')
-  $(Get-Method 'public void CmdBreakOnProcEntryAt(string filePath, int line)' $web)
-  $(Get-Method 'private void BreakOnEntry(ProcRef proc)' $web)
+  $(Get-Method 'public bool CmdBreakOnProcEntryAt(string filePath, int line, out string message)' $web)
+  $((Get-Method 'private bool BreakOnEntry(ProcRef proc, out string message)' $web) -replace '^private bool', 'public bool')
+  $(Get-Method 'private bool RefuseBreakOnEntry(string why, string consoleTail, out string message)' $web)
   $((Get-Method 'private void OnWatch(DebugWatch w)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void EditVar(string data)' $web) -replace '^private void', 'public void')
   $((Get-Method 'private void Expand(string data)' $web) -replace '^private void', 'public void')
@@ -1357,7 +1458,8 @@ $gh = New-Object ClarionDebugger.Terminal.BridgePad
 $gh.RunPushProcedures('C:\App\app.exe')
 $gh.HoldWork = $true
 $gh.RunPushProcedures('C:\Other\new.exe')
-$gh.CmdBreakOnProcEntryAt('C:\Src\clbrws011.clw', 50)
+$ghMsg = $null
+[void]$gh.CmdBreakOnProcEntryAt('C:\Src\clbrws011.clw', 50, [ref] $ghMsg)
 Check 'mid-refresh, a POSITION in the old list resolves to nothing either' `
   (($gh._svc.Adds.Count -eq 0) -and (@(Errs $gh)[0] -match 'no listed procedure is in')) (($gh._svc.Adds -join ',') + ' / ' + ($gh.Lines -join ' / '))
 # The generation check and the install gate, ISOLATED on the table itself.
@@ -1439,7 +1541,12 @@ $posPad = New-Object ClarionDebugger.Terminal.BridgePad
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'UNBOUNDED' 'clbrws006.clw' 10 -ExtentUnknown))
 [ClarionDebugger.Terminal.ClarionDebuggerService]::Listed.Add((Proc 'NEXTP' 'clbrws006.clw' 50 'procedure' 70))
 $posPad.RunPushProcedures('C:\App\app.exe')
-function PosAdd { param($path, $line) $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $posPad.CmdBreakOnProcEntryAt($path, $line); $posPad._svc.Adds -join ',' }
+# PosAdd also keeps what the call RETURNED (e61e4f92's frozen contract), for the checks after this block.
+function PosAdd { param($path, $line)
+  $posPad._svc.Adds.Clear(); $posPad.Lines.Clear(); $m = $null
+  $script:posOk = $posPad.CmdBreakOnProcEntryAt($path, $line, [ref] $m); $script:posMsg = $m
+  $posPad._svc.Adds -join ','
+}
 function PosRefused { param($path, $line, $reason)
   $a = PosAdd $path $line
   ($a -eq '') -and (@(Errs $posPad).Count -eq 1) -and ((@(Errs $posPad)[0]) -match $reason)
@@ -1475,6 +1582,50 @@ Check 'CONTROL: NEXTP, bounded, still resolves beside it (50..70, cursor 60)' `
   ((PosAdd 'C:\Src\clbrws006.clw' 60) -ceq 'clbrws006.clw:50') ($posPad._svc.Adds -join ',')
 Check 'and the version-mismatch refusal (A, no extent member at all) does not claim the debug info is at fault' `
   ((PosRefused 'C:\Src\clbrws005.clw' 40 'engine/host version mismatch') -and (($posPad.Lines -join ' / ') -notmatch 'debug info')) ($posPad.Lines -join ' / ')
+# ---- what the pad RETURNS to ClarionAssistant (e61e4f92 frozen contract, 2026-09-25) --------------------
+# The toast's text on a miss, and true/false for "was anything set". The Debug Console lines are unchanged,
+# so each refusal is also checked for the line it always wrote.
+function PosSaid { "$script:posOk / '$script:posMsg' / console: $($posPad.Lines -join ' / ')" }
+$null = PosAdd 'C:\Src\clbrws011.clw' 10
+Check 'a position outside every procedure returns false, with the pad''s reason as the message' `
+  (($script:posOk -eq $false) -and ($script:posMsg -cmatch '^Break on entry: .*above the first.* — nothing was set\.$')) (PosSaid)
+Check 'and its Debug Console line is the one it always wrote, hint included' `
+  ((@(Errs $posPad).Count -eq 1) -and (@(Errs $posPad)[0] -cmatch '^err\|break on entry: .*above the first.* — nothing was set\. \(If the Procedures pane is empty, open the app''s solution or refresh it\.\)$')) (PosSaid)
+Check 'but the toast does not carry the pane-only hint' ($script:posMsg -notmatch 'Procedures pane') (PosSaid)
+$posPad._svc.IsRunning = $true; $posPad._svc.Accept = $true
+$null = PosAdd 'C:\Src\clbrws011.clw' 90
+Check 'LIVE, the engine took it: true, "sent to the debugger", naming the procedure and its entry' `
+  (($script:posOk -eq $true) -and ($script:posMsg -ceq 'Break on entry: OTHER  clbrws011.clw:80 (sent to the debugger)')) (PosSaid)
+Check 'and the Debug Console still says it, with no error line' `
+  ((@(Errs $posPad).Count -eq 0) -and ($posPad.Lines -contains 'info|break on entry: OTHER  clbrws011.clw:80')) (PosSaid)
+$posPad._svc.Accept = $false
+$null = PosAdd 'C:\Src\clbrws011.clw' 90
+Check 'LIVE, the engine refused it: false, and the message says the engine did not take it' `
+  (($script:posOk -eq $false) -and ($script:posMsg -ceq 'Break on entry: could not set a breakpoint at clbrws011.clw:80 — the engine did not take the request.')) (PosSaid)
+Check 'and the Debug Console line is the one it always wrote' `
+  ((@(Errs $posPad).Count -eq 1) -and (@(Errs $posPad)[0] -ceq 'err|break on entry: could not set a breakpoint at clbrws011.clw:80 — the engine did not take the request.')) (PosSaid)
+$posPad._svc.Accept = $true; $posPad._svc.IsRunning = $false; $posPad._pending.Clear()
+$null = PosAdd 'C:\Src\clbrws011.clw' 90
+Check 'IDLE: true, "staged for the next Start", and it IS staged' `
+  (($script:posOk -eq $true) -and ($script:posMsg -ceq 'Break on entry: OTHER  clbrws011.clw:80 (staged for the next Start)') -and ($posPad._pending.Count -eq 1)) (PosSaid)
+$null = PosAdd 'C:\Src\clbrws011.clw' 100
+Check 'IDLE again, same procedure: true, "already staged", and not staged twice' `
+  (($script:posOk -eq $true) -and ($script:posMsg -ceq 'Break on entry: OTHER  clbrws011.clw:80 (already staged for the next Start)') -and ($posPad._pending.Count -eq 1)) (PosSaid)
+$posPad._pending.Clear(); $posPad._svc.IsRunning = $true
+# The shared body's own refusals, on ProcRefs built here: the list cannot produce either one any more.
+function BoeRef { param($module, $line, $name)
+  $r = New-Object ClarionDebugger.Terminal.ProcRef; $r.Module = $module; $r.Line = $line; $r.Name = $name
+  $posPad.Lines.Clear(); $posPad._svc.Adds.Clear(); $m = $null
+  $script:posOk = $posPad.BreakOnEntry($r, [ref] $m); $script:posMsg = $m
+}
+BoeRef '..\evil clw' 5 'BAD'
+Check 'an unusable module: false, says why, sets nothing' `
+  (($script:posOk -eq $false) -and ($script:posMsg -ceq 'Break on entry: not a module name the debugger can use: ..\evil clw') -and ($posPad._svc.Adds.Count -eq 0)) (PosSaid)
+BoeRef 'clbrws011.clw' 0 'NOLINE'
+Check 'no definition line: false, says why, sets nothing' `
+  (($script:posOk -eq $false) -and ($script:posMsg -ceq 'Break on entry: NOLINE has no definition line to break on.') -and ($posPad._svc.Adds.Count -eq 0)) (PosSaid)
+Check 'and it still writes its Debug Console line' ((@(Errs $posPad).Count -eq 1) -and (@(Errs $posPad)[0] -ceq 'err|break on entry: NOLINE has no definition line to break on.')) (PosSaid)
+
 # The service's reading of an engine row, RUN on rows in the engine's shape (Json.Symbols): the three cases
 # the host tells apart.
 $symRow = { param($extra) '{"name":"P","raw":"P","kind":"procedure","rva":"0x1000","line":10' + $extra + ',"moduleIdx":1,"module":"m.clw"}' }
@@ -2714,7 +2865,7 @@ Check 'SetHover sends the engine''s verb' `
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 440
+$EXPECTED_CHECKS = 471
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
