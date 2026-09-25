@@ -97,6 +97,30 @@ if ($SelfTest) {
        Find = "GetUIntOrNull(json, `"tid`"),`n                                               GetStr(json, `"reqId`"));"; Repl = 'GetUIntOrNull(json, "tid"), null);' }
     @{ Id = 'V2'; File = 'svc'; Why = 'ParseWatch drops the watch reply''s reqId';
        Find = 'w.ReqId = GetStr(json, "reqId");'; Repl = '' }
+    @{ Id = 'S13'; File = 'grants'; Why = 'the edit authorization check does not sync to the service epoch';
+       Find = "// switch or disagreeing inventory is refused here with no other call on the table in between.`n            Sync();";
+       Repl = '// switch or disagreeing inventory is refused here with no other call on the table in between.' }
+    @{ Id = 'S14'; File = 'grants'; Why = 'the frame offer path does not sync to the service epoch';
+       Find = "// retires it here, with everything else from that epoch.`n            Sync();";
+       Repl = '// retires it here, with everything else from that epoch.' }
+    @{ Id = 'Y1'; File = 'grants'; Why = 'ExpandVerified does not sync';
+       Find = 'public bool ExpandVerified(string reqId) { Sync(); return'; Repl = 'public bool ExpandVerified(string reqId) { return' }
+    @{ Id = 'Y2'; File = 'grants'; Why = 'IsFrameOffered does not sync';
+       Find = "public bool IsFrameOffered(string va, string ebp)`n        {`n            Sync();"; Repl = "public bool IsFrameOffered(string va, string ebp)`n        {" }
+    @{ Id = 'Y3'; File = 'grants'; Why = 'IsWritePending does not sync';
+       Find = "public bool IsWritePending(string va)`n        {`n            Sync();"; Repl = "public bool IsWritePending(string va)`n        {" }
+    @{ Id = 'Y4'; File = 'grants'; Why = 'IsGranted does not sync';
+       Find = "public bool IsGranted(string va, string typeCode, int size, int places, uint? tid)`n        {`n            Sync();"; Repl = "public bool IsGranted(string va, string typeCode, int size, int places, uint? tid)`n        {" }
+    @{ Id = 'Y5'; File = 'grants'; Why = 'Count does not sync';
+       Find = 'public int Count { get { Sync(); return'; Repl = 'public int Count { get { return' }
+    @{ Id = 'Y6'; File = 'grants'; Why = 'ExpandableCount does not sync';
+       Find = 'public int ExpandableCount { get { Sync(); return'; Repl = 'public int ExpandableCount { get { return' }
+    @{ Id = 'Y7'; File = 'grants'; Why = 'Grant does not sync, so a grant made first after a move is lost';
+       Find = "public void Grant(string va, string typeCode, int size, int places, uint? tid)`n        {`n            Sync();"; Repl = "public void Grant(string va, string typeCode, int size, int places, uint? tid)`n        {" }
+    @{ Id = 'Y8'; File = 'grants'; Why = 'GrantExpandable does not sync';
+       Find = "public void GrantExpandable(string module, uint typeRef, string addr)`n        {`n            Sync();"; Repl = "public void GrantExpandable(string module, uint typeRef, string addr)`n        {" }
+    @{ Id = 'Y9'; File = 'grants'; Why = 'ExpandForwarded does not sync';
+       Find = 'public void ExpandForwarded(int reqId) { Sync(); _expands'; Repl = 'public void ExpandForwarded(int reqId) { _expands' }
     @{ Id = 'S9'; File = 'svc'; Why = 'the session end leaves the selection standing';
        Find = "SetState(DebugSessionState.Idle);`n                MoveSelection(null, null, ThreadSelectionCause.Ended, true);";
        Repl = 'SetState(DebugSessionState.Idle);' }
@@ -132,8 +156,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 23 finds + 23 mutations + 1 control
-  Assert-CheckTotal 47
+  # 34 finds + 34 mutations + 1 control
+  Assert-CheckTotal 69
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -228,6 +252,18 @@ namespace ClarionDebugger.Terminal
     private void Console(string level, string text) { }
     private void ClearExecutionLineIfHooked() { }
     public bool Granted(string va, uint tid) { return _editGrants.IsGranted(va, "0x03", 4, 0, tid); }
+    // The edit authorization check itself (EditVar's TryConsume), called with nothing in front of it.
+    public bool Consume(string va, uint tid) { return _editGrants.TryConsume(va, "0x03", 4, 0, tid); }
+    // Each table member on its own, for section 5: a move, then ONLY that call.
+    public void GrantNow(string va, uint tid) { _editGrants.Grant(va, "0x03", 4, 0, tid); }
+    public void ExpandableNow(string addr) { _editGrants.GrantExpandable("clbrws011.clw", 77, addr); }
+    public bool ExpandIssued(string addr) { return _editGrants.IsExpandIssued("clbrws011.clw", 77, addr); }
+    public void ExpandForwarded(int reqId) { _editGrants.ExpandForwarded(reqId); }
+    public bool ExpandVerified(string reqId) { return _editGrants.ExpandVerified(reqId); }
+    public bool FrameOffered() { return _editGrants.IsFrameOffered("0x402000", "0x19FF40"); }
+    public bool WritePending(string va) { return _editGrants.IsWritePending(va); }
+    public int Count { get { return _editGrants.Count; } }
+    public int ExpandableCount { get { return _editGrants.ExpandableCount; } }
     public bool Offer(uint tid, string id) {
       return _editGrants.OfferFrames(tid, id, new[] { new KeyValuePair<string, string>("0x402000", "0x19FF40") });
     }
@@ -488,10 +524,60 @@ $l.Drain()
 $l.D.Line((ModData 9001 $lmid))
 Check 'a request bound after an inventory moved the selection is answered, with nothing queued to wipe it' `
   ($l.Offer(9001, $lid) -and $l.Granted('0x4A2200', 9001)) "stack=$lid moduledata=$lmid"
+# THE LAZY CLEAR IS ONLY AS GOOD AS ITS READERS (PM's condition, 3517fd15): a move must be noticed by the very call
+# that would honour a stale grant or offer, with NO other call on the table in between.
+$z = New-Object ClarionDebugger.Terminal.GrantPad
+$z.D.Line((Paused 4812))
+$z.WatchOrExplain('GLO:X'); $z.D.Line((WatchHit 4812 $z._svc.LastWatchId))
+$z.D.Line((Picked 9001 $true))
+Check 'a grant minted before a switch is refused by the edit check alone, nothing called in between' (-not $z.Consume('0x4A10F0', 4812)) ''
+$z2 = New-Object ClarionDebugger.Terminal.GrantPad
+$z2.D.Line((Paused 4812))
+$z2.WatchOrExplain('GLO:X'); $z2.D.Line((WatchHit 4812 $z2._svc.LastWatchId))
+Check 'CONTROL: before any move, the edit check honours that grant' ($z2.Consume('0x4A10F0', 4812)) ''
+$y = New-Object ClarionDebugger.Terminal.GrantPad
+$y.D.Line((Paused 4812))
+$y.RequestStack(); $yid = $y._svc.LastStackId
+$y.D.Line((Threads 4812 9001))
+Check 'a stack reply to a request sent before an inventory moved the selection offers nothing, the offer call alone deciding' `
+  (-not $y.Offer(9001, $yid)) "id=$yid"
 Check 'the pad wires the watch reply exactly as OnSvcWatch does: marshal, then OnWatch' `
   ((Get-CSharpCodeOnly $web) -match 'private void OnSvcWatch\(DebugWatch w\) => UI\(\(\) => OnWatch\(w\)\);') ''
 
-Assert-CheckTotal 46
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '5. every member of the grant table notices a selection move by itself (3517fd15)'
+# Each check: state made in one epoch, the selection moves (an accepted switch), and then ONE member is called with
+# nothing in front of it. A reader must answer for the new epoch; a writer must record into it, not into the old
+# table the next read will retire. (Regrant and FrameLocalsForwarded do not sync, and say why in HostGrants.cs.)
+function Fresh { $t = New-Object ClarionDebugger.Terminal.GrantPad; $t.D.Line((Paused 4812)); $t }
+function MoveSel { param($t) $t.D.Line((Picked 9001 $true)) }
+$t = Fresh; $t.ExpandableNow('0x4B0000'); $t.ExpandForwarded(7)
+Check 'CONTROL: a forwarded expand is verified in its own epoch' ($t.ExpandVerified('7')) ''
+$t = Fresh; $t.ExpandableNow('0x4B0000'); $t.ExpandForwarded(7); MoveSel $t
+Check 'ExpandVerified: an expand forwarded before the move grants nothing after it' (-not $t.ExpandVerified('7')) ''
+$t = Fresh; $t.RequestStack(); [void]$t.Offer(4812, $t._svc.LastStackId)
+Check 'CONTROL: an offered frame is offered in its own epoch' ($t.FrameOffered()) ''
+$t = Fresh; $t.RequestStack(); [void]$t.Offer(4812, $t._svc.LastStackId); MoveSel $t
+Check 'IsFrameOffered: a frame offered before the move is not offered after it' (-not $t.FrameOffered()) ''
+$t = Fresh; $t.GrantNow('0x4A10F0', 4812); [void]$t.Consume('0x4A10F0', 4812)
+Check 'CONTROL: a spent grant leaves its write pending' ($t.WritePending('0x4A10F0')) ''
+$t = Fresh; $t.GrantNow('0x4A10F0', 4812); [void]$t.Consume('0x4A10F0', 4812); MoveSel $t
+Check 'IsWritePending: a write sent before the move is not pending after it (the refusal says stale, not pending)' (-not $t.WritePending('0x4A10F0')) ''
+$t = Fresh; $t.GrantNow('0x4A10F0', 4812); MoveSel $t
+Check 'IsGranted: a grant made before the move is not granted after it' (-not $t.Granted('0x4A10F0', 4812)) ''
+$t = Fresh; $t.GrantNow('0x4A10F0', 4812); MoveSel $t
+Check 'Count: it counts none of them after it' ($t.Count -eq 0) "$($t.Count)"
+$t = Fresh; $t.ExpandableNow('0x4B0000'); MoveSel $t
+Check 'ExpandableCount: nor any expandable row' ($t.ExpandableCount -eq 0) "$($t.ExpandableCount)"
+$t = Fresh; MoveSel $t; $t.GrantNow('0x4A10F4', 9001)
+Check 'Grant: a grant made as the FIRST call after a move stands' ($t.Granted('0x4A10F4', 9001)) ''
+$t = Fresh; MoveSel $t; $t.ExpandableNow('0x4C0000')
+Check 'GrantExpandable: an expandable row recorded first after a move is issued' ($t.ExpandIssued('0x4C0000')) ''
+$t = Fresh; MoveSel $t; $t.ExpandForwarded(9)
+Check 'ExpandForwarded: an expand forwarded after a move is verified' ($t.ExpandVerified('9')) ''
+
+Assert-CheckTotal 61
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

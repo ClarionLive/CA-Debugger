@@ -314,6 +314,13 @@ namespace ClarionDebugger.Terminal
         public bool IsWritePending(string va)
         {
             Sync();
+            return WritePending(va);
+        }
+
+        // The unsynced read, for a member that has synced already: each public member syncs ONCE, first, so no
+        // member's own sync can be masked by another's it happens to call.
+        private bool WritePending(string va)
+        {
             return !string.IsNullOrEmpty(va) && _writesInFlight.ContainsKey(va.ToUpperInvariant());
         }
 
@@ -322,9 +329,11 @@ namespace ClarionDebugger.Terminal
         /// that address.</summary>
         public bool TryConsume(string va, string typeCode, int size, int places, uint? tid)
         {
+            // THE EDIT AUTHORIZATION CHECK, so it notices a selection move on its own: a grant minted before a stop,
+            // switch or disagreeing inventory is refused here with no other call on the table in between.
             Sync();
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return false;
-            if (IsWritePending(va)) return false;
+            if (WritePending(va)) return false;
             string scoped = tid.HasValue ? Key(va, typeCode, size, places, TidKey(tid)) : null;
             string key = (scoped != null && _keys.Contains(scoped)) ? scoped
                        : _keys.Contains(Key(va, typeCode, size, places, Unscoped)) ? Key(va, typeCode, size, places, Unscoped)
@@ -339,7 +348,9 @@ namespace ClarionDebugger.Terminal
         /// it spent, so the refreshed row is editable again.</summary>
         public void Regrant(string va)
         {
-            Sync();
+            // NO Sync, on purpose: this puts back a key spent in the table as it stands. After a selection move the
+            // key is stale, and the next member that reads syncs and retires it with the rest; syncing here first
+            // could change no answer any reader gives (mutation-run 2026-09-25: none went red).
             if (string.IsNullOrEmpty(va)) return;
             string vaKey = va.ToUpperInvariant();
             string spent;
@@ -414,7 +425,9 @@ namespace ClarionDebugger.Terminal
         /// against the current offer: the offer's thread goes with it.</summary>
         public void FrameLocalsForwarded(int reqId)
         {
-            Sync();
+            // NO Sync, on purpose: it records the CURRENT offer's thread, and a selection move empties the offer, so
+            // after one it records no thread and FrameLocalsVerified can never grant for it, synced or not. The pad
+            // calls it only after IsFrameOffered, which has synced.
             _frameLocalsInFlight[reqId.ToString(CultureInfo.InvariantCulture)] = _framesTid;
         }
 
