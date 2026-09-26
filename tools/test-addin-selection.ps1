@@ -31,6 +31,7 @@ param(
   [string] $ServicePath = '',
   [string] $HostGrantsPath = '',
   [string] $WebViewPath = '',
+  [string] $ReaderPath = '',
   [switch] $SelfTest
 )
 
@@ -40,7 +41,8 @@ $root = Join-Path $PSScriptRoot '..'
 if (-not $ServicePath) { $ServicePath = Join-Path $root 'src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs' }
 if (-not $HostGrantsPath) { $HostGrantsPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\HostGrants.cs' }
 if (-not $WebViewPath) { $WebViewPath = Join-Path $root 'src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs' }
-$others = @('Services\RedFileService.cs', 'Services\ClarionVersionService.cs', 'Wire\JsonMessageReader.cs', 'Wire\WireRules.cs',
+if (-not $ReaderPath) { $ReaderPath = Join-Path $root 'src\ClarionDebugger.Addin\Wire\JsonMessageReader.cs' }
+$others = @('Services\RedFileService.cs', 'Services\ClarionVersionService.cs', 'Wire\WireRules.cs',
   'Wire\AttachableProcess.cs', 'Terminal\PageMessages.cs') | ForEach-Object { Join-Path $root ('src\ClarionDebugger.Addin\' + $_) }
 
 # ================================================================================================ -SelfTest
@@ -125,6 +127,10 @@ if ($SelfTest) {
        Find = "if (mayGrant)`n                    sb.Append(`",\`"va\`":`")"; Repl = "if (w.Found)`n                    sb.Append(`",\`"va\`":`")" }
     @{ Id = 'R2'; File = 'web'; Why = 'an ungranted moduledata reply is posted verbatim';
        Find = 'if (granted || string.IsNullOrEmpty(itemsJson)) return itemsJson ?? "";'; Repl = 'if (itemsJson != null || granted) return itemsJson ?? "";' }
+    @{ Id = 'P1'; File = 'reader'; Why = 'the stripper takes any unquoted word as a literal';
+       Find = 'return tok == "true" || tok == "false" || tok == "null" || s_jsonNumber.IsMatch(tok);'; Repl = 'return tok.Length > 0 && (tok[0] != ''-'' && !char.IsDigit(tok[0]) || s_jsonNumber.IsMatch(tok));' }
+    @{ Id = 'P2'; File = 'reader'; Why = 'the stripper takes any run of digit-ish characters as a number';
+       Find = 'return tok == "true" || tok == "false" || tok == "null" || s_jsonNumber.IsMatch(tok);'; Repl = 'return tok == "true" || tok == "false" || tok == "null" || (tok.Length > 0 && (tok[0] == ''-'' || tok[0] == ''+'' || tok[0] == ''.'' || char.IsDigit(tok[0])));' }
     @{ Id = 'S9'; File = 'svc'; Why = 'the session end leaves the selection standing';
        Find = "SetState(DebugSessionState.Idle);`n                MoveSelection(null, null, ThreadSelectionCause.Ended, true);";
        Repl = 'SetState(DebugSessionState.Idle);' }
@@ -132,7 +138,7 @@ if ($SelfTest) {
   $base = Join-Path ([IO.Path]::GetTempPath()) ('selection-selftest-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $base | Out-Null
   try {
-    $src = @{ svc = $ServicePath; grants = $HostGrantsPath; web = $WebViewPath }
+    $src = @{ svc = $ServicePath; grants = $HostGrantsPath; web = $WebViewPath; reader = $ReaderPath }
     $runs = @()
     foreach ($m in $M) {
       $dir = Join-Path $base $m.Id; New-Item -ItemType Directory -Path $dir | Out-Null
@@ -151,7 +157,7 @@ if ($SelfTest) {
     foreach ($r in $runs) {
       $d = Join-Path $base $r.Id
       $out = & pwsh -NoProfile -File $PSCommandPath -ServicePath (Join-Path $d 'ClarionDebuggerService.cs') -HostGrantsPath (Join-Path $d 'HostGrants.cs') `
-        -WebViewPath (Join-Path $d 'ClarionDebuggerWebView.cs') 2>&1
+        -WebViewPath (Join-Path $d 'ClarionDebuggerWebView.cs') -ReaderPath (Join-Path $d 'JsonMessageReader.cs') 2>&1
       $code = $LASTEXITCODE
       $passed = [bool](@($out) -match '^ALL \d+ CHECKS PASSED')
       $compiled = [bool](@($out) -match '^compiled the service and the grant table$')
@@ -160,8 +166,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 36 finds + 36 mutations + 1 control
-  Assert-CheckTotal 73
+  # 38 finds + 38 mutations + 1 control
+  Assert-CheckTotal 77
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -258,7 +264,8 @@ namespace ClarionDebugger.Terminal
     private void Console(string level, string text) { }
     private void ClearExecutionLineIfHooked() { }
     public bool Granted(string va, uint tid) { return _editGrants.IsGranted(va, "0x03", 4, 0, tid); }
-    public static string Strip(string json) { return JsonMessageReader.WithoutMembers(json, new[] { "va", "typeCode", "size", "places" }); }
+    public static string Strip(string json) { return JsonMessageReader.WithoutMembers(json, EditTupleMembers); }   // the pad's own list, lifted
+    public static string ReadOnlyRows(string items) { return RowsAsGranted(items, false); }
     // The edit authorization check itself (EditVar's TryConsume), called with nothing in front of it.
     public bool Consume(string va, uint tid) { return _editGrants.TryConsume(va, "0x03", 4, 0, tid); }
     // Each table member on its own, for section 5: a move, then ONLY that call.
@@ -281,7 +288,7 @@ namespace ClarionDebugger.Terminal
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('selection-probe-' + [guid]::NewGuid().ToString('N') + '.cs')
 [IO.File]::WriteAllText($tmp, $probe)
 try {
-  $paths = @($ServicePath, $HostGrantsPath) + $others | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
+  $paths = @($ServicePath, $HostGrantsPath, $ReaderPath) + $others | ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
   Add-Type -Path ($paths + $tmp) -IgnoreWarnings -WarningAction SilentlyContinue -ReferencedAssemblies @(
     'System.Xml', 'System.Xml.ReaderWriter', 'System.Diagnostics.Process', 'System.Diagnostics.FileVersionInfo',
     'System.ComponentModel.Primitives', 'System.Text.RegularExpressions', 'System.Collections', 'System.Linq',
@@ -580,6 +587,19 @@ $want = '[{"name":"G","value":"has \"va\":\"0x1\" in it","addr":"0x10","children
 Check 'the stripper removes the tuple at every depth, keeps a string that merely contains one, and keeps what expand needs' `
   ($GP::Strip($nested) -ceq $want) ($GP::Strip($nested))
 Check 'text that is not well-formed strips to nothing' (($null -eq $GP::Strip('[{"va":"0x1"')) -and ($null -eq $GP::Strip('[{"a":1}] x'))) ''
+# PRIMITIVES ARE VALIDATED (codex security, pipeline run 2): any run of characters used to pass as a value, so
+# `"name":bad` survived the strip and the page was posted broken JSON instead of no rows.
+$tuple = ',"va":"0x1","typeCode":"0x03","size":4,"places":0'
+$badPrims = @('bad', 'True', 'nul', '01', '1.', '.5', '+1', '0x10', '1e', '--1', '1.5.2')
+$badLet = @($badPrims | Where-Object { $null -ne $GP::Strip('[{"name":' + $_ + $tuple + '}]') })
+Check 'a bad literal or number anywhere makes the strip fail: bad, True, nul, 01, 1., .5, +1, 0x10, 1e, --1, 1.5.2' ($badLet.Count -eq 0) ($badLet -join ', ')
+$cut = @('[{"name":"G"', '[{"name":"G', '[{"name":"G","children":[', '[{"name":"G"}', '[{"name":"G"}]]', '[{"name":"G"}] ,', '[{"name":"G"}]{}')
+$cutLet = @($cut | Where-Object { $null -ne $GP::Strip($_) })
+Check 'a truncated string, object or array, or anything after the top-level value, strips to nothing' ($cutLet.Count -eq 0) ($cutLet -join ' | ')
+Check 'and such a reply is posted as NO rows, never as broken ones' ($GP::ReadOnlyRows('{"name":bad' + $tuple + '}') -ceq '') ($GP::ReadOnlyRows('{"name":bad' + $tuple + '}'))
+$goodPrims = '[{"a":0,"b":-1,"c":12.5,"d":-0.25,"e":1e3,"f":2E-4,"g":6.02e+23,"h":true,"i":false,"j":null' + $tuple + '}]'
+Check 'CONTROL: every valid primitive survives the strip unchanged' `
+  ($GP::Strip($goodPrims) -ceq '[{"a":0,"b":-1,"c":12.5,"d":-0.25,"e":1e3,"f":2E-4,"g":6.02e+23,"h":true,"i":false,"j":null}]') ($GP::Strip($goodPrims))
 Check 'the pad wires the watch reply exactly as OnSvcWatch does: marshal, then OnWatch' `
   ((Get-CSharpCodeOnly $web) -match 'private void OnSvcWatch\(DebugWatch w\) => UI\(\(\) => OnWatch\(w\)\);') ''
 
@@ -616,7 +636,7 @@ Check 'GrantExpandable: an expandable row recorded first after a move is issued'
 $t = Fresh; MoveSel $t; $t.ExpandForwarded(9)
 Check 'ExpandForwarded: an expand forwarded after a move is verified' ($t.ExpandVerified('9')) ''
 
-Assert-CheckTotal 69
+Assert-CheckTotal 73
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"
