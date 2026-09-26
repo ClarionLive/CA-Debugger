@@ -1413,7 +1413,7 @@ namespace ClarionDebugger.Terminal
             try
             {
                 var r = ProjectTargetService.ResolveTarget();
-                if (r == null) return;   // it never returns null today; nothing to state if it ever does
+                if (r == null) return;   // defensive: ResolveTarget catches everything and returns a resolution, but a null would otherwise throw here
                 if (!string.IsNullOrEmpty(r.Path))
                 {
                     // Log only on an actual change. This runs on every IDE context event, and
@@ -1718,7 +1718,7 @@ namespace ClarionDebugger.Terminal
                 {
                     foreach (var key in new List<string>(_transientBps))
                     {
-                        if (key == _rtcCleanupKey) continue;   // its del is already sent
+                        if (string.Equals(key, _rtcCleanupKey, StringComparison.OrdinalIgnoreCase)) continue;   // its del is already sent
                         int ci = key.LastIndexOf(':');
                         if (ci <= 0) continue;
                         int tl;
