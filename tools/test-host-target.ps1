@@ -57,6 +57,12 @@ if ($SelfTest) {
        Find = 'if (exeCount > 1) return TargetOutcome.SeveralExes;'; Repl = 'if (exeCount > 1 && exeCount < 0) return TargetOutcome.SeveralExes;' }
     @{ Id = 'T9'; File = 'pts'; Why = 'a child property''s own condition is ignored';
        Find = 'if (!childApplies) continue;'; Repl = 'if (!childApplies && childCond == "") continue;' }
+    @{ Id = 'T10'; File = 'pts'; Why = 'the startup project falls back to Solution.StartupProject (the first startable one)';
+       Find = 'return ReflectionHelpers.GetProp(prefs, "StartupProject");'; Repl = 'return ReflectionHelpers.GetProp(prefs, "StartupProject") ?? ReflectionHelpers.GetProp(solution, "StartupProject");' }
+    @{ Id = 'W10'; File = 'web'; Why = 'Start confirming a target does not relist';
+       Find = 'if (!listed) ListProceduresForTarget();   // a list emptied'; Repl = '// a list emptied' }
+    @{ Id = 'W11'; File = 'web'; Why = 'a Browse pick does not relist';
+       Find = "PushTarget();`n                    if (!listed) ListProceduresForTarget();"; Repl = 'PushTarget();' }
     @{ Id = 'W1'; File = 'web'; Why = 'the target message omits state';
        Find = '+ ",\"state\":\"" + s + "\""'; Repl = '' }
     @{ Id = 'W2'; File = 'web'; Why = 'a target with no path is not "none"';
@@ -108,8 +114,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 18 finds + 18 mutations + 1 control
-  Assert-CheckTotal 37
+  # 21 finds + 21 mutations + 1 control
+  Assert-CheckTotal 43
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -311,10 +317,28 @@ Check 'the pad writes _exeState nowhere else (ApplyNoTarget''s caller pushes)' `
   (($webCode -match 'private TargetState _exeState = TargetState\.None;') -and ($everywhere -eq $inWriters)) "$everywhere write(s), $inWriters in the checked methods"
 Check 'a procedures list is pushed only through ListProceduresForTarget, and the start path' `
   (([regex]::Matches($webCode, 'PushProcedures\(_exe\)').Count -eq 1) -and ($webCode -match 'private bool ListProceduresForTarget\(\)\s*\{\s*if \(!string\.IsNullOrEmpty\(_exe\) && \(_exeState == TargetState\.Auto \|\| _exeState == TargetState\.Manual\)\)')) ''
-Check 'the refresh, the ready handler and the refresh button list through it' `
-  ([regex]::Matches($webCode, 'ListProceduresForTarget\(\)').Count -eq 4) "$([regex]::Matches($webCode, 'ListProceduresForTarget\(\)').Count) mention(s)"
+Check 'the refresh, the ready handler, the refresh button, and a confirm by Start or Browse list through it' `
+  ([regex]::Matches($webCode, 'ListProceduresForTarget\(\)').Count -eq 6) "$([regex]::Matches($webCode, 'ListProceduresForTarget\(\)').Count) mention(s)"
+# A list emptied while the target was unconfirmed comes back when Start or Browse confirms one (debugger LOW, run 1):
+# after the push, unless it was already listed for that same confirmed path.
+foreach ($sig in 'private bool ResolveTargetForStart()', 'private bool Browse()') {
+  $b = Get-CSharpCodeOnly (Get-Method $sig $web)
+  $iListed = $b.IndexOf('bool listed = IsListedTarget('); $iPush = $b.IndexOf('PushTarget();', [Math]::Max($iListed, 0))
+  $iList = $b.IndexOf('if (!listed) ListProceduresForTarget();')
+  Check "$sig relists after it pushes a confirmed target, when that target was not the one listed" `
+    (($iListed -ge 0) -and ($iPush -gt $iListed) -and ($iList -gt $iPush)) "listed=$iListed push=$iPush list=$iList"
+}
+Check 'IsListedTarget means: confirmed, and the same path' `
+  ((Get-CSharpCodeOnly (Get-Method 'private bool IsListedTarget(string exe)' $web)) -match `
+    'return \(_exeState == TargetState\.Auto \|\| _exeState == TargetState\.Manual\)\s*&& string\.Equals\(_exe, exe, StringComparison\.OrdinalIgnoreCase\);') ''
+# The startup project is the one the user SET. Solution.StartupProject falls back to the first IsStartable project
+# (its IL, C10/C11/C12, read 2026-09-25), which would make "Several EXEs" unreachable.
+$ptsSrc = Get-Content -Raw -LiteralPath $TargetServicePath
+$gsp = Get-CSharpCodeOnly (Get-Method 'private static object GetStartupProject(object solution)' $ptsSrc)
+Check 'GetStartupProject reads only the preferences'' StartupProject, never the solution''s fallback' `
+  (($gsp -match 'return ReflectionHelpers\.GetProp\(prefs, "StartupProject"\);') -and ([regex]::Matches($gsp, '"StartupProject"').Count -eq 1)) ''
 
-Assert-CheckTotal 42
+Assert-CheckTotal 46
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

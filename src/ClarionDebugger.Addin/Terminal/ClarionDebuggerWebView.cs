@@ -63,6 +63,11 @@ namespace ClarionDebugger.Terminal
         // whether confirmation ever arrives. UI-thread only.
         private string _pendingRtcKey;
         private int _pendingRtcLine;   // requested line of the pending run-to-cursor — matches the engine's bp echo by line
+        // A run-to-cursor the engine REFUSED in one image may still have armed in another (arm-all, contract C3):
+        // its key stays tracked - out of the pane - while a `bp del` removes every copy, until the `bp list` sent
+        // after that del is answered (the engine answers in order, so every echo for the add and the del is in
+        // by then). Null when no such cleanup is in flight. UI-thread only.
+        private string _rtcCleanupKey;
         private readonly HashSet<string> _watched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         // What the page may hand back, as the HOST issued it (afbc68c7). The page names a Procedures row by
         // the id it was sent with, and an edit by the row's own tuple; both are checked here rather than
@@ -336,17 +341,34 @@ namespace ClarionDebugger.Terminal
         // a resume and a new stop, or from an engine that echoes no id, is posted for display and grants nothing.
         private void OnSvcModuleData(string module, string itemsJson, uint? tid, string reqId) => UI(() =>
         {
-            if (_editGrants.ReadAnswered(reqId)) _editGrants.GrantRows(itemsJson, tid);
-            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
+            bool mayGrant = _editGrants.ReadAnswered(reqId);
+            if (mayGrant) _editGrants.GrantRows(itemsJson, tid);
+            Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + RowsAsGranted(itemsJson, mayGrant) + "]" + TidJson(tid) + "}");
         });
+
+        // The members that make a row editable on the page: the edit tuple the engine attaches, and EditVar checks.
+        private static readonly string[] EditTupleMembers = { "va", "typeCode", "size", "places" };
+
+        /// <summary>A row reply's items as the page may see them: verbatim when the host granted them, and WITHOUT
+        /// every row's edit tuple when it did not (3517fd15, codex security run 1). A row shown with a tuple the host
+        /// will refuse offers an edit pencil that only fails; "display only" has to be what the page is shown.
+        /// Nothing else is touched: "View memory" reads the row's own <c>addr</c>, and a reference row keeps what
+        /// <c>expand</c> needs. Text that is not well-formed is posted as no rows at all.</summary>
+        private static string RowsAsGranted(string itemsJson, bool granted)
+        {
+            if (granted || string.IsNullOrEmpty(itemsJson)) return itemsJson ?? "";
+            string all = JsonMessageReader.WithoutMembers("[" + itemsJson + "]", EditTupleMembers);
+            return all == null || all.Length < 2 ? "" : all.Substring(1, all.Length - 2);
+        }
 
         private void OnSvcExpanded(string reqId, string itemsJson) => UI(() =>
         {
             // Only a reply to an expand the host VERIFIED and forwarded may grant (afbc68c7): its rows are
             // members of a group the host itself offered. Any other reply is posted for display, and grants
             // nothing - its rows cannot be edited or expanded further.
-            if (_editGrants.ExpandVerified(reqId)) _editGrants.GrantRows(itemsJson, null);
-            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]}");
+            bool verified = _editGrants.ExpandVerified(reqId);
+            if (verified) _editGrants.GrantRows(itemsJson, null);
+            Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]}");
         });
 
         private void OnSvcFrameLocals(string reqId, string itemsJson, uint? tid) => UI(() =>
@@ -354,8 +376,9 @@ namespace ClarionDebugger.Terminal
             // Only a reply to a framelocals the host VERIFIED and forwarded may grant (49538b78 wave 5): its rows
             // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
             // posted for display, and grants nothing.
-            if (_editGrants.FrameLocalsVerified(reqId, tid)) _editGrants.GrantRows(itemsJson, tid);
-            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}");
+            bool verified = _editGrants.FrameLocalsVerified(reqId, tid);
+            if (verified) _editGrants.GrantRows(itemsJson, tid);
+            Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]" + TidJson(tid) + "}");
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
             Post("{\"type\":\"libstate\",\"reqId\":" + Str(reqId) + ",\"error\":" + Str(error) + ",\"items\":[" + (itemsJson ?? "") + "]" + TidJson(tid) + "}"));
@@ -429,7 +452,13 @@ namespace ClarionDebugger.Terminal
             SendBps();
         });
         private void OnSvcBreakpointRemoved(string m, int l) => UI(() => SendBps());
-        private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() => SendBps());
+        private void OnSvcBreakpointList(List<DebugBreakpoint> list) => UI(() =>
+        {
+            // The list sent after a run-to-cursor cleanup's del: every echo of that add and that del came before it,
+            // so the key has nothing left to hide.
+            if (_rtcCleanupKey != null) { _transientBps.Remove(_rtcCleanupKey); _rtcCleanupKey = null; }
+            SendBps();
+        });
         private void OnSvcBreakpointError(string m, int l, string err) => UI(() =>
         {
             // A pending run-to-cursor transient the engine rejected (e.g. no resolvable code record): it never
@@ -437,12 +466,22 @@ namespace ClarionDebugger.Terminal
             // same reason as bp-set (one pending RTC; module spelling may be the engine's canonical form).
             if (_pendingRtcKey != null && l == _pendingRtcLine)
             {
-                _transientBps.Remove(_pendingRtcKey);
+                string key = _pendingRtcKey;
                 _pendingRtcKey = null;
                 Console("err", "run to cursor: " + m + ":" + l + " — " + err + " (could not arm; staying paused).");
+                // One image refused it; another may have armed it already, or be about to (1be3b82e, debugger LOW
+                // run 1). Remove every copy and keep the key tracked until that is settled, or a copy armed in
+                // another image would outlive the run as an untracked breakpoint. Nothing sent, nothing to settle.
+                int ci = key.LastIndexOf(':');
+                if (ci > 0 && _svc.RemoveBreakpoint(key.Substring(0, ci), l) && _svc.RequestBreakpointList())
+                    _rtcCleanupKey = key;
+                else
+                    _transientBps.Remove(key);
                 SendBps();
                 return;
             }
+            // Another image's refusal of the same add, or the cleanup del finding nothing to remove: not news.
+            if (_rtcCleanupKey != null && string.Equals(_rtcCleanupKey, TransientKey(m, l), StringComparison.OrdinalIgnoreCase)) return;
             Console("err", "breakpoint " + m + ":" + l + " — " + err);
         });
         private void OnSvcTraced(string m, int l, string msg, int hits) => UI(() => Console("trace", m + ":" + l + "  " + msg + "  (#" + hits + ")"));
@@ -462,7 +501,7 @@ namespace ClarionDebugger.Terminal
         private void OnSvcLog(string s) => UI(() => Console("info", s));
         private void OnSvcExited(int code) => UI(() =>
         {
-            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine();
+            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; _rtcCleanupKey = null; ClearExecutionLine();
             var attach = _attach;
             _attach = null;
             if (attach == null) { Console("info", "— session ended (exit " + code + ") —"); Post("{\"type\":\"clear\"}"); return; }
@@ -483,7 +522,7 @@ namespace ClarionDebugger.Terminal
         private void OnSvcDetached(DebugDetach d) => UI(() =>
         {
             if (_attach != null) _attach.Detached = true;
-            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; ClearExecutionLine();
+            _editGrants.Clear(); _transientBps.Clear(); _pendingRtcKey = null; _rtcCleanupKey = null; ClearExecutionLine();
             Post("{\"type\":\"clear\"}");   // first: `clear` empties the console, and the lines below must survive it
             string name = d != null && !string.IsNullOrEmpty(d.Name) ? d.Name
                         : !string.IsNullOrEmpty(_lastAttachName) ? _lastAttachName : "the app";
@@ -1292,7 +1331,7 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>
-        /// Decide the target EXE for a Start. Always prefers a FRESH ProjectTargetService.ResolveTargetExe()
+        /// Decide the target EXE for a Start. Always prefers a FRESH ProjectTargetService.ResolveTarget()
         /// against the active project. A manual Browse pick is reused only if the IDE context (solution+project)
         /// is unchanged AND the file still exists; otherwise the stale manual pick is discarded. When nothing
         /// auto-resolves, falls back to a one-shot Browse tied to the current context. Returns true if _exe is a
@@ -1312,11 +1351,13 @@ namespace ClarionDebugger.Terminal
             {
                 if (!string.Equals(fresh, _exe, StringComparison.OrdinalIgnoreCase) || _exeAuto == false)
                     Console("info", "resolved target: " + Path.GetFileName(fresh));
+                bool listed = IsListedTarget(fresh);
                 _exe = fresh;
                 _exeAuto = true;
                 _exeManualKey = null;            // an auto-resolve supersedes any prior manual pick
                 _exeState = TargetState.Auto; _exeNote = null;
                 PushTarget();
+                if (!listed) ListProceduresForTarget();   // a list emptied while unconfirmed comes back, even if Start stops here
                 if (File.Exists(_exe)) return true;
                 Console("err", "Resolved target does not exist on disk: " + _exe + " — build the app, or choose one to launch.");
                 return BrowseForContext(ctx);
@@ -1372,6 +1413,7 @@ namespace ClarionDebugger.Terminal
             try
             {
                 var r = ProjectTargetService.ResolveTarget();
+                if (r == null) return;   // it never returns null today; nothing to state if it ever does
                 if (!string.IsNullOrEmpty(r.Path))
                 {
                     // Log only on an actual change. This runs on every IDE context event, and
@@ -1428,6 +1470,14 @@ namespace ClarionDebugger.Terminal
             }
             ClearProcedures();
             return false;
+        }
+
+        /// <summary>True when the Procedures list already belongs to <paramref name="exe"/>: it is the confirmed target
+        /// now, so the list was pushed for it (ListProceduresForTarget), and relisting would only parse it again.</summary>
+        private bool IsListedTarget(string exe)
+        {
+            return (_exeState == TargetState.Auto || _exeState == TargetState.Manual)
+                && string.Equals(_exe, exe, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>Empty the Procedures list, retiring every id the old one was sent with.</summary>
@@ -1525,10 +1575,12 @@ namespace ClarionDebugger.Terminal
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
+                    bool listed = IsListedTarget(dlg.FileName);
                     _exe = dlg.FileName;
                     _exeAuto = false; // a manual pick — re-resolve will still take precedence on the next Start
                     _exeState = TargetState.Manual; _exeNote = null;
                     PushTarget();
+                    if (!listed) ListProceduresForTarget();
                     return true;
                 }
             }
@@ -1666,6 +1718,7 @@ namespace ClarionDebugger.Terminal
                 {
                     foreach (var key in new List<string>(_transientBps))
                     {
+                        if (key == _rtcCleanupKey) continue;   // its del is already sent
                         int ci = key.LastIndexOf(':');
                         if (ci <= 0) continue;
                         int tl;
@@ -1674,6 +1727,7 @@ namespace ClarionDebugger.Terminal
                     }
                     _transientBps.Clear();
                     _pendingRtcKey = null;   // defensive: any in-flight run-to-cursor is now moot (we've stopped)
+                    _rtcCleanupKey = null;
                     // Resync the pane from engine truth. A transient can snap onto the SAME planted address as a
                     // real breakpoint at a different requested line; the engine ref-counts the INT3 and keeps the
                     // real bp armed, but its bp-del echo carries only the planted line, and the host bp mirror
@@ -1911,20 +1965,25 @@ namespace ClarionDebugger.Terminal
             bool mayGrant = _editGrants.ReadAnswered(w.ReqId);
             if (w.Found && mayGrant) _editGrants.Grant(w.Va, w.TypeCode, w.Size, w.Places, w.Tid);
             if (w.Found)
+            {
                 sb.Append(",\"value\":").Append(Str(w.Value))
                   .Append(",\"typeName\":").Append(Str(w.TypeName))
-                  .Append(",\"threaded\":").Append(w.Threaded ? "true" : "false")
-                  // edit-variable-value metadata so the Watch value cell can be written back
-                  .Append(",\"va\":").Append(Str(w.Va))
-                  .Append(",\"typeCode\":").Append(Str(w.TypeCode))
-                  .Append(",\"size\":").Append(w.Size)
-                  .Append(",\"places\":").Append(w.Places)
-                  // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
-                  .Append(",\"note\":").Append(Str(w.Note))
+                  .Append(",\"threaded\":").Append(w.Threaded ? "true" : "false");
+                // edit-variable-value metadata so the Watch value cell can be written back - ONLY when this reply
+                // granted it (3517fd15, codex security run 1). Sent for a reply that granted nothing, it put an edit
+                // pencil on a value the host then refused: "display only" has to be what the page is shown.
+                if (mayGrant)
+                    sb.Append(",\"va\":").Append(Str(w.Va))
+                      .Append(",\"typeCode\":").Append(Str(w.TypeCode))
+                      .Append(",\"size\":").Append(w.Size)
+                      .Append(",\"places\":").Append(w.Places);
+                // a real value that carries a caveat (e.g. a THREADed variable this thread hasn't used yet)
+                sb.Append(",\"note\":").Append(Str(w.Note))
                   // "View memory" address (own storage only) and the caller frame a local resolved in
                   .Append(",\"addr\":").Append(Str(w.Addr))
                   .Append(",\"frameIdx\":").Append(w.FrameIdx.HasValue ? w.FrameIdx.Value.ToString(CultureInfo.InvariantCulture) : "null")
                   .Append(",\"frameProc\":").Append(Str(w.FrameProc));
+            }
             else
                 // a miss: distinguish a frame local that is merely out of scope, a genuinely unknown name, and
                 // a name that resolved but could not be read (error) — all three must clear the row's pending state

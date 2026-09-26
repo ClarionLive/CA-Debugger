@@ -17,16 +17,6 @@ namespace ClarionDebugger.Services
     /// </summary>
     public static class ProjectTargetService
     {
-        /// <summary>
-        /// Returns the full path to the open app's EXE (best-guess if the file isn't built yet), or
-        /// null if the IDE has no project / the active project isn't an EXE and the solution doesn't
-        /// have exactly one EXE project. Callers can fall back to Browse() on null.
-        /// </summary>
-        public static string ResolveTargetExe()
-        {
-            return ResolveTarget().Path;
-        }
-
         /// <summary>Why a resolve came back with the target it did, or with none (0214f33a): the pad states it on
         /// the target bar, so "several EXEs, pick one" is not shown as the same nothing as "no solution".</summary>
         public enum TargetOutcome { Resolved, NoSolution, NoExe, SeveralExes, Failed }
@@ -61,9 +51,10 @@ namespace ClarionDebugger.Services
         }
 
         /// <summary>
-        /// Resolve the open app's EXE, and say how. Three rules, in order (0214f33a):
-        ///   1. the IDE's STARTUP project (Solution.Preferences.StartupProject, else Solution.StartupProject),
-        ///      when its .cwproj is an executable - what the IDE's own Run would start;
+        /// Resolve the open app's EXE - its full path, a best guess when it is not built yet - and say how, or why
+        /// there is none (callers fall back to Browse). Three rules, in order (0214f33a):
+        ///   1. the startup project the user SET (Solution.Preferences.StartupProject), when its .cwproj is an
+        ///      executable - what the IDE's own Run would start;
         ///   2. the ACTIVE project, when it is an executable;
         ///   3. the solution's only executable project (the DLL-belongs-to-EXE guard).
         /// Otherwise no target, and why: no EXE, or several with none marked as the one (Browse decides).
@@ -121,12 +112,17 @@ namespace ClarionDebugger.Services
             return TargetOutcome.Resolved;
         }
 
-        /// <summary>The IDE's startup project: the solution's preferences' choice, else the solution's own
-        /// property. Null when neither is readable.</summary>
+        /// <summary>The startup project the user SET, or null when none is set (or it is unreadable).
+        /// <para>
+        /// ONLY the preferences' property. Solution.StartupProject is not "the one set": in the C12 IDE (its IL read
+        /// 2026-09-25) it returns the preferences' choice, else the FIRST project whose IsStartable is true - so with
+        /// two EXEs and none chosen it names one arbitrarily, and "Several EXEs - pick one" could never be said.
+        /// SolutionPreferences.StartupProject returns null unless a project GUID was stored for it.
+        /// </para></summary>
         private static object GetStartupProject(object solution)
         {
             object prefs = ReflectionHelpers.GetProp(solution, "Preferences");
-            return ReflectionHelpers.GetProp(prefs, "StartupProject") ?? ReflectionHelpers.GetProp(solution, "StartupProject");
+            return ReflectionHelpers.GetProp(prefs, "StartupProject");
         }
 
         /// <summary>A project's OutputType/OutputName, read from its .cwproj under the configuration and platform
@@ -199,7 +195,7 @@ namespace ClarionDebugger.Services
                     string fn = ReflectionHelpers.GetProp(proj, "FileName") as string;
                     string outType, outName;
                     if (!ReadProjectOutput(proj, solution, out outType, out outName)) continue;
-                    if (IsExecutable(outType)) continue;          // EXE handled by ResolveTargetExe
+                    if (IsExecutable(outType)) continue;          // EXE handled by ResolveTarget
 
                     string projectDir = Path.GetDirectoryName(fn);
                     if (string.IsNullOrEmpty(projectDir)) continue;

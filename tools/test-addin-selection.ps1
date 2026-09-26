@@ -86,7 +86,7 @@ if ($SelfTest) {
     @{ Id = 'W1'; File = 'web'; Why = 'OnWatch grants a found reply whatever request it answers';
        Find = 'if (w.Found && mayGrant)'; Repl = 'if (w.Found)' }
     @{ Id = 'W2'; File = 'web'; Why = 'OnSvcModuleData grants whatever request it answers';
-       Find = 'if (_editGrants.ReadAnswered(reqId)) _editGrants.GrantRows(itemsJson, tid);'; Repl = '_editGrants.ReadAnswered(reqId); _editGrants.GrantRows(itemsJson, tid);' }
+       Find = 'if (mayGrant) _editGrants.GrantRows(itemsJson, tid);'; Repl = '_editGrants.GrantRows(itemsJson, tid);' }
     @{ Id = 'W3'; File = 'web'; Why = 'WatchOrExplain does not record the id it sent';
        Find = 'if (_svc.Watch(name, id)) _editGrants.ReadRequested(id);'; Repl = 'if (_svc.Watch(name, id)) { }' }
     @{ Id = 'W4'; File = 'web'; Why = 'RequestModuleData does not record the id it sent';
@@ -121,6 +121,10 @@ if ($SelfTest) {
        Find = "public void GrantExpandable(string module, uint typeRef, string addr)`n        {`n            Sync();"; Repl = "public void GrantExpandable(string module, uint typeRef, string addr)`n        {" }
     @{ Id = 'Y9'; File = 'grants'; Why = 'ExpandForwarded does not sync';
        Find = 'public void ExpandForwarded(int reqId) { Sync(); _expands'; Repl = 'public void ExpandForwarded(int reqId) { _expands' }
+    @{ Id = 'R1'; File = 'web'; Why = 'OnWatch posts the edit tuple for a reply that granted nothing';
+       Find = "if (mayGrant)`n                    sb.Append(`",\`"va\`":`")"; Repl = "if (w.Found)`n                    sb.Append(`",\`"va\`":`")" }
+    @{ Id = 'R2'; File = 'web'; Why = 'an ungranted moduledata reply is posted verbatim';
+       Find = 'if (granted || string.IsNullOrEmpty(itemsJson)) return itemsJson ?? "";'; Repl = 'if (itemsJson != null || granted) return itemsJson ?? "";' }
     @{ Id = 'S9'; File = 'svc'; Why = 'the session end leaves the selection standing';
        Find = "SetState(DebugSessionState.Idle);`n                MoveSelection(null, null, ThreadSelectionCause.Ended, true);";
        Repl = 'SetState(DebugSessionState.Idle);' }
@@ -156,8 +160,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 34 finds + 34 mutations + 1 control
-  Assert-CheckTotal 69
+  # 36 finds + 36 mutations + 1 control
+  Assert-CheckTotal 73
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -180,6 +184,8 @@ $lifted = @(
   ((Get-Method 'private void RequestStack()' $web) -replace '^private void', 'public void'),
   (Get-Method 'private void OnWatch(DebugWatch w)' $web),
   ((Get-Method 'private void OnSvcModuleData(' $web) + ');'),
+  (Get-Statement 'private static readonly string[] EditTupleMembers' $web),
+  (Get-Method 'private static string RowsAsGranted(string itemsJson, bool granted)' $web),
   (Get-Method 'private void OnSvcResumed(string mode)' $web)
 ) -join "`n"
 $probe = @"
@@ -252,6 +258,7 @@ namespace ClarionDebugger.Terminal
     private void Console(string level, string text) { }
     private void ClearExecutionLineIfHooked() { }
     public bool Granted(string va, uint tid) { return _editGrants.IsGranted(va, "0x03", 4, 0, tid); }
+    public static string Strip(string json) { return JsonMessageReader.WithoutMembers(json, new[] { "va", "typeCode", "size", "places" }); }
     // The edit authorization check itself (EditVar's TryConsume), called with nothing in front of it.
     public bool Consume(string va, uint tid) { return _editGrants.TryConsume(va, "0x03", 4, 0, tid); }
     // Each table member on its own, for section 5: a move, then ONLY that call.
@@ -541,6 +548,38 @@ $y.RequestStack(); $yid = $y._svc.LastStackId
 $y.D.Line((Threads 4812 9001))
 Check 'a stack reply to a request sent before an inventory moved the selection offers nothing, the offer call alone deciding' `
   (-not $y.Offer(9001, $yid)) "id=$yid"
+# DISPLAY ONLY MEANS NO EDIT TUPLE ON THE PAGE (codex security, pipeline run 1). A reply that grants nothing was
+# still posted with va/typeCode/size/places, so the page drew an edit pencil the host then refused.
+function Last { param($t) $t.Posts[$t.Posts.Count - 1] }
+$tupleRx = '"(va|typeCode|size|places)":'
+$d = New-Object ClarionDebugger.Terminal.GrantPad
+$d.D.Line((Paused 4812))
+$d.WatchOrExplain('GLO:X'); $d.D.Line((WatchHit 4812 $d._svc.LastWatchId))
+Check 'CONTROL: the current reply posts its edit tuple, and its View-memory addr' `
+  (((Last $d) -cmatch '"va":"0x4A10F0","typeCode":"0x03","size":4,"places":0') -and ((Last $d) -cmatch '"addr":null')) (Last $d)
+$d.D.Line((WatchHit 4812 $null '0x4A1300'))
+Check 'a watch reply with no reqId is posted with NO edit tuple, the rest intact' `
+  (((Last $d) -notmatch $tupleRx) -and ((Last $d) -cmatch '"found":true,"value":"5","typeName":"LONG","threaded":false,"note":null,"addr":null')) (Last $d)
+$d.WatchOrExplain('GLO:X'); $stale = $d._svc.LastWatchId
+$d.D.Line((Picked 9001 $true))
+$d.D.Line((WatchHit 9001 $stale '0x4A1304'))
+Check 'a watch reply with a STALE reqId is posted with no edit tuple' ((Last $d) -notmatch $tupleRx) (Last $d)
+$d.RequestModuleData(); $mid = $d._svc.LastModuleDataId
+$d.D.Line((ModData 9001 $mid))
+Check 'CONTROL: the current moduledata reply keeps its rows'' edit tuples' ((Last $d) -cmatch '"va":"0x4A2200","typeCode":"0x03","size":4,"places":0') (Last $d)
+$d.D.Line((ModData 9001 $null '0x4A2300'))
+Check 'a moduledata reply with no reqId is posted with no edit tuple, the rest of the row kept' `
+  (((Last $d) -notmatch $tupleRx) -and ((Last $d) -cmatch '\{"name":"G:X","type":"LONG","value":"1"\}')) (Last $d)
+$d.D.Line((ModData 9001 $mid '0x4A2304'))
+Check 'a moduledata reply with a spent reqId is posted with no edit tuple' ((Last $d) -notmatch $tupleRx) (Last $d)
+# The stripper walks JSON, not text: a key-like run inside a string survives, nested children lose theirs, and
+# text that is not JSON strips to nothing rather than to a guess.
+$GP = [ClarionDebugger.Terminal.GrantPad]
+$nested = '[{"name":"G","value":"has \"va\":\"0x1\" in it","va":"0x10","typeCode":"0x03","size":4,"places":0,"addr":"0x10","children":[{"name":"C","va":"0x14","typeCode":"0x03","size":4,"places":0,"addr":"0x14"}]},{"name":"R","ref":true,"addr":"0x4B0000","module":"m.clw","typeRef":7}]'
+$want = '[{"name":"G","value":"has \"va\":\"0x1\" in it","addr":"0x10","children":[{"name":"C","addr":"0x14"}]},{"name":"R","ref":true,"addr":"0x4B0000","module":"m.clw","typeRef":7}]'
+Check 'the stripper removes the tuple at every depth, keeps a string that merely contains one, and keeps what expand needs' `
+  ($GP::Strip($nested) -ceq $want) ($GP::Strip($nested))
+Check 'text that is not well-formed strips to nothing' (($null -eq $GP::Strip('[{"va":"0x1"')) -and ($null -eq $GP::Strip('[{"a":1}] x'))) ''
 Check 'the pad wires the watch reply exactly as OnSvcWatch does: marshal, then OnWatch' `
   ((Get-CSharpCodeOnly $web) -match 'private void OnSvcWatch\(DebugWatch w\) => UI\(\(\) => OnWatch\(w\)\);') ''
 
@@ -577,7 +616,7 @@ Check 'GrantExpandable: an expandable row recorded first after a move is issued'
 $t = Fresh; MoveSel $t; $t.ExpandForwarded(9)
 Check 'ExpandForwarded: an expand forwarded after a move is verified' ($t.ExpandVerified('9')) ''
 
-Assert-CheckTotal 61
+Assert-CheckTotal 69
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

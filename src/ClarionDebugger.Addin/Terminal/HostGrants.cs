@@ -413,7 +413,7 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>True when this exact (va, ebp) is a frame the current offer holds. The offer is the selected
-        /// thread's: only its replies offer, and the clear in front of every selection change empties it.</summary>
+        /// thread's: only its replies offer, and a selection change retires it at this call's own Sync.</summary>
         public bool IsFrameOffered(string va, string ebp)
         {
             Sync();

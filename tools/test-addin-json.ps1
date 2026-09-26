@@ -1288,6 +1288,8 @@ public sealed class BridgePad {
   $((Get-Method 'private void FrameLocals(string data)' $web) -replace '^private void', 'public void')
   $(Get-Method 'private void RefuseFrameLocals(int reqId, string why)' $web)
   $(Get-Method 'private void PostVarSet(string va, bool ok, string value, string error)' $web)
+  $(Get-Statement 'private static readonly string[] EditTupleMembers' $web)
+  $(Get-Method 'private static string RowsAsGranted(string itemsJson, bool granted)' $web)
   $arrowHandlers
   public void RunPushProcedures(string exe) { PushProcedures(exe); }
 }
@@ -1794,9 +1796,9 @@ Check 'the service passes the stack reply''s reqId on' `
 Check 'a resume clears them, for the epoch it resumed in, read before the marshal' `
   ((Get-CSharpCodeOnly (Get-Method 'private void OnSvcResumed(string mode)' $web)) -match 'int epoch = _svc\.Selection\.Epoch;\s*UI\(\(\) => \{ _editGrants\.Resumed\(epoch\);') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
-Check 'the frame-locals and expand replies grant their rows only for a request the host verified' `
-  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'if \(_editGrants\.FrameLocalsVerified\(reqId, tid\)\) _editGrants\.GrantRows\(itemsJson, tid\)') -and `
-   ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExpanded(')) -match 'if \(_editGrants\.ExpandVerified\(reqId\)\) _editGrants\.GrantRows\(itemsJson, null\)')) ''
+Check 'the frame-locals and expand replies grant their rows only for a request the host verified, and post any other read-only' `
+  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'bool verified = _editGrants\.FrameLocalsVerified\(reqId, tid\);\s*if \(verified\) _editGrants\.GrantRows\(itemsJson, tid\);[\s\S]*RowsAsGranted\(itemsJson, verified\)') -and `
+   ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExpanded(')) -match 'bool verified = _editGrants\.ExpandVerified\(reqId\);\s*if \(verified\) _editGrants\.GrantRows\(itemsJson, null\);[\s\S]*RowsAsGranted\(itemsJson, verified\)')) ''
 
 # ---- one write per address at a time (codex security, pipeline run 2) ---------------------------------
 # The varset reply names only the ADDRESS. With two issued tuples on one va (two type or thread views of it)
@@ -1915,6 +1917,8 @@ $fp.OnSvcFrameLocals('2', (LocalAt '0x4FFFF8'), 4812)
 $fp.EditVar((EditAt '0x4FFFF8'))
 Check 'a reply to a framelocals the host did not forward creates no edit grant' ($fp._svc.Sets.Count -eq 0) ($fp._svc.Sets -join ' ; ')
 Check 'CONTROL: that reply was still posted for display' (($fp.Posts.Count -ge 1) -and ($fp.Posts[0] -cmatch '"type":"framelocals","reqId":"2","items":\[\{"name":"L:N"')) ($fp.Posts -join ' / ')
+# ...READ-ONLY: posted without the edit tuple, so the page offers no pencil the host would refuse (codex run 1).
+Check 'and posted with no edit tuple: exactly the row''s name, type and value' ($fp.Posts[0] -cmatch '"items":\[\{"name":"L:N","type":"LONG","value":"1"\}\]') ($fp.Posts[0])
 # A reqId the host never saw at all grants nothing either.
 $fp._svc.Sets.Clear()
 $fp.OnSvcFrameLocals('77', (LocalAt '0x4FFFE8'), 4812)
@@ -3063,7 +3067,7 @@ Check 'WireRules.TryUInt takes plain decimal digits in the DWORD range and nothi
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 497
+$EXPECTED_CHECKS = 498
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
