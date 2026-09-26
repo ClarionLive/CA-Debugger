@@ -47,7 +47,9 @@ namespace ClarionDbg.Cli
         private sealed class HoldStep
         {
             public byte[] Ev; public uint[] Tf; public string Want;
+            public Action Before;   // runs before the event is delivered, e.g. a command at a stop
             public HoldStep(byte[] ev, uint[] tf, string want) { Ev = ev; Tf = tf; Want = want; }
+            public HoldStep(byte[] ev, uint[] tf, string want, Action before) : this(ev, tf, want) { Before = before; }
         }
 
         /// <summary>
@@ -103,6 +105,7 @@ namespace ClarionDbg.Cli
                         trace = eng.RunRearmHoldScriptForTest(ops, new[] { T1, T2, T3 }, steps.ConvertAll(s => s.Ev),
                             i =>
                             {
+                                if (steps[i].Before != null) steps[i].Before();
                                 ops.Tf.Clear(); foreach (var t in steps[i].Tf) ops.Tf.Add(t);
                                 if (BitConverter.ToUInt32(steps[i].Ev, 0) == Native.EXIT_THREAD_DEBUG_EVENT)
                                     ops.Exited.Add(BitConverter.ToUInt32(steps[i].Ev, 8));
@@ -140,7 +143,7 @@ namespace ClarionDbg.Cli
                 new HoldStep(ss(T1), none, "0,0,1"),
             }, -1, all3);
             if (r.Item2.Count != 1 || r.Item2[0] != Va)
-                failures.Add("rearm hold (single-step): the re-plant wrote [" + Hex(r.Item2) + "], expected [0x" + Va.ToString("X") + "]");
+                failures.Add("rearm hold (single-step): INT3s written [" + Hex(r.Item2) + "], expected [0x" + Va.ToString("X") + "]");
 
             // Its next event passed to the app: the app's handler runs, not one instruction. TF still reads set,
             // so only the continue status can end the hold here.
@@ -157,7 +160,7 @@ namespace ClarionDbg.Cli
                 new HoldStep(bare(Native.EXIT_THREAD_DEBUG_EVENT, T1), new[] { T1 }, "0,0,1"),
             }, -1, new[] { T2, T3 });
             if (r.Item2.Count != 1 || r.Item2[0] != Va)
-                failures.Add("rearm hold (stepper exits): the re-plant wrote [" + Hex(r.Item2) + "], expected [0x" + Va.ToString("X")
+                failures.Add("rearm hold (stepper exits): INT3s written [" + Hex(r.Item2) + "], expected [0x" + Va.ToString("X")
                              + "] - a thread that exits owing a step must not leave the byte restored");
 
             // The process exits: that event is never continued, so nothing reconciles after it.
@@ -194,7 +197,7 @@ namespace ClarionDbg.Cli
                 new HoldStep(ss(T2), none, "0,0,1"),
             }, -1, all3);
             if (r.Item2.Count != 1 || r.Item2[0] != TempVa)
-                failures.Add("rearm hold (temp re-arm): the re-plant wrote [" + Hex(r.Item2) + "], expected [0x" + TempVa.ToString("X") + "]");
+                failures.Add("rearm hold (temp re-arm): INT3s written [" + Hex(r.Item2) + "], expected [0x" + TempVa.ToString("X") + "]");
 
             // A held thread's hit on the SAME breakpoint was queued behind T1's. T1 keeps the hold until its trap;
             // then it passes to T2; the INT3 goes back once, at T2's trap, not under T2 at T1's.
@@ -206,8 +209,22 @@ namespace ClarionDbg.Cli
                 new HoldStep(ss(T2), none, "0,0,1"),
             }, -1, all3);
             if (r.Item2.Count != 1 || r.Item2[0] != Va)
-                failures.Add("rearm hold (queued hit on a held thread): the re-plant wrote [" + Hex(r.Item2) + "], expected [0x"
+                failures.Add("rearm hold (queued hit on a held thread): INT3s written [" + Hex(r.Item2) + "], expected [0x"
                              + Va.ToString("X") + "] once, at the last owed step");
+
+            // setip on a thread whose queued hit on the SAME breakpoint arrived behind the stepper's (wave 7 pipeline
+            // run 1). T2's re-plant is handed over while T1 still owes its step off Va: 0xCC must not go back under
+            // T1 then, or T1 takes the same hit twice. It goes back once, at T1's trap.
+            DebugEngine setIpEng = null;
+            r = run("setip handover while another thread owes the step", e => setIpEng = e, new List<HoldStep>
+            {
+                new HoldStep(bp(T1, Va), new[] { T1 }, "0,1,2"),
+                new HoldStep(bp(T2, Va), new[] { T1 }, "0,1,2"),
+                new HoldStep(ss(T1), none, "0,0,1", () => setIpEng.HandOverRearmForTest(T2, 0x00401500)),
+            }, -1, all3);
+            if (r.Item2.Count != 1 || r.Item2[0] != Va)
+                failures.Add("rearm hold (setip handover while another thread owes the step): INT3s written [" + Hex(r.Item2)
+                             + "], expected [0x" + Va.ToString("X") + "] once, at T1's trap - not also at the handover");
 
             // A HELD thread exits (killed from outside, say): nothing is left to resume, and the release skips it.
             run("held thread exits", null, new List<HoldStep>
@@ -237,7 +254,7 @@ namespace ClarionDbg.Cli
                          + "table: a thread stepping off a restored INT3 runs alone, every other thread suspended exactly "
                          + "once; the hold ends at its single-step, when its event is passed to the app, when it exits (the "
                          + "owed INT3 then paid), at the process's exit and at a detach; it is never taken for a step trap, "
-                         + "a call-skip or a clear TF; a held thread that exits is not resumed; a thread created during it is held; a queued hit on a held thread takes "
+                         + "a call-skip or a clear TF; a held thread that exits is not resumed; setip's re-arm handover does not re-plant under a thread still owing its step; a thread created during it is held; a queued hit on a held thread takes "
                          + "the hold over at the first stepper's trap and the INT3 goes back once, at the last; every count "
                          + "ends where it began, including an app-suspended thread's.");
         }

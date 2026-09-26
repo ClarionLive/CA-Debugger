@@ -49,11 +49,10 @@ namespace ClarionDbg.Cli
         /// and a missing stop is undetectable from inside the debugger while an extra one is explicable
         /// in a second, now that every echo carries its <c>ownerPath</c>.</item>
         /// <item>no image named, several carry it, but the caller asked for ONE target (<c>|one=1</c>) —
-        /// the first, AND SAY SO. That is run-to-cursor, which means "get me to HERE and stop once";
-        /// arming it everywhere would turn it into "stop somewhere on the way", defeating the feature
-        /// rather than widening it. The log line is the point: an arbitrary choice announced beats the
-        /// same choice made silently, and it is the most this can honestly buy until the host can name
-        /// the image for a run-to-cursor from the file the caret is in.</item>
+        /// the first, AND SAY SO. The log line is the point: an arbitrary choice announced beats the same
+        /// choice made silently. Run-to-cursor sent this until wave 7; from 2026-09-25 the host sends its
+        /// transient as a plain unqualified add, armed in every image, so a stop in any image ends it
+        /// (contract C3). Nothing sends |one=1 now; it is still parsed and honoured.</item>
         /// </list></summary>
         private void AddBreakpoint(BpSpec spec)
         {
