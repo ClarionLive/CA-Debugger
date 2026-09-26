@@ -36,10 +36,11 @@ namespace ClarionDbg.Cli
         /// <summary>The caller wants this breakpoint in exactly ONE image, even if several carry the
         /// compiland and it named none (<c>|one=1</c>).
         /// <para>
-        /// This exists for run-to-cursor, which is composed host-side as <c>bp add</c> + <c>continue</c>
-        /// and so is indistinguishable from an ordinary add down here. "Get me to HERE and stop once"
-        /// must not become "stop somewhere on the way", which is what arming it in every image would do.
-        /// A persistent user breakpoint never sets it - see <see cref="DebugEngine.AddBreakpoint"/>.
+        /// It was added for run-to-cursor, which is composed host-side as <c>bp add</c> + <c>continue</c>.
+        /// From wave 7 (2026-09-25) the host sends that transient WITHOUT it, as a plain unqualified add
+        /// armed in every image carrying the compiland, and removes every copy with one <c>bp del</c> at the
+        /// stop (contract C3). Nothing sends it now; it is still parsed and honoured - see
+        /// <see cref="DebugEngine.AddBreakpoint"/>.
         /// </para>
         /// <para>
         /// DEFAULT FALSE IS DELIBERATE. An older host sends neither <c>img=</c> nor <c>one=</c>, and it
@@ -1444,6 +1445,7 @@ namespace ClarionDbg.Cli
             int wrote;
             Native.WriteProcessMemory(_hProcess, Ptr(va), new[] { value }, 1, out wrote);
             Native.FlushInstructionCache(_hProcess, Ptr(va), (IntPtr)1);
+            if (value == 0xCC && _int3Trace != null) _int3Trace.Add(va);   // protocolcheck only (Stepping.cs)
         }
 
         /// <summary>Write a block of bytes to target memory (data writes — edit-variable-value). Returns

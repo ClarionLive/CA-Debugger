@@ -709,8 +709,10 @@ namespace ClarionDbg.Cli
                 foreach (var f in dead) Remove(f);
             }
 
-            /// <summary>A resume. EVERY thread but <paramref name="tid"/> runs freely now (the engine suspends
-            /// none), so their observations go; <paramref name="tid"/>'s go too unless <paramref name="keepTid"/>.</summary>
+            /// <summary>A resume. EVERY thread but <paramref name="tid"/> runs now, so their observations go;
+            /// <paramref name="tid"/>'s go too unless <paramref name="keepTid"/>. (Since 2026-09-25 the re-arm hold
+            /// suspends the others while <paramref name="tid"/> steps off a restored breakpoint byte, but only for
+            /// that one instruction: they run again at its trap, long before any setip can use what they left.)</summary>
             internal void OnResume(uint tid, bool keepTid)
             {
                 var dead = new List<SetIpFrameKey>();
@@ -1113,24 +1115,38 @@ namespace ClarionDbg.Cli
             }
             ctx.Eip = newVa;
 
-            // THE RE-ARM HANDOVER (risk 5). _rearm holds ONE entry per thread. At a breakpoint stop it is the
-            // hit VA, whose byte was restored so the real instruction can run. If we left that entry and the
-            // target is itself armed, RestoreIfArmed would OVERWRITE it, and the origin breakpoint would never
-            // be re-planted: it would silently stop firing. So re-plant the OLD VA first - EIP no longer sits
-            // on it, so 0xCC there is safe - and only then restore the target's byte and record the new one.
-            Rearm pr;
-            if (_rearm.TryGetValue(tid, out pr) && pr.Va != newVa)
-            {
-                bool stillWanted = pr.IsTemp ? _temp.ContainsKey(pr.Va) : _armed.ContainsKey(pr.Va);
-                if (stillWanted) WriteByte(pr.Va, 0xCC);
-                _rearm.Remove(tid);
-            }
-            RestoreIfArmed(tid, newVa);
+            HandOverRearm(tid, newVa);
 
             string canon = m.Dbg.ModuleNameForIdx(targetMi) ?? module;
             if (EmitJson) EmitThreadEvent(tid, SetIpOkJson(canon, line, fromLine, f.TargetRva, newVa, via));
             Console.WriteLine($"  setip: {canon}:{line} (from line {fromLine}, EIP 0x{oldVa:X8} -> 0x{newVa:X8}, via {via})");
             return true;
+        }
+
+        /// <summary>THE RE-ARM HANDOVER (risk 5), for a setip that moved <paramref name="tid"/>'s EIP to
+        /// <paramref name="newVa"/>. _rearm holds ONE entry per thread. At a breakpoint stop it is the hit VA,
+        /// whose byte was restored so the real instruction can run. If we left that entry and the target is
+        /// itself armed, RestoreIfArmed would OVERWRITE it, and the origin breakpoint would never be re-planted:
+        /// it would silently stop firing. So the OLD VA's re-plant is paid first - EIP no longer sits on it - and
+        /// only then is the target's byte restored and the new one recorded.
+        /// <para>
+        /// Through ReplantPending, not an inline write (wave 7 pipeline run 1): another thread can still owe a
+        /// step off the same address - two threads hit it, one is the re-arm hold's stepper and this one's hit
+        /// was queued behind it - and 0xCC written under that thread fires again as a duplicate hit.
+        /// </para></summary>
+        private void HandOverRearm(uint tid, uint newVa)
+        {
+            Rearm pr;
+            if (_rearm.TryGetValue(tid, out pr) && pr.Va != newVa) ReplantPending(tid);
+            RestoreIfArmed(tid, newVa);
+        }
+
+        /// <summary>Test seam: setip's re-arm handover alone, for thread <paramref name="tid"/> moved to
+        /// <paramref name="newVa"/>. Writes bytes through WriteProcessMemory, so it refuses a live target.</summary>
+        internal void HandOverRearmForTest(uint tid, uint newVa)
+        {
+            RefuseSeamIfAttached("HandOverRearmForTest");
+            HandOverRearm(tid, newVa);
         }
 
         /// <summary>Read the stop symbol's span and record in <paramref name="f"/> the two facts setip's proof

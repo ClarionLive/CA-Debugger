@@ -70,15 +70,11 @@ namespace ClarionDbg.Cli
             if (!_rearm.TryGetValue(tid, out pr)) return;
             _rearm.Remove(tid);
             bool stillWanted = pr.IsTemp ? _temp.ContainsKey(pr.Va) : _armed.ContainsKey(pr.Va);
-            if (stillWanted && !RearmOwedAt(pr.Va))
-            {
-                WriteByte(pr.Va, 0xCC);
-                if (_replantTrace != null) _replantTrace.Add(pr.Va);
-            }
+            if (stillWanted && !RearmOwedAt(pr.Va)) WriteByte(pr.Va, 0xCC);
         }
 
-        // protocolcheck's record of the INT3s ReplantPending wrote, in order. Null in a session.
-        private List<uint> _replantTrace;
+        // protocolcheck's record of every INT3 WriteByte wrote, in order, whoever wrote it. Null in a session.
+        private List<uint> _int3Trace;
 
         private bool RearmOwedAt(uint va)
         {
@@ -752,7 +748,7 @@ namespace ClarionDbg.Cli
         /// event i is delivered (to set the fake's TF, as the handlers would have); <paramref name="afterContinue"/>
         /// runs at event i's ContinueDebugEvent, after the reconcile. With <paramref name="detachAt"/> &gt;= 0 a
         /// detach is pending when event detachAt arrives, and the drain behind it finds nothing queued. Returns
-        /// the INT3s the re-plant wrote, in order. The loop ends at EXIT_PROCESS, at a detach, or after the last
+        /// every INT3 written during the run, in order. The loop ends at EXIT_PROCESS, at a detach, or after the last
         /// event.</summary>
         internal List<uint> RunRearmHoldScriptForTest(ThreadOps ops, uint[] threads, List<byte[]> events,
                                                       Action<int> beforeEvent, Action<int> afterContinue, int detachAt)
@@ -762,7 +758,7 @@ namespace ClarionDbg.Cli
             _threadOps = ops;
             foreach (uint t in threads) NoteThreadCreated(t);
             _seenInitialBreak = true;
-            var trace = _replantTrace = new List<uint>();
+            var trace = _int3Trace = new List<uint>();
             _detachTrace = new List<string>();
             int next = 0;
             _loopWait = (buf, ms) =>
@@ -785,7 +781,7 @@ namespace ClarionDbg.Cli
             catch (EventSourceExhausted) { }
             finally
             {
-                _replantTrace = null; _detachTrace = null;
+                _int3Trace = null; _detachTrace = null;
                 RestoreDebugApi();
                 _threadOps = new Win32ThreadOps();
             }
