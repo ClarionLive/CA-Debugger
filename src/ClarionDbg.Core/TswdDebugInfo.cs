@@ -16,8 +16,10 @@ namespace ClarionDbg.Core
     /// <summary>
     /// One record of the TOC +0x1C address table — the CLEAN line table: 8-byte
     /// {u32 codeRVA, u16 line, u16 moduleIdx}, strictly RVA-ascending with NO line resets.
-    /// moduleIdx partitions all code into compilands (one per code .clw), in .text LINK order
-    /// (NOT module-name-array order — bind to a name by content/symbol, never by index rank).
+    /// moduleIdx partitions all code into compilands (one per code .clw) and IS the index into the
+    /// +0x08 module-name array, so <see cref="TswdDebugInfo.FindModuleIdx"/> and
+    /// <see cref="TswdDebugInfo.ModuleNameForIdx"/> name it directly. The RECORDS run in .text link order,
+    /// which need not follow that array's order: walk them by RVA, never infer a module from a record's rank.
     /// This is the primary address-&gt;line path (binary-search by RVA) and the per-proc tag source.
     /// </summary>
     public struct AddrRec

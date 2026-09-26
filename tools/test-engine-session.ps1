@@ -270,7 +270,7 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and $oneShot.Name -notcontains $_.Name -and (Test-NamesEngineBinary $_.FullName) })
     # A number, not "every": if another harness appears this says so instead of quietly covering the old set.
     # 4 since test-setip.ps1 (a77abd94, 2026-09-23).
-    Check 'exactly 5 scripts here launch the engine binary' ($harnesses.Count -eq 5) (($harnesses.Name) -join ', ')
+    Check 'exactly 6 scripts here launch the engine binary' ($harnesses.Count -eq 6) (($harnesses.Name) -join ', ')
 
     foreach ($h in $harnesses) {
         $text = Get-Content -Raw -LiteralPath $h.FullName
@@ -506,7 +506,7 @@ Invoke-CheckSection '8) the pump keeps the engine''s line order, stdout and stde
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 72   # +3 section 8, the pump's line order (wave 5); was 69: 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
+$EXPECTED_CHECKS = 76   # +4 test-engine-samename.ps1's per-harness checks (1be3b82e, wave 7); was 72: +3 section 8, the pump's line order (wave 5); was 69: 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

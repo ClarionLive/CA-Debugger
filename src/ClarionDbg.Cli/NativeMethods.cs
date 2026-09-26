@@ -101,6 +101,16 @@ namespace ClarionDbg.Cli
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT_X86 lpContext);
 
+        // The re-arm hold (DebugEngine.Stepping.cs). Both return the PREVIOUS suspend count, or 0xFFFFFFFF on
+        // failure; the handle needs THREAD_SUSPEND_RESUME.
+        public const uint THREAD_SUSPEND_RESUME = 0x0002;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint SuspendThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint ResumeThread(IntPtr hThread);
+
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 

@@ -409,7 +409,12 @@ namespace ClarionDebugger.Disassembly
                 // flight was asked under a selection that no longer exists: SeatState.Stopped retires it,
                 // records this stop's own request as the seat in flight (not painted until it lands), and
                 // keeps the stop's symbol — the runtime location for non-TSWD stops.
-                _seat.Stopped(SelTid, p.Sym);
+                // UNDER THE STOP'S OWN THREAD (debugger L3, wave 6). The selection held here is this stop's or a
+                // NEWER one: a late open reads the service's selection directly (SeatOnLateOpen), and that read can
+                // be ahead of this queued event - a switch made since. p.Va is the STOPPED thread's address, so it is
+                // seated as that thread's (StopSeatTid), never as the newer selection's.
+                uint seatTid = StopSeatTid(p.Tid, SelTid);
+                _seat.Stopped(seatTid, p.Sym);
                 UpdateThreadBanner();
                 // ASK, like the other two entry points. This was the only path that set the selection from
                 // what it happened to be told and never requested the inventory. If p.Tid is ABSENT while the
@@ -421,7 +426,21 @@ namespace ClarionDebugger.Disassembly
                 // "cannot happen" from a path that now fails closed.
                 _svc?.RequestThreads();
                 _svc?.RequestDisasmAt(p.Va, WindowCount, MakeTag(WinTag), Context);
+                // ...and when the held selection is that newer, OTHER thread, the view shows the selection, not the
+                // stop. The engine stamps a disasm with ITS selected thread whatever address it was asked for, so the
+                // window above would pass the tid gate as the selected thread's and paint the stopped thread's code
+                // under its banner. Seating the selected thread starts a new epoch, which retires that window.
+                if (SeatState.IsOtherThread(SelTid, seatTid)) SeatOnSelectedThread();
             });
+        }
+
+        /// <summary>The thread a stop's seat is recorded under: the stop's own thread when the engine named it,
+        /// else the held selection (an engine that stamps nothing; the view then knows no better). Never the held
+        /// selection when the stop names a thread: that selection may be a newer one (debugger L3).</summary>
+        internal static uint StopSeatTid(uint? stoppedTid, uint selTid)
+        {
+            uint t = TidOf(stoppedTid);
+            return t != 0 ? t : selTid;
         }
 
         /// <summary>The tag sent with a request: its KIND plus the epoch that asked for it. The engine

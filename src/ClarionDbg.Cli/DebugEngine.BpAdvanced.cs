@@ -56,11 +56,13 @@ namespace ClarionDbg.Cli
             // 1) Condition gate — false ⇒ resume silently; indeterminate ⇒ pause and surface why.
             if (!string.IsNullOrEmpty(bp.Condition))
             {
-                bool? cond = TryEvalCondition(bp.Condition, tid, hThread);
+                string why;
+                bool? cond = TryEvalCondition(bp.Condition, tid, hThread, out why);
                 if (cond == false) return false;
                 if (cond == null)
                 {
-                    Console.WriteLine($"  bp {bp.Module}:{bp.Line}: condition '{bp.Condition}' could not be evaluated — pausing");
+                    Console.WriteLine($"  bp {bp.Module}:{bp.Line}: condition '{bp.Condition}' could not be evaluated"
+                                      + (why != null ? " (" + why + ")" : "") + " — pausing");
                     return true;
                 }
             }
@@ -102,9 +104,12 @@ namespace ClarionDbg.Cli
         /// LHS is a data name (global / module-static / record buffer / record field — the same scope the
         /// Watch panel resolves, THREADed names included, read on the hitting thread). RHS is a numeric
         /// literal, a quoted string, or another data name. Returns the boolean result, or null when it
-        /// cannot be evaluated (unparseable, unresolvable, or unreadable).</summary>
-        private bool? TryEvalCondition(string expr, uint tid, IntPtr hThread)
+        /// cannot be evaluated (unparseable, unresolvable, or unreadable). <paramref name="why"/> is the reason
+        /// when there is one to give: a name several FILE records answer to (3517fd15 item 4) says which, since
+        /// "could not be evaluated" alone leaves the user no way to fix the condition.</summary>
+        private bool? TryEvalCondition(string expr, uint tid, IntPtr hThread, out string why)
         {
+            why = null;
             if (string.IsNullOrWhiteSpace(expr)) return true;
 
             string op; int opPos, opLen;
@@ -115,7 +120,7 @@ namespace ClarionDbg.Cli
             if (lhsName.Length == 0 || rhsRaw.Length == 0) return null;
 
             double lnum; string lstr;
-            int lk = ReadVarValue(lhsName, tid, hThread, out lnum, out lstr);
+            int lk = ReadVarValue(lhsName, tid, hThread, out lnum, out lstr, out why);
             if (lk == 0) return null; // unresolvable / unreadable ⇒ indeterminate
 
             // Resolve RHS: quoted string literal, numeric literal, or a second data name.
@@ -130,7 +135,7 @@ namespace ClarionDbg.Cli
             }
             else
             {
-                int rk = ReadVarValue(rhsRaw, tid, hThread, out rnum, out rstr);
+                int rk = ReadVarValue(rhsRaw, tid, hThread, out rnum, out rstr, out why);
                 if (rk == 0) return null;
                 rhsString = rk == 2;
             }
@@ -210,11 +215,14 @@ namespace ClarionDbg.Cli
         /// <summary>Read a data name's CURRENT value synchronously at hit time, on the thread that hit.
         /// Returns 0 = not found / unreadable, 1 = numeric (num set), 2 = string (str set). Reuses the Watch
         /// panel's name resolution AND its THREADed instance resolution; numeric scalars are decoded raw
-        /// (locale/quote-proof), everything else falls back to the shared display formatter.</summary>
-        private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str)
+        /// (locale/quote-proof), everything else falls back to the shared display formatter.
+        /// <para><paramref name="ambiguity"/> is the message when an ambiguous name is why it could not be read
+        /// (null otherwise). This overload comes FIRST: tools/test-threaded-template-rule.ps1 extracts the body by
+        /// its signature's first match.</para></summary>
+        private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str, out string ambiguity)
         {
             num = 0; str = null;
-            TswdDebugInfo.DataLocation loc; LoadedModule owner; string ambiguity;
+            TswdDebugInfo.DataLocation loc; LoadedModule owner;
             // An ambiguous name (two FILE records, 04d7b4c8) is unreadable too: a condition pauses and says so.
             if (ResolveDataAcrossModules(name, out owner, out loc, out ambiguity) != DataResolve.Found) return 0;
 
@@ -274,6 +282,12 @@ namespace ClarionDbg.Cli
                     str = StripQuotes(FormatValueAt(code, 0, loc.Size, 0, va));
                     return 2;
             }
+        }
+
+        private int ReadVarValue(string name, uint tid, IntPtr hThread, out double num, out string str)
+        {
+            string ambiguity;
+            return ReadVarValue(name, tid, hThread, out num, out str, out ambiguity);
         }
 
         /// <summary>Decode a scalar numeric type (LONG/ULONG/SHORT/BYTE/SREAL/REAL) to a double.</summary>

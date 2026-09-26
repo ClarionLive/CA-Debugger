@@ -496,6 +496,7 @@ $selTake = (Get-Method 'internal static SelectionStep TakeSelection(ref ThreadSe
 $selApply = (Get-Method 'private void ApplySelection(ThreadSelection s)' $viewSrc) -replace '^private void', 'public void'
 $selStep = (Get-Method 'internal enum SelectionStep' $viewSrc) -replace '^internal', 'public'
 $selTidOf = Get-Method 'private static uint TidOf(uint? t)' $viewSrc
+$selStopSeat = (Get-Method 'internal static uint StopSeatTid(uint? stoppedTid, uint selTid)' $viewSrc) -replace '^internal static', 'public static'
 $selSrc = @"
 using System;
 using System.Collections.Generic;
@@ -513,6 +514,7 @@ public class ViewSelectionProbe {
   private void SeatOnSelectedThread() { Seats++; }
   $selStep
   $selTidOf
+  $selStopSeat
   $selTake
   $selApply
   public uint SelTid { get { return TidOf(_selection.Tid); } }
@@ -592,8 +594,41 @@ $tidFieldRx = '(?m)^\s*private\s+uint\??\s+_\w*[Tt]id\s*[;=]'
 Check 'the view declares no thread-id field of its own' ([regex]::Matches($viewCode, $tidFieldRx).Count -eq 0) (([regex]::Matches($viewCode, $tidFieldRx) | ForEach-Object { $_.Value.Trim() }) -join ', ')
 Check 'CONTROL: that scan finds the field this ticket removed' ([regex]::Matches((Get-CSharpCodeOnly "        private uint _selTid;        // x`n"), $tidFieldRx).Count -eq 1) ''
 
+# ------------------------------------------------------------------------------------------------------------
+Write-Host ''
+Write-Host '7. a stop is seated under ITS OWN thread, never under a newer selection (debugger L3, wave 6)'
+# A late open reads the service's selection directly, and that read can be AHEAD of a stop still queued for the
+# UI thread: a switch made since. OnPaused used to record the stop's seat under the held (newer) selection, with
+# the STOPPED thread's address. RUN: the real StopSeatTid over the real SeatState; OnPaused's use of it is pinned
+# by position below, since the view is a WinForms control.
+Check 'a stop that names its thread is seated under it, whatever selection is held' `
+  (([SelProbe.ViewSelectionProbe]::StopSeatTid([Nullable[uint32]]$A, $B) -eq $A) -and ([SelProbe.ViewSelectionProbe]::StopSeatTid([Nullable[uint32]]$A, $A) -eq $A)) ''
+Check 'a stop that names none (an unstamped engine) is seated under the held selection, as before' `
+  (([SelProbe.ViewSelectionProbe]::StopSeatTid($null, $B) -eq $B) -and ([SelProbe.ViewSelectionProbe]::StopSeatTid([Nullable[uint32]]0, $B) -eq $B)) ''
+# The whole sequence OnPaused runs when the held selection (B) is newer than the stop (A): the stop's seat is A's,
+# and because B is another thread the view reseats on B - a new epoch, which retires the window asked at A's VA.
+$l3 = New-Object SelProbe.ViewSelectionProbe
+$l3.ApplySelection((Snap $A $A 1 'Stop')); $l3.ApplySelection((Snap $B $A 2 'Switch'))   # the late read, ahead of the stop
+$seatTid = [SelProbe.ViewSelectionProbe]::StopSeatTid([Nullable[uint32]]$A, $l3.SelTid)
+$l3._seat.Stopped($seatTid, 'MAIN')
+$stopEpoch = $l3._seat.Epoch
+Check 'the stop''s window is in flight for the STOPPED thread, not the held one' ($l3._seat.SeatingTid -eq $A) "seating=$($l3._seat.SeatingTid)"
+$other = [ClarionDebugger.Disassembly.SeatState]::IsOtherThread($l3.SelTid, $seatTid)
+$began = $l3._seat.TryBeginSeat($l3.SelTid)
+Check '...and the held selection being another thread starts a seat on it, retiring the stop''s window' `
+  ($other -and $began -and ($l3._seat.SeatingTid -eq $B) -and (-not $l3._seat.IsCurrent($stopEpoch))) "other=$other began=$began seating=$($l3._seat.SeatingTid)"
+$paused = Get-CSharpCodeOnly (Get-Method 'private void OnPaused(DebugPause p)' $viewSrc)
+$iSeatTid = $paused.IndexOf('uint seatTid = StopSeatTid(p.Tid, SelTid);')
+$iStopped = $paused.IndexOf('_seat.Stopped(seatTid, p.Sym);')
+$iWindow = $paused.IndexOf('_svc?.RequestDisasmAt(p.Va, WindowCount, MakeTag(WinTag), Context);')
+$iReseat = $paused.IndexOf('if (SeatState.IsOtherThread(SelTid, seatTid)) SeatOnSelectedThread();')
+Check 'OnPaused seats the stop under StopSeatTid, asks for its window, THEN reseats on another held thread' `
+  (($iSeatTid -ge 0) -and ($iStopped -gt $iSeatTid) -and ($iWindow -gt $iStopped) -and ($iReseat -gt $iWindow)) `
+  "seatTid=$iSeatTid stopped=$iStopped window=$iWindow reseat=$iReseat"
+Check 'and nothing else in OnPaused records a seat under SelTid' ($paused -notmatch '_seat\.Stopped\(SelTid') ''
+
 # The count, asserted: "ALL CHECKS PASSED" is equally true of a run that silently skipped a section.
-$EXPECTED_CHECKS = 150
+$EXPECTED_CHECKS = 156
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

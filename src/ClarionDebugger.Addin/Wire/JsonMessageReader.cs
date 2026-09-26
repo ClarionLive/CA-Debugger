@@ -136,8 +136,91 @@ namespace ClarionDebugger.Wire
             return true;
         }
 
+        /// <summary><paramref name="json"/> re-written without every member named in <paramref name="names"/>, in
+        /// objects at ANY depth (a group's <c>children</c> included); everything else is kept, value for value, with
+        /// the insignificant whitespace dropped. Null when the text is not well-formed - there is then no telling
+        /// what a member removal would have removed.
+        /// <para>
+        /// For rows the host forwards but may not let the page edit (3517fd15): an engine row carries its edit
+        /// tuple (<c>va</c>, <c>typeCode</c>, <c>size</c>, <c>places</c>), and a row shown with it gets an edit
+        /// pencil the host would then refuse. Walked like <see cref="ForEachObject"/>, so a key-like run inside a
+        /// string value is never mistaken for a member.
+        /// </para></summary>
+        public static string WithoutMembers(string json, System.Collections.Generic.ICollection<string> names)
+        {
+            if (json == null) return null;
+            var sb = new StringBuilder(json.Length);
+            int i = 0;
+            SkipWhitespace(json, ref i);
+            if (!CopyValue(json, ref i, sb, names)) return null;
+            SkipWhitespace(json, ref i);
+            return i == json.Length ? sb.ToString() : null;
+        }
+
+        /// <summary>Copy one value at <paramref name="i"/> into <paramref name="sb"/>, leaving out the named members
+        /// of every object in it. False on malformed input.
+        /// <para>ONE GRAMMAR WITH <see cref="WalkValue"/>: the same strings (ReadString), the same containers and the
+        /// same primitives (<see cref="ScanPrimitive"/>). Keep the two in step - a text one accepts and the other
+        /// refuses would be granted by one path and posted by the other.</para></summary>
+        private static bool CopyValue(string json, ref int i, StringBuilder sb, System.Collections.Generic.ICollection<string> names)
+        {
+            if (i >= json.Length) return false;
+            char c = json[i];
+            if (c == '"')
+            {
+                int s = i;
+                if (ReadString(json, ref i) == null) return false;
+                sb.Append(json, s, i - s);
+                return true;
+            }
+            if (c == '{' || c == '[')
+            {
+                bool obj = c == '{';
+                char close = obj ? '}' : ']';
+                sb.Append(c);
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == close) { i++; sb.Append(close); return true; }
+                bool wrote = false;
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    var item = new StringBuilder();
+                    bool keep = true;
+                    if (obj)
+                    {
+                        int ks = i;
+                        if (i >= json.Length || json[i] != '"') return false;
+                        string key = ReadString(json, ref i);
+                        if (key == null) return false;
+                        keep = !names.Contains(key);
+                        item.Append(json, ks, i - ks);
+                        SkipWhitespace(json, ref i);
+                        if (i >= json.Length || json[i] != ':') return false;
+                        i++;
+                        item.Append(':');
+                        SkipWhitespace(json, ref i);
+                    }
+                    if (!CopyValue(json, ref i, item, names)) return false;
+                    if (keep) { if (wrote) sb.Append(','); sb.Append(item); wrote = true; }
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != close) return false;
+                    i++;
+                    sb.Append(close);
+                    return true;
+                }
+            }
+            int st = i;
+            if (!ScanPrimitive(json, ref i)) return false;
+            sb.Append(json, st, i - st);
+            return true;
+        }
+
         /// <summary>Walk one value at <paramref name="i"/>, collecting every object's text into
-        /// <paramref name="found"/>. False on malformed input.</summary>
+        /// <paramref name="found"/>. False on malformed input. ONE GRAMMAR WITH <see cref="CopyValue"/>: keep them in
+        /// step.</summary>
         private static bool WalkValue(string json, ref int i, System.Collections.Generic.List<string> found)
         {
             if (i >= json.Length) return false;
@@ -184,12 +267,25 @@ namespace ClarionDebugger.Wire
                     return true;
                 }
             }
-            // number, true, false, null: at least one character, up to the next structural one.
+            return ScanPrimitive(json, ref i);
+        }
+
+        /// <summary>Step over one primitive - <c>true</c>, <c>false</c>, <c>null</c> or a JSON number - up to the next
+        /// structural character or whitespace. False for anything else: an unquoted word, <c>01</c>, <c>1.</c>,
+        /// <c>.5</c>, <c>+1</c>, <c>0x10</c> (3517fd15, codex security run 2). It used to take any run of
+        /// characters, so a stripped row with a bad token came out as broken JSON instead of as no rows.</summary>
+        private static bool ScanPrimitive(string json, ref int i)
+        {
             int s = i;
             while (i < json.Length && json[i] != ',' && json[i] != '}' && json[i] != ']'
                    && json[i] != ' ' && json[i] != '\t' && json[i] != '\r' && json[i] != '\n') i++;
-            return i > s;
+            if (i == s) return false;
+            string tok = json.Substring(s, i - s);
+            return tok == "true" || tok == "false" || tok == "null" || s_jsonNumber.IsMatch(tok);
         }
+
+        private static readonly System.Text.RegularExpressions.Regex s_jsonNumber =
+            new System.Text.RegularExpressions.Regex(@"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?\z");
 
         /// <summary>Consume one value. Returns its text only when <paramref name="capture"/>, so skipping a
         /// member costs no allocation. Sets <paramref name="i"/> to -1 on malformed input.</summary>

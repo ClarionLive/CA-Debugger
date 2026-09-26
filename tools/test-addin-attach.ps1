@@ -280,6 +280,7 @@ namespace ClarionDebugger.Terminal
     private readonly EditGrants _editGrants = new EditGrants(() => ThreadSelection.None);
     public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     public string _pendingRtcKey;
+    public string _rtcCleanupKey;   // a refused run-to-cursor's cleanup in flight (1be3b82e run 1): a session end clears it too
     // Posts and console lines in ONE ordered list, because the order is the point: `clear` empties the
     // page's console, so a line posted before it is gone.
     public List<string> Posts = new List<string>();

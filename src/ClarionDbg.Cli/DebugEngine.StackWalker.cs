@@ -40,37 +40,55 @@ namespace ClarionDbg.Cli
             }
         }
 
-        private const string STACK_REQID = "reqid=";   // a token no frame count can be
-        private const int STACK_REQID_MAX_DIGITS = 10;
+        private const string REQID_TOKEN = "reqid=";   // a token no frame count, watch name or other argument can be
+        private const int REQID_MAX_DIGITS = 10;
+
+        /// <summary>
+        /// Take the optional trailing <c>reqid=N</c> off a command's tokens (C1, wave 7): the ONE parser for it, used
+        /// by `stack`, `watch` and `moduledata`. It is always the LAST token, N is 1 to 10 digits, and
+        /// <paramref name="reqId"/> is null when there is none. A malformed id, or a <c>reqid=</c> token anywhere
+        /// but last, is refused with <paramref name="error"/> naming <paramref name="grammar"/> (the command's
+        /// "verb: expected ..."), never skipped: a request whose id was silently dropped would be answered with
+        /// no id, and the host cannot tell that reply from an older engine's.
+        /// <paramref name="rest"/> is <paramref name="parts"/> without the id.
+        /// </summary>
+        internal static bool TryTakeReqId(string[] parts, string grammar, out string[] rest, out string reqId, out string error)
+        {
+            rest = parts; reqId = null; error = null;
+            int last = parts.Length - 1;
+            for (int i = 1; i < last; i++)
+                if (parts[i].StartsWith(REQID_TOKEN, StringComparison.Ordinal))
+                {
+                    error = grammar + ", reqid=N last";
+                    return false;
+                }
+            if (last < 1 || !parts[last].StartsWith(REQID_TOKEN, StringComparison.Ordinal)) return true;
+            string id = parts[last].Substring(REQID_TOKEN.Length);
+            if (id.Length == 0 || id.Length > REQID_MAX_DIGITS || !IsAllDigits(id))
+            {
+                error = grammar + ", N 1.." + REQID_MAX_DIGITS + " digits";
+                return false;
+            }
+            reqId = id;
+            rest = new string[last];
+            Array.Copy(parts, rest, last);
+            return true;
+        }
 
         /// <summary>The arguments of `stack` (and `bt`/`where`): an optional frame count, then an optional
-        /// <c>reqid=N</c> (1 to 10 digits), in that order. Anything else is refused with the reason in
+        /// <c>reqid=N</c> (<see cref="TryTakeReqId"/>), in that order. Anything else is refused with the reason in
         /// <paramref name="error"/>. <paramref name="reqId"/> is null when none was given.</summary>
         internal static bool TryParseStackArgs(string[] parts, out int max, out string reqId, out string error)
         {
-            max = STACK_FRAMES_DEFAULT; reqId = null; error = null;
-            int i = 1;
-            if (parts.Length > i && !parts[i].StartsWith(STACK_REQID, StringComparison.Ordinal))
+            max = STACK_FRAMES_DEFAULT;
+            if (!TryTakeReqId(parts, "stack: expected [maxFrames] [reqid=N]", out parts, out reqId, out error)) return false;
+            if (parts.Length > 1 && (!int.TryParse(parts[1], out max) || max < 1 || max > STACK_FRAMES_MAX))
             {
-                if (!int.TryParse(parts[i], out max) || max < 1 || max > STACK_FRAMES_MAX)
-                {
-                    error = $"stack: max frames must be 1..{STACK_FRAMES_MAX}";
-                    return false;
-                }
-                i++;
+                max = 0; reqId = null;
+                error = $"stack: max frames must be 1..{STACK_FRAMES_MAX}";
+                return false;
             }
-            if (parts.Length > i)
-            {
-                string id = parts[i].StartsWith(STACK_REQID, StringComparison.Ordinal) ? parts[i].Substring(STACK_REQID.Length) : null;
-                if (id == null || id.Length == 0 || id.Length > STACK_REQID_MAX_DIGITS || !IsAllDigits(id))
-                {
-                    error = "stack: expected [maxFrames] [reqid=N], N 1.." + STACK_REQID_MAX_DIGITS + " digits";
-                    return false;
-                }
-                reqId = id;
-                i++;
-            }
-            if (parts.Length > i) { error = "stack: expected [maxFrames] [reqid=N]"; return false; }
+            if (parts.Length > 2) { reqId = null; error = "stack: expected [maxFrames] [reqid=N]"; return false; }
             return true;
         }
 

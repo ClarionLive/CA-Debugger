@@ -301,15 +301,42 @@ namespace ClarionDbg.Cli
             _modules.Insert(0, _exe);
         }
 
+        /// <summary>Test seam (1be3b82e): add a preloaded image that has NOT mapped (LoadBase 0), as a solution DLL
+        /// that has not loaded yet is.</summary>
+        internal void AddUnmappedImageForTest(TswdDebugInfo dbg, string imageName)
+        {
+            _modules.Add(new LoadedModule { Name = imageName, Dbg = dbg, Preloaded = true, Size = 0x100000 });
+        }
+
+        /// <summary>Test seam (1be3b82e): map every unmapped image at <paramref name="baseVa"/>, 16 MB apart.</summary>
+        internal void MapImagesForTest(uint baseVa)
+        {
+            foreach (var m in _modules) if (m.LoadBase == 0) { m.LoadBase = baseVa; baseVa += 0x1000000; }
+        }
+
         /// <summary>Test seam (04d7b4c8): make <paramref name="dbg"/> the EXE's debug info and run the REAL watch handler
         /// for <paramref name="name"/> with no thread context, so no local can answer. For names that never read
-        /// target memory (an ambiguous one); there is no process behind it.</summary>
+        /// target memory (an ambiguous one); there is no process behind it. <paramref name="name"/> is the rest of
+        /// the command line, so it may end in " reqid=N".</summary>
         internal void WatchWithImageForTest(TswdDebugInfo dbg, string imageName, string name)
         {
             UseImageForTest(dbg, imageName);
             var ctx = default(Native.CONTEXT_X86);
-            HandleWatchCommand(new[] { "watch", name }, 1, IntPtr.Zero, ref ctx, false);
+            HandleWatchCommand(("watch " + name).Split(' '), 1, IntPtr.Zero, ref ctx, false);
         }
+
+        /// <summary>Test seam (3517fd15 item 4): the REAL condition gate for a breakpoint whose condition is
+        /// <paramref name="condition"/>, on the same kind of image as <see cref="WatchWithImageForTest"/>. Prints
+        /// "pause: &lt;its answer&gt;" after whatever the gate printed.</summary>
+        internal void ConditionWithImageForTest(TswdDebugInfo dbg, string imageName, string condition)
+        {
+            UseImageForTest(dbg, imageName);
+            var bp = new UserBreakpoint { Module = "a.clw", Line = 1, Condition = condition };
+            Console.WriteLine("pause: " + ShouldPauseAtBp(bp, 1, IntPtr.Zero));
+        }
+
+        /// <summary>Test seam (3517fd15 item 7): how many times a watch asked the stack for a local.</summary>
+        internal int LocalLookupsForTest { get { return _localLookups; } }
 
         /// <summary>Test seam (04d7b4c8): the other three callers of the data lookup, on the same kind of image as
         /// <see cref="WatchWithImageForTest"/>. Prints `sym`'s own lines, then "condition: &lt;ReadVarValue's
@@ -327,15 +354,23 @@ namespace ClarionDbg.Cli
 
         // ------------------------------------------------------------------ watch (by name)
 
+        /// <summary>The id of the watch request being answered, or null: every watch event it emits carries it
+        /// (<see cref="EmitWatchEvent"/>). Set by every <see cref="HandleWatchCommand"/>, the only caller of that emitter.</summary>
+        private string _watchReqId;
+
         /// <summary>
-        /// watch NAME — resolve a data name and read its CURRENT value on the paused thread. Every outcome
+        /// watch NAME [reqid=N] — resolve a data name and read its CURRENT value on the paused thread. Every outcome
         /// emits a watch event keyed by the name (value, miss, or error), so a row the host is showing as
         /// pending always resolves to something instead of waiting forever. Answers inline: nothing here
-        /// runs target code, so the caller always stays in the pause loop.
+        /// runs target code, so the caller always stays in the pause loop. With a reqid, every one of those
+        /// events names it (C1, wave 7): the host grants an edit only on a reply to a request it still holds.
         /// </summary>
         private void HandleWatchCommand(string[] parts, uint tid, IntPtr hThread, ref Native.CONTEXT_X86 ctx, bool haveCtx)
         {
-            if (parts.Length < 2) { EmitError("watch expects: watch NAME"); return; }
+            string reqId, error;
+            if (!TryTakeReqId(parts, "watch: expected watch NAME [reqid=N]", out parts, out reqId, out error)) { EmitError(error); return; }
+            if (parts.Length < 2) { EmitError("watch expects: watch NAME [reqid=N]"); return; }
+            _watchReqId = reqId;   // null too: every watch sets it, so an id never outlives its own request
             string name = parts[1];
 
             // What the rest reads: a global's template address and type, or a global-headed watch PATH's
@@ -352,9 +387,13 @@ namespace ClarionDbg.Cli
             // frame's local. Locals live on the stack (never .cwtls), so this is a direct read. A local found in
             // a caller's frame says which one (bae5f46d). An AMBIGUOUS global still sits in that order: the
             // stopped frame's local wins over it, and a caller's local does not.
+            // A qualifier (image!, module!) names where DATA lives, and no local holds one, so a qualified name
+            // skips the local lookup outright (3517fd15 item 7), as the path form already did (q1 == null).
             uint slotVa; LocalSym lsym; LoadedModule lowner; int fIdx; string fProc;
-            if (TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, global != DataResolve.NotFound,
-                                       out slotVa, out lsym, out lowner, out fIdx, out fProc))
+            string q1, q2, bare;
+            bool qualified = ParseQualified(name, out q1, out q2, out bare) && q1 != null;
+            if (!qualified && TryResolveLocalOnStack(ref ctx, haveCtx, hThread, name, global != DataResolve.NotFound,
+                                                     out slotVa, out lsym, out lowner, out fIdx, out fProc))
             {
                 EmitWatchValue(tid, name, slotVa, slotVa, false, lsym.TypeCode, lsym.Size, lsym.Target, lsym.Places,
                                frameIdx: fIdx, frameProc: fProc);
@@ -386,7 +425,7 @@ namespace ClarionDbg.Cli
                     // is merely out of scope right now (that procedure is not on the stack) — flag that so the Watch row reads
                     // "(out of scope)" rather than the misleading "(not found)" used for genuinely unknown names.
                     bool outOfScope = haveCtx && IsKnownLocalName(name);
-                    EmitThreadEvent(tid, Json.WatchMiss(name, outOfScope));
+                    EmitWatchEvent(tid, Json.WatchMiss(name, outOfScope));
                     Console.WriteLine($"  watch {name}: {(outOfScope ? "out of scope" : "not found")}");
                     return;
                 }
@@ -630,17 +669,23 @@ namespace ClarionDbg.Cli
         {
             if (outcome == WatchPathOutcome.Miss)
             {
-                EmitThreadEvent(tid, Json.WatchMiss(name, false));
+                EmitWatchEvent(tid, Json.WatchMiss(name, false));
                 Console.WriteLine($"  watch {name}: not found");
             }
             else EmitWatchError(tid, name, error);
+        }
+
+        /// <summary>Emit a watch event, naming the request it answers when that carried an id.</summary>
+        private void EmitWatchEvent(uint tid, string json)
+        {
+            EmitThreadEvent(tid, Json.WithReqId(json, _watchReqId));
         }
 
         /// <summary>A watch that could not be read. Emitted against the NAME so the host can resolve that row
         /// instead of leaving it pending — the failure the old EmitError path never delivered.</summary>
         private void EmitWatchError(uint tid, string name, string reason)
         {
-            EmitThreadEvent(tid, Json.WatchError(name, reason));
+            EmitWatchEvent(tid, Json.WatchError(name, reason));
             Console.WriteLine($"  watch {name}: {reason}");
         }
 
@@ -676,7 +721,7 @@ namespace ClarionDbg.Cli
             string value = FormatValueAt(typeCode, target, size, places, instanceVa);
             bool isNullRef = typeCode == 0x16 && value == "(null)";
             string tn = ClarionTypeLabel(typeCode, target, size, places, isNullRef);
-            EmitThreadEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note,
+            EmitWatchEvent(tid, Json.Watch(name, true, templateVa, instanceVa, threaded, typeCode, tn, size, places, value, buf, read, editable && IsEditableCode(typeCode), note,
                                             addr: OwnStorageAddr(threaded, templateVa, instanceVa),
                                             frameIdx: frameIdx, frameProc: frameProc));
             Console.WriteLine($"  watch {name}: {(tn ?? $"type 0x{typeCode:X2}")} size {size} at 0x{instanceVa:X}{(threaded ? $" (threaded; template 0x{templateVa:X})" : "")}{(note != null ? " — " + note : "")}");

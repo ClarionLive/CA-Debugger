@@ -345,11 +345,143 @@ Invoke-CheckSection 'ownerPath is LEARNED on the bp-set merge, so a pending row 
     ($learn -match 'known\.OwnerPath == null && echo\.OwnerPath != null') ''
 }
 
+Write-Host ''
+Invoke-CheckSection 'image: every bplist row names the image it is armed in, LAST (1be3b82e, contract C2)' {
+  # With arm-all an unqualified breakpoint is one engine row per image, so two rows can share module+line. The
+  # page labels those by "image": the engine's ownerPath for the row, or null while pending / pre-launch. RUN: the
+  # real SendBps (and every helper it calls) over stub collaborators, checked against the contract's literal row.
+  $bpl = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+namespace BpList {
+$(Get-Method 'public sealed class DebugBreakpoint' $svc)
+public sealed class FakeSvc { public bool IsRunning; public DebugBreakpoint[] Breakpoints = new DebugBreakpoint[0]; }
+public sealed class FakeGutter { public List<DebugBreakpoint> Marks = new List<DebugBreakpoint>(); public List<DebugBreakpoint> Snapshot() { return Marks; } }
+public sealed class Pad {
+  public FakeSvc _svc = new FakeSvc();
+  public FakeGutter _gutter = new FakeGutter();
+  public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+  public List<string> Posts = new List<string>();
+  private void Post(string s) { Posts.Add(s); }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $(Get-Method 'private static string TransientKey(string module, int line)' $web)
+  $pathStateEnum
+  $mapMethods
+  $(Get-Method 'private Dictionary<string, string> GutterPathsByModuleLine()' $web)
+  $((Get-Method 'private void SendBps()' $web) -replace '^private void', 'public void')
+}
+}
+"@
+  Add-Type -TypeDefinition $bpl -Language CSharp | Out-Null
+  function Row { param($owner, [int] $ln = 50)
+    $b = New-Object BpList.DebugBreakpoint; $b.Module = 'clbrws011.clw'; $b.RequestedLineOrNull = $ln; $b.Line = $ln
+    # Only when there is one: PowerShell's $null assigned to a C# string field arrives as "", not null.
+    if ($null -ne $owner) { $b.OwnerPath = $owner }
+    $b
+  }
+  $p = New-Object BpList.Pad
+  $p._svc.IsRunning = $true
+  $p._svc.Breakpoints = @((Row 'C:\App\a.dll'), (Row 'C:\App\b.dll'), (Row $null 60))
+  $p.SendBps()
+  $msg = $p.Posts[$p.Posts.Count - 1]
+  $expect = '{"type":"bplist","bps":[' +
+    '{"module":"clbrws011.clw","line":50,"requested":50,"path":null,"pathState":"unknown","condition":null,"hitMode":null,"hitValue":0,"trace":null,"hitCount":0,"image":"C:\\App\\a.dll"},' +
+    '{"module":"clbrws011.clw","line":50,"requested":50,"path":null,"pathState":"unknown","condition":null,"hitMode":null,"hitValue":0,"trace":null,"hitCount":0,"image":"C:\\App\\b.dll"},' +
+    '{"module":"clbrws011.clw","line":60,"requested":60,"path":null,"pathState":"unknown","condition":null,"hitMode":null,"hitValue":0,"trace":null,"hitCount":0,"image":null}]}'
+  Check 'a live bplist is exactly the contract''s rows: each image by its full path, a pending row null, "image" last' ($msg -ceq $expect) $msg
+  $q = New-Object BpList.Pad
+  $q._pending.Add((Row $null 70))
+  $q.SendBps()
+  Check 'a pre-launch (staged) row carries "image":null, last' ($q.Posts[0] -cmatch '"hitCount":0,"image":null\}\]\}$') $q.Posts[0]
+  # The transient filter is unchanged: a run-to-cursor row, in any image, is never in the pane.
+  $t = New-Object BpList.Pad
+  $t._svc.IsRunning = $true
+  $t._svc.Breakpoints = @((Row 'C:\App\a.dll' 80), (Row 'C:\App\b.dll' 80), (Row 'C:\App\a.dll'))
+  [void]$t._transientBps.Add('clbrws011.clw:80')
+  $t.SendBps()
+  Check 'a run-to-cursor transient armed in two images shows in neither row' `
+    (($t.Posts[0] -notmatch '"line":80') -and ($t.Posts[0] -cmatch '"line":50')) $t.Posts[0]
+}
+
+Write-Host ''
+Invoke-CheckSection 'run to cursor refused by one image: every copy is removed, and tracked until that is settled (1be3b82e run 1)' {
+  # With arm-all (contract C3) one `bp add` is answered per image, so image A's refusal can arrive before image B's
+  # confirmation. The pad used to drop the transient on the refusal, and B's copy then lived on as an untracked
+  # breakpoint. RUN: the real handlers over a recording service, fed the echoes in that order.
+  # Hoisted: the ');' each arrow handler needs back would unbalance a $() inside the here-string.
+  $rtcHandlers = @('private void OnSvcBreakpointSet(DebugBreakpoint bp)', 'private void OnSvcBreakpointError(string m, int l, string err)',
+    'private void OnSvcBreakpointList(List<DebugBreakpoint> list)') |
+    ForEach-Object { ((Get-Method $_ $web) + ');') -replace '^private void', 'public void' }
+  $rtcHandlers = $rtcHandlers -join "`n"
+  $rtc = @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Text;
+namespace Rtc {
+$(Get-Method 'public sealed class DebugBreakpoint' $svc)
+$(Get-Method 'public enum DebugSessionState' $svc)
+public sealed class FakeSvc {
+  public bool IsRunning = true; public DebugBreakpoint[] Breakpoints = new DebugBreakpoint[0];
+  public List<string> Sent = new List<string>();
+  public bool RemoveBreakpoint(string m, int l) { Sent.Add("bp del " + m + ":" + l); return true; }
+  public bool RequestBreakpointList() { Sent.Add("bp list"); return true; }
+  public void Continue() { Sent.Add("continue"); }
+}
+public sealed class FakeGutter { public List<DebugBreakpoint> Marks = new List<DebugBreakpoint>(); public List<DebugBreakpoint> Snapshot() { return Marks; } }
+public sealed class Pad {
+  public FakeSvc _svc = new FakeSvc();
+  public FakeGutter _gutter = new FakeGutter();
+  public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public HashSet<string> _transientBps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+  public string _pendingRtcKey; public int _pendingRtcLine;
+  $(Get-Statement 'private string _rtcCleanupKey' $web)
+  public string CleanupKey { get { return _rtcCleanupKey; } }
+  public DebugSessionState CurrentState = DebugSessionState.Paused;
+  public List<string> Posts = new List<string>(), Lines = new List<string>();
+  private void Post(string s) { Posts.Add(s); }
+  private void Console(string level, string text) { Lines.Add(level + "|" + text); }
+  private void UI(Action a) { a(); }
+  $(Get-Method 'private static string Str(string s)' $web)
+  $(Get-Method 'private static string TransientKey(string module, int line)' $web)
+  $pathStateEnum
+  $mapMethods
+  $(Get-Method 'private Dictionary<string, string> GutterPathsByModuleLine()' $web)
+  $(Get-Method 'private void SendBps()' $web)
+  $rtcHandlers
+}
+}
+"@
+  Add-Type -TypeDefinition $rtc -Language CSharp | Out-Null
+  function RtcRow { param([string] $owner) $b = New-Object Rtc.DebugBreakpoint; $b.Module = 'clbrws011.clw'; $b.RequestedLineOrNull = 80; $b.Line = 80; $b.OwnerPath = $owner; $b }
+  $p = New-Object Rtc.Pad
+  [void]$p._transientBps.Add('clbrws011.clw:80'); $p._pendingRtcKey = 'clbrws011.clw:80'; $p._pendingRtcLine = 80
+  $p.OnSvcBreakpointError('clbrws011.clw', 80, 'no code records in module')     # image A refuses...
+  Check 'a refused run-to-cursor sends `bp del` for every copy, then a `bp list` to learn when that is settled' `
+    (($p._svc.Sent -join ' / ') -ceq 'bp del clbrws011.clw:80 / bp list') ($p._svc.Sent -join ' / ')
+  Check '...stays paused, and keeps the key tracked' ((-not ($p._svc.Sent -contains 'continue')) -and $p._transientBps.Contains('clbrws011.clw:80')) ''
+  $p._svc.Breakpoints = @((RtcRow 'C:\App\b.dll'))
+  $p.OnSvcBreakpointSet((RtcRow 'C:\App\b.dll'))                                 # ...then image B arms it
+  Check 'image B''s copy, confirmed after A''s refusal, neither resumes nor shows in the pane' `
+    ((-not ($p._svc.Sent -contains 'continue')) -and ($p.Posts[$p.Posts.Count - 1] -notmatch '"line":80')) $p.Posts[$p.Posts.Count - 1]
+  $n = $p.Lines.Count
+  $p.OnSvcBreakpointError('clbrws011.clw', 80, 'no such breakpoint')
+  Check 'another refusal of it (image C, or the del finding nothing) is not reported as a breakpoint error' ($p.Lines.Count -eq $n) ($p.Lines -join ' / ')
+  $p._svc.Breakpoints = @()
+  $p.OnSvcBreakpointList([System.Collections.Generic.List[Rtc.DebugBreakpoint]]::new())
+  Check 'the list reply settles it: the key is no longer tracked' ((-not $p._transientBps.Contains('clbrws011.clw:80')) -and ($null -eq $p.CleanupKey)) ''
+  $p.OnSvcBreakpointError('clbrws011.clw', 90, 'no code records in module')
+  Check 'CONTROL: an unrelated breakpoint error is still reported' ($p.Lines[$p.Lines.Count - 1] -cmatch '^err\|breakpoint clbrws011.clw:90') ($p.Lines -join ' / ')
+}
+
 # THE COUNT, ASSERTED AND PRINTED (60344b78). Invoke-CheckSection above closes a section that throws or
 # breaks out of the script; this closes one that returns early or is skipped. COUNTING RULE: the RUNTIME
 # count of Check calls ($script:checks before this line) on a clean run, measured 2026-09-22 - not a count
 # of `Check` lines, which differs wherever a Check sits in a loop. Update it deliberately with the checks.
-$EXPECTED_CHECKS = 37
+$EXPECTED_CHECKS = 46
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

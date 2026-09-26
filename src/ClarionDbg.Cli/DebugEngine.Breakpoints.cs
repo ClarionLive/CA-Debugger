@@ -49,11 +49,10 @@ namespace ClarionDbg.Cli
         /// and a missing stop is undetectable from inside the debugger while an extra one is explicable
         /// in a second, now that every echo carries its <c>ownerPath</c>.</item>
         /// <item>no image named, several carry it, but the caller asked for ONE target (<c>|one=1</c>) —
-        /// the first, AND SAY SO. That is run-to-cursor, which means "get me to HERE and stop once";
-        /// arming it everywhere would turn it into "stop somewhere on the way", defeating the feature
-        /// rather than widening it. The log line is the point: an arbitrary choice announced beats the
-        /// same choice made silently, and it is the most this can honestly buy until the host can name
-        /// the image for a run-to-cursor from the file the caret is in.</item>
+        /// the first, AND SAY SO. The log line is the point: an arbitrary choice announced beats the same
+        /// choice made silently. Run-to-cursor sent this until wave 7; from 2026-09-25 the host sends its
+        /// transient as a plain unqualified add, armed in every image, so a stop in any image ends it
+        /// (contract C3). Nothing sends |one=1 now; it is still parsed and honoured.</item>
         /// </list></summary>
         private void AddBreakpoint(BpSpec spec)
         {
@@ -777,6 +776,48 @@ namespace ClarionDbg.Cli
         {
             Rearm r;
             return _rearm.TryGetValue(tid, out r) && r.Va == va && !r.IsTemp;
+        }
+
+        // ------------------------------------------------------------------ test seams for multi-image breakpoints
+        //
+        // Contract C3 (wave 7): run-to-cursor is `bp add module:line` with no |one=1, removed with `bp del
+        // module:line`, so these drive the REAL bp command and the REAL image-mapped sequence against images
+        // whose TSWD protocolcheck builds. An image registered at load base 0 is known but not mapped, as a
+        // solution DLL is before launch: breakpoints bind to it and nothing is written to any process.
+
+        /// <summary>Register an image with the given path and debug info, as the module table holds one.</summary>
+        internal LoadedModule AddImageForTest(string path, TswdDebugInfo dbg, uint loadBase)
+        {
+            RefuseSeamIfAttached("AddImageForTest");
+            var m = new LoadedModule { Path = path, Name = Path.GetFileName(path).ToLowerInvariant(),
+                                       LoadBase = loadBase, Size = 0x200000, Dbg = dbg };
+            _modules.Add(m);
+            return m;
+        }
+
+        /// <summary>One `bp ...` command line, through the real handler.</summary>
+        internal void BpCommandForTest(string line)
+        {
+            RefuseSeamIfAttached("BpCommandForTest");
+            HandleBpCommand(line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries));
+        }
+
+        /// <summary>What a LOAD_DLL does for breakpoints once the image is in the table (DebugEngine.Modules.cs):
+        /// plant those bound to it, then resolve pending ones and copy unqualified ones into it.</summary>
+        internal void ImageMappedForTest(LoadedModule m)
+        {
+            RefuseSeamIfAttached("ImageMappedForTest");
+            PlantOwnBps(m);
+            ResolvePendingFor(m);
+        }
+
+        /// <summary>Each logical breakpoint as "module:requestedLine@ownerPath" ("(pending)" for no owner).</summary>
+        internal List<string> BpsForTest()
+        {
+            var list = new List<string>();
+            foreach (var b in _bps)
+                list.Add(b.Module + ":" + b.RequestedLine + "@" + (b.Owner != null ? b.Owner.Path : "(pending)"));
+            return list;
         }
     }
 }

@@ -289,6 +289,7 @@ namespace ClarionDbg.Cli
 
                 DetachStep("clear-rearm");
                 _rearm.Clear();
+                ReleaseRearmHold();    // resume what the re-arm hold suspended: once we let go, nobody else will
 
                 DetachStep("clear-tf");
                 foreach (uint t in _threads) if (!ClearTf(t)) tfFailed.Add(t);
@@ -341,6 +342,7 @@ namespace ClarionDbg.Cli
                 aborted = "detach aborted: " + ex.Message;
                 // Best effort, in the order the normal path would have: the held event must not be left to the
                 // stop (which would hand it to the app as unhandled), and the debugger must still let go.
+                try { ReleaseRearmHold(); } catch { }
                 if (!heldContinued) { try { _loopContinue(Pid(held), Tid(held), heldStatus ?? Native.DBG_CONTINUE); } catch { } }
                 _hProcess = IntPtr.Zero;
                 if (!stopTried && !exited)

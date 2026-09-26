@@ -36,10 +36,11 @@ namespace ClarionDbg.Cli
         /// <summary>The caller wants this breakpoint in exactly ONE image, even if several carry the
         /// compiland and it named none (<c>|one=1</c>).
         /// <para>
-        /// This exists for run-to-cursor, which is composed host-side as <c>bp add</c> + <c>continue</c>
-        /// and so is indistinguishable from an ordinary add down here. "Get me to HERE and stop once"
-        /// must not become "stop somewhere on the way", which is what arming it in every image would do.
-        /// A persistent user breakpoint never sets it - see <see cref="DebugEngine.AddBreakpoint"/>.
+        /// It was added for run-to-cursor, which is composed host-side as <c>bp add</c> + <c>continue</c>.
+        /// From wave 7 (2026-09-25) the host sends that transient WITHOUT it, as a plain unqualified add
+        /// armed in every image carrying the compiland, and removes every copy with one <c>bp del</c> at the
+        /// stop (contract C3). Nothing sends it now; it is still parsed and honoured - see
+        /// <see cref="DebugEngine.AddBreakpoint"/>.
         /// </para>
         /// <para>
         /// DEFAULT FALSE IS DELIBERATE. An older host sends neither <c>img=</c> nor <c>one=</c>, and it
@@ -643,6 +644,7 @@ namespace ClarionDbg.Cli
                 {
                     if (_interactive) continue;   // no event: the commands were serviced at the top of the pass
                     Console.WriteLine("(timeout waiting for debug event — terminating target)");
+                    ReleaseRearmHold();   // resume what the re-arm hold suspended before the kill (ca29e2da)
                     Native.TerminateProcess(_hProcess, 0);
                     // drain until exit
                     while (Native.WaitForDebugEvent(buf, 2000))
@@ -699,6 +701,7 @@ namespace ClarionDbg.Cli
 
                     case Native.EXIT_THREAD_DEBUG_EVENT:
                         NoteThreadExited(tid);
+                        ForgetRearmThread(tid);   // its owed re-plant, and any hold on it (DebugEngine.Stepping.cs)
                         // DEFENCE IN DEPTH, NOT LOAD-BEARING — and saying so is the point. It does run with a
                         // non-empty cache: the previous episode's entries outlive that episode and sit there
                         // while the target runs, which is exactly when EXIT_THREAD arrives, so this really
@@ -758,6 +761,7 @@ namespace ClarionDbg.Cli
                         uint exitCode = U32(buf, 12);
                         Console.WriteLine($"process exited (code {exitCode})");
                         if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));
+                        ReleaseRearmHold();   // this event is never continued, so the reconcile below never runs
                         running = false;
                         break;
 
@@ -772,7 +776,12 @@ namespace ClarionDbg.Cli
                 if (running && _detachPending) { DetachAt(buf, status); break; }
 
                 if (running)
+                {
+                    // The re-arm hold (DebugEngine.Stepping.cs): suspend or resume the other threads for what this
+                    // continue releases, while the process is still frozen on the event.
+                    ReconcileRearmHold(tid, status);
                     _loopContinue(pid, tid, status);
+                }
             }
         }
 
@@ -1229,12 +1238,14 @@ namespace ClarionDbg.Cli
         {
             if (parts.Length < 2) { EmitError("sym expects: sym NAME"); return; }
             string name = parts[1];
-            TswdDebugInfo.DataLocation loc; LoadedModule owner; string ambiguity;
-            var found = ResolveDataAcrossModules(name, out owner, out loc, out ambiguity);
+            TswdDebugInfo.DataLocation loc; LoadedModule owner; string ambiguity; List<string> forms;
+            var found = ResolveDataAcrossModules(name, out owner, out loc, out ambiguity, out forms);
             if (found != DataResolve.Found)
             {
-                // Ambiguous (04d7b4c8) goes out as not found: no address for a name that has two.
-                if (EmitJson) Console.WriteLine("@JSON " + Json.Sym(name, false, 0, 0, 0, null, 0, null));
+                // Ambiguous (04d7b4c8) goes out as not found: no address for a name that has two. It also lists
+                // the forms that name one each (3517fd15 item 8).
+                if (EmitJson) Console.WriteLine("@JSON " + (found == DataResolve.Ambiguous ? Json.SymAmbiguous(name, forms)
+                                                                                           : Json.Sym(name, false, 0, 0, 0, null, 0, null)));
                 Console.WriteLine($"  sym {name}: {(found == DataResolve.Ambiguous ? ambiguity : "not found")}");
                 return;
             }
@@ -1434,6 +1445,7 @@ namespace ClarionDbg.Cli
             int wrote;
             Native.WriteProcessMemory(_hProcess, Ptr(va), new[] { value }, 1, out wrote);
             Native.FlushInstructionCache(_hProcess, Ptr(va), (IntPtr)1);
+            if (value == 0xCC && _int3Trace != null) _int3Trace.Add(va);   // protocolcheck only (Stepping.cs)
         }
 
         /// <summary>Write a block of bytes to target memory (data writes — edit-variable-value). Returns

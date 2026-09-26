@@ -156,10 +156,11 @@ namespace ClarionDebugger.Terminal
     /// refused.
     /// </para>
     /// <para>
-    /// CURRENT means "since the last stop, resume, or thread switch": the owner clears this at each, and the
-    /// replies that follow refill it. A grant is scoped to the thread the row was read on; a row the engine
-    /// did not stamp (an expanded reference) is granted UNSCOPED and accepts any thread, which is safe
-    /// because the engine refuses a write whose thread is not the selected one on its own.
+    /// CURRENT means "since the last stop, resume, or thread switch": a stop or a switch moves the service's
+    /// selection epoch, which this table checks on every call and retires itself on; the owner clears it at a
+    /// resume, which moves none. The replies that follow refill it. A grant is scoped to the thread the row
+    /// was read on; a row the engine did not stamp (an expanded reference) is granted UNSCOPED and accepts any
+    /// thread, which is safe because the engine refuses a write whose thread is not the selected one on its own.
     /// </para>
     /// <para>
     /// BOUNDED: past <see cref="MaxGrants"/> further rows are simply not granted, which fails closed - an
@@ -199,15 +200,30 @@ namespace ClarionDebugger.Terminal
         //
         // THE SELECTED THREAD IS THE SERVICE'S (49538b78 8b). This table kept its own copy, set by the pad at
         // a stop and a switch and by nothing else, so an inventory that moved the selection left it behind.
-        // It now reads the service's selection when a reply arrives, and a stack request remembers the
-        // selection EPOCH it was sent in: a reply offers only while that epoch is still current. The read is
-        // on the UI thread and may be AHEAD of the event being handled there; ahead can only mean a newer
-        // epoch or another thread, so it refuses an offer and never makes one.
+        // It now reads the service's selection when a reply arrives. The read is on the UI thread and may be
+        // AHEAD of the event being handled there; ahead can only mean a newer epoch or another thread, so it
+        // refuses an offer and never makes one.
+        //
+        // THE WHOLE TABLE BELONGS TO ONE SELECTION EPOCH (3517fd15). Everything in it - grants, offers, and the
+        // ids of the requests whose replies may grant - was issued under _epoch, and every public member first
+        // compares that with the service's epoch NOW (Sync): a selection that has moved retires the lot, before
+        // anything is checked or recorded. That is what binds an outstanding id to the epoch it was sent in (a
+        // per-id epoch beside it could never fail), and it is the ONLY way a selection move clears this table.
+        // The pad used to clear it from each move's handler, marshalled to the UI thread, so a request bound on
+        // that thread in between was wiped by the clear queued before it (debugger L2, wave 6). There is no
+        // marshalled clear for a move any more, so there is nothing to arrive out of order: whatever runs first
+        // after the move observes it and clears, and everything it records is the new epoch's.
         private readonly HashSet<string> _framesOffered = new HashSet<string>(StringComparer.Ordinal);
         private uint? _framesTid;          // the thread the current offer came from
         private readonly Func<ThreadSelection> _selection;   // the service's selected thread, read, never kept
-        private readonly Dictionary<string, int> _stackIds = new Dictionary<string, int>(StringComparer.Ordinal);  // sent this clear, unanswered: id -> selection epoch
-        private uint _nextStackId;         // never reset: an id is unique for the session
+        private int _epoch;                // the selection epoch everything in this table was issued under
+        private readonly HashSet<string> _stackIds = new HashSet<string>(StringComparer.Ordinal);  // stack requests sent this epoch, unanswered
+        // WATCH and MODULEDATA requests sent this epoch, unanswered (3517fd15, codex adversary wave 6). Their
+        // replies grant edit tuples, and used to grant whatever request they answered - a reply delayed past a
+        // resume and a new stop re-granted a row from the old pause. Now only a reply echoing one of these ids
+        // grants; a reply with no id (an older engine) is shown and grants nothing.
+        private readonly HashSet<string> _readIds = new HashSet<string>(StringComparer.Ordinal);
+        private uint _nextRequestId;       // never reset: an id is unique for the session
         private readonly Dictionary<string, uint?> _frameLocalsInFlight =
             new Dictionary<string, uint?>(StringComparer.Ordinal);
 
@@ -218,30 +234,67 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>The number of EDIT tuples granted.</summary>
-        public int Count { get { return _keys.Count; } }
+        public int Count { get { Sync(); return _keys.Count; } }
 
         /// <summary>The number of EXPANDABLE tuples issued.</summary>
-        public int ExpandableCount { get { return _expandable.Count; } }
+        public int ExpandableCount { get { Sync(); return _expandable.Count; } }
 
-        /// <summary>Retire everything: edit grants, expandable rows, offered frames and forwarded requests, and
-        /// start a new EPOCH, so a stack reply to a request sent before now offers nothing. One clear, so no
-        /// clear site can retire one family and leave another live.</summary>
+        /// <summary>Retire everything: edit grants, expandable rows, offered frames and every forwarded or
+        /// outstanding request, so a reply to a request sent before now grants and offers nothing. One clear,
+        /// so no clear site can retire one family and leave another live. Unconditional: for a session's end.</summary>
         public void Clear()
         {
             _keys.Clear(); _expandable.Clear(); _expandsInFlight.Clear(); _writesInFlight.Clear();
             _framesOffered.Clear(); _framesTid = null; _frameLocalsInFlight.Clear();
-            _stackIds.Clear();
+            _stackIds.Clear(); _readIds.Clear();
         }
 
-        /// <summary>A fresh stack request id, never issued before in this session.</summary>
-        public string NewStackRequestId()
+        /// <summary>The target resumed while <paramref name="epoch"/> was the selection, as read on the thread that
+        /// raised the resume. A resume moves no selection, so Sync cannot see it: this retires what was issued in that
+        /// epoch - every row on screen is now stale - and spares only a table that has already moved on to a newer one
+        /// (a stop after the resume, observed before this marshalled call ran).</summary>
+        public void Resumed(int epoch)
         {
-            _nextStackId++;
-            return _nextStackId.ToString(CultureInfo.InvariantCulture);
+            if (epoch < _epoch) return;
+            Clear();
+            _epoch = epoch;
+        }
+
+        /// <summary>Bring the table to the service's epoch NOW, retiring everything first when it has moved: a stop,
+        /// an accepted switch, or an inventory that disagreed with the host. Every member that reads, checks or
+        /// records calls it before anything else.</summary>
+        private void Sync()
+        {
+            int now = _selection().Epoch;
+            if (now == _epoch) return;
+            Clear();
+            _epoch = now;
+        }
+
+        /// <summary>A fresh request id, never issued before in this session: the ONE source for every request
+        /// whose reply the table will match by id (stack, watch, moduledata).</summary>
+        public string NewRequestId()
+        {
+            _nextRequestId++;
+            return _nextRequestId.ToString(CultureInfo.InvariantCulture);
         }
 
         /// <summary>The host sent stack request <paramref name="id"/> under the service's current selection.</summary>
-        public void StackRequested(string id) { if (!string.IsNullOrEmpty(id)) _stackIds[id] = _selection().Epoch; }
+        public void StackRequested(string id) { Sync(); if (!string.IsNullOrEmpty(id)) _stackIds.Add(id); }
+
+        /// <summary>The host sent a watch or moduledata request <paramref name="id"/> under the service's current
+        /// selection: its reply may grant (<see cref="ReadAnswered"/>).</summary>
+        public void ReadRequested(string id) { Sync(); if (!string.IsNullOrEmpty(id)) _readIds.Add(id); }
+
+        /// <summary>A watch or moduledata reply echoing <paramref name="reqId"/> arrived: true when it may GRANT its
+        /// rows, i.e. it answers a request sent in the current epoch and not yet answered (it is answered now).
+        /// False for no id at all (an engine that predates the echo: the reply is shown, read-only), one from
+        /// before the selection moved or the target resumed, one never sent, or one already answered.</summary>
+        public bool ReadAnswered(string reqId)
+        {
+            Sync();
+            return reqId != null && _readIds.Remove(reqId);
+        }
 
         // A grant is CONSUMED by the write it authorises (afbc68c7, codex security gate): otherwise one grant
         // let the same write be replayed for the rest of the pause. The consumed key waits here, by address,
@@ -260,6 +313,14 @@ namespace ClarionDebugger.Terminal
         /// <summary>True while a write to <paramref name="va"/> has been sent and not yet answered.</summary>
         public bool IsWritePending(string va)
         {
+            Sync();
+            return WritePending(va);
+        }
+
+        // The unsynced read, for a member that has synced already: each public member syncs ONCE, first, so no
+        // member's own sync can be masked by another's it happens to call.
+        private bool WritePending(string va)
+        {
             return !string.IsNullOrEmpty(va) && _writesInFlight.ContainsKey(va.ToUpperInvariant());
         }
 
@@ -268,8 +329,11 @@ namespace ClarionDebugger.Terminal
         /// that address.</summary>
         public bool TryConsume(string va, string typeCode, int size, int places, uint? tid)
         {
+            // THE EDIT AUTHORIZATION CHECK, so it notices a selection move on its own: a grant minted before a stop,
+            // switch or disagreeing inventory is refused here with no other call on the table in between.
+            Sync();
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return false;
-            if (IsWritePending(va)) return false;
+            if (WritePending(va)) return false;
             string scoped = tid.HasValue ? Key(va, typeCode, size, places, TidKey(tid)) : null;
             string key = (scoped != null && _keys.Contains(scoped)) ? scoped
                        : _keys.Contains(Key(va, typeCode, size, places, Unscoped)) ? Key(va, typeCode, size, places, Unscoped)
@@ -284,6 +348,9 @@ namespace ClarionDebugger.Terminal
         /// it spent, so the refreshed row is editable again.</summary>
         public void Regrant(string va)
         {
+            // NO Sync, on purpose: this puts back a key spent in the table as it stands. After a selection move the
+            // key is stale, and the next member that reads syncs and retires it with the rest; syncing here first
+            // could change no answer any reader gives (mutation-run 2026-09-25: none went red).
             if (string.IsNullOrEmpty(va)) return;
             string vaKey = va.ToUpperInvariant();
             string spent;
@@ -295,6 +362,7 @@ namespace ClarionDebugger.Terminal
         /// <summary>Record an expandable row (a lazy reference / array-element group node) the host issued.</summary>
         public void GrantExpandable(string module, uint typeRef, string addr)
         {
+            Sync();
             if (string.IsNullOrEmpty(module) || string.IsNullOrEmpty(addr)) return;
             if (_keys.Count + _expandable.Count >= MaxGrants) return;
             _expandable.Add(ExpandKey(module, typeRef, addr));
@@ -304,16 +372,17 @@ namespace ClarionDebugger.Terminal
         /// current. Anything else is a forged or stale expand and is not forwarded.</summary>
         public bool IsExpandIssued(string module, uint typeRef, string addr)
         {
+            Sync();
             if (string.IsNullOrEmpty(module) || string.IsNullOrEmpty(addr)) return false;
             return _expandable.Contains(ExpandKey(module, typeRef, addr));
         }
 
         /// <summary>The host forwarded expand <paramref name="reqId"/> to the engine after verifying it.</summary>
-        public void ExpandForwarded(int reqId) { _expandsInFlight.Add(reqId.ToString(CultureInfo.InvariantCulture)); }
+        public void ExpandForwarded(int reqId) { Sync(); _expandsInFlight.Add(reqId.ToString(CultureInfo.InvariantCulture)); }
 
         /// <summary>Consume the record that <paramref name="reqId"/> was a verified, forwarded expand. False
         /// for a reply the host never asked for, or one from before the last clear; its rows grant nothing.</summary>
-        public bool ExpandVerified(string reqId) { return reqId != null && _expandsInFlight.Remove(reqId); }
+        public bool ExpandVerified(string reqId) { Sync(); return reqId != null && _expandsInFlight.Remove(reqId); }
 
         /// <summary>A stack reply for <paramref name="tid"/>, echoing request <paramref name="reqId"/>, carried
         /// exactly these frames, each a (va, ebp) pair. They are OFFERED, replacing the previous offer, only when
@@ -324,14 +393,13 @@ namespace ClarionDebugger.Terminal
         /// nothing: the page never asks about one.</summary>
         public bool OfferFrames(uint? tid, string reqId, IEnumerable<KeyValuePair<string, string>> vaEbp)
         {
+            // Sent under a selection that has since moved (a stop, a switch, an inventory that disagreed): Sync
+            // retires it here, with everything else from that epoch.
+            Sync();
             // An id from before the last clear, one never sent, one already answered, or none at all. It is
             // answered either way: a live id stamped for another thread spends it too.
-            int sentEpoch;
-            if (reqId == null || !_stackIds.TryGetValue(reqId, out sentEpoch)) return false;
-            _stackIds.Remove(reqId);
-            // Sent under a selection that has since moved (a stop, a switch, an inventory that disagreed).
+            if (reqId == null || !_stackIds.Remove(reqId)) return false;
             var sel = _selection();
-            if (sentEpoch != sel.Epoch) return false;
             // A live id is the selected thread's request, so a reply stamped otherwise comes from an engine
             // that does not agree about the selection: its frames are not the ones asked for.
             if (!WireRules.TidIsKnown(tid) || tid != sel.Tid) return false;
@@ -345,9 +413,10 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>True when this exact (va, ebp) is a frame the current offer holds. The offer is the selected
-        /// thread's: only its replies offer, and the clear in front of every selection change empties it.</summary>
+        /// thread's: only its replies offer, and a selection change retires it at this call's own Sync.</summary>
         public bool IsFrameOffered(string va, string ebp)
         {
+            Sync();
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(ebp)) return false;
             return _framesOffered.Contains(FrameKey(va, ebp));
         }
@@ -356,6 +425,9 @@ namespace ClarionDebugger.Terminal
         /// against the current offer: the offer's thread goes with it.</summary>
         public void FrameLocalsForwarded(int reqId)
         {
+            // NO Sync, on purpose: it records the CURRENT offer's thread, and a selection move empties the offer, so
+            // after one it records no thread and FrameLocalsVerified can never grant for it, synced or not. The pad
+            // calls it only after IsFrameOffered, which has synced.
             _frameLocalsInFlight[reqId.ToString(CultureInfo.InvariantCulture)] = _framesTid;
         }
 
@@ -365,6 +437,7 @@ namespace ClarionDebugger.Terminal
         /// for another thread; its rows grant nothing.</summary>
         public bool FrameLocalsVerified(string reqId, uint? replyTid)
         {
+            Sync();
             uint? sentTid;
             if (reqId == null || !_frameLocalsInFlight.TryGetValue(reqId, out sentTid)) return false;
             _frameLocalsInFlight.Remove(reqId);
@@ -385,6 +458,7 @@ namespace ClarionDebugger.Terminal
         /// ignored.</summary>
         public void Grant(string va, string typeCode, int size, int places, uint? tid)
         {
+            Sync();
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return;
             if (_keys.Count + _expandable.Count >= MaxGrants) return;
             _keys.Add(Key(va, typeCode, size, places, TidKey(tid)));
@@ -416,6 +490,7 @@ namespace ClarionDebugger.Terminal
         /// A page with no thread selection (null) matches only an unscoped grant.</summary>
         public bool IsGranted(string va, string typeCode, int size, int places, uint? tid)
         {
+            Sync();
             if (string.IsNullOrEmpty(va) || string.IsNullOrEmpty(typeCode)) return false;
             return (tid.HasValue && _keys.Contains(Key(va, typeCode, size, places, TidKey(tid))))
                 || _keys.Contains(Key(va, typeCode, size, places, Unscoped));

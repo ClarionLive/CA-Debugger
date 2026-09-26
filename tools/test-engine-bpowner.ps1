@@ -359,20 +359,27 @@ Invoke-CheckSection 'an ambiguous single-target pick ANNOUNCES itself - it is th
     ($oneStmts.Count -gt 0 -and $oneStmts[0] -match '^Console\.WriteLine') ($oneStmts[0]) 
 }
 
-Invoke-CheckSection 'the host SENDS one=1 for run-to-cursor, and for nothing else' {
-  # The engine cannot tell a transient from a persistent add - run-to-cursor is composed host-side as
-  # `bp add` + `continue` and arrives as an ordinary add - so this is the only thing standing between
-  # "get me to HERE and stop once" and "stop somewhere on the way".
+Invoke-CheckSection 'the host sends one=1 for nothing, run-to-cursor included (1be3b82e, contract C3)' {
+  # Run-to-cursor used to ask for ONE image (|one=1), and the engine took the first carrier. The host cannot
+  # name the image the caret's file is compiled into, so that first pick could run past the line the user meant.
+  # It now arms in EVERY image like any unqualified add, and the stop removes every copy with `bp del`. The
+  # engine still parses one=1 (the sections above); nothing in the host sends it.
   $webPath = Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Terminal\ClarionDebuggerWebView.cs'
   $svcPath = Join-Path $PSScriptRoot '..\src\ClarionDebugger.Addin\Services\ClarionDebuggerService.cs'
   $web = Get-Content -Raw -LiteralPath $webPath
   $svc = Get-Content -Raw -LiteralPath $svcPath
+  $webCode = Get-CSharpCodeOnly $web
+  $svcCode = Get-CSharpCodeOnly $svc
   $rtc = Get-CSharpBlock 'public void CmdRunToCursor(string spec)' $web
-  Check 'CmdRunToCursor asks for a single target' ($rtc -match '_svc\.AddBreakpoint\(module, line, true\)') ''
-  # EXACTLY ONE site passes true. Counting is the guard: a second one would mean some persistent breakpoint
-  # had quietly become single-target, which is this ticket's bug reintroduced from the host side.
-  $trueSites = [regex]::Matches($web, 'AddBreakpoint\([^)]*,\s*true\)')
-  Check 'and it is the ONLY caller that does - 1 site' ($trueSites.Count -eq 1) "$($trueSites.Count) site(s)"
+  Check 'CmdRunToCursor sends a plain unqualified add' ($rtc -match '_svc\.AddBreakpoint\(module, line\)') ''
+  # NO site passes a third argument, and the service has no way to write one=1: comments stripped, so this
+  # section's own explanation (and the service's doc) cannot satisfy or fail it.
+  $trueRx = 'AddBreakpoint\([^)]*,[^)]*,[^)]*\)'
+  $trueSites = [regex]::Matches($webCode, $trueRx)
+  Check 'no caller passes a single-target flag - 0 sites' ($trueSites.Count -eq 0) "$($trueSites.Count) site(s)"
+  Check 'CONTROL: that scan sees a single-target call' ([regex]::Matches((Get-CSharpCodeOnly 'if (!_svc.AddBreakpoint(module, line, true)) return;'), $trueRx).Count -eq 1) ''
+  Check 'and the service writes one=1 nowhere' ($svcCode -notmatch 'one=1') ''
+  Check 'CONTROL: that check sees one=1 in code' ((Get-CSharpCodeOnly 'x = "bp add " + m + (s ? "|one=1" : "");') -match 'one=1') ''
   # The other four call sites are persistent user breakpoints or removals and must NOT be single-target:
   # OnGutterBpAdded and CmdBreakOnProcEntry both stage in _pending and survive to the next session, so a
   # gutter dot in a second DLL has to arm there too - which is the whole point of the ticket.
@@ -383,11 +390,10 @@ Invoke-CheckSection 'the host SENDS one=1 for run-to-cursor, and for nothing els
   $procEntry = Get-CSharpBlock 'private bool BreakOnEntry(ProcRef proc, out string message)' $web
   Check 'and neither is break-on-proc-entry, which is a persistent breakpoint despite staging like one' `
     ($procEntry -match '_svc\.AddBreakpoint\(module, line\)') ''
-  $svcAdd = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line, bool singleTarget)' $svc
-  Check 'the service writes one=1 only when asked' ($svcAdd -match 'singleTarget \? "\|one=1" : ""') ''
-  $svcAdd2 = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line)' $svc
-  Check 'and the 2-argument overload defaults to FALSE, so an unthinking caller gets the fix' `
-    ($svcAdd2 -match 'AddBreakpoint\(module, line, false\)') ''
+  $svcAdd = Get-CSharpBlock 'public bool AddBreakpoint(string module, int line)' $svc
+  Check 'the service''s one add writes `bp add module:line` and nothing after it' `
+    ($svcAdd -match 'SendCommand\("bp add " \+ module \+ ":" \+ line\)') ''
+  Check 'and it has no single-target overload left to call' ($svcCode -notmatch 'bool singleTarget') ''
   # A properties edit rebuilds the spec through BuildBpSpec. It edits PERSISTENT rows only - run-to-cursor
   # transients are filtered out of the pane - so it must never ask for one image. (A host-side
   # SingleTargetRequested flag used to be read here and was never set; removed in pipeline run 1.)
@@ -419,7 +425,7 @@ Write-Host ''
 # THE COUNT, ASSERTED (6493d226). COUNTING RULE: the RUNTIME count of Check calls on a clean run, measured
 # 2026-09-24 as 89 - one fewer than the lines that say Check, because the compatibility section's
 # 'git show failed' branch runs only when the others in that section do not. Update it with the checks.
-$EXPECTED_CHECKS = 89
+$EXPECTED_CHECKS = 92
 Assert-CheckTotal $EXPECTED_CHECKS
 
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
