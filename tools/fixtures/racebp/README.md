@@ -6,7 +6,8 @@ The main program waits in an ACCEPT loop on a timer window: a STARTed thread get
 starting thread's ACCEPT loop, and the first version, which waited in a plain LOOP, hung with neither worker
 ever running (measured 2026-09-25).
 
-`tools/test-bp-race.ps1` copies it to a temp folder, builds it and runs the non-interactive engine on it.
+The second part of `tools/test-bp-threaded.ps1` copies it to a temp folder, builds it and runs the engine on it
+with a tracepoint on that line (a tracepoint never pauses, so every hit takes the silent re-arm route).
 
 ## Rebuild
 

@@ -23,6 +23,16 @@
 # never true of this file. Both poke sites below resolve through the shared Get-EngineTargetPid immediately
 # before posting, and skip - out loud - when the target cannot be verified.
 #
+# SECOND PART, THE RE-ARM RACE (ca29e2da). The engine re-arms a breakpoint by putting the original byte back,
+# single-stepping the thread that hit it and planting the INT3 again at that thread's trap; before the fix
+# every OTHER thread ran during that step, and one that reached the address then went straight past the
+# breakpoint. tools\fixtures\racebp has two threads call one procedure a fixed number of times each, so a
+# tracepoint on its body has an exact expected hit count, and a short count is the race. Measured 2026-09-25
+# with 2000 iterations (4000 hits expected): the engine at 0d9d44b reported 1827 and 1124 here (a tracepoint,
+# the silent re-arm route) and 575, 2000, 369, 2001 and 2009 as a plain non-interactive breakpoint; the fixed
+# engine 4000 every time. It needs Clarion 11 to build the fixture; -SkipRace leaves it out. A pass is
+# evidence, not proof that no interleaving misses one: protocolcheck CheckRearmHold pins the bookkeeping.
+#
 #   e.g. tools\test-bp-threaded.ps1
 #        tools\test-bp-threaded.ps1 -Name AUT:AU_LNAME -MenuItem "2/5" -Verbose2
 param(
@@ -54,6 +64,13 @@ param(
     [string]$Condition = "",
     [string]$Expect    = "",               # the value every fired trace must show (defaults to the RHS)
     [string]$LogFile   = "",
+    # The re-arm race (second part): how many runs, the fixture, and the Clarion 11 toolchain that builds it.
+    [int]$RaceRuns     = 2,
+    [int]$RaceTimeoutSec = 60,
+    [switch]$SkipRace,
+    [string]$RaceFixture = "$PSScriptRoot\fixtures\racebp",
+    [string]$MSBuild   = 'C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe',
+    [string]$ClarionBin = 'C:\Clarion11\bin',
     [switch]$Verbose2                      # echo every engine line, not just the interesting ones
 )
 
@@ -284,11 +301,75 @@ Invoke-CheckSection 'drive the target through both legs, then judge what the eng
         $(if ($wrong.Count) { "$($wrong.Count) fired with a value the condition should have rejected: " + (($wrong | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ' | ') } else { '' })
   }
 }
+# ------------------------------------------------------------------------------------------------------
+# SECOND PART: the re-arm race (ca29e2da). See the header. The breakpoint line and the expected count are read
+# from the fixture source, not typed here.
+if (-not $SkipRace) {
+  $raceSrc = [IO.File]::ReadAllLines((Join-Path $RaceFixture 'racebp.clw'))
+  $raceLine = 0; $raceIter = 0
+  for ($i = 0; $i -lt $raceSrc.Length; $i++) {
+      if ($raceSrc[$i] -match '^\s+Calls \+= 1\s*$') { $raceLine = $i + 1 }
+      if ($raceSrc[$i] -match '^Iterations\s+LONG\((\d+)\)') { $raceIter = [int]$Matches[1] }
+  }
+  $raceExpected = 2 * $raceIter
+  $raceWork = Join-Path ([IO.Path]::GetTempPath()) ('ClarionDbg-racebp-' + [Guid]::NewGuid().ToString('N'))
+  $raceExe = Join-Path $raceWork 'racebp.exe'
+  try {
+    Invoke-CheckSection 'R the re-arm race fixture builds with Clarion 11' {
+      New-Item -ItemType Directory -Path $raceWork | Out-Null
+      foreach ($f in Get-ChildItem -LiteralPath $RaceFixture -File | Where-Object { $_.Extension -in '.clw', '.cwproj' }) {
+        # CRLF whatever the checkout did: the Clarion compiler rejects LF.
+        $text = [IO.File]::ReadAllText($f.FullName) -replace "`r?`n", "`r`n"
+        [IO.File]::WriteAllText((Join-Path $raceWork $f.Name), $text, [Text.Encoding]::ASCII)
+      }
+      $build = ''
+      if ((Test-Path -LiteralPath $MSBuild) -and (Test-Path -LiteralPath (Join-Path $ClarionBin 'SoftVelocity.Build.Clarion.targets'))) {
+        Push-Location $raceWork
+        try { $build = & $MSBuild racebp.cwproj -nologo -v:m "/p:ClarionBinPath=$ClarionBin" 2>&1 | Out-String }
+        finally { Pop-Location }
+      } else { $build = "no Clarion 11 toolchain at $MSBuild / $ClarionBin" }
+      Check "R0 racebp.exe was built (tracepoint at racebp.clw:$raceLine, $raceExpected hits expected)" `
+        ((Test-Path -LiteralPath $raceExe) -and $raceLine -gt 0 -and $raceIter -gt 0) $(if (Test-Path -LiteralPath $raceExe) { '' } else { $build.Trim() })
+    }
+
+    $traceB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('race'))
+    for ($r = 1; $r -le $RaceRuns; $r++) {
+      Invoke-CheckSection "R run $r of ${RaceRuns}: two threads through one breakpoint, every hit reported" {
+        $rs = New-EngineSession -Engine $Engine -Target $raceExe -BreakArgs "--bp `"racebp.clw:$raceLine|t=$traceB64`"" `
+                                -WorkingDirectory $raceWork -CaptureStdErr
+        $hits = 0; $exited = $false
+        try {
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          while (-not $exited -and $sw.Elapsed.TotalSeconds -lt $RaceTimeoutSec) {
+            foreach ($l in (Read-EngineLines $rs)) {
+              # -cmatch: wire spellings (09207c17).
+              if ($l -cmatch '"event":"trace"') { $hits++ }
+              elseif ($l -cmatch '"event":"exited"') { $exited = $true }
+            }
+            if (-not $exited) { Start-Sleep -Milliseconds 100 }
+          }
+        }
+        finally {
+          Stop-EngineSession $rs
+          Stop-EngineTarget $rs
+          Remove-EngineSession $rs
+        }
+        Check "R$r the target ran to completion under the engine (an exited event within $RaceTimeoutSec s)" $exited ''
+        Check "R$r the tracepoint fired exactly $raceExpected times" ($hits -eq $raceExpected) "$hits hit(s)"
+      }
+    }
+  }
+  finally {
+    if (Test-Path -LiteralPath $raceWork) { Remove-Item -LiteralPath $raceWork -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+}
+
 # THE COUNT, ASSERTED AND PRINTED (60344b78). The run above sits inside Invoke-CheckSection, so a throw or a
 # top-level `break` anywhere in it is a non-zero exit rather than a silent success with no verdict. This
 # catches a verdict check that was skipped. COUNTING RULE: the RUNTIME count of Check calls - 7 with or
-# without -Condition, since H and I replace E and G. Update it deliberately with the checks.
-$EXPECTED_CHECKS = 7
+# without -Condition, since H and I replace E and G, plus the race part's R0 and two per run unless -SkipRace.
+# Update it deliberately with the checks.
+$EXPECTED_CHECKS = 7 + $(if ($SkipRace) { 0 } else { 1 + 2 * $RaceRuns })
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host "========================================"
