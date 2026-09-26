@@ -136,6 +136,88 @@ namespace ClarionDebugger.Wire
             return true;
         }
 
+        /// <summary><paramref name="json"/> re-written without every member named in <paramref name="names"/>, in
+        /// objects at ANY depth (a group's <c>children</c> included); everything else is kept, value for value, with
+        /// the insignificant whitespace dropped. Null when the text is not well-formed - there is then no telling
+        /// what a member removal would have removed.
+        /// <para>
+        /// For rows the host forwards but may not let the page edit (3517fd15): an engine row carries its edit
+        /// tuple (<c>va</c>, <c>typeCode</c>, <c>size</c>, <c>places</c>), and a row shown with it gets an edit
+        /// pencil the host would then refuse. Walked like <see cref="ForEachObject"/>, so a key-like run inside a
+        /// string value is never mistaken for a member.
+        /// </para></summary>
+        public static string WithoutMembers(string json, System.Collections.Generic.ICollection<string> names)
+        {
+            if (json == null) return null;
+            var sb = new StringBuilder(json.Length);
+            int i = 0;
+            SkipWhitespace(json, ref i);
+            if (!CopyValue(json, ref i, sb, names)) return null;
+            SkipWhitespace(json, ref i);
+            return i == json.Length ? sb.ToString() : null;
+        }
+
+        /// <summary>Copy one value at <paramref name="i"/> into <paramref name="sb"/>, leaving out the named members
+        /// of every object in it. False on malformed input.</summary>
+        private static bool CopyValue(string json, ref int i, StringBuilder sb, System.Collections.Generic.ICollection<string> names)
+        {
+            if (i >= json.Length) return false;
+            char c = json[i];
+            if (c == '"')
+            {
+                int s = i;
+                if (ReadString(json, ref i) == null) return false;
+                sb.Append(json, s, i - s);
+                return true;
+            }
+            if (c == '{' || c == '[')
+            {
+                bool obj = c == '{';
+                char close = obj ? '}' : ']';
+                sb.Append(c);
+                i++;
+                SkipWhitespace(json, ref i);
+                if (i < json.Length && json[i] == close) { i++; sb.Append(close); return true; }
+                bool wrote = false;
+                while (true)
+                {
+                    SkipWhitespace(json, ref i);
+                    var item = new StringBuilder();
+                    bool keep = true;
+                    if (obj)
+                    {
+                        int ks = i;
+                        if (i >= json.Length || json[i] != '"') return false;
+                        string key = ReadString(json, ref i);
+                        if (key == null) return false;
+                        keep = !names.Contains(key);
+                        item.Append(json, ks, i - ks);
+                        SkipWhitespace(json, ref i);
+                        if (i >= json.Length || json[i] != ':') return false;
+                        i++;
+                        item.Append(':');
+                        SkipWhitespace(json, ref i);
+                    }
+                    if (!CopyValue(json, ref i, item, names)) return false;
+                    if (keep) { if (wrote) sb.Append(','); sb.Append(item); wrote = true; }
+                    SkipWhitespace(json, ref i);
+                    if (i >= json.Length) return false;
+                    if (json[i] == ',') { i++; continue; }
+                    if (json[i] != close) return false;
+                    i++;
+                    sb.Append(close);
+                    return true;
+                }
+            }
+            // number, true, false, null: at least one character, up to the next structural one.
+            int st = i;
+            while (i < json.Length && json[i] != ',' && json[i] != '}' && json[i] != ']'
+                   && json[i] != ' ' && json[i] != '\t' && json[i] != '\r' && json[i] != '\n') i++;
+            if (i == st) return false;
+            sb.Append(json, st, i - st);
+            return true;
+        }
+
         /// <summary>Walk one value at <paramref name="i"/>, collecting every object's text into
         /// <paramref name="found"/>. False on malformed input.</summary>
         private static bool WalkValue(string json, ref int i, System.Collections.Generic.List<string> found)
