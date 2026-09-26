@@ -113,6 +113,8 @@ namespace ClarionDbg.Cli
                 CheckWatchAndModuleDataReqId,
                 CheckSuggestedNamesArePasteable,
                 CheckConditionAmbiguityAndQualifiedWatch,
+                CheckRearmHold,
+                CheckRunToCursorArmsEveryImage,
             };
 
             foreach (var check in checks)

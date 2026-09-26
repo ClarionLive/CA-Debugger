@@ -643,6 +643,7 @@ namespace ClarionDbg.Cli
                 {
                     if (_interactive) continue;   // no event: the commands were serviced at the top of the pass
                     Console.WriteLine("(timeout waiting for debug event — terminating target)");
+                    ReleaseRearmHold();   // resume what the re-arm hold suspended before the kill (ca29e2da)
                     Native.TerminateProcess(_hProcess, 0);
                     // drain until exit
                     while (Native.WaitForDebugEvent(buf, 2000))
@@ -699,6 +700,7 @@ namespace ClarionDbg.Cli
 
                     case Native.EXIT_THREAD_DEBUG_EVENT:
                         NoteThreadExited(tid);
+                        ForgetRearmThread(tid);   // its owed re-plant, and any hold on it (DebugEngine.Stepping.cs)
                         // DEFENCE IN DEPTH, NOT LOAD-BEARING — and saying so is the point. It does run with a
                         // non-empty cache: the previous episode's entries outlive that episode and sit there
                         // while the target runs, which is exactly when EXIT_THREAD arrives, so this really
@@ -758,6 +760,7 @@ namespace ClarionDbg.Cli
                         uint exitCode = U32(buf, 12);
                         Console.WriteLine($"process exited (code {exitCode})");
                         if (EmitJson) Console.WriteLine("@JSON " + Json.Exited(exitCode));
+                        ReleaseRearmHold();   // this event is never continued, so the reconcile below never runs
                         running = false;
                         break;
 
@@ -772,7 +775,12 @@ namespace ClarionDbg.Cli
                 if (running && _detachPending) { DetachAt(buf, status); break; }
 
                 if (running)
+                {
+                    // The re-arm hold (DebugEngine.Stepping.cs): suspend or resume the other threads for what this
+                    // continue releases, while the process is still frozen on the event.
+                    ReconcileRearmHold(tid, status);
                     _loopContinue(pid, tid, status);
+                }
             }
         }
 
