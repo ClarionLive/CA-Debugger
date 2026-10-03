@@ -478,11 +478,68 @@ public sealed class Pad {
   Check 'CONTROL: an unrelated breakpoint error is still reported' ($p.Lines[$p.Lines.Count - 1] -cmatch '^err\|breakpoint clbrws011.clw:90') ($p.Lines -join ' / ')
 }
 
+Write-Host ''
+Invoke-CheckSection 'gutter removal removes EVERY image''s copy: unqualified on purpose (Owner ruling 2026-10-03, fb5766d1 #1)' {
+  # A .clw BASENAME names one file (Owner ruling 2026-10-03), so the gutter's removal of a breakpoint means every
+  # copy of it, in every image that armed one. OnGutterRemoved drops the file path it is handed and the pad sends
+  # one unqualified `bp del module:line`. Pinned here so that a path-qualified delete is a deliberate change.
+  # RUN: the real OnGutterRemoved / OnGutterBpRemoved / SameBp over a recording service.
+  # Get-Statement, not Get-Method: this handler is a brace-less `=> UI(() => ...);`, which brace matching would run past.
+  $gutHandlers = (Get-Statement 'private void OnGutterRemoved(string m, int l, string f)' $web) -replace '^private void', 'public void'
+  $gut = @"
+using System;
+using System.Collections.Generic;
+namespace Gut {
+$(Get-Method 'public sealed class DebugBreakpoint' $svc)
+public static class ClarionDebuggerService {
+  $(Get-Method 'internal static bool BpLineMatches(DebugBreakpoint b, int? requestedLine, int plantedLine)' $svc)
+}
+public sealed class FakeSvc {
+  public bool IsRunning = true; public bool Accept = true;
+  public List<string> Sent = new List<string>();
+  public bool RemoveBreakpoint(string m, int l) { Sent.Add("bp del " + m + ":" + l); return Accept; }
+}
+public sealed class Pad {
+  public FakeSvc _svc = new FakeSvc();
+  public List<DebugBreakpoint> _pending = new List<DebugBreakpoint>();
+  public int BpsSent;
+  private void SendBps() { BpsSent++; }
+  private void UI(Action a) { a(); }
+  $gutHandlers
+  $(Get-Method 'private void OnGutterBpRemoved(string module, int line)' $web)
+  $(Get-Method 'private static bool SameBp(DebugBreakpoint b, string module, int line)' $web)
+}
+}
+"@
+  Add-Type -TypeDefinition $gut -Language CSharp | Out-Null
+  function GutRow { param([string] $module, [int] $line, [string] $owner)
+    $b = New-Object Gut.DebugBreakpoint; $b.Module = $module; $b.RequestedLineOrNull = $line; $b.Line = $line; $b.OwnerPath = $owner; $b }
+  function Staged { param($p) @($p._pending | ForEach-Object { $_.Module + ':' + $_.Line + '@' + $_.OwnerPath }) -join ', ' }
+  # Two images each staged a copy of clbrws011.clw:80; a third breakpoint is on another line.
+  $p = New-Object Gut.Pad
+  $p._pending.Add((GutRow 'clbrws011.clw' 80 'C:\App\a.dll')); $p._pending.Add((GutRow 'clbrws011.clw' 80 'C:\App\b.dll'))
+  $p._pending.Add((GutRow 'clbrws011.clw' 90 'C:\App\a.dll'))
+  $p.OnGutterRemoved('clbrws011.clw', 80, 'C:\App\A\clbrws011.clw')
+  Check 'a live gutter removal sends ONE unqualified `bp del module:line`, with no path in it' `
+    (($p._svc.Sent -join ' / ') -ceq 'bp del clbrws011.clw:80') ($p._svc.Sent -join ' / ')
+  Check '...and forgets BOTH images'' staged copies, keeping the other line' ((Staged $p) -ceq 'clbrws011.clw:90@C:\App\a.dll') (Staged $p)
+  # Not running: nothing goes to an engine, and both copies leave the next session's launch spec.
+  $q = New-Object Gut.Pad; $q._svc.IsRunning = $false
+  $q._pending.Add((GutRow 'clbrws011.clw' 80 'C:\App\a.dll')); $q._pending.Add((GutRow 'CLBRWS011.CLW' 80 'C:\App\b.dll'))
+  $q.OnGutterRemoved('clbrws011.clw', 80, 'C:\App\B\clbrws011.clw')
+  Check 'with no session, a gutter removal drops every staged copy (module ignoring case) and resends the list' `
+    (($q._pending.Count -eq 0) -and ($q.BpsSent -eq 1) -and ($q._svc.Sent.Count -eq 0)) "staged=[$(Staged $q)] sendBps=$($q.BpsSent) sent=$($q._svc.Sent -join ',')"
+  # The command the service builds is the unqualified spec, with nothing after the line.
+  $rb = Get-CSharpCodeOnly (Get-Method 'public bool RemoveBreakpoint(string module, int line)' $svc)
+  Check 'the service sends `bp del` as module:line and nothing else' `
+    ($rb -match '\{\s*return IsValidModuleName\(module\) && SendCommand\("bp del " \+ module \+ ":" \+ line\);\s*\}\s*$') $rb
+}
+
 # THE COUNT, ASSERTED AND PRINTED (60344b78). Invoke-CheckSection above closes a section that throws or
 # breaks out of the script; this closes one that returns early or is skipped. COUNTING RULE: the RUNTIME
 # count of Check calls ($script:checks before this line) on a clean run, measured 2026-09-22 - not a count
 # of `Check` lines, which differs wherever a Check sits in a loop. Update it deliberately with the checks.
-$EXPECTED_CHECKS = 46
+$EXPECTED_CHECKS = 50
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

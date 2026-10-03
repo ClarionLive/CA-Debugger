@@ -338,10 +338,12 @@ namespace ClarionDebugger.Terminal
         // tuple issued here. An expanded reference carries no tid, so its rows are granted unscoped.
         // Only a reply to a moduledata the host sent in the current epoch may grant (3517fd15): one delayed past
         // a resume and a new stop, or from an engine that echoes no id, is posted for display and grants nothing.
+        // A reply that may grant but is not well-formed grants nothing and is posted as NO rows (wave 8 X1): its
+        // body is never posted verbatim unless GrantRows read the whole of it.
         private void OnSvcModuleData(string module, string itemsJson, uint? tid, string reqId) => UI(() =>
         {
             bool mayGrant = _editGrants.ReadAnswered(reqId);
-            if (mayGrant) _editGrants.GrantRows(itemsJson, tid);
+            if (mayGrant) mayGrant = _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + RowsAsGranted(itemsJson, mayGrant) + "]" + TidJson(tid) + "}");
         });
 
@@ -366,7 +368,7 @@ namespace ClarionDebugger.Terminal
             // members of a group the host itself offered. Any other reply is posted for display, and grants
             // nothing - its rows cannot be edited or expanded further.
             bool verified = _editGrants.ExpandVerified(reqId);
-            if (verified) _editGrants.GrantRows(itemsJson, null);
+            if (verified) verified = _editGrants.GrantRows(itemsJson, null);
             Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]}");
         });
 
@@ -376,7 +378,7 @@ namespace ClarionDebugger.Terminal
             // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
             // posted for display, and grants nothing.
             bool verified = _editGrants.FrameLocalsVerified(reqId, tid);
-            if (verified) _editGrants.GrantRows(itemsJson, tid);
+            if (verified) verified = _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]" + TidJson(tid) + "}");
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
@@ -552,6 +554,10 @@ namespace ClarionDebugger.Terminal
         }
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
+        // The file path f is dropped ON PURPOSE (Owner ruling 2026-10-03: a .clw BASENAME names one file). The
+        // removal goes out as an unqualified `bp del module:line`, which removes the breakpoint from EVERY image
+        // that armed a copy, and that is the intended result; tools/test-addin-bpident.ps1 pins it, so a
+        // path-qualified delete has to be a deliberate change.
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
 
         private async void OnHandleCreated(object sender, EventArgs e)
@@ -736,7 +742,7 @@ namespace ClarionDebugger.Terminal
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
-                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
+                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr[|imgBase]"
                     case "framelocals": FrameLocals(data); break;   // call-stack frame locals: data = "reqId|va|ebp"
                     case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
                         if (_svc.State == DebugSessionState.Paused)
@@ -2057,9 +2063,9 @@ namespace ClarionDebugger.Terminal
             if (why != null) PostVarSet(req.Va, false, null, why);
         }
 
-        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
-        /// is forwarded ONLY when that exact tuple is an expandable row the host issued for the rows now current
-        /// (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
+        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr[|imgBase]</c>,
+        /// and it is forwarded ONLY when that exact tuple, image base included (w8-expand-base), is an expandable
+        /// row the host issued for the rows now current (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
         /// address the page named - edit metadata included - and a forged expand would mint the edit grants
         /// that EditVar checks. A refusal, or a request the service would not send, is ANSWERED with an empty
         /// expanded reply for that reqId, so the node the page is opening does not wait forever.</summary>
@@ -2068,12 +2074,12 @@ namespace ClarionDebugger.Terminal
             if (_svc.State != DebugSessionState.Paused) return;
             var x = ExpandRequest.Parse(data);
             if (x == null) return;
-            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr))
+            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr, x.ImgBase))
             {
                 RefuseExpand(x.ReqId, "that node is no longer current (or was never offered) — let the view refresh, then open it again");
                 return;
             }
-            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr))
+            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr, x.ImgBase))
             {
                 RefuseExpand(x.ReqId, "the engine did not take the request");
                 return;
