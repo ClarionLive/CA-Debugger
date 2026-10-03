@@ -64,7 +64,7 @@ Check 'a genuinely live session still throws "already running"' `
 # The pad asks FIRST, so it never announces a start that is not going to happen.
 $padStart = Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)
 $iAsk = $padStart.IndexOf('_svc.IsEngineStillClosing')
-$iResolve = $padStart.IndexOf('ResolveTargetForStart()')
+$iResolve = $padStart.IndexOf('ResolveTargetForStart(out listed)')
 $iStarting = $padStart.IndexOf('"starting: "')
 Check 'the pad refuses before resolving the target or announcing a start' `
   (($iAsk -ge 0) -and ($iResolve -gt $iAsk) -and ($iStarting -gt $iAsk)) "ask=$iAsk resolve=$iResolve starting=$iStarting"

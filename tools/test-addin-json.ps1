@@ -1321,7 +1321,7 @@ Check 'CONTROL: PushProcedures posts an empty "loading" list, then the list' `
 # either reaches both kinds of session.
 $webCode = Get-CSharpCodeOnly $web
 Check 'StartSession and AttachSession both load symbols through LoadStaticSymbols, the one reader of the globals' `
-  (((Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)) -match 'LoadStaticSymbols\(_exe\);') -and `
+  (((Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)) -match 'LoadStaticSymbols\(_exe, relist: !listed\);') -and `
    ((Get-CSharpCodeOnly (Get-Method 'private void AttachSession(AttachableProcess target)' $web)) -match 'LoadStaticSymbols\(exe\);') -and `
    ([regex]::Matches($webCode, 'GetGlobalsJson\(').Count -eq 1)) ''
 
