@@ -1,3 +1,4 @@
+# suite: live=no
 # Regression check: which FILE a breakpoint row means, when two loaded DLLs each hold a .clw of that name.
 #
 # A breakpoint is named on the wire by a bare .clw BASENAME. In a multi-DLL app two images can each carry a

@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # The Target EXE, v2 (0214f33a, contract C4): what the pad resolves, and what its target bar is allowed to claim.
 #
 #   pwsh -NoProfile -File tools\test-host-target.ps1 [-TargetServicePath <ProjectTargetService.cs>] [-WebViewPath <ClarionDebuggerWebView.cs>]

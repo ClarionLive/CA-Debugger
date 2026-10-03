@@ -1,3 +1,4 @@
+// suite: live=no; success='^all \d+ inline script block\(s\) parse OK$'
 // Parse-only check of the pad's inline <script> bodies: catches a stray brace or a typo that would break
 // the page silently inside the IDE's WebView. The other pad tests pull individual FUNCTIONS out of the
 // page, so they cannot see a syntax error in the code between them.

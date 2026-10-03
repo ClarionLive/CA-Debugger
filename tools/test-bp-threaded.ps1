@@ -1,3 +1,4 @@
+# suite: live=yes
 # Regression rig for 465a3873 -- a TRACEPOINT over a THREADed (.cwtls) name, hit REPEATEDLY WITHOUT
 # PAUSING, then resumed and hit again.
 #

@@ -1,3 +1,4 @@
+# suite: live=no
 # The watch reply's addr / frameIdx / frameProc members, engine writer to page (04b9679e).
 #
 # The add-in does not forward a watch reply: ParseWatch reads it into a DebugWatch and OnWatch writes a NEW

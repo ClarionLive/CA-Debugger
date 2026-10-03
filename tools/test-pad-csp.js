@@ -1,3 +1,4 @@
+// suite: live=no
 // Content-Security-Policy of the debugger pad (1797b13a).
 //
 // The pad is trusted for memory reads, so its <meta http-equiv="Content-Security-Policy"> is defence in depth

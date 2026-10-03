@@ -1,3 +1,4 @@
+// suite: live=no
 // Watch-list persistence (ticket 08adccc7), run against the REAL functions in debugger.html.
 //
 // Same idea as pad-dom.js and test-addin-json.ps1: extract the shipped code and run it, rather than

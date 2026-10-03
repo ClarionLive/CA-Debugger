@@ -1,3 +1,6 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
+# suite: live=yes; args=-WithClarion
 # The attach picker's process enumerator (ticket 3f2d747f part B): PeProbe, the headers-only PE probe in
 # ClarionDbg.Core, and the `ClarionDbg procs --json` verb built on it.
 #

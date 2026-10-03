@@ -1,4 +1,5 @@
-﻿# Paced interactive smoke test for the Phase 2 engine.
+﻿# suite: live=yes; success='^=== exit code: 0 ===$'; nototal='a paced step/stepover/stepout smoke run with no Check calls; its verdict is the engine exit code'
+# Paced interactive smoke test for the Phase 2 engine.
 # Launches ClarionDbg break --interactive, waits for the paused event, then issues
 # step / stepover / stepout / continue with real delays, printing all output.
 #

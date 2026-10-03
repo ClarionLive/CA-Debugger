@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # The host's ONE selected thread (49538b78 item 8b, Owner decision 3, 2026-09-24).
 #
 #   pwsh -NoProfile -File tools\test-addin-selection.ps1 [-ServicePath <ClarionDebuggerService.cs>] [-HostGrantsPath <HostGrants.cs>]

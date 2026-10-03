@@ -1,3 +1,4 @@
+// suite: live=no
 // Regression check: which Call Stack frame the pad treats as "the frame with locals" (70b58a1a).
 //
 // After an ordinary stop, frame 0 is a Clarion procedure and its locals are the ones to show. After a

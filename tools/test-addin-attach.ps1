@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # Regression check: the HOST side of "Attach to a running process" (ticket 3f2d747f part C).
 #
 #   pwsh -NoProfile -File tools\test-addin-attach.ps1

@@ -1,4 +1,5 @@
-﻿# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
+﻿# suite: live=no
+# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
 #
 # Two ways this hurts, both silent:
 #   - a "tid" read out of a nested array or a string value names the wrong thread, so good replies get

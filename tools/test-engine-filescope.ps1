@@ -1,3 +1,4 @@
+# suite: live=yes
 # Real compiler output for data-name resolution (tickets 04d7b4c8 and 52458d89): builds the hand-coded
 # fixture tools\fixtures\filescope with Clarion 11 and asks the engine's offline `data` and `globals` commands
 # about it.

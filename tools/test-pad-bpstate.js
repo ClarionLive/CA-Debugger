@@ -1,3 +1,4 @@
+// suite: live=no
 // What the page does with a breakpoint row's pathState — the page half of the FROZEN contract, 49538b78
 // item 5. The host half is Quinn-2's (SendBps / GutterPathFor); tools/test-addin-bpident.ps1 covers that.
 //

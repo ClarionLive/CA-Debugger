@@ -1,4 +1,5 @@
-﻿# Checks the shared harness machinery in engine-session.ps1 WITHOUT an engine, a debuggee or Clarion.
+﻿# suite: live=no
+# Checks the shared harness machinery in engine-session.ps1 WITHOUT an engine, a debuggee or Clarion.
 #
 # The two interactive harnesses can only be run by hand against a real target, so the parts of them
 # that are easy to get quietly wrong - which pid gets signalled, and whether the output pump loses or
@@ -11,6 +12,10 @@
 # this suite scans PowerShell, not C#, so it has nothing to extract - and lib-extract imposes
 # Set-StrictMode on its callers, under which this file throws (see EXPECTED_CHECKS below).
 . "$PSScriptRoot\lib-check.ps1"
+# Get-SuiteHeaders: the suites' own `suite:` lines (w8-suite-header). Section 5 pins the harness SET to the
+# live=yes suites, and EXPECTED_CHECKS below derives its per-harness checks from the same count.
+. "$PSScriptRoot\lib-suites.ps1"
+$LIVE_SUITES = @(@((Get-SuiteHeaders -ToolsDir $PSScriptRoot).Entries) | Where-Object { $_.Live } | ForEach-Object { $_.File } | Sort-Object -Unique)
 
 # A session with no process behind it: a plain list stands in for the synchronized sink the real
 # OutputDataReceived handler fills.
@@ -268,9 +273,13 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     Check 'exactly 2 scripts run the engine only as a one-shot static verb (procs, data, globals), so they launch no debuggee' `
         ($oneShot.Count -eq 2 -and (($oneShot.Name | Sort-Object) -join ',') -eq 'test-engine-filescope.ps1,test-procs.ps1') (($oneShot.Name) -join ', ')
     $harnesses = @($all | Where-Object { $_.Name -ne $self -and $_.Name -ne 'run-all.ps1' -and $oneShot.Name -notcontains $_.Name -and (Test-NamesEngineBinary $_.FullName) })
-    # A number, not "every": if another harness appears this says so instead of quietly covering the old set.
-    # 4 since test-setip.ps1 (a77abd94, 2026-09-23).
-    Check 'exactly 6 scripts here launch the engine binary' ($harnesses.Count -eq 6) (($harnesses.Name) -join ', ')
+    # A SET, not "every" and not a typed number: the harnesses this scan finds must be exactly the suites
+    # whose header says live=yes, less the one-shot pair pinned above. A harness that stops naming the binary
+    # drops out of the scan but not out of its header, and a new live harness is in both - so neither can
+    # change the per-harness checks below without this saying so. (2026-10-03: 6 harnesses, 8 live suites.)
+    $scanned = (@($harnesses.Name) + @($oneShot.Name) | Sort-Object) -join ', '
+    Check 'the scripts that launch the engine binary, plus the one-shot pair, are exactly the live=yes suites' `
+        ($LIVE_SUITES.Count -gt 0 -and $scanned -ceq ($LIVE_SUITES -join ', ')) "scan: $scanned; live=yes: $($LIVE_SUITES -join ', ')"
 
     foreach ($h in $harnesses) {
         $text = Get-Content -Raw -LiteralPath $h.FullName
@@ -506,7 +515,10 @@ Invoke-CheckSection '8) the pump keeps the engine''s line order, stdout and stde
 # It is also why this suite states a NUMBER rather than "all": before this, a section that died took its
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
-$EXPECTED_CHECKS = 76   # +4 test-engine-samename.ps1's per-harness checks (1be3b82e, wave 7); was 72: +3 section 8, the pump's line order (wave 5); was 69: 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
+# The 4 per-harness checks in section 5 are counted from the live=yes headers, less the one-shot pair (pinned
+# to exactly 2 there), so adding a live harness needs no edit here. The base is everything else; 2026-10-03:
+# 52 = 76 - 4 * 6 harnesses. The history below is of the old single number.
+$EXPECTED_CHECKS = 52 + 4 * ($LIVE_SUITES.Count - 2)   # was 76: +4 test-engine-samename.ps1's per-harness checks (1be3b82e, wave 7); was 72: +3 section 8, the pump's line order (wave 5); was 69: 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
 Assert-CheckTotal $EXPECTED_CHECKS
 
 # $script:checks, NOT a value snapshotted before the line above. It used to be captured first, so a clean

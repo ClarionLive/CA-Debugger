@@ -1,3 +1,4 @@
+# suite: live=yes
 # Two DLLs with the SAME file name, live (ticket 1be3b82e item 2): builds the hand-coded fixture
 # tools\fixtures\samename with Clarion 11 - a\shared.dll and b\shared.dll, each compiled from a file named
 # sharedmod.clw, plus samehost.exe, which loads both by full path and calls SHAREDPROC in A and then in B -
