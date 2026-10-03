@@ -24,7 +24,7 @@ namespace ClarionDbg.Cli
                          + "claims that entry, a same-build copy from another directory claims the one matching preload, and "
                          + "two matching preloads, only a different build of the name, another name's same build or an unread link time "
                          + "claim nothing (a new entry); a readable copy with the same link time and size but different debug data "
-                         + "claims nothing, and an unreadable one claims only when its mapped header's link time, size, checksum and "
+                         + "claims nothing, nor does a readable file whose link time is not the mapped header's, and an unreadable one claims only when its mapped header's link time, size, checksum and "
                          + "debug entry (type, link time, data size) all read and match, so a header with no size never matches a "
                          + "preload of the old 0x10000 floor, and two copies with empty debug data are not one build (fb5766d1 #2).");
 
@@ -100,11 +100,18 @@ namespace ClarionDbg.Cli
                 string otherDebug = writeVariant("OtherDebug", b => b[fixtureDbg.PointerToRawData + fixtureDbg.SizeOfData / 2] ^= 0xFF);
                 if (claim(otherDebug, 0x11111111) != null)
                     failures.Add("same-name dlls: a readable copy whose debug data differs (same link time and size) claimed A's entry");
+                // The file on disk must be the build that mapped: B's file (same debug data, its own link time) read at a
+                // path whose MAPPED header says A's link time is a file replaced since, and proves nothing about A.
+                var bDisk = PeImage.Load(bPath);
+                if (DebugEngine.ClaimUnmapped(table, Path.Combine(root, "Replaced", "shared.dll"), "shared.dll",
+                        new DebugEngine.MappedBuild { DiskPe = bDisk, Stamp = 0x11111111, Size = bDisk.SizeOfImage }) != null)
+                    failures.Add("same-name dlls: a readable file whose link time is not the mapped header's claimed A's entry");
 
-                // UNREADABLE: the mapped header alone (DiskPe null), read through the REAL ReadMappedBuild over the bytes.
+                // UNREADABLE: the mapped header alone (DiskPe null), read through the REAL ReadMappedBuild over the bytes,
+                // laid out by A's section table, so a patched header field is the only difference.
                 Func<byte[], LoadedModule> claimHeader = bytes =>
                     DebugEngine.ClaimUnmapped(table, Path.Combine(root, "Gone", "shared.dll"), "shared.dll",
-                                              DebugEngine.ReadMappedBuild(FileAsMapped(bytes), null));
+                                              DebugEngine.ReadMappedBuild(FileAsMapped(bytes, aPe), null));
                 Func<Action<byte[]>, byte[]> variant = patch => { var b = (byte[])aBytes.Clone(); patch(b); return b; };
                 if (claimHeader(aBytes) != ea)
                     failures.Add("same-name dlls (control): an unreadable copy whose mapped header matches A in every field did not claim A's entry");
@@ -114,6 +121,8 @@ namespace ClarionDbg.Cli
                     failures.Add("same-name dlls: an unreadable copy whose debug entry has a different link time claimed A's entry");
                 if (claimHeader(variant(b => BitConverter.GetBytes(fixtureDbg.SizeOfData + 1).CopyTo(b, dbgEntryOff + 16))) != null)
                     failures.Add("same-name dlls: an unreadable copy whose debug entry has a different data size claimed A's entry");
+                if (claimHeader(variant(b => BitConverter.GetBytes(fixtureDbg.Type ^ 0x100u).CopyTo(b, dbgEntryOff + 12))) != null)
+                    failures.Add("same-name dlls: an unreadable copy whose debug entry has a different type claimed A's entry");
                 if (claimHeader(variant(b => BitConverter.GetBytes(0u).CopyTo(b, optHdr + 96 + 6 * 8 + 4))) != null)
                     failures.Add("same-name dlls: an unreadable copy with no debug directory claimed A's entry");
                 if (claimHeader(variant(b => BitConverter.GetBytes(0u).CopyTo(b, peHdr))) != null)
@@ -180,12 +189,13 @@ namespace ClarionDbg.Cli
 
         /// <summary>A U32 reader over a PE FILE laid out as the loader would map it, for ReadMappedBuild: an RVA below
         /// the first section is a header offset (the same in file and memory), any other goes through the section
-        /// table. A file whose headers do not parse reads as raw offsets; anything out of range reads 0, as an
+        /// table - of <paramref name="layout"/> when given (so a header patched to be unparseable keeps its layout),
+        /// else of the bytes themselves. With neither it reads raw offsets; anything out of range reads 0, as an
         /// unreadable page does.</summary>
-        private static Func<uint, uint> FileAsMapped(byte[] bytes)
+        private static Func<uint, uint> FileAsMapped(byte[] bytes, PeImage layout = null)
         {
-            PeImage pe = null;
-            try { pe = new PeImage(bytes); } catch { pe = null; }
+            PeImage pe = layout;
+            if (pe == null) { try { pe = new PeImage(bytes); } catch { pe = null; } }
             uint firstSection = uint.MaxValue;
             if (pe != null) foreach (var s in pe.Sections) firstSection = Math.Min(firstSection, s.VirtualAddress);
             return rva =>

@@ -27,7 +27,7 @@ namespace ClarionDbg.Cli
         public string MappedPath;      // where the loader actually mapped this image (null while unmapped). Differs from
                                        // Path only for a same-build claim, which BORROWS the preload's path; a borrowed
                                        // Path yields to a live image genuinely at that path (fb5766d1 #3)
-        public bool PathBorrowed { get { return LoadBase != 0 && MappedPath != null && !string.Equals(Path, MappedPath, System.StringComparison.OrdinalIgnoreCase); } }
+        public bool PathBorrowed { get { return MappedPath != null &&!string.Equals(Path, MappedPath, System.StringComparison.OrdinalIgnoreCase); } }
 
         // per-module threaded-data eval (Tier 1/2 only; 0 when the image has no .cwtls / no import)
         public uint CwtlsLo, CwtlsHi;          // .cwtls section RVA range (file-aligned Span: may include padding)
