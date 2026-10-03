@@ -29,8 +29,6 @@
 #
 # ASCII only, for Windows PowerShell 5.1.
 
-# suite: live=no
-# suite: live=no; args=-SelfTest
 param(
   # Defaulted in the body: Windows PowerShell 5.1 leaves $PSScriptRoot empty in this block.
   [string] $TargetServicePath = '',
