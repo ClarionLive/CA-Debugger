@@ -23,6 +23,11 @@ namespace ClarionDbg.Cli
         public PeImage Pe;             // null when the file could not be read (rare; Tier 3 keeps base+size)
         public TswdDebugInfo Dbg;      // null for Tier 3 (no TSWD)
         public bool Preloaded;         // true = registered from the solution list (kept on unload); false = runtime-discovered (dropped on unload)
+        public string PreloadPath;     // the solution path a preloaded entry was registered under; Path returns to it on unload
+        public string MappedPath;      // where the loader actually mapped this image (null while unmapped). Differs from
+                                       // Path only for a same-build claim, which BORROWS the preload's path; a borrowed
+                                       // Path yields to a live image genuinely at that path (fb5766d1 #3)
+        public bool PathBorrowed { get { return LoadBase != 0 && MappedPath != null && !string.Equals(Path, MappedPath, System.StringComparison.OrdinalIgnoreCase); } }
 
         // per-module threaded-data eval (Tier 1/2 only; 0 when the image has no .cwtls / no import)
         public uint CwtlsLo, CwtlsHi;          // .cwtls section RVA range (file-aligned Span: may include padding)
