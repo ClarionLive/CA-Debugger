@@ -60,21 +60,47 @@ namespace ClarionDebugger.Terminal
         }
     }
 
-    /// <summary>Lazy reference expansion: <c>reqId|module|typeRef|addr</c>.</summary>
+    /// <summary>Lazy reference expansion: <c>reqId|module|typeRef|addr</c>, or <c>reqId|module|typeRef|addr|imgBase</c>
+    /// when the row carried the load base of its image (w8-expand-base). A fifth field that is not
+    /// <see cref="ImageBase"/> grammar - an empty one included - rejects the whole request.</summary>
     internal sealed class ExpandRequest
     {
         public int ReqId;
         public string Module;
         public uint TypeRef;
         public string Addr;
+        /// <summary>The row's <c>imgBase</c> exactly as the page sent it, or null when it sent none.</summary>
+        public string ImgBase;
 
         public static ExpandRequest Parse(string data)
         {
             if (string.IsNullOrEmpty(data)) return null;
             var a = data.Split('|');
             int rq; uint tr;
-            if (a.Length != 4 || !PageNumbers.TryInt(a[0], out rq) || !PageNumbers.TryUInt(a[2], out tr)) return null;
-            return new ExpandRequest { ReqId = rq, Module = a[1], TypeRef = tr, Addr = a[3] };
+            if ((a.Length != 4 && a.Length != 5) || !PageNumbers.TryInt(a[0], out rq) || !PageNumbers.TryUInt(a[2], out tr)) return null;
+            string imgBase = a.Length == 5 ? a[4] : null;
+            if (imgBase != null && !ImageBase.IsValid(imgBase)) return null;
+            return new ExpandRequest { ReqId = rq, Module = a[1], TypeRef = tr, Addr = a[3], ImgBase = imgBase };
+        }
+    }
+
+    /// <summary>An image load base as the engine writes it on an expandable row (<c>"imgBase":"0x%08X"</c>) and
+    /// the expand command takes it: 0x followed by 1-8 hex digits, nothing else (w8-expand-base).</summary>
+    internal static class ImageBase
+    {
+        public static bool IsValid(string s)
+        {
+            uint v;
+            return TryParse(s, out v);
+        }
+
+        public static bool TryParse(string s, out uint value)
+        {
+            value = 0;
+            if (s == null || s.Length < 3 || s.Length > 10 || s[0] != '0' || s[1] != 'x') return false;
+            for (int i = 2; i < s.Length; i++)
+                if (!Uri.IsHexDigit(s[i])) return false;
+            return uint.TryParse(s.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out value);
         }
     }
 
