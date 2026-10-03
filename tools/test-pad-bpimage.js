@@ -1,3 +1,4 @@
+// suite: live=no
 // Breakpoint rows that name their image: the page half of the FROZEN contract C2 (1be3b82e #3, wave 7).
 //
 // The host adds "image" to every {"type":"bplist"} row: the engine's ownerPath for that row, or null when

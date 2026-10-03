@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # Asserts, against the ENGINE'S OWN SOURCE, that every stop resets the hover tracker before the pause loop.
 #
 #   pwsh -NoProfile -File tools\test-engine-hover-sites.ps1

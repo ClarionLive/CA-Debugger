@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # Asserts, against the ENGINE'S OWN SOURCE, that every stop drops the stack-frame cache before the pause loop.
 #
 #   pwsh -NoProfile -File tools\test-engine-framecache-sites.ps1

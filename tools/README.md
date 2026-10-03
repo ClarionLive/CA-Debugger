@@ -1,8 +1,8 @@
 # tools/ - the verify set
 
 This repo has no CI. The suites in this folder, together with `ClarionDbg.exe protocolcheck` and the two
-builds, are the whole regression net. `run-all.ps1` is the one command that runs it, and its `$Suites`
-table is the canonical list.
+builds, are the whole regression net. `run-all.ps1` is the one command that runs it. It DISCOVERS the
+suites from a `suite:` header line in each one (`lib-suites.ps1`); there is no hand-kept list.
 
 ## Run it
 
@@ -10,6 +10,7 @@ table is the canonical list.
 pwsh -NoProfile -File tools\run-all.ps1                  # build the engine, protocolcheck, every offline suite
 pwsh -NoProfile -File tools\run-all.ps1 -IncludeLive     # ...plus the suites that drive a live debuggee
 pwsh -NoProfile -File tools\run-all.ps1 -NoBuild -Only test-addin-hooks.ps1
+pwsh -NoProfile -File tools\run-all.ps1 -List            # print the discovered suite list and stop
 ```
 
 It prints one line per suite (`PASS`, `FAIL`, or `SKIPPED (live)`), shows the tail of any failing
@@ -19,9 +20,11 @@ suite's output, and exits non-zero if anything failed. It **fails closed**:
 |---|---|
 | a suite exits non-zero | FAIL |
 | a suite exits 0 but never prints its own success line (a top-level `break` does this) | FAIL |
-| a `tools\test-*.ps1` / `tools\test-*.js` on disk that is not in `$Suites` | FAIL (UNLISTED) |
-| a `$Suites` entry whose file is gone | FAIL |
-| a listed `.ps1` suite that does not call `Assert-CheckTotal`, with no `NoTotal` reason in its entry | FAIL |
+| a `tools\test-*.ps1` / `tools\test-*.js` with no `suite:` line | FAIL (NO SUITE LINE) |
+| a malformed `suite:` line, one past line 40 or below `param()`, or a `success=` not anchored with `^` | FAIL |
+| a `.ps1` with a `$SelfTest` parameter but no `args=-SelfTest` line | FAIL |
+| fewer entries discovered than `$MinEntries` in `run-all.ps1` (a floor that may only be raised) | FAIL |
+| a `.ps1` suite that does not call `Assert-CheckTotal`, with no `nototal=` reason on its line | FAIL |
 | a `.ps1` in the repo with non-ASCII bytes and no UTF-8 BOM, other than the `$EncodingPending` list | FAIL |
 | a `$EncodingPending` file that no longer needs the exception | FAIL (the list may only shrink) |
 | the engine build fails or warns, protocolcheck is missing, `pwsh` or `node` is missing | FAIL |
@@ -29,9 +32,20 @@ suite's output, and exits non-zero if anything failed. It **fails closed**:
 
 ## Adding a suite
 
-Add **one line** to `$Suites` in `run-all.ps1`, for example `@{ File = 'test-disasm-seat.ps1' }`. Until
-you do, the runner fails with `UNLISTED`. Optional fields are `Args`, `Live = $true`, `Success` (a regex
-for a success line other than the default) and `NoTotal` (the reason a `.ps1` does not pin its total).
+Give the suite **one header line per way it is run**, ASCII, within its first 40 lines and above
+`param()` (a `.js` uses `//` for `#`). Until it has one, the runner fails with `NO SUITE LINE`.
+
+```
+# suite: live=no
+# suite: live=no; args=-SelfTest
+# suite: live=yes; args=-WithClarion
+# suite: live=no; success='^all \d+ inline script block\(s\) parse OK$'
+# suite: live=yes; nototal='reason'
+```
+
+`live=yes|no` is required. Optional keys are `args`, `success` (an anchored regex for a success line other
+than the default) and `nototal` (`.ps1` only: why it does not pin its total). A value with a space or `;`
+is single-quoted. `lib-suites.ps1` holds the grammar, and `test-run-all.ps1` proves each guard on it fails.
 
 A new PowerShell suite should:
 
@@ -48,29 +62,10 @@ A new PowerShell suite should:
 
 ## The set
 
-As of 2026-09-22. The list in `run-all.ps1` is authoritative. This table only explains it.
-
-| Suite | Kind | What it guards |
-|---|---|---|
-| `protocolcheck` (engine binary) | engine | the wire protocol builders, one claim per check |
-| `test-addin-bpident.ps1` | offline | which file a breakpoint row means when two DLLs share a `.clw` name |
-| `test-addin-bpremove.ps1` | offline | the pad's staging list is trimmed only when the engine took the removal |
-| `test-addin-hooks.ps1` | offline | the reflection hooks into ClarionAssistant, one child process per scenario |
-| `test-addin-json.ps1` | offline | the add-in's JSON reader and writer |
-| `test-addin-attach.ps1` (plain and `-SelfTest`) | offline | attach host side (3f2d747f): only a host-listed pid is attached, Stop sends `detach` (not `quit`) and waits 8 s, the `detached` event resets the pad, a closing pad still warns durably (log, with a %TEMP% fallback, + a dialog that survives a dead UI context) on an unsafe detach, and an attach carries `--expect-start`; `-SelfTest` breaks each guard (31 mutations) and requires red |
-| `test-engine-bpowner.ps1` | offline | breakpoint ownership across images: the spec grammar, the image-matching rule and the identity predicates (not that a breakpoint fires in both images) |
-| `test-engine-session.ps1` | offline | the shared engine-session lifecycle, and that harnesses use it |
-| `test-engine-tid-members.ps1` (plain and `-SelfTest`) | offline | no thread-id JSON member written by hand; thread ids to users go through TidText |
-| `test-engine-hover-sites.ps1` (plain and `-SelfTest`) | offline | PausedWait resets the hover tracker as an unconditional top-level statement before its command loop (position, not text) |
-| `test-pad-*.js` | offline (node) | the debugger pad page |
-| `test-bp-threaded.ps1` | **live** | a tracepoint over a THREADed name, hit repeatedly without pausing |
-| `test-watch-threaded.ps1` | **live** | a watch reads a THREADed name from its instance, not a HISTORY:: copy |
-| `test-interactive.ps1` | **live** | step / stepover / stepout from a startup breakpoint |
-| `test-engine-setip-sites.ps1` (plain and `-SelfTest`) | offline | every resume cuts setip's observations back as ArmResume's first statement, and every step trap records its ESP (position, not text) |
-| `test-procs.ps1` (plain, `-SelfTest`, and **live** `-WithClarion`) | offline | the headers-only PE probe and the `procs --json` attach-candidate list |
-| `test-attach.ps1 -SelfTest` | offline | 14 planted faults each turn protocolcheck red on the check aimed at it: no drain, no EIP rewind; the thread reseed keeping the break thread, breaking a tie the wrong way, not setting main; commands read only on a wait timeout; and the 4b run 2 hardenings removed (a TF-clear or EIP-rewind failure unreported, bytes removed earlier forgotten by the drain or paused on by the loop, an unreadable image reported as not x86, --expect-start never compared, a throwing detach sending nothing); and a QUIET detach (a refused attach) reporting an `exited` |
-| `test-attach.ps1` | **live** | attach to a running clbrws, then detach paused, running, after a step-over, by `quit` and by closing stdin, and `--expect-start` (a wrong creation time refused with nothing planted, the listed one attaching): the app lives, no debugger is attached, and every breakpoint byte matches the file on disk. It cannot reproduce the drain's race (its header says why, with the 2026-09-23 measurement) |
-| `test-setip.ps1` | **live** | set next statement on SplashScreen: back via `observed`, forward refused (stack-unproven), both breakpoints still fire around a setip, Step starts from the new line, nothing observed survives a continue or a step-out, and the ACCEPT-boundary, prologue, routine and Pause-stop refusals |
+`pwsh -NoProfile -File tools\run-all.ps1 -List` prints it, one line per run variant, read from the suites'
+own headers. What each suite guards is in that suite's header comment. A table here was dropped
+(2026-10-03, ticket 49538b78): it was a second hand-kept list, and by then it had already fallen behind
+the runner's.
 
 **Live** suites launch `clbrws.exe` from the Clarion 11 examples
 (`C:\Users\Public\Documents\SoftVelocity\Clarion11\Examples\HowToClarion\Browses`) under the engine and

@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # Asserts, against the ENGINE'S OWN SOURCE, that every watch reply is emitted through EmitWatchEvent, the one
 # place that adds the request id.
 #

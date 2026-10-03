@@ -1,3 +1,4 @@
+// suite: live=no
 // The pad side of "Set next statement" (task a77abd94): the source-view menu item, its gate, the one-time
 // hazard warning, and the refusal toast.
 //

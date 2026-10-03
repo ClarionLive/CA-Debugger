@@ -1,3 +1,4 @@
+// suite: live=no
 // Regression check: the Memory panel (ticket 633d8b2f) - the hex + ASCII dump, its paging, its reply
 // matching, and "View memory" on variable rows.
 //

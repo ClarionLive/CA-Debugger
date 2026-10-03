@@ -1,4 +1,5 @@
-﻿# Regression check: the engine outliving its own "exited" event (ticket 0449e5c9, Owner's decision: option C).
+﻿# suite: live=no
+# Regression check: the engine outliving its own "exited" event (ticket 0449e5c9, Owner's decision: option C).
 #
 #   pwsh -NoProfile -File tools\test-addin-lifecycle.ps1
 #

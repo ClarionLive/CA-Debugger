@@ -1,3 +1,4 @@
+// suite: live=no
 // The target bar's page half of the FROZEN contract C4 (0214f33a #1, wave 7).
 //
 // The host sends {"type":"target","path":"...","exists":bool,"state":"auto"|"manual"|"unconfirmed"|"none",

@@ -1,3 +1,4 @@
+# suite: live=no
 # Regression check: which IMAGE a breakpoint is armed in, when two loaded DLLs each carry a same-named .clw.
 #
 # A .clw name on the wire is a bare BASENAME. The old `OwnerOfModule` (removed) answered "the first loaded image carrying it",

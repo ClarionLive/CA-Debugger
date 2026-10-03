@@ -1,3 +1,4 @@
+# suite: live=no
 # Behavioural test of the Disassembly view's SEAT LIFECYCLE (ticket 8f352618).
 #
 #   pwsh -NoProfile -File tools\test-disasm-seat.ps1 [-SeatStatePath <SeatState.cs>] [-ViewPath <DisassemblyView.cs>]

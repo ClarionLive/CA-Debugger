@@ -1,3 +1,4 @@
+# suite: live=no
 # Regression check: OnGutterBpRemoved trims the pad's staging list only when the engine took the removal.
 #
 # _pending (what StartSession resends wholesale) and _svc.Breakpoints (the engine's live list) are separate,

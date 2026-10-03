@@ -1,3 +1,4 @@
+// suite: live=no
 // Regression check: a pause with NO source file must not leave the PREVIOUS stop's code on screen.
 //
 // 87c66af6 moved the location caption into the source header and made the 'paused' handler always write it

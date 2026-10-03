@@ -1,3 +1,4 @@
+// suite: live=no
 // Regression check: a Variables/Watch row must never keep a STALE instance address or its edit pencil.
 //
 // Rows are reused across stops. A row that resolved to one thread's instance and then gets a reply with no
