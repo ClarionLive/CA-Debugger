@@ -302,7 +302,7 @@ namespace ClarionDbg.Cli
                 failures.Add("expand base: the module name must match case-insensitively");
             foreach (var bad in new[] { "0x30000000", "0x40000000", "0x0", "0x00000000" })
                 if (exp(bad) != null) failures.Add("expand base: " + bad + " names no mapped shared.dll but resolved one (fail closed)");
-            foreach (var bad in new[] { "20000000", "0x", "0x123456789", "0x020000000","0xZZ", "0x2000000g", "-0x1", "0x+1", "" })
+            foreach (var bad in new[] { "20000000", "0x", "0x123456789", "0x020000000", "1020000000", "0xZZ", "0x2000000g", "-0x1", "0x+1", "" })
                 if (exp(bad) != null) failures.Add("expand base: malformed base '" + bad + "' resolved an image");
 
             var eng = NewEngine();

@@ -639,13 +639,12 @@ namespace ClarionDbg.Cli
             return ModuleByNameAndBase(modules, name, loadBase);
         }
 
-        /// <summary>The imgBase grammar: <c>0x</c> (either case) then 1-8 hex digits, nothing else.</summary>
+        /// <summary>The imgBase grammar: <c>0x</c> (either case) then 1-8 hex digits, nothing else. AllowHexSpecifier
+        /// alone admits hex digits only: no sign, no whitespace, no second prefix.</summary>
         internal static bool TryParseImgBase(string s, out uint value)
         {
             value = 0;
             if (s == null || s.Length < 3 || s.Length > 10 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) return false;
-            for (int i = 2; i < s.Length; i++)
-                if (!Uri.IsHexDigit(s[i])) return false;
             return uint.TryParse(s.Substring(2), System.Globalization.NumberStyles.AllowHexSpecifier,
                                  System.Globalization.CultureInfo.InvariantCulture, out value);
         }

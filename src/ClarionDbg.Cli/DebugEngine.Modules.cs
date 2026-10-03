@@ -187,7 +187,7 @@ namespace ClarionDbg.Cli
             if (just == null || just.LoadBase == 0) return changed;
             foreach (var o in modules)
             {
-                if (o == just || o.LoadBase == 0 || !SamePath(o.Path, just.Path)) continue;
+                if (o == just || !SamePath(o.Path, just.Path)) continue;
                 LoadedModule loser = just.PathBorrowed ? just : o.PathBorrowed ? o : null;
                 if (loser == null) continue;   // neither borrowed: two genuine mappings of one path cannot coexist
                 loser.Path = loser.MappedPath;
