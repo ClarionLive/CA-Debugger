@@ -63,8 +63,8 @@ $discovered = Get-SuiteHeaders -ToolsDir $tools
 $Suites = @($discovered.Entries)
 # A FLOOR on the entries discovered. It may only be RAISED: lowered, a suite deleted together with its header
 # is gone without a word. 2026-10-03: 56 = the 55 entries of the hand-kept $Suites at 81f268e, plus
-# tools\test-run-all.ps1.
-$MinEntries = 56
+# tools\test-run-all.ps1. 2026-10-03 (integration/wave8): 58, adding test-engine-samename-w8.ps1 and its -SelfTest.
+$MinEntries = 58
 # A .ps1 suite's success line names its count (lib-check's summary). The node suites predate a shared
 # summary, so theirs may or may not carry one.
 $DefaultSuccess = @{ '.ps1' = '^ALL \d+ CHECKS PASSED'; '.js' = '^ALL (\d+ )?CHECKS PASSED$' }
