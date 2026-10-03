@@ -37,7 +37,7 @@ namespace ClarionDbg.Cli
 					// STACK, never in .cwtls, so there is no shared-template value to veto and nothing to
 					// explain — which is an answer, not an absence of one.
 					rows.Add(NodeJson(l.Name, l.Type, l.TypeCode, l.Target, l.Size, l.Places,
-									  slotVa, l.FrameOff, m.Name, null, true));
+									  slotVa, l.FrameOff, m.Name, m.LoadBase, null, true));
 				}
 			return rows;
 		}
@@ -335,7 +335,25 @@ namespace ClarionDbg.Cli
         internal string NodeJsonForTest(string name, ClarionType type, byte code, byte target, uint size, int places,
                                         uint va, string module, string note, bool editable)
         {
-            return NodeJson(name, type, code, target, size, places, va, null, module, note, editable);
+            return NodeJson(name, type, code, target, size, places, va, null, module, 0, note, editable);
+        }
+
+        /// <summary>As <see cref="NodeJsonForTest(string, ClarionType, byte, byte, uint, int, uint, string, string, bool)"/>,
+        /// naming the owning image's load base, for the w8-expand-base claim that every expandable row carries it.</summary>
+        internal string NodeJsonForTest(string name, ClarionType type, byte code, byte target, uint size, int places,
+                                        uint va, string module, uint imgBase, string note, bool editable)
+        {
+            return NodeJson(name, type, code, target, size, places, va, null, module, imgBase, note, editable);
+        }
+
+        /// <summary>The image identity every expandable (ref:true) row carries, written in ONE place so no producer
+        /// can carry the name without the base (w8-expand-base): <c>module</c> is the image's file name and
+        /// <c>imgBase</c> its LoadBase as 0x + 8 uppercase hex digits. The page sends imgBase back on `expand`, and
+        /// the engine resolves the image by name AND base, so two same-named DLLs are told apart.</summary>
+        private static StringBuilder AppendRowImage(StringBuilder sb, string module, uint imgBase)
+        {
+            return sb.Append(",\"module\":").Append(Json.Str(module))
+                     .Append(",\"imgBase\":\"0x").Append(imgBase.ToString("X8")).Append('"');
         }
 
         /// <summary>The single composite value renderer. Three shapes:
@@ -351,7 +369,7 @@ namespace ClarionDbg.Cli
         /// writer — a default that is safe for today's callers is an unasked question with an optimistic
         /// answer.</remarks>
         private string NodeJson(string name, ClarionType type, byte code, byte target, uint size, int places, uint va, int? frameOff, string module,
-                                string note, bool editable)
+                                uint imgBase, string note, bool editable)
         {
             var sb = new StringBuilder();
             sb.Append("{\"name\":").Append(Json.Str(name));
@@ -377,8 +395,8 @@ namespace ClarionDbg.Cli
                 else
                     sb.Append(",\"value\":").Append(Json.Str("0x" + ptr.ToString("X")))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(ptr.ToString("X")).Append('"')
-                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(g)))
-                      .Append(",\"module\":").Append(Json.Str(module))
+                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(g)));
+                AppendRowImage(sb, module, imgBase)
                       .Append(",\"typeRef\":").Append(g.TypeRef);
             }
             else if (g != null)
@@ -390,14 +408,14 @@ namespace ClarionDbg.Cli
                 // under a read-only parent would let a commit rewrite the value every future Clarion thread
                 // starts from, and the setval thread guard cannot catch it (the tid is honest; the ADDRESS
                 // belongs to no thread).
-                sb.Append(",\"children\":[").Append(GroupChildrenJson(g, va, module, editable, note)).Append(']');
+                sb.Append(",\"children\":[").Append(GroupChildrenJson(g, va, module, imgBase, editable, note)).Append(']');
             }
             else if (type != null && type.Kind == TypeKind.Array)
             {
                 int hi = type.LoBound + type.Length - 1;
                 sb.Append(",\"type\":").Append(Json.Str(type.Length > 0 ? "ARRAY[" + type.LoBound + ".." + hi + "]" : "ARRAY"));
                 sb.Append(",\"value\":").Append(Json.Str("[…]"));
-                string kids = ArrayChildrenJson(type, va, module, editable, note);
+                string kids = ArrayChildrenJson(type, va, module, imgBase, editable, note);
                 if (kids.Length > 0) sb.Append(",\"children\":[").Append(kids).Append(']');
             }
             else
@@ -440,7 +458,7 @@ namespace ClarionDbg.Cli
         /// for today's callers is not a safe default; it is an unasked question with an optimistic answer.
         /// Making them required turns "did you think about the veto?" into a compile error. Both existing
         /// callers already passed them, so nothing changed but the fence.</remarks>
-        private string GroupChildrenJson(ClarionType g, uint baseVa, string module,
+        private string GroupChildrenJson(ClarionType g, uint baseVa, string module, uint imgBase,
                                          bool editable, string note)
         {
             if (g == null || g.Members == null) return "";
@@ -506,7 +524,7 @@ namespace ClarionDbg.Cli
                 // genuinely unrecoverable case. Falling back to a bare "?" would make every such member
                 // visually indistinguishable; tag it with its byte offset instead so it stays identifiable.
                 string mName = mb.Name ?? ("(unnamed+" + mb.Offset + ")");
-                sb.Append(NodeJson(mName, mb.Type, mc, mt, msz, mpl, mva, null, module, note, editable));
+                sb.Append(NodeJson(mName, mb.Type, mc, mt, msz, mpl, mva, null, module, imgBase, note, editable));
             }
             return sb.ToString();
         }
@@ -520,7 +538,7 @@ namespace ClarionDbg.Cli
         /// baseVa + k*stride inside that same shared block and inherit the veto.</param>
         /// <param name="note">the parent's explanation, carried onto each element row.</param>
         /// <remarks>Required for the same reason as GroupChildrenJson's — see the note there.</remarks>
-        private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module,
+        private string ArrayChildrenJson(ClarionType arr, uint baseVa, string module, uint imgBase,
                                          bool editable, string note)
         {
             if (arr == null || arr.Length <= 0 || arr.ElemSize == 0) return "";
@@ -538,8 +556,8 @@ namespace ClarionDbg.Cli
                     sb.Append("{\"name\":").Append(Json.Str(idx))
                       .Append(",\"type\":\"GROUP\",\"value\":").Append(Json.Str("{…}"))
                       .Append(",\"ref\":true,\"addr\":\"0x").Append(eva.ToString("X")).Append('"')
-                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(elem)))
-                      .Append(",\"module\":").Append(Json.Str(module))
+                      .Append(",\"refKind\":").Append(Json.Str(RefKindOf(elem)));
+                    AppendRowImage(sb, module, imgBase)
                       .Append(",\"typeRef\":").Append(elem.TypeRef);
                     // Carries no `va`, so it is not editable regardless — but it should still say why it is
                     // not this thread's data, and see the expand caveat on HandleExpandCommand.
@@ -550,7 +568,7 @@ namespace ClarionDbg.Cli
                 {
                     byte ec, et; uint esz; int epl;
                     CodeForType(elem, out ec, out et, out esz, out epl);
-                    sb.Append(NodeJson(idx, elem, ec, et, esz, epl, eva, null, module, note, editable));
+                    sb.Append(NodeJson(idx, elem, ec, et, esz, epl, eva, null, module, imgBase, note, editable));
                 }
             }
             if (arr.Length > cap)
@@ -570,18 +588,18 @@ namespace ClarionDbg.Cli
         /// protocol change and a host that never omits the flag.</summary>
         private void HandleExpandCommand(string[] parts, uint tid)
         {
-            // expand <reqId> <module> <typeRef(dec)> <addr(hex)>
-            if (parts.Length < 5) { EmitError("expand expects: expand reqId module typeRef addr"); return; }
+            // expand <reqId> <module> <typeRef(dec)> <addr(hex)> [<imgBase(0x hex)>]
+            if (parts.Length < 5) { EmitError("expand expects: expand reqId module typeRef addr [base]"); return; }
             string reqId = parts[1];
             uint typeRef; uint.TryParse(parts[3], out typeRef);
             uint addr = ParseHexU(parts[4]);
             var rows = new List<string>();
-            var m = ModuleByName(parts[2]);
+            var m = ExpandImage(_modules, parts);
             if (m != null && m.Dbg != null && addr != 0)
             {
                 var t = m.Dbg.ResolveType(typeRef);
                 var g = (t != null && t.Kind == TypeKind.Group) ? t : GroupTypeOf(t);
-                if (g != null) rows.Add(ExpandChildrenJson(g, addr, parts[2], tid));
+                if (g != null) rows.Add(ExpandChildrenJson(g, addr, m.Name, m.LoadBase, tid));
             }
             if (EmitJson)
                 Console.WriteLine("@JSON {\"event\":\"expanded\",\"reqId\":" + Json.Str(reqId)
@@ -592,11 +610,43 @@ namespace ClarionDbg.Cli
         /// expanded is not data the selected thread may be offered a write to. Split out of
         /// <see cref="HandleExpandCommand"/> only so `protocolcheck` can assert the derive-and-render pair
         /// it shares; the TSWD type lookup above is the part a no-target check cannot reach.</summary>
-        private string ExpandChildrenJson(ClarionType g, uint addr, string module, uint tid)
+        private string ExpandChildrenJson(ClarionType g, uint addr, string module, uint imgBase, uint tid)
         {
             string note;
             bool editable = ExpandEditAllowed(g, addr, tid, out note);
-            return GroupChildrenJson(g, addr, module, editable, note);
+            return GroupChildrenJson(g, addr, module, imgBase, editable, note);
+        }
+
+        /// <summary>
+        /// The image an `expand` command names (w8-expand-base). Four arguments name it by file name alone, as
+        /// before: the first mapped image of that name. A fifth, <c>0x</c> + 1-8 hex digits, is the row's imgBase:
+        /// only the mapped image with that LoadBase AND that name answers, and none means NO image - never the first
+        /// of the name, which is the image a same-named DLL's row must not be read against. A fifth argument that is
+        /// not that grammar is refused the same way. Null means the caller replies with no children.
+        /// </summary>
+        internal static LoadedModule ExpandImage(IList<LoadedModule> modules, string[] parts)
+        {
+            if (parts == null || parts.Length < 5) return null;
+            string name = parts[2];
+            if (parts.Length < 6)
+            {
+                foreach (var m in modules)
+                    if (m.LoadBase != 0 && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
+                return null;
+            }
+            uint loadBase;
+            if (!TryParseImgBase(parts[5], out loadBase)) return null;
+            return ModuleByNameAndBase(modules, name, loadBase);
+        }
+
+        /// <summary>The imgBase grammar: <c>0x</c> (either case) then 1-8 hex digits, nothing else. AllowHexSpecifier
+        /// alone admits hex digits only: no sign, no whitespace, no second prefix.</summary>
+        internal static bool TryParseImgBase(string s, out uint value)
+        {
+            value = 0;
+            if (s == null || s.Length < 3 || s.Length > 10 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) return false;
+            return uint.TryParse(s.Substring(2), System.Globalization.NumberStyles.AllowHexSpecifier,
+                                 System.Globalization.CultureInfo.InvariantCulture, out value);
         }
 
         /// <summary>May the members of the group at <paramref name="addr"/> carry edit metadata?
@@ -666,7 +716,7 @@ namespace ClarionDbg.Cli
         /// type lookup, which needs a loaded image's debug info.</summary>
         internal string ExpandChildrenForTest(ClarionType g, uint addr, string module, uint tid)
         {
-            return ExpandChildrenJson(g, addr, module, tid);
+            return ExpandChildrenJson(g, addr, module, 0, tid);
         }
 
         private static uint ParseHexU(string s)
@@ -817,7 +867,7 @@ namespace ClarionDbg.Cli
                             }
                         }
                         ClarionType gt = ds.Type != null && ds.Type.Kind == TypeKind.Group ? ds.Type : null;
-                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name, note, editable));
+                        rows.Add(NodeJson(ds.Name, gt, ds.TypeCode, 0, ds.Size, 0, va, null, m.Name, m.LoadBase, note, editable));
                     }
                 }
             }
