@@ -244,7 +244,7 @@ namespace ClarionDbg.Cli
             uint baseVa = found.Owner != null ? found.Owner.LoadBase : 0;
             // Drop the logical breakpoint first so the ref-count check below sees only the survivors.
             _bps.Remove(found);
-            UnplantUnreferenced(found, baseVa);
+            UnplantUnreferenced(found, baseVa, false);
             Console.WriteLine($"bp: removed {canon}:{found.Line}");
             // Echo the whole breakpoint, not just its planted line: `canon` IS found.Module here, and the
             // host needs found.RequestedLine to know which of the lines sharing this planted record went.
@@ -253,9 +253,24 @@ namespace ClarionDbg.Cli
 
         /// <summary>Restore the INT3s <paramref name="found"/> planted in the image at <paramref name="baseVa"/> that no
         /// OTHER breakpoint still needs. Shared by <see cref="RemoveOne"/> (which has already dropped it from the list)
-        /// and <see cref="UnbindFromYieldedImage"/> (which has not, hence the skip of <paramref name="found"/> itself).</summary>
-        private void UnplantUnreferenced(UserBreakpoint found, uint baseVa)
+        /// and <see cref="UnbindFromYieldedImage"/> (which has not, hence the skip of <paramref name="found"/> itself).
+        /// <para>
+        /// <paramref name="checkedRestore"/> (the yield): the restore is checked, a VA leaves <c>_armed</c> only when its
+        /// original byte went back, and the result is false with <paramref name="failedVa"/> set at the first that did
+        /// not, so the caller can keep the breakpoint bound instead of losing track of a 0xCC (pipeline run 1, fde2387e).
+        /// Unchecked (RemoveOne): unchanged - the breakpoint is already gone from the list, and an <c>_armed</c> VA no
+        /// breakpoint references would be a hit with no owner, so it is restored best-effort and forgotten.
+        /// </para></summary>
+        private bool UnplantUnreferenced(UserBreakpoint found, uint baseVa, bool checkedRestore)
         {
+            uint failedVa;
+            return UnplantUnreferenced(found, baseVa, checkedRestore, out failedVa);
+        }
+
+        private bool UnplantUnreferenced(UserBreakpoint found, uint baseVa, bool checkedRestore, out uint failedVa)
+        {
+            failedVa = 0;
+            bool allRestored = true;
             foreach (var rva in found.Rvas)
             {
                 // Ref-count the physical INT3: another breakpoint (a different gutter line that snapped
@@ -277,10 +292,32 @@ namespace ClarionDbg.Cli
                     foreach (var kv in _rearm)
                         if (!kv.Value.IsTemp && kv.Value.Va == va) { pendingTid = kv.Key; pending = true; break; }
                     if (pending) _rearm.Remove(pendingTid);
-                    else WriteByte(va, orig);
+                    else if (!checkedRestore) WriteByte(va, orig);
+                    else if (!RestoreByteChecked(va, orig))
+                    {
+                        if (allRestored) failedVa = va;
+                        allRestored = false;
+                        continue;   // still 0xCC in the target: it stays in _armed, so the engine still owns it
+                    }
                     _armed.Remove(va);
                 }
             }
+            return allRestored;
+        }
+
+        /// <summary>protocolcheck only: replaces the checked restore's write, so a failed restore can be injected
+        /// without a process. Null in a real session.</summary>
+        private Func<uint, byte, bool> _restoreWriteHook;
+
+        internal void SetRestoreWriteHookForTest(Func<uint, byte, bool> hook)
+        {
+            RefuseSeamIfAttached("SetRestoreWriteHookForTest");
+            _restoreWriteHook = hook;
+        }
+
+        private bool RestoreByteChecked(uint va, byte orig)
+        {
+            return _restoreWriteHook != null ? _restoreWriteHook(va, orig) : TryWriteByte(va, orig);
         }
 
         /// <summary>
@@ -314,13 +351,21 @@ namespace ClarionDbg.Cli
 
         /// <summary>Return to pending every breakpoint bound to <paramref name="y"/> through an <c>|img=</c> spec that
         /// <paramref name="y"/> no longer matches now that its path has yielded, restoring the INT3s no other
-        /// breakpoint in y still needs. An unqualified breakpoint, or one naming y by file name, stays where it is.</summary>
+        /// breakpoint in y still needs. An unqualified breakpoint, or one naming y by file name, stays where it is.
+        /// A breakpoint whose restore fails stays bound to y, still planted and tracked, and is not re-homed: an
+        /// untracked 0xCC would stop the app with nothing to answer for it.</summary>
         private void UnbindFromYieldedImage(LoadedModule y)
         {
             foreach (var bp in _bps)
             {
                 if (bp.Owner != y || string.IsNullOrEmpty(bp.OwnerSpec) || ImageMatches(y, bp.OwnerSpec)) continue;
-                UnplantUnreferenced(bp, y.LoadBase);
+                uint failedVa;
+                if (!UnplantUnreferenced(bp, y.LoadBase, true, out failedVa))
+                {
+                    Console.WriteLine($"bp: {bp.Module}:{bp.Line} asked for {bp.OwnerSpec}, but could not restore the original byte "
+                                      + $"at 0x{failedVa:X8} in {y.Path}; it stays armed there");
+                    continue;
+                }
                 bp.Owner = null;
                 bp.ModuleIdx = -1;
                 bp.Rvas.Clear();
@@ -862,6 +907,9 @@ namespace ClarionDbg.Cli
             RefuseSeamIfAttached("ImageMappedForTest");
             ArmMappedImage(m);
         }
+
+        /// <summary>Whether <paramref name="va"/> is in the armed set (an INT3 the engine owns).</summary>
+        internal bool IsArmedForTest(uint va) { return _armed.ContainsKey(va); }
 
         /// <summary>The VAs of the breakpoint at <paramref name="module"/>:<paramref name="requestedLine"/> bound to
         /// <paramref name="owner"/> (owner's LoadBase + each rva); empty when there is none.</summary>

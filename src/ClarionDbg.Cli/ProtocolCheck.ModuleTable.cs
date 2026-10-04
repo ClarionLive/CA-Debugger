@@ -296,7 +296,8 @@ namespace ClarionDbg.Cli
                          + "with |img=<preload path> leaves the copy (its INT3 restored unless another breakpoint in the copy still "
                          + "uses it) and binds to the image now at that path, a pending |img=<copy path> breakpoint binds to the "
                          + "copy, the bp-list re-sync comes after both and names the final owners, and a del naming either path "
-                         + "reaches its breakpoint.");
+                         + "reaches its breakpoint; when restoring the copy's byte FAILS, the breakpoint stays bound to the copy with "
+                         + "its VA still armed, the failure is printed with its address, and no re-home is echoed.");
 
             const string Pre = @"C:\App\Dll1\shared.dll", Cpy = @"C:\App\Exe\shared.dll";
             Func<string, string> img = p => "|img=" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(p));
@@ -337,9 +338,15 @@ namespace ClarionDbg.Cli
                 if (vas.Count != 1) { failures.Add("yield rebind: the fixture breakpoint has " + vas.Count + " address(es), expected 1"); return; }
                 eng.PlantForTest(vas[0], 0x90, false);
                 int armed = eng.ArmedCountForTest;
+                var writes = new List<string>();
+                Func<uint, byte, bool> record = (va, b) => { writes.Add(va.ToString("X8") + "=" + b.ToString("X2")); return true; };
+                eng.SetRestoreWriteHookForTest(record);
 
                 var genuine = genuineIn(eng);
                 string log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                if (string.Join(" ", writes) != vas[0].ToString("X8") + "=90")
+                    failures.Add("yield rebind: leaving the copy must write the original byte 90 back at " + vas[0].ToString("X8")
+                                 + " once; wrote [" + string.Join(" ", writes) + "]");
                 if (borrower.Path != Cpy || genuine.Path != Pre)
                     failures.Add("yield rebind: the fixture did not yield (copy=" + borrower.Path + " new=" + genuine.Path + ")");
                 e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:20@" + Cpy });
@@ -384,12 +391,40 @@ namespace ClarionDbg.Cli
                 { failures.Add("yield rebind: the fixture's lines 4 and 5 do not share one INT3 in the copy"); return; }
                 eng.PlantForTest(vas[0], 0x90, false);
                 armed = eng.ArmedCountForTest;
+                writes.Clear();
+                eng.SetRestoreWriteHookForTest(record);
                 genuine = genuineIn(eng);
                 CaptureConsole(() => eng.ImageMappedForTest(genuine));
                 e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:4@" + Cpy, "A.CLW:4@" + Pre });
                 if (e != null) failures.Add("yield rebind (shared INT3): the breakpoints are " + e);
-                if (eng.ArmedCountForTest != armed)
+                if (eng.ArmedCountForTest != armed || writes.Count != 0)
                     failures.Add("yield rebind (shared INT3): leaving the copy restored an INT3 an unqualified breakpoint there still uses");
+
+                // A restore that FAILS (fde2387e): the breakpoint stays bound to the copy, its VA stays armed, the
+                // failure is named, and no re-home to the preload path is echoed.
+                eng = NewEngine();
+                eng.EmitJson = true;
+                borrower = borrowerIn(eng);
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                vas = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (vas.Count != 1) { failures.Add("yield rebind (failed restore): the fixture breakpoint has " + vas.Count + " address(es)"); return; }
+                eng.PlantForTest(vas[0], 0x90, false);
+                writes.Clear();
+                eng.SetRestoreWriteHookForTest((va, b) => { writes.Add(va.ToString("X8")); return false; });
+                genuine = genuineIn(eng);
+                log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                if (writes.Count != 1)
+                    failures.Add("yield rebind (failed restore): the fixture's restore was attempted " + writes.Count + " time(s), expected 1");
+                e = bps(eng, new[] { "A.CLW:5@" + Cpy });
+                if (e != null) failures.Add("yield rebind (failed restore): the breakpoint must stay bound to the copy; it is " + e);
+                var still = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (still.Count != 1 || still[0] != vas[0] || !eng.IsArmedForTest(vas[0]))
+                    failures.Add("yield rebind (failed restore): the INT3 at " + vas[0].ToString("X8") + " must stay armed and owned by the copy's breakpoint");
+                if (log.IndexOf("could not restore the original byte at 0x" + vas[0].ToString("X8"), StringComparison.Ordinal) < 0)
+                    failures.Add("yield rebind (failed restore): the failure was not named: " + log.Trim());
+                if (log.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) >= 0
+                    || log.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
+                    failures.Add("yield rebind (failed restore): a re-home was echoed for a breakpoint that stayed in the copy: " + log.Trim());
             }
             catch (Exception ex) { failures.Add("yield rebind: " + ex.GetType().Name + ": " + ex.Message); }
         }
