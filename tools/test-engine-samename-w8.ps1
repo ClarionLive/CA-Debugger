@@ -12,10 +12,13 @@
 #          preload it claims; that when A's own file maps too, the copy's entry yields A's path (a bp-list naming
 #          C); and that the unmap that moves the path back re-sends bp-list, so the host's rows - replayed here
 #          through the host's own merge rules - hold ONE row after the reload, not a ghost and a live one.
+#          (3) that a procedure named at symbol-pool offset 0 owns its locals (c4910921): in the two-procedure
+#          d\shared.dll, OBJ is SHAREDPROC's and CNT2 is OTHERPROC's, in the TSWD and in `framelocals` at each
+#          stop, with no phantom CNT2 under SHAREDPROC. (1) asks `framelocals` at the stopped VA too: before
+#          the fix, the one-procedure DLLs keyed OBJ to sharedmod$$$__attach_process (measured 2026-10-03).
+#          (3) also sets a breakpoint ON SHAREDPROC's CALL to OTHERPROC (1d371325): at the OTHERPROC stop the
+#          stack still has SHAREDPROC as frame 1, and `watch OBJ` answers from that caller frame.
 #   CANNOT - the page or add-in (rows are replayed, not rendered); an image that is not a byte copy; attach.
-#          `framelocals` at the stop finds no locals in these one-procedure DLLs (the TSWD keys OBJ to
-#          sharedmod$$$__attach_process; measured 2026-10-03, tracked separately), so (1) asks at the entry that
-#          carries OBJ, with the stopped frame's EBP. The row is still the real builder's, over the live frame.
 #
 # -SelfTest (no Clarion, no debuggee): feeds the host-row replay and the (2) verdicts two recorded event
 # streams, one with the unload re-sync and one without it, and shows the verdicts pass the first and FAIL the
@@ -36,6 +39,13 @@ param(
   # sharedmod.clw's `SharedTag = ...` line, after Obj is set. Breakable lines in both builds are 13-14, 16-20
   # (measured 2026-10-03), so this binds exactly in each.
   [int]    $BpLine     = 18,
+  # d\sharedmod.clw (two procedures): SHAREDPROC's `SharedTag = 'D'`, after Obj is set, and OTHERPROC's
+  # `SharedCount += Cnt2`, after Cnt2 = 5. Breakable lines are 14-15, 17-24, 26-27 (measured 2026-10-03).
+  [int]    $BpLineD1   = 19,
+  [int]    $BpLineD2   = 27,
+  # d\sharedmod.clw's `OtherProc()` line: its first instruction is the CALL (E8 at RVA 0x111B, measured
+  # 2026-10-04), so its breakpoint covers the opcode the stack walk reads (1d371325).
+  [int]    $BpLineD3   = 20,
   [int]    $StopTimeoutSec = 30,
   [switch] $SelfTest,
   [switch] $Verbose2
@@ -43,6 +53,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'engine-session.ps1')
+. (Join-Path $PSScriptRoot 'lib-engine-events.ps1')   # Read-Events, Wait-Event, Wait-Stop, Send, Ask, Show-Stop
 . (Join-Path $PSScriptRoot 'lib-extract.ps1')   # dot-sources lib-check.ps1 too
 $script:checks = 0
 $script:failures = 0
@@ -108,6 +119,7 @@ public static class HostRows {
 "@
 Add-Type -TypeDefinition $hostRows -Language CSharp | Out-Null
 Set-StrictMode -Off   # lib-extract.ps1 turns it on; this suite reads optional event members freely
+$PSDefaultParameterValues = Get-EngineEventDefaults -TimeoutSec $StopTimeoutSec -Verbose2 ([bool]$Verbose2)
 
 # The service's own arm statements, as the HostRows arms call them. Text, but POSITION-pinned: each must start
 # its line, so `if (false) ...` in front of one does not pass.
@@ -163,7 +175,7 @@ function Get-CopyVerdicts($Events) {
   )
 }
 
-# --- live session plumbing (as test-engine-samename.ps1) -----------------------------------------------
+# --- live session plumbing (the rest is lib-engine-events.ps1) -----------------------------------------------
 
 function New-Session([string] $Target, [string] $BreakArgs) {
   $s = New-EngineSession -Engine $Engine -Target $Target -BreakArgs $BreakArgs -WorkingDirectory $script:work
@@ -173,62 +185,12 @@ function New-Session([string] $Target, [string] $BreakArgs) {
   return $s
 }
 
-function Read-Events($S) {
-  foreach ($l in (Read-EngineLines $S)) {
-    if ($null -eq $l) { continue }
-    [void]$S.Raw.Add($l)
-    if ($Verbose2) { Write-Host "    | $l" }
-    if ($l.StartsWith('@JSON ')) {
-      $o = $null
-      try { $o = $l.Substring(6) | ConvertFrom-Json } catch { }
-      if ($null -ne $o) { [void]$S.Events.Add($o) }
-    }
-  }
-}
-
-function Wait-Event($S, [scriptblock] $Pred) {
-  $sw = [Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $StopTimeoutSec) {
-    Read-Events $S
-    while ($S.Seen -lt $S.Events.Count) {
-      $e = $S.Events[$S.Seen]; $S.Seen++
-      if (& $Pred $e) { return $e }
-    }
-    if ($S.Proc.HasExited) {
-      Start-Sleep -Milliseconds 200; Read-Events $S
-      if ($S.Seen -ge $S.Events.Count) { return $null }
-      continue
-    }
-    Start-Sleep -Milliseconds 100
-  }
-  return $null
-}
-
-function Wait-Stop($S) { return (Wait-Event $S { param($e) $e.event -ceq 'paused' -or $e.event -ceq 'exited' }) }
-
-function Send($S, [string] $Cmd) {
-  if ($Verbose2) { Write-Host "    > $Cmd" }
-  $S.Proc.StandardInput.WriteLine($Cmd)
-}
-
-# One request, its reply by reqId.
-function Ask($S, [string] $Cmd, [string] $Ev, [string] $ReqId) {
-  Send $S $Cmd
-  return (Wait-Event $S { param($e) $e.event -ceq $Ev -and "$($e.reqId)" -eq $ReqId })
-}
-
 function Close-Session($S) {
   Stop-EngineSession $S
   Start-Sleep -Milliseconds 300
   Read-Events $S
   Stop-EngineTarget $S
   Remove-EngineSession $S
-}
-
-function Show-Stop($e) {
-  if ($null -eq $e) { return '(no stop)' }
-  if ($e.event -ceq 'exited') { return "exited code $($e.code)" }
-  return "paused $($e.reason) $($e.module):$($e.line) va $($e.va)"
 }
 
 function Names($Items) { return (@($Items | ForEach-Object { $_.name }) -join ',') }
@@ -294,12 +256,14 @@ $Engine = (Resolve-Path -LiteralPath $Engine).Path
 $dllA = Join-Path $script:work 'a\shared.dll'
 $dllB = Join-Path $script:work 'b\shared.dll'
 $dllC = Join-Path $script:work 'c\shared.dll'
+$dllD = Join-Path $script:work 'd\shared.dll'
+$two  = Join-Path $script:work 'two'
 
 try {
   Invoke-CheckSection 'the fixture builds with Clarion 11' {
     Check 'MSBuild is present' (Test-Path -LiteralPath $MSBuild) $MSBuild
     Check 'the Clarion build targets are present' (Test-Path -LiteralPath (Join-Path $ClarionBin 'SoftVelocity.Build.Clarion.targets')) $ClarionBin
-    $copy = @(@($Fixture, '', '*'), @($Fixture, 'a', '*'), @($Fixture, 'b', '*'), @($HostFixture, '', 'samehost.*'))
+    $copy = @(@($Fixture, '', '*'), @($Fixture, 'a', '*'), @($Fixture, 'b', '*'), @($Fixture, 'd', '*'), @($HostFixture, '', 'samehost.*'))
     foreach ($c in $copy) {
       $to = Join-Path $script:work $c[1]
       New-Item -ItemType Directory -Force -Path $to | Out-Null
@@ -310,7 +274,7 @@ try {
       }
     }
     $log = ''
-    foreach ($p in 'a\shared.cwproj', 'b\shared.cwproj', 'samehost.cwproj', 'cpyhost.cwproj') {
+    foreach ($p in 'a\shared.cwproj', 'b\shared.cwproj', 'd\shared.cwproj', 'samehost.cwproj', 'cpyhost.cwproj') {
       Push-Location (Split-Path (Join-Path $script:work $p))
       try { $log += & $MSBuild (Split-Path -Leaf $p) -nologo -v:m "/p:ClarionBinPath=$ClarionBin" 2>&1 | Out-String }
       finally { Pop-Location }
@@ -319,9 +283,19 @@ try {
       New-Item -ItemType Directory -Force -Path (Split-Path $dllC) | Out-Null
       Copy-Item -LiteralPath $dllA -Destination $dllC
     }
+    # (3)'s run folder: samehost.exe and its runtime beside two\a\shared.dll (the two-procedure D build) and
+    # two\b\shared.dll (B), since samehost loads a\ and b\ beside itself.
+    if ((Test-Path -LiteralPath $dllD) -and (Test-Path -LiteralPath $dllB)) {
+      foreach ($x in 'a', 'b') { New-Item -ItemType Directory -Force -Path (Join-Path $two $x) | Out-Null }
+      Get-ChildItem -LiteralPath $script:work -File | Where-Object { $_.Name -eq 'samehost.exe' -or $_.Extension -eq '.dll' } |
+        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $two }
+      Copy-Item -LiteralPath $dllD -Destination (Join-Path $two 'a\shared.dll')
+      Copy-Item -LiteralPath $dllB -Destination (Join-Path $two 'b\shared.dll')
+    }
     $built = (Test-Path -LiteralPath (Join-Path $script:work 'samehost.exe')) -and (Test-Path -LiteralPath (Join-Path $script:work 'cpyhost.exe')) `
-             -and (Test-Path -LiteralPath $dllA) -and (Test-Path -LiteralPath $dllB) -and (Test-Path -LiteralPath $dllC)
-    Check 'samehost.exe, cpyhost.exe, a\, b\ and c\shared.dll are in place' $built $(if ($built) { '' } else { $log.Trim() })
+             -and (Test-Path -LiteralPath $dllA) -and (Test-Path -LiteralPath $dllB) -and (Test-Path -LiteralPath $dllC) `
+             -and (Test-Path -LiteralPath (Join-Path $two 'samehost.exe')) -and (Test-Path -LiteralPath (Join-Path $two 'a\shared.dll'))
+    Check 'samehost.exe, cpyhost.exe, a\, b\, c\ and d\shared.dll, and the two\ run folder are in place' $built $(if ($built) { '' } else { $log.Trim() })
     if (-not $built) { return }
     $ha = (Get-FileHash -LiteralPath $dllA).Hash; $hb = (Get-FileHash -LiteralPath $dllB).Hash; $hc = (Get-FileHash -LiteralPath $dllC).Hash
     Check 'a\ and b\shared.dll are different builds' ($ha -ne $hb) "a=$ha b=$hb"
@@ -337,6 +311,15 @@ try {
       }
       Check "$($x[0])\shared.dll carries sharedmod.clw with line $BpLine breakable" $ok $lines.Trim()
     }
+    $lines = & $Engine lines $dllD --module sharedmod.clw 2>&1 | Out-String
+    $ok = 0
+    if ($lines -match 'breakable lines:\s*(.+)') {
+      foreach ($part in $matches[1].Trim().Split(',')) {
+        $lh = $part.Trim().Split('-')
+        foreach ($want in $BpLineD1, $BpLineD2, $BpLineD3) { if ([int]$lh[0] -le $want -and $want -le [int]$lh[-1]) { $ok++ } }
+      }
+    }
+    Check "d\shared.dll carries sharedmod.clw with lines $BpLineD1, $BpLineD3 and $BpLineD2 breakable" ($ok -eq 3) $lines.Trim()
   }
 
   Invoke-CheckSection "(1) expand resolves in the image the row's imgBase names" {
@@ -355,11 +338,8 @@ try {
         Check "(1) stop $($i + 1) is $BpSpec in a shared.dll" ($null -ne $here -and $stop.line -eq $BpLine -and $t -in 'a', 'b') (Show-Stop $stop)
         if ($null -eq $here) { break }
 
-        # framelocals at the entry that carries OBJ (see the header), with the stopped frame's EBP.
-        $lo = & $Engine locals $here.path 2>&1 | Out-String
-        $entry = if ($lo -match '\(entry (0x[0-9A-Fa-f]+)\)') { U32 $matches[1] } else { 0 }
         $req++
-        $fl = Ask $s ("framelocals $req " + ('0x{0:X8}' -f ((U32 $here.base) + $entry)) + " $($stop.regs.ebp)") 'framelocals' "$req"
+        $fl = Ask $s "framelocals $req $($stop.va) $($stop.regs.ebp)" 'framelocals' "$req"
         $obj = @($fl.items | Where-Object { $_.name -ieq 'OBJ' }) | Select-Object -First 1
         Check "(1) [$t] the Obj row is a ref row carrying its image's base $($here.base) as 0x + 8 hex digits" `
           ($null -ne $obj -and $obj.ref -eq $true -and $obj.imgBase -cmatch '^0x[0-9A-F]{8}$' -and (U32 $obj.imgBase) -eq (U32 $here.base)) "$($obj | ConvertTo-Json -Compress)"
@@ -406,6 +386,75 @@ try {
       ($null -ne $last -and $stop.event -ceq 'paused' -and $stop.line -eq $BpLine -and $va -ge (U32 $last.base) -and $va -lt ((U32 $last.base) + (U32 $last.size))) (Show-Stop $stop)
     Check '(2) cpyhost exits 0 (every load, free and the call worked)' ($null -ne $end -and $end.event -ceq 'exited' -and $end.code -eq 0) (Show-Stop $end)
   }
+
+  Invoke-CheckSection '(3) two procedures: the one named at pool offset 0 owns its locals (c4910921)' {
+    # The TSWD, read by the engine's own `locals` verb: procedure -> its local names.
+    $lo = & $Engine locals $dllD 2>&1 | Out-String
+    $owned = @{}; $cur = $null
+    foreach ($ln in ($lo -split "`r?`n")) {
+      if ($ln -match '^\s{2}(\S+)\s+\(entry 0x[0-9A-Fa-f]+\)') { $cur = $matches[1]; $owned[$cur] = @() }
+      elseif ($cur -and $ln -match '^\s+\[ebp[-+][0-9A-Fa-fx]+\]\s+(\S+)') { $owned[$cur] += $matches[1] }
+    }
+    Check '(3) d\shared.dll: SHAREDPROC owns OBJ and nothing else (no phantom CNT2)' ((@($owned['SHAREDPROC']) -join ',') -eq 'OBJ') $lo.Trim()
+    Check '(3) d\shared.dll: OTHERPROC owns CNT2 and nothing else' ((@($owned['OTHERPROC']) -join ',') -eq 'CNT2') ''
+
+    $pathD = Join-Path $two 'a\shared.dll'
+    # $BpLineD3 is the CALL itself (1d371325): its INT3 sits over the E8 that OTHERPROC returns through.
+    $s = New-Session (Join-Path $two 'samehost.exe') "--solution-dll `"$pathD`" --bp sharedmod.clw:$BpLineD1 --bp sharedmod.clw:$BpLineD3 --bp sharedmod.clw:$BpLineD2"
+    $req = 300; $atShared = $null; $atOther = $null; $end = $null
+    try {
+      for ($i = 0; $i -lt 8; $i++) {
+        $stop = Wait-Stop $s
+        if ($null -eq $stop -or $stop.event -cne 'paused') { $end = $stop; break }
+        $va = U32 $stop.va
+        $inD = @($s.Events | Where-Object { $_.event -ceq 'module-loaded' -and $_.path -eq $pathD -and
+                                           $va -ge (U32 $_.base) -and $va -lt ((U32 $_.base) + (U32 $_.size)) }).Count -gt 0
+        if ($inD -and $stop.line -in $BpLineD1, $BpLineD2) {
+          $req++
+          $fl = Ask $s "framelocals $req $($stop.va) $($stop.regs.ebp)" 'framelocals' "$req"
+          $r = [pscustomobject]@{ Stop = $stop; Names = (@($fl.items | ForEach-Object { $_.name }) -join ','); Items = @($fl.items) }
+          if ($stop.line -eq $BpLineD1) { $atShared = $r }
+          else {
+            $atOther = $r
+            $req++
+            $r | Add-Member -NotePropertyName Watch -NotePropertyValue (Ask $s "watch OBJ reqid=$req" 'watch' "$req")
+            $req++
+            $r | Add-Member -NotePropertyName Stack -NotePropertyValue (Ask $s "stack reqid=$req" 'stack' "$req")
+            $req++
+            $slot = '0x{0:X8}' -f ((U32 $stop.regs.ebp) + 4)
+            $r | Add-Member -NotePropertyName RetSlot -NotePropertyValue (Ask $s "mem $slot 4 $req" 'mem' "$req")
+          }
+        }
+        Send $s 'continue'
+      }
+      if ($null -eq $end) { $end = Wait-Stop $s }
+    }
+    finally { Close-Session $s }
+    Check "(3) framelocals at the SHAREDPROC stop (line $BpLineD1, in d) lists OBJ and no CNT2" `
+      ($null -ne $atShared -and $atShared.Names -eq 'OBJ') "$(if ($atShared) { "$(Show-Stop $atShared.Stop): [$($atShared.Names)]" } else { '(no stop in d)' })"
+    $cnt = if ($atOther) { @($atOther.Items | Where-Object { $_.name -eq 'CNT2' }) | Select-Object -First 1 }
+    Check "(3) framelocals at the OTHERPROC stop (line $BpLineD2, in d) lists CNT2 = 5 and nothing else" `
+      ($null -ne $atOther -and $atOther.Names -eq 'CNT2' -and "$($cnt.value)" -eq '5') "$(if ($atOther) { "$(Show-Stop $atOther.Stop): [$($atOther.Names)] CNT2=$($cnt.value)" } else { '(no stop in d)' })"
+    # 1d371325: with a breakpoint on SHAREDPROC's CALL line, OTHERPROC's caller is still frame 1, and a watch on
+    # the caller's local answers from it (frame-0 locals, then globals, then caller frames).
+    $ret = $null
+    if ($atOther -and $atOther.RetSlot -and "$($atOther.RetSlot.bytes)".Length -eq 8) {
+      $hx = "$($atOther.RetSlot.bytes)"
+      $ret = [Convert]::ToUInt32($hx.Substring(6, 2) + $hx.Substring(4, 2) + $hx.Substring(2, 2) + $hx.Substring(0, 2), 16)
+    }
+    $baseD = @($s.Events | Where-Object { $_.event -ceq 'module-loaded' -and $_.path -eq $pathD }) | Select-Object -Last 1
+    $callBp = @($s.Events | Where-Object { $_.event -ceq 'bp-set' -and $_.ownerPath -eq $pathD -and $_.line -eq $BpLineD3 }) | Select-Object -Last 1
+    $callVa = if ($callBp -and $baseD -and @($callBp.rvas).Count -eq 1) { (U32 $baseD.base) + (U32 @($callBp.rvas)[0]) } else { 0 }
+    Check "(3) precondition: the line-$BpLineD3 breakpoint's INT3 sits on the 5-byte CALL that OTHERPROC returns through" `
+      ($null -ne $ret -and $callVa -ne 0 -and $callVa + 5 -eq $ret) ("ret " + $(if ($null -ne $ret) { '0x{0:X8}' -f $ret } else { '?' }) + "; bp " + ($callBp | ConvertTo-Json -Compress))
+    $f1 = if ($atOther -and $atOther.Stack) { @($atOther.Stack.frames) | Where-Object { $_.frame -eq 1 } | Select-Object -First 1 }
+    Check "(3) at the OTHERPROC stop the stack's frame 1 is SHAREDPROC, chain-walked (not uncertain, with a frame base)" `
+      ($null -ne $f1 -and $f1.proc -eq 'SHAREDPROC' -and $f1.uncertain -eq $false -and (U32 $f1.ebp) -ne 0 -and (U32 $f1.va) -eq $ret) "$($atOther.Stack | ConvertTo-Json -Compress -Depth 5)"
+    $w = if ($atOther) { $atOther.Watch }
+    Check '(3) watch OBJ at the OTHERPROC stop resolves from the caller frame (frameIdx 1, SHAREDPROC)' `
+      ($null -ne $w -and $w.found -eq $true -and $w.frameIdx -eq 1 -and $w.frameProc -eq 'SHAREDPROC') "$($w | ConvertTo-Json -Compress -Depth 4)"
+    Check '(3) samehost exits 0 (both CALLs worked)' ($null -ne $end -and $end.event -ceq 'exited' -and $end.code -eq 0) (Show-Stop $end)
+  }
 }
 finally {
   if (Test-Path -LiteralPath $script:work) { Remove-Item -LiteralPath $script:work -Recurse -Force -ErrorAction SilentlyContinue }
@@ -413,7 +462,7 @@ finally {
 
 # The backstop for a section that returns early without throwing (lib-check.ps1, guard (b)). Update the
 # number deliberately when adding or removing a check.
-$EXPECTED_CHECKS = 32
+$EXPECTED_CHECKS = 41
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

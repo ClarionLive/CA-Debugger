@@ -1064,11 +1064,17 @@ namespace ClarionDbg.Core
                 byte tag = _b[_base + p];
                 if (tag != 0x04 && tag != 0x05) continue;
                 uint nameRef = U32(p + 5);
-                if (nameRef < 1 || nameRef >= (uint)poolLen) continue;
+                if (nameRef >= (uint)poolLen) continue;
                 string nm = SymbolNameAt((int)nameRef, poolLen);
                 if (nm == null) continue;
 
                 uint f3 = U32(p + 9);
+                // nameRef 0 is the pool's FIRST string, a real name (BuildSymbols takes it too). Dropping it lost
+                // that procedure's record, so its locals went to the procedure before it (c4910921, measured
+                // 2026-10-03 on fixture samename-w8: OTHERPROC sat at offset 0 and its CNT2 showed under
+                // SHAREDPROC). A zero dword is also common scan noise, so offset 0 counts only for a procedure
+                // record that a symbol confirms (same raw name, same entry), and never for a local.
+                if (nameRef == 0 && !(f3 >= _textLo && f3 < _textHi && IsSymbolEntry(nm, f3))) continue;
                 if (f3 >= _textLo && f3 < _textHi)                  // proc: 2nd field is an entry RVA in .text
                 {
                     cur = f3; haveCur = true;
@@ -1118,6 +1124,14 @@ namespace ClarionDbg.Core
             }
             _locals = outMap;
             return _locals;
+        }
+
+        /// <summary>True when a text symbol has exactly this raw name at exactly this entry RVA.</summary>
+        private bool IsSymbolEntry(string rawName, uint entryRva)
+        {
+            foreach (var s in Symbols)
+                if (s.EntryRva == entryRva && string.Equals(s.RawName, rawName, StringComparison.Ordinal)) return true;
+            return false;
         }
 
         // ----- typeRef aggregate layout (GROUP/array/DECIMAL member offsets, from the blob alone) -----
