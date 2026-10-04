@@ -297,7 +297,9 @@ namespace ClarionDbg.Cli
                          + "uses it) and binds to the image now at that path, a pending |img=<copy path> breakpoint binds to the "
                          + "copy, the bp-list re-sync comes after both and names the final owners, and a del naming either path "
                          + "reaches its breakpoint; when restoring the copy's byte FAILS, the breakpoint stays bound to the copy with "
-                         + "its VA still armed, the failure is printed with its address, and no re-home is echoed.");
+                         + "its VA still armed, the failure is printed with its address, and no re-home is echoed; with two addresses where "
+                         + "the second restore fails, the first is re-planted (0xCC) and stays armed, and if that re-plant fails too it "
+                         + "is named and leaves both the armed set and the binding, so every address the binding keeps is planted.");
 
             const string Pre = @"C:\App\Dll1\shared.dll", Cpy = @"C:\App\Exe\shared.dll";
             Func<string, string> img = p => "|img=" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(p));
@@ -425,6 +427,55 @@ namespace ClarionDbg.Cli
                 if (log.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) >= 0
                     || log.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
                     failures.Add("yield rebind (failed restore): a re-home was echoed for a breakpoint that stayed in the copy: " + log.Trim());
+
+                // Two RVAs, the FIRST restore succeeds and the second fails: all or nothing, so the first is re-planted
+                // and re-armed before the binding is kept; and if that re-plant fails too, the binding shrinks to match.
+                foreach (bool replantFails in new[] { false, true })
+                {
+                    string tag = replantFails ? "yield rebind (failed restore and re-plant): " : "yield rebind (multi-address rollback): ";
+                    eng = NewEngine();
+                    eng.EmitJson = true;
+                    borrower = borrowerIn(eng);
+                    CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                    eng.AddBpRvaForTest("A.CLW", 5, borrower, 0x1200);
+                    var two = eng.BpVasForTest("A.CLW", 5, borrower);
+                    if (two.Count != 2) { failures.Add(tag + "the fixture breakpoint has " + two.Count + " address(es), expected 2"); return; }
+                    eng.PlantForTest(two[0], 0x90, false);
+                    eng.PlantForTest(two[1], 0x91, false);
+                    var mem = new Dictionary<uint, byte> { { two[0], 0xCC }, { two[1], 0xCC } };
+                    var trail = new List<string>();
+                    eng.SetRestoreWriteHookForTest((va, b) =>
+                    {
+                        bool ok = b == 0xCC ? !replantFails : va != two[1];
+                        trail.Add(va.ToString("X8") + "=" + b.ToString("X2") + (ok ? "" : "!"));
+                        if (ok) mem[va] = b;
+                        return ok;
+                    });
+                    genuine = genuineIn(eng);
+                    log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                    string want = two[0].ToString("X8") + "=90 " + two[1].ToString("X8") + "=91! " + two[0].ToString("X8") + "=CC"
+                                  + (replantFails ? "!" : "");
+                    if (string.Join(" ", trail) != want)
+                        failures.Add(tag + "writes were [" + string.Join(" ", trail) + "], expected [" + want + "]");
+                    e = bps(eng, new[] { "A.CLW:5@" + Cpy });
+                    if (e != null) failures.Add(tag + "the breakpoint must stay bound to the copy; it is " + e);
+                    var kept = eng.BpVasForTest("A.CLW", 5, borrower);
+                    var expectKept = replantFails ? new List<uint> { two[1] } : new List<uint> { two[0], two[1] };
+                    if (string.Join(",", kept) != string.Join(",", expectKept))
+                        failures.Add(tag + "the binding holds [" + string.Join(",", kept) + "], expected [" + string.Join(",", expectKept) + "]");
+                    foreach (var va in kept)   // every retained address is planted AND tracked
+                        if (mem[va] != 0xCC || !eng.IsArmedForTest(va))
+                            failures.Add(tag + "retained address " + va.ToString("X8") + " is " + mem[va].ToString("X2")
+                                         + (eng.IsArmedForTest(va) ? "" : " and not armed") + ", expected planted (CC) and armed");
+                    if (replantFails && (eng.IsArmedForTest(two[0])
+                        || log.IndexOf("could not re-plant 0x" + two[0].ToString("X8"), StringComparison.Ordinal) < 0))
+                        failures.Add(tag + "an address whose re-plant failed must be named and leave the armed set: " + log.Trim());
+                    if (log.IndexOf("could not restore the original byte at 0x" + two[1].ToString("X8"), StringComparison.Ordinal) < 0)
+                        failures.Add(tag + "the failed restore was not named: " + log.Trim());
+                    if (log.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) >= 0
+                        || log.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
+                        failures.Add(tag + "a re-home was echoed for a breakpoint that stayed in the copy: " + log.Trim());
+                }
             }
             catch (Exception ex) { failures.Add("yield rebind: " + ex.GetType().Name + ": " + ex.Message); }
         }
