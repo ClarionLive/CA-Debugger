@@ -529,7 +529,63 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
-        /// A TSWD blob for <see cref="CheckStackWalkReadsCallUnderInt3"/>: one compiland (walk.clw), five +0x1C line
+        /// The disassembly names a call through a stub under our INT3 (1d371325, the audit's second raw read).
+        ///
+        /// FollowThunk decodes the instruction at a call target that has no symbol, to name what the stub jumps
+        /// to. It read the code raw, so a breakpoint on the stub decoded as int3 and the listing lost the
+        /// callee's name. Driven through the REAL NameForCodeVa over a stub in THIS process, outside the fake
+        /// image: `jmp rel32` to CALLEE. THREE CASES: the clean stub names walk.dll!CALLEE (the control); a
+        /// planted user breakpoint over the E9 still names it; an INT3 nobody planted names nothing.
+        /// NOT COVERED: the `jmp [slot]` stub form, whose slot read is data, not code.
+        /// </summary>
+        private static void CheckDisasmThunkNameUnderInt3(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("the disassembly's stub-following reads the stub with our INT3s restored: a call target "
+                         + "that is a `jmp` stub carrying a user breakpoint still names the callee it jumps to, while "
+                         + "an INT3 the engine did not plant names nothing (1d371325). Not covered: a real debuggee.");
+
+            IntPtr region = VirtualAlloc(IntPtr.Zero, (UIntPtr)0x3000u, MemReserve | MemCommitFlag, PageReadWriteFlag);
+            if (region == IntPtr.Zero) { failures.Add("thunk-under-INT3 control: could not commit three pages in this process"); return; }
+            try
+            {
+                uint r = unchecked((uint)region.ToInt32());
+                TswdDebugInfo dbg;
+                try { dbg = new TswdDebugInfo(BuildCallerCalleeBlob(), 0, 0x1000, 0x2000, 0x3000); }
+                catch (Exception ex) { failures.Add("thunk-under-INT3: the fixture blob did not parse - " + ex.Message); return; }
+
+                uint stub = r + 0x2800, callee = r + 0x1400;   // the stub sits past the image (Size 0x2000): no symbol
+                // plant: 0 none, 1 user breakpoint over the stub's opcode.
+                Func<byte, int, string> name = (opcode, plant) =>
+                {
+                    var page = new byte[0x3000];
+                    for (int i = 0x1000; i < 0x2000; i++) page[i] = 0x90;
+                    page[0x2800] = opcode;                                                  // E9 rel32 -> CALLEE
+                    BitConverter.GetBytes(unchecked(callee - (stub + 5))).CopyTo(page, 0x2801);
+                    Marshal.Copy(page, 0, region, page.Length);
+                    var eng = NewEngine();
+                    eng.SetProcessHandleForTest(System.Diagnostics.Process.GetCurrentProcess().Handle);
+                    if (plant != 0) eng.PlantForTest(stub, 0xE9, false);
+                    var m = new LoadedModule { Name = "walk.dll", LoadBase = r, Size = 0x2000, Dbg = dbg };
+                    return eng.NameForCodeVaForTest(m, stub);
+                };
+
+                string clean = name(0xE9, 0);
+                if (clean != "walk.dll!CALLEE")
+                    failures.Add("thunk-under-INT3 control: the clean stub names " + (clean ?? "nothing")
+                                 + ", expected walk.dll!CALLEE - the fixture does not follow");
+                string user = name(0xCC, 1);
+                if (user != "walk.dll!CALLEE")
+                    failures.Add("thunk-under-INT3: a user breakpoint over the stub lost the callee's name - got "
+                                 + (user ?? "nothing") + ", expected walk.dll!CALLEE");
+                string foreign = name(0xCC, 0);
+                if (foreign != null)
+                    failures.Add("thunk-under-INT3: an INT3 the engine never planted was followed as a stub - got " + foreign);
+            }
+            finally { VirtualFree(region, UIntPtr.Zero, MemRelease); }
+        }
+
+        /// <summary>
+        /// A TSWD blob for <see cref="CheckStackWalkReadsCallUnderInt3"/> and <see cref="CheckDisasmThunkNameUnderInt3"/>: one compiland (walk.clw), five +0x1C line
         /// records and two procedures. CALLER (entry 0x1100) calls at 0x1110 and resumes at 0x1115 (line 12); CALLEE
         /// (entry 0x1400) is where the thread stops. Text is RVA 0x1000..0x2000. No +0x2C tree.
         /// </summary>
