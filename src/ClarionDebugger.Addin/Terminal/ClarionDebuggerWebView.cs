@@ -249,9 +249,8 @@ namespace ClarionDebugger.Terminal
                 {
                     if (CurrentState != DebugSessionState.Idle) return;
                     _exe = null; _exeAuto = false; _exeManualKey = null;
-                    _exeState = TargetState.None; _exeNote = ProjectTargetService.NoSolutionNote;
                     ClearProcedures();
-                    PushTarget();                     // blanks the target bar
+                    SetTargetState(TargetState.None, ProjectTargetService.NoSolutionNote);   // blanks the target bar
                     Console("info", "solution closed — target cleared");
                 }
                 catch (Exception ex)
@@ -339,10 +338,12 @@ namespace ClarionDebugger.Terminal
         // tuple issued here. An expanded reference carries no tid, so its rows are granted unscoped.
         // Only a reply to a moduledata the host sent in the current epoch may grant (3517fd15): one delayed past
         // a resume and a new stop, or from an engine that echoes no id, is posted for display and grants nothing.
+        // A reply that may grant but is not well-formed grants nothing and is posted as NO rows (wave 8 X1): its
+        // body is never posted verbatim unless GrantRows read the whole of it.
         private void OnSvcModuleData(string module, string itemsJson, uint? tid, string reqId) => UI(() =>
         {
             bool mayGrant = _editGrants.ReadAnswered(reqId);
-            if (mayGrant) _editGrants.GrantRows(itemsJson, tid);
+            if (mayGrant) mayGrant = _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"moduledata\",\"module\":" + Str(module) + ",\"items\":[" + RowsAsGranted(itemsJson, mayGrant) + "]" + TidJson(tid) + "}");
         });
 
@@ -367,7 +368,7 @@ namespace ClarionDebugger.Terminal
             // members of a group the host itself offered. Any other reply is posted for display, and grants
             // nothing - its rows cannot be edited or expanded further.
             bool verified = _editGrants.ExpandVerified(reqId);
-            if (verified) _editGrants.GrantRows(itemsJson, null);
+            if (verified) verified = _editGrants.GrantRows(itemsJson, null);
             Post("{\"type\":\"expanded\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]}");
         });
 
@@ -377,7 +378,7 @@ namespace ClarionDebugger.Terminal
             // are the locals of a frame the host itself offered, at that frame's own EBP. Any other reply is
             // posted for display, and grants nothing.
             bool verified = _editGrants.FrameLocalsVerified(reqId, tid);
-            if (verified) _editGrants.GrantRows(itemsJson, tid);
+            if (verified) verified = _editGrants.GrantRows(itemsJson, tid);
             Post("{\"type\":\"framelocals\",\"reqId\":" + Str(reqId) + ",\"items\":[" + RowsAsGranted(itemsJson, verified) + "]" + TidJson(tid) + "}");
         });
         private void OnSvcLibState(string reqId, string error, string itemsJson, uint? tid) => UI(() =>
@@ -553,6 +554,10 @@ namespace ClarionDebugger.Terminal
         }
 
         private void OnGutterAdded(string m, int l, string f) => UI(() => OnGutterBpAdded(m, l));
+        // The file path f is dropped ON PURPOSE (Owner ruling 2026-10-03: a .clw BASENAME names one file). The
+        // removal goes out as an unqualified `bp del module:line`, which removes the breakpoint from EVERY image
+        // that armed a copy, and that is the intended result; tools/test-addin-bpident.ps1 pins it, so a
+        // path-qualified delete has to be a deliberate change.
         private void OnGutterRemoved(string m, int l, string f) => UI(() => OnGutterBpRemoved(m, l));
 
         private async void OnHandleCreated(object sender, EventArgs e)
@@ -737,7 +742,7 @@ namespace ClarionDebugger.Terminal
                         if (!string.IsNullOrEmpty(data)) { _watched.Add(data); if (_svc.State == DebugSessionState.Paused) WatchOrExplain(data); }
                         break;
                     case "unwatch": if (!string.IsNullOrEmpty(data)) _watched.Remove(data); break;
-                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr"
+                    case "expand": Expand(data); break;   // lazy ref-node expansion: data = "reqId|module|typeRef|addr[|imgBase]"
                     case "framelocals": FrameLocals(data); break;   // call-stack frame locals: data = "reqId|va|ebp"
                     case "mem":   // Memory panel read: data = "reqId|0xADDR|len". Trust model (page trusted for reads, 2026-09-23): see RequestMem.
                         if (_svc.State == DebugSessionState.Paused)
@@ -1233,7 +1238,8 @@ namespace ClarionDebugger.Terminal
                 // pick is honoured only as a ONE-SHOT tied to the solution/project context it was chosen for: if
                 // that context has changed (or can't be confirmed the same), the stale pick is discarded and we
                 // re-resolve / re-Browse rather than launching a hidden EXE against a different solution.
-                if (!ResolveTargetForStart()) return;
+                bool listed;
+                if (!ResolveTargetForStart(out listed)) return;
 
                 // Echo the resolved target so the console always confirms which process is about to launch.
                 Console("info", "target: " + _exe);
@@ -1246,15 +1252,17 @@ namespace ClarionDebugger.Terminal
                 Console("info", "starting: " + Path.GetFileName(_exe) + SessionCounts(solutionDlls));
                 _svc.StartSession(_exe, _pending.ToArray(), solutionDlls);
 
-                LoadStaticSymbols(_exe);
+                LoadStaticSymbols(_exe, relist: !listed);   // a Start that switched the target listed it already
             }
             catch (Exception ex) { Console("err", "start failed: " + ex.Message); }
         }
 
         /// <summary>A session's static symbols, read from the image on disk for a launch and an attach alike
         /// (70860d6b C7): the data symbols (file buffers) for the Variables tree, off the UI thread, and the
-        /// Procedures list against this target.</summary>
-        private void LoadStaticSymbols(string exe)
+        /// Procedures list against this target - unless <paramref name="relist"/> is false: the Start that resolved
+        /// this target has just pushed its list (ResolveTargetForStart), and a second push only parsed it again for
+        /// _procGen to discard (fb5766d1 X2). An attach always lists.</summary>
+        private void LoadStaticSymbols(string exe, bool relist = true)
         {
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
@@ -1262,7 +1270,7 @@ namespace ClarionDebugger.Terminal
                 if (!string.IsNullOrEmpty(g))
                     UI(() => Post(g.Replace("\"event\":\"globals\"", "\"type\":\"globals\"")));
             });
-            PushProcedures(exe);
+            if (relist) PushProcedures(exe);
         }
 
         /// <summary>The "  (N breakpoint(s), M solution DLL(s))" a session's start line ends with.</summary>
@@ -1287,6 +1295,16 @@ namespace ClarionDebugger.Terminal
         /// them to the page for the Procedures list. Clicking a row reuses the existing 'jump' handler, so
         /// no new inbound action is needed. Silent on failure (the list just stays empty).</summary>
         private int _procGen;   // generation token — discard stale async procedure pushes (EXE switch / overlapping ready+start+refresh)
+        private int _procListGen; private string _procListExe;   // the generation and EXE of the last ListProceduresForTarget push
+
+        /// <summary>True when the latest list action since <paramref name="gen0"/> was ListProceduresForTarget's push of
+        /// <paramref name="exe"/>'s procedures, and nothing (a clear, any other push) has superseded it.</summary>
+        private bool ListedSince(int gen0, string exe)
+        {
+            return _procGen != gen0 && _procGen == _procListGen
+                && string.Equals(_procListExe, exe, StringComparison.OrdinalIgnoreCase);
+        }
+
         private void PushProcedures(string exe)
         {
             if (string.IsNullOrEmpty(exe)) return;
@@ -1336,8 +1354,18 @@ namespace ClarionDebugger.Terminal
         /// is unchanged AND the file still exists; otherwise the stale manual pick is discarded. When nothing
         /// auto-resolves, falls back to a one-shot Browse tied to the current context. Returns true if _exe is a
         /// valid, launchable target; false (with a console message) to abort the Start. Never throws.
+        /// <paramref name="listed"/> is true when resolving pushed the Procedures list for that target (it switched to
+        /// it, by auto-resolve or Browse), so the Start does not list it a second time.
         /// </summary>
-        private bool ResolveTargetForStart()
+        private bool ResolveTargetForStart(out bool listed)
+        {
+            int gen0 = _procGen;
+            bool ok = ResolveTargetForStartCore();
+            listed = ok && ListedSince(gen0, _exe);
+            return ok;
+        }
+
+        private bool ResolveTargetForStartCore()
         {
             string ctx = null;
             try { ctx = ProjectTargetService.GetActiveContextKey(); } catch { }
@@ -1355,8 +1383,7 @@ namespace ClarionDebugger.Terminal
                 _exe = fresh;
                 _exeAuto = true;
                 _exeManualKey = null;            // an auto-resolve supersedes any prior manual pick
-                _exeState = TargetState.Auto; _exeNote = null;
-                PushTarget();
+                SetTargetState(TargetState.Auto, null);
                 if (!listed) ListProceduresForTarget();   // a list emptied while unconfirmed comes back, even if Start stops here
                 if (File.Exists(_exe)) return true;
                 Console("err", "Resolved target does not exist on disk: " + _exe + " — build the app, or choose one to launch.");
@@ -1372,17 +1399,15 @@ namespace ClarionDebugger.Terminal
                 // Context changed (or unconfirmable) — never launch a hidden EXE against a different solution.
                 Console("err", "Previously chosen target no longer matches the active solution — choose a target to launch.");
                 _exe = ""; _exeManualKey = null;
-                _exeState = TargetState.None; _exeNote = why;
-                PushTarget();
+                SetTargetState(TargetState.None, why);
                 return BrowseForContext(ctx);
             }
 
-            // 3) Nothing to launch — offer a one-shot Browse. An older auto path is kept for the next retry but is
-            //    no longer this solution's target, so the bar stops presenting it as one before the dialog opens.
+            // 3) Nothing to launch — offer a one-shot Browse. The bar stops presenting an older auto path as this
+            //    solution's target before the dialog opens: ApplyNoTarget's rule, the one every other resolve that
+            //    finds nothing follows (kept for a retry but unconfirmed; gone when no solution is open).
             Console("err", "Could not auto-detect a Target EXE for the current solution — choose one to launch.");
-            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
-            _exeNote = why;
-            PushTarget();
+            ApplyNoTarget(r != null ? r.Outcome : ProjectTargetService.TargetOutcome.Failed, why, ctx);
             return BrowseForContext(ctx);
         }
 
@@ -1396,8 +1421,7 @@ namespace ClarionDebugger.Terminal
             {
                 Console("err", "Chosen target does not exist: " + _exe);
                 _exe = ""; _exeManualKey = null;
-                _exeState = TargetState.None; _exeNote = "The chosen EXE does not exist";
-                PushTarget();
+                SetTargetState(TargetState.None, "The chosen EXE does not exist");
                 return false;
             }
             return true;
@@ -1422,35 +1446,42 @@ namespace ClarionDebugger.Terminal
                     _exe = r.Path;
                     _exeAuto = true;
                     _exeManualKey = null;
-                    _exeState = TargetState.Auto; _exeNote = null;
                     if (changed) Console("info", "auto-detected target: " + Path.GetFileName(_exe));
-                    PushTarget();
+                    SetTargetState(TargetState.Auto, null);
                     return;
                 }
                 // NO TARGET FROM THE SOLUTION (0214f33a). This returned silently, and whatever path the bar held -
                 // an older solution's auto target - went on looking like this solution's. Now the bar says so.
                 ApplyNoTarget(r.Outcome, r.Note, SafeContextKey());
-                PushTarget();
             }
             catch { }
         }
 
         /// <summary>What a resolve that found no target does to the one the pad holds. No solution open: the target
         /// is gone ("none"). Otherwise a manual pick made for THIS solution context stays manual; any other path is
-        /// kept for a retry but UNCONFIRMED; with no path at all the state is "none". The note says why.</summary>
+        /// kept for a retry but UNCONFIRMED; with no path at all the state is "none". The note says why. Pushed, as
+        /// every state write is (SetTargetState).</summary>
         private void ApplyNoTarget(ProjectTargetService.TargetOutcome outcome, string note, string ctx)
         {
             if (outcome == ProjectTargetService.TargetOutcome.NoSolution)
             {
                 _exe = ""; _exeAuto = false; _exeManualKey = null;
-                _exeState = TargetState.None; _exeNote = note;
+                SetTargetState(TargetState.None, note);
                 return;
             }
             bool manualHere = !_exeAuto && !string.IsNullOrEmpty(_exe) && ctx != null
                               && string.Equals(ctx, _exeManualKey, StringComparison.OrdinalIgnoreCase);
-            if (manualHere) { _exeState = TargetState.Manual; _exeNote = null; return; }
-            _exeState = string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed;
-            _exeNote = note;
+            if (manualHere) { SetTargetState(TargetState.Manual, null); return; }
+            SetTargetState(string.IsNullOrEmpty(_exe) ? TargetState.None : TargetState.Unconfirmed, note);
+        }
+
+        /// <summary>Write what the target bar says about the target, and push it. The ONLY writer of _exeState and
+        /// _exeNote (fb5766d1): a write and its push cannot be separated, so the bar never shows a state the pad
+        /// has already left.</summary>
+        private void SetTargetState(TargetState state, string note)
+        {
+            _exeState = state; _exeNote = note;
+            PushTarget();
         }
 
         private static string SafeContextKey()
@@ -1466,6 +1497,7 @@ namespace ClarionDebugger.Terminal
             if (!string.IsNullOrEmpty(_exe) && (_exeState == TargetState.Auto || _exeState == TargetState.Manual))
             {
                 PushProcedures(_exe);
+                _procListGen = _procGen; _procListExe = _exe;
                 return true;
             }
             ClearProcedures();
@@ -1578,8 +1610,7 @@ namespace ClarionDebugger.Terminal
                     bool listed = IsListedTarget(dlg.FileName);
                     _exe = dlg.FileName;
                     _exeAuto = false; // a manual pick — re-resolve will still take precedence on the next Start
-                    _exeState = TargetState.Manual; _exeNote = null;
-                    PushTarget();
+                    SetTargetState(TargetState.Manual, null);
                     if (!listed) ListProceduresForTarget();
                     return true;
                 }
@@ -2032,9 +2063,9 @@ namespace ClarionDebugger.Terminal
             if (why != null) PostVarSet(req.Va, false, null, why);
         }
 
-        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr</c>, and it
-        /// is forwarded ONLY when that exact tuple is an expandable row the host issued for the rows now current
-        /// (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
+        /// <summary>Lazy expansion of a reference / group node: data is <c>reqId|module|typeRef|addr[|imgBase]</c>,
+        /// and it is forwarded ONLY when that exact tuple, image base included (w8-expand-base), is an expandable
+        /// row the host issued for the rows now current (afbc68c7, codex security gate). Otherwise the engine would render any type's members at any
         /// address the page named - edit metadata included - and a forged expand would mint the edit grants
         /// that EditVar checks. A refusal, or a request the service would not send, is ANSWERED with an empty
         /// expanded reply for that reqId, so the node the page is opening does not wait forever.</summary>
@@ -2043,12 +2074,12 @@ namespace ClarionDebugger.Terminal
             if (_svc.State != DebugSessionState.Paused) return;
             var x = ExpandRequest.Parse(data);
             if (x == null) return;
-            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr))
+            if (!_editGrants.IsExpandIssued(x.Module, x.TypeRef, x.Addr, x.ImgBase))
             {
                 RefuseExpand(x.ReqId, "that node is no longer current (or was never offered) — let the view refresh, then open it again");
                 return;
             }
-            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr))
+            if (!_svc.RequestExpand(x.ReqId, x.Module, x.TypeRef, x.Addr, x.ImgBase))
             {
                 RefuseExpand(x.ReqId, "the engine did not take the request");
                 return;

@@ -3,6 +3,7 @@
 #   pwsh -NoProfile -File tools\run-all.ps1                 # build the engine, then every offline suite
 #   pwsh -NoProfile -File tools\run-all.ps1 -IncludeLive    # ...and the suites that drive a live debuggee
 #   pwsh -NoProfile -File tools\run-all.ps1 -Only test-addin-hooks.ps1,test-pad-parse.js
+#   pwsh -NoProfile -File tools\run-all.ps1 -List           # discover and validate the suite list, print it, stop
 #
 # There is no CI. Before this file the only full list of suites lived in the PM's spawn briefs, so a new
 # suite was born unlisted and rotted unrun, and a green reported as "12 suites" was really 12 of 15 - the
@@ -13,10 +14,16 @@
 #   - a suite that exits 0 WITHOUT printing its own success line. A top-level `break` in a harness gives
 #     exit 0 and no summary at all (measured by ticket 60344b78: 69 of 222 checks, no summary, exit 0), so
 #     an exit code alone would certify a suite that died politely;
-#   - a tools\test-* file on disk that is not in $Suites below, so a new suite cannot rot unlisted;
-#   - a $Suites entry whose file is gone;
-#   - a listed PowerShell suite that does not pin its own total with Assert-CheckTotal (tools\lib-check.ps1),
-#     unless its entry names why not. The success line is only trustworthy if the suite counted itself;
+#   - a tools\test-* file with no `suite:` header line, so a new suite cannot rot unlisted. The list is
+#     DISCOVERED from those headers (w8-suite-header, tools\lib-suites.ps1), not hand-kept here: the old
+#     $Suites array was hand-merged at every wave's integration. Discovery reads the files on disk, so the
+#     old "listed but missing" failure can no longer arise;
+#   - a malformed header line, a success regex not anchored with ^, and a .ps1 with a $SelfTest parameter
+#     but no args=-SelfTest variant (lib-suites.ps1 lists the rest);
+#   - fewer entries discovered than $MinEntries, so a suite deleted together with its header is noticed;
+#   - a PowerShell suite that does not pin its own total with Assert-CheckTotal (tools\lib-check.ps1),
+#     unless its header names why not (nototal=). The success line is only trustworthy if the suite counted
+#     itself;
 #   - a .ps1 anywhere in the repo that carries non-ASCII bytes without a UTF-8 BOM. Windows PowerShell 5.1
 #     reads such a file as CP1252 and can fail to parse it far from the cause (ticket 718ea446);
 #   - the engine build failing or warning, protocolcheck missing, or node missing.
@@ -34,7 +41,10 @@ param(
   # Run only these suite files (the list and encoding checks still run in full).
   [string[]] $Only = @(),
   # Print every suite's full output, not only a failing suite's.
-  [switch] $ShowOutput
+  [switch] $ShowOutput,
+  # Discover and validate the suite list, print one line per entry, and stop: no encoding check, no build,
+  # no suites. Exit 1 if discovery failed. tools\test-run-all.ps1 drives the discovery guards through this.
+  [switch] $List
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,70 +55,16 @@ $engineExe = Join-Path $repo 'src\ClarionDbg.Cli\bin\Debug\net48\ClarionDbg.exe'
 
 # ---------------------------------------------------------------------------------------------- THE LIST
 #
-# ADDING A SUITE IS ONE LINE HERE. Fields:
-#   File      the file in tools\ (required)
-#   Args      extra arguments, e.g. @('-SelfTest'). A file may be listed more than once with different Args.
-#   Live      $true for a suite that needs the Clarion example app and a live debuggee
-#   Success   regex for the suite's own success line, matched against each output line. Defaults below.
-#   NoTotal   a .ps1 that deliberately does not call Assert-CheckTotal must say why here
-$Suites = @(
-  @{ File = 'test-addin-bpident.ps1' }
-  @{ File = 'test-addin-bpremove.ps1' }
-  @{ File = 'test-addin-hooks.ps1' }
-  @{ File = 'test-addin-json.ps1' }
-  @{ File = 'test-addin-watch-fields.ps1' }
-  @{ File = 'test-addin-lifecycle.ps1' }
-  @{ File = 'test-addin-attach.ps1' }
-  @{ File = 'test-addin-attach.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-addin-selection.ps1' }
-  @{ File = 'test-addin-selection.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-host-target.ps1' }
-  @{ File = 'test-host-target.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-host-tid-members.ps1' }
-  @{ File = 'test-host-tid-members.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-disasm-seat.ps1' }
-  @{ File = 'test-file-record-predicate.ps1' }
-  @{ File = 'test-threaded-template-rule.ps1' }
-  @{ File = 'test-procs.ps1' }
-  @{ File = 'test-procs.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-procs.ps1'; Args = @('-WithClarion'); Live = $true }
-  @{ File = 'test-attach.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-attach.ps1'; Live = $true }
-  @{ File = 'test-engine-bpowner.ps1' }
-  @{ File = 'test-engine-session.ps1' }
-  @{ File = 'test-engine-setip-sites.ps1' }
-  @{ File = 'test-engine-setip-sites.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-engine-tid-members.ps1' }
-  @{ File = 'test-engine-tid-members.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-engine-hover-sites.ps1' }
-  @{ File = 'test-engine-hover-sites.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-engine-framecache-sites.ps1' }
-  @{ File = 'test-engine-framecache-sites.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-engine-reqid-sites.ps1' }
-  @{ File = 'test-engine-reqid-sites.ps1'; Args = @('-SelfTest') }
-  @{ File = 'test-pad-bpstate.js' }
-  @{ File = 'test-pad-contrast.js' }
-  @{ File = 'test-pad-editmeta.js' }
-  @{ File = 'test-pad-memory.js' }
-  @{ File = 'test-pad-attach.js' }
-  @{ File = 'test-pad-parse.js'; Success = '^all \d+ inline script block\(s\) parse OK$' }
-  @{ File = 'test-pad-source.js' }
-  @{ File = 'test-pad-setip.js' }
-  @{ File = 'test-pad-threads.js' }
-  @{ File = 'test-pad-frames.js' }
-  @{ File = 'test-pad-xss.js' }
-  @{ File = 'test-pad-csp.js' }
-  @{ File = 'test-pad-bpimage.js' }
-  @{ File = 'test-pad-target.js' }
-  @{ File = 'test-pad-watch-persist.js' }
-  @{ File = 'test-bp-threaded.ps1'; Live = $true }
-  @{ File = 'test-watch-threaded.ps1'; Live = $true }
-  @{ File = 'test-setip.ps1'; Live = $true }
-  @{ File = 'test-engine-filescope.ps1'; Live = $true }
-  @{ File = 'test-engine-samename.ps1'; Live = $true }
-  @{ File = 'test-interactive.ps1'; Live = $true; Success = '^=== exit code: 0 ===$'
-     NoTotal = 'a paced step/stepover/stepout smoke run with no Check calls; its verdict is the engine exit code' }
-)
+# ADDING A SUITE IS ONE LINE IN THE SUITE, not here: `# suite: live=no` (a .js: `// suite: live=no`) within
+# its first 40 lines, above param(), one line per run variant. The grammar and each way a line can fail:
+# tools\lib-suites.ps1.
+. (Join-Path $tools 'lib-suites.ps1')
+$discovered = Get-SuiteHeaders -ToolsDir $tools
+$Suites = @($discovered.Entries)
+# A FLOOR on the entries discovered. It may only be RAISED: lowered, a suite deleted together with its header
+# is gone without a word. 2026-10-03: 56 = the 55 entries of the hand-kept $Suites at 81f268e, plus
+# tools\test-run-all.ps1. 2026-10-03 (integration/wave8): 58, adding test-engine-samename-w8.ps1 and its -SelfTest.
+$MinEntries = 58
 # A .ps1 suite's success line names its count (lib-check's summary). The node suites predate a shared
 # summary, so theirs may or may not carry one.
 $DefaultSuccess = @{ '.ps1' = '^ALL \d+ CHECKS PASSED'; '.js' = '^ALL (\d+ )?CHECKS PASSED$' }
@@ -132,14 +88,11 @@ function Show-Tail {
 # ---------------------------------------------------------------------------------------------- the list is complete
 Write-Host "run-all: $repo"
 Write-Host ''
-$listed = @($Suites | ForEach-Object { $_.File } | Sort-Object -Unique)
-$onDisk = @(Get-ChildItem -LiteralPath $tools -File | Where-Object { $_.Name -like 'test-*.ps1' -or $_.Name -like 'test-*.js' } |
-            ForEach-Object { $_.Name } | Sort-Object)
-foreach ($f in $onDisk) {
-  if ($listed -notcontains $f) { Report 'FAIL' $f 'UNLISTED: a suite on disk that nothing runs - add one line to $Suites in tools\run-all.ps1' }
-}
-foreach ($f in $listed) {
-  if ($onDisk -notcontains $f) { Report 'FAIL' $f 'LISTED BUT MISSING: remove it from $Suites, or restore the file' }
+foreach ($e in $discovered.Errors) { Report 'FAIL' $e.File $e.Message }
+$fileCount = @($Suites | ForEach-Object { $_.File } | Sort-Object -Unique).Count
+Write-Host "run-all: discovered $($Suites.Count) suite entries in $fileCount files (floor `$MinEntries = $MinEntries)"
+if ($Suites.Count -lt $MinEntries) {
+  Report 'FAIL' 'suite list' "BELOW THE FLOOR: $($Suites.Count) entries discovered, `$MinEntries = $MinEntries - a suite lost its header or its file"
 }
 foreach ($s in $Suites) {
   $path = Join-Path $tools $s.File
@@ -147,9 +100,16 @@ foreach ($s in $Suites) {
     # Code only, not comments: a file that merely DISCUSSES Assert-CheckTotal has not opted in.
     $code = @(Get-Content -LiteralPath $path | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
     if ($code -notmatch '(?m)^\s*Assert-CheckTotal\b') {
-      Report 'FAIL' $s.File 'does not pin its total with Assert-CheckTotal, so its success line cannot be trusted (or give its entry a NoTotal reason)'
+      Report 'FAIL' $s.File 'does not pin its total with Assert-CheckTotal, so its success line cannot be trusted (or give its suite line a nototal= reason)'
     }
   }
+}
+if ($List) {
+  foreach ($s in $Suites) { Write-Host (Format-SuiteEntry $s) }
+  Write-Host ''
+  if ($script:failed) { Write-Host "RUN-ALL LIST FAILED: $($script:failed) problem(s), $($Suites.Count) entries"; exit 1 }
+  Write-Host "RUN-ALL LIST OK: $($Suites.Count) entries"
+  exit 0
 }
 
 # ---------------------------------------------------------------------------------------------- encoding

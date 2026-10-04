@@ -1,3 +1,4 @@
+// suite: live=no
 // Breakpoint rows that name their image: the page half of the FROZEN contract C2 (1be3b82e #3, wave 7).
 //
 // The host adds "image" to every {"type":"bplist"} row: the engine's ownerPath for that row, or null when
@@ -39,7 +40,7 @@ let curFile = null;
 let bps = [];
 
 const FNS = ['BP_PATH_STATES', 'esc', 'bpPathState', 'bpPathDeclines', 'bpActionKey', 'bpAmbiguousActionKeys',
-             'bpLineKey', 'bpSharedLines', 'bpImageName', 'bpImageLabel', 'badge', 'hitLabel', 'buildBps'];
+             'bpLineKey', 'bpSharedLines', 'bpImageKnown', 'bpImageName', 'bpImageLabel', 'badge', 'hitLabel', 'buildBps'];
 const missing = [];
 const src = FNS.map(n => {
   try { return pad.extract(html, n); }
@@ -100,6 +101,8 @@ console.log('\n4) basenames split on both separators; null is "(pending)"');
   check('a bare file name is its own basename', label(rows[3]).textContent === 'bare.dll', label(rows[3]).textContent);
   const miss = render([row('m.clw', 5, undefined), row('m.clw', 5, '')]);
   check('an absent or empty image is pending too', label(miss[0]).textContent === '(pending)' && label(miss[1]).textContent === '(pending)');
+  // The label and its tooltip read one test of "known" (bpImageKnown, wave 8 #7b): they agree on every pending shape.
+  check('...and so is its tooltip', miss.every(r => label(r).title === '(pending)' + TAIL), miss.map(r => label(r).title).join(' | '));
 }
 
 console.log('\n5) hostile image strings render as text');

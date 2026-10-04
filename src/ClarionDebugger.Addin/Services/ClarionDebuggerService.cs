@@ -988,12 +988,18 @@ namespace ClarionDebugger.Services
 
         /// <summary>Lazily expand a reference node: ask the engine to deref <paramref name="addrHex"/> and render
         /// the referent type's members. Result arrives via ExpandedReceived keyed by <paramref name="reqId"/>.
-        /// Args are validated to block command/arg injection over the space-split stdin protocol.</summary>
-        public bool RequestExpand(int reqId, string module, uint typeRef, string addrHex)
+        /// Args are validated to block command/arg injection over the space-split stdin protocol.
+        /// <para>
+        /// <paramref name="imgBase"/> is the load base of the image the row was read from (w8-expand-base): it is
+        /// appended as a fifth argument only when present, and the engine then reads that image's module and no
+        /// other. Absent, the engine resolves <paramref name="module"/> by name as before.
+        /// </para></summary>
+        public bool RequestExpand(int reqId, string module, uint typeRef, string addrHex, string imgBase = null)
         {
             if (!IsValidModuleName(module)) return false;
             if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]+$")) return false;
-            return SendCommand("expand " + reqId + " " + module + " " + typeRef + " " + addrHex);
+            if (imgBase != null && !Regex.IsMatch(imgBase, "^0x[0-9A-Fa-f]{1,8}$")) return false;
+            return SendCommand("expand " + reqId + " " + module + " " + typeRef + " " + addrHex + (imgBase != null ? " " + imgBase : ""));
         }
 
         /// <summary>Request the locals of ONE call-stack frame (Call-Stack-driven Variables): the engine reads

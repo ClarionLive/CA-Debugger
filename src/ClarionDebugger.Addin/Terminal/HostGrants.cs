@@ -359,22 +359,32 @@ namespace ClarionDebugger.Terminal
             if (_keys.Count + _expandable.Count < MaxGrants) _keys.Add(spent);
         }
 
-        /// <summary>Record an expandable row (a lazy reference / array-element group node) the host issued.</summary>
-        public void GrantExpandable(string module, uint typeRef, string addr)
+        /// <summary>Record an expandable row (a lazy reference / array-element group node) the host issued, with
+        /// the load base of the image its module was read from: <paramref name="imgBase"/>, null when the row
+        /// carried none (an engine from before w8-expand-base). The base is part of the grant: two loaded images
+        /// can carry a compiland of one name, and the base is what tells the engine which one to read. A row whose
+        /// base is present but not <see cref="ImageBase"/> grammar grants nothing, since the request that echoes
+        /// it is refused anyway.</summary>
+        public void GrantExpandable(string module, uint typeRef, string addr, string imgBase = null)
         {
             Sync();
             if (string.IsNullOrEmpty(module) || string.IsNullOrEmpty(addr)) return;
+            string key = ExpandKey(module, typeRef, addr, imgBase);
+            if (key == null) return;
             if (_keys.Count + _expandable.Count >= MaxGrants) return;
-            _expandable.Add(ExpandKey(module, typeRef, addr));
+            _expandable.Add(key);
         }
 
-        /// <summary>True when this exact (module, typeRef, addr) is a row the host issued for the rows now
-        /// current. Anything else is a forged or stale expand and is not forwarded.</summary>
-        public bool IsExpandIssued(string module, uint typeRef, string addr)
+        /// <summary>True when this exact (module, typeRef, addr, imgBase) is a row the host issued for the rows
+        /// now current. Anything else is a forged or stale expand and is not forwarded: a page that swaps the base
+        /// for another image's, or drops it to fall back to the engine's first-match name lookup, names a row the
+        /// host never issued.</summary>
+        public bool IsExpandIssued(string module, uint typeRef, string addr, string imgBase = null)
         {
             Sync();
             if (string.IsNullOrEmpty(module) || string.IsNullOrEmpty(addr)) return false;
-            return _expandable.Contains(ExpandKey(module, typeRef, addr));
+            string key = ExpandKey(module, typeRef, addr, imgBase);
+            return key != null && _expandable.Contains(key);
         }
 
         /// <summary>The host forwarded expand <paramref name="reqId"/> to the engine after verifying it.</summary>
@@ -449,9 +459,19 @@ namespace ClarionDebugger.Terminal
             return va.ToUpperInvariant() + "|" + ebp.ToUpperInvariant();
         }
 
-        private static string ExpandKey(string module, uint typeRef, string addr)
+        /// <summary>The grant key, or null when <paramref name="imgBase"/> is present but malformed. The base is
+        /// keyed by VALUE, so "0x00400000" and "0x400000" name one image; "-" stands for no base, which no valid
+        /// base can produce.</summary>
+        private static string ExpandKey(string module, uint typeRef, string addr, string imgBase)
         {
-            return module.ToUpperInvariant() + "|" + typeRef.ToString(CultureInfo.InvariantCulture) + "|" + addr.ToUpperInvariant();
+            string b = "-";
+            if (imgBase != null)
+            {
+                uint v;
+                if (!ImageBase.TryParse(imgBase, out v)) return null;
+                b = v.ToString("X8", CultureInfo.InvariantCulture);
+            }
+            return module.ToUpperInvariant() + "|" + typeRef.ToString(CultureInfo.InvariantCulture) + "|" + addr.ToUpperInvariant() + "|" + b;
         }
 
         /// <summary>Record one editable tuple. Rows with no address or type code are not editable and are
@@ -465,17 +485,20 @@ namespace ClarionDebugger.Terminal
         }
 
         /// <summary>Record every editable row, and every EXPANDABLE row, inside an engine row array body (the
-        /// text between the brackets, exactly as it is forwarded to the page), children included.</summary>
-        public void GrantRows(string itemsJson, uint? tid)
+        /// text between the brackets, exactly as it is forwarded to the page), children included. Returns false,
+        /// having granted nothing, when the body is not well-formed JSON: the caller then posts it as NO rows,
+        /// never verbatim (49538b78 wave 8 X1). An empty body is well-formed and grants nothing.</summary>
+        public bool GrantRows(string itemsJson, uint? tid)
         {
-            if (string.IsNullOrEmpty(itemsJson)) return;
-            JsonMessageReader.ForEachObject("[" + itemsJson + "]", o =>
+            if (string.IsNullOrEmpty(itemsJson)) return true;
+            return JsonMessageReader.ForEachObject("[" + itemsJson + "]", o =>
             {
                 if (JsonMessageReader.ReadField(o, "ref") == "true")
                 {
                     uint typeRef;
                     if (PageNumbers.TryUInt(JsonMessageReader.ReadField(o, "typeRef"), out typeRef))
-                        GrantExpandable(JsonMessageReader.ReadField(o, "module"), typeRef, JsonMessageReader.ReadField(o, "addr"));
+                        GrantExpandable(JsonMessageReader.ReadField(o, "module"), typeRef, JsonMessageReader.ReadField(o, "addr"),
+                            JsonMessageReader.ReadField(o, "imgBase"));
                 }
                 string va = JsonMessageReader.ReadField(o, "va");
                 string tc = JsonMessageReader.ReadField(o, "typeCode");

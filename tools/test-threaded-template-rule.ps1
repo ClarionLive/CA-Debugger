@@ -1,3 +1,4 @@
+# suite: live=no
 # Source-level check: the THREADed-template question has ONE rule, over a symbol's SPAN (tickets ef0a941d,
 # 3c031cdc).
 #

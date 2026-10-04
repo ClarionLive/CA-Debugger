@@ -1,3 +1,4 @@
+// suite: live=no
 // Injection sinks in the debugger pad (e1dea0d9).
 //
 // The pad is a WebView2 page the Owner has ruled TRUSTED for memory reads, and every symbol name, type and

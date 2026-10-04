@@ -1,3 +1,4 @@
+// suite: live=no
 // The pad side of "Attach to a running process" (ticket 3f2d747f part C): the Attach… button's gate, the
 // picker that lists processes and sends back a pid, the Stop tooltip while attached, and - the point of
 // most of this file - that a process's NAME and PATH are rendered as TEXT and never as markup.

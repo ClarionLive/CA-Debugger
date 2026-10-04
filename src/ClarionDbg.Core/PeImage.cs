@@ -29,6 +29,7 @@ namespace ClarionDbg.Core
         public uint ImageBase { get; private set; }
         public uint SizeOfImage { get; private set; }
         public uint TimeDateStamp { get; private set; }   // file header +8: the link time, which tells two builds apart
+        public uint CheckSum { get; private set; }        // optional header +64: 0 unless the linker stamped one
         public uint EntryPointRva { get; private set; }
         public uint DebugDirRva { get; private set; }
         public uint DebugDirSize { get; private set; }
@@ -63,6 +64,7 @@ namespace ClarionDbg.Core
             EntryPointRva = BitConverter.ToUInt32(bytes, optOff + 16);
             ImageBase = BitConverter.ToUInt32(bytes, optOff + 28);
             SizeOfImage = BitConverter.ToUInt32(bytes, optOff + 56);
+            CheckSum = BitConverter.ToUInt32(bytes, optOff + 64);
 
             // Data directories begin at +96 in PE32; Debug Directory is index 6 (8 bytes each).
             int debugDir = optOff + 96 + 6 * 8;
@@ -279,7 +281,7 @@ namespace ClarionDbg.Core
         }
 
         /// <summary>Holds the first IMAGE_DEBUG_DIRECTORY entry.</summary>
-        public struct DebugEntry { public uint Type; public uint SizeOfData; public uint PointerToRawData; }
+        public struct DebugEntry { public uint TimeDateStamp; public uint Type;public uint SizeOfData; public uint PointerToRawData; }
 
         public DebugEntry ReadFirstDebugEntry()
         {
@@ -288,6 +290,7 @@ namespace ClarionDbg.Core
             int o = (int)off;
             return new DebugEntry
             {
+                TimeDateStamp = BitConverter.ToUInt32(Bytes, o + 4),
                 Type = BitConverter.ToUInt32(Bytes, o + 12),
                 SizeOfData = BitConverter.ToUInt32(Bytes, o + 16),
                 PointerToRawData = BitConverter.ToUInt32(Bytes, o + 24),
@@ -306,10 +309,28 @@ namespace ClarionDbg.Core
             if (o + 28 > Bytes.Length) return false;
             entry = new DebugEntry
             {
+                TimeDateStamp = BitConverter.ToUInt32(Bytes, o + 4),
                 Type = BitConverter.ToUInt32(Bytes, o + 12),
                 SizeOfData = BitConverter.ToUInt32(Bytes, o + 16),
                 PointerToRawData = BitConverter.ToUInt32(Bytes, o + 24),
             };
+            return true;
+        }
+
+        /// <summary>Are the first debug entry's DATA bytes (for a Clarion image, the whole TSWD blob) present in
+        /// both images and byte-equal, under the same entry type? False when either has no debug entry, its data
+        /// is empty, or it runs past the end of the file. Two builds of one DLL differ here even when their link
+        /// time and size agree, which is what makes it a build identity rather than a hint (fb5766d1 #2).</summary>
+        public static bool SameFirstDebugData(PeImage a, PeImage b)
+        {
+            DebugEntry ea, eb;
+            if (a == null || b == null || !a.TryReadFirstDebugEntry(out ea) || !b.TryReadFirstDebugEntry(out eb)) return false;
+            if (ea.Type != eb.Type || ea.SizeOfData == 0 || ea.SizeOfData != eb.SizeOfData) return false;
+            long n = ea.SizeOfData;
+            if ((long)ea.PointerToRawData + n > a.Bytes.Length || (long)eb.PointerToRawData + n > b.Bytes.Length) return false;
+            long pa = ea.PointerToRawData, pb = eb.PointerToRawData;
+            for (long i = 0; i < n; i++)
+                if (a.Bytes[pa + i] != b.Bytes[pb + i]) return false;
             return true;
         }
     }

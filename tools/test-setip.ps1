@@ -1,3 +1,4 @@
+# suite: live=yes
 # LIVE: set next statement (task a77abd94) against clbrws.exe's SplashScreen.
 #
 # What only a live run can show, and protocolcheck cannot (ProtocolCheck.SetIp.cs covers the decision, the

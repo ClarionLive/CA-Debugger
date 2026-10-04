@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # Asserts, against the ENGINE'S OWN SOURCE, that no file writes a thread-id JSON member by hand.
 #
 #   pwsh -NoProfile -File tools\test-engine-tid-members.ps1

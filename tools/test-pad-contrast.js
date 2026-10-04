@@ -1,3 +1,4 @@
+// suite: live=no
 // Regression check: the pad's CAUTION colour is readable in BOTH themes.
 //
 // The states this colour paints are the ones saying WHICH THREAD THE PANELS ARE SHOWING, and which call

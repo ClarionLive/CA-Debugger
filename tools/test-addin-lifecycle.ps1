@@ -1,4 +1,5 @@
-﻿# Regression check: the engine outliving its own "exited" event (ticket 0449e5c9, Owner's decision: option C).
+﻿# suite: live=no
+# Regression check: the engine outliving its own "exited" event (ticket 0449e5c9, Owner's decision: option C).
 #
 #   pwsh -NoProfile -File tools\test-addin-lifecycle.ps1
 #
@@ -63,7 +64,7 @@ Check 'a genuinely live session still throws "already running"' `
 # The pad asks FIRST, so it never announces a start that is not going to happen.
 $padStart = Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)
 $iAsk = $padStart.IndexOf('_svc.IsEngineStillClosing')
-$iResolve = $padStart.IndexOf('ResolveTargetForStart()')
+$iResolve = $padStart.IndexOf('ResolveTargetForStart(out listed)')
 $iStarting = $padStart.IndexOf('"starting: "')
 Check 'the pad refuses before resolving the target or announcing a start' `
   (($iAsk -ge 0) -and ($iResolve -gt $iAsk) -and ($iStarting -gt $iAsk)) "ask=$iAsk resolve=$iResolve starting=$iStarting"

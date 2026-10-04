@@ -1,4 +1,6 @@
-﻿# Asserts, against the ADD-IN'S OWN SOURCE, that no host file writes a thread-id JSON member by hand.
+﻿# suite: live=no
+# suite: live=no; args=-SelfTest
+# Asserts, against the ADD-IN'S OWN SOURCE, that no host file writes a thread-id JSON member by hand.
 #
 #   pwsh -NoProfile -File tools\test-host-tid-members.ps1
 #   pwsh -NoProfile -File tools\test-host-tid-members.ps1 -SelfTest

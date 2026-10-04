@@ -1,4 +1,5 @@
-﻿# Interactive engine harness for THREADed (.cwtls) data — the repro/regression rig for issue "table
+﻿# suite: live=yes
+# Interactive engine harness for THREADed (.cwtls) data — the repro/regression rig for issue "table
 # fields stuck on ...". Launches ClarionDbg break --interactive --json, optionally opens a browse by
 # POSTING a menu command (Clarion menus are owner-drawn and carry no text, so -MenuItem takes a
 # "topIndex/itemIndex" path), then feeds stdin commands and prints/logs every engine reply.

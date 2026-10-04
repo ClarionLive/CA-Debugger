@@ -1,3 +1,4 @@
+# suite: live=no
 # Source-level check: "is this a FILE record buffer's name" has ONE shape test (ticket 04d7b4c8 item 2).
 #
 # The module-data panel used a bare EndsWith(":RECORD"), which also counted a form's HISTORY::COU:RECORD and

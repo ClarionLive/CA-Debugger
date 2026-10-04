@@ -22,6 +22,7 @@ namespace ClarionDbg.Cli
                 Pe = pe,
                 Dbg = dbg,
                 Preloaded = preloaded,
+                PreloadPath = preloaded ? path : null,
                 Size = pe != null ? pe.SizeOfImage : 0,
             };
             m.ResolveThreadedInfo();
@@ -82,13 +83,11 @@ namespace ClarionDbg.Cli
         /// read its TSWD against B's code.
         /// <para>
         /// ONE FALLBACK, on build identity rather than name: an output copied beside the EXE loads from a path the
-        /// host never named. A same-name PRELOADED entry is still that image when its PE link time and size equal
-        /// the mapped image's (<paramref name="mappedStamp"/>, <paramref name="mappedSize"/>), and only when
-        /// exactly one entry does; two builds of <c>shared.dll</c> differ in both, so neither is claimed.
+        /// host never named. A same-name PRELOADED entry is still that image when <see cref="SameBuild"/> proves
+        /// it from <paramref name="mapped"/>, and only when exactly one entry does.
         /// </para>
         /// </summary>
-        internal static LoadedModule ClaimUnmapped(IList<LoadedModule> modules, string path, string name,
-                                                   uint mappedStamp, uint mappedSize)
+        internal static LoadedModule ClaimUnmapped(IList<LoadedModule> modules, string path, string name, MappedBuild mapped)
         {
             foreach (var im in modules)
                 if (im.LoadBase == 0 && SamePath(im.Path, path)) return im;
@@ -96,15 +95,114 @@ namespace ClarionDbg.Cli
             foreach (var im in modules)
             {
                 if (im.LoadBase != 0 || !im.Preloaded || im.Pe == null || im.Name != name) continue;
-                if (mappedStamp == 0 || im.Pe.TimeDateStamp != mappedStamp || im.Pe.SizeOfImage != mappedSize) continue;
+                if (!SameBuild(im.Pe, mapped)) continue;
                 if (same != null) return null;   // two builds answer: neither is provably this one
                 same = im;
             }
             return same;
         }
 
+        /// <summary>What the engine could learn about the build of an image that just mapped: its file on disk
+        /// when the mapped path reads (<see cref="DiskPe"/>), and the identity fields of the MAPPED header, read
+        /// from the target. A field that did not read is 0, never a placeholder (fb5766d1 #2: the size reader
+        /// used to answer a made-up 0x10000 for a bad header, and a preload of that size matched it).</summary>
+        internal sealed class MappedBuild
+        {
+            public PeImage DiskPe;        // the mapped path's file, parsed; null when it does not read
+            public uint Stamp;            // file header +8 (link time)
+            public uint Size;             // optional header +56 (SizeOfImage)
+            public uint CheckSum;         // optional header +64
+            public uint DebugStamp;      // that entry's TimeDateStamp (+4)
+            public uint DebugType;        // ... its Type (+12)
+            public uint DebugSize;        // ... its SizeOfData (+16)
+        }
+
+        /// <summary>
+        /// Is <paramref name="pre"/> (a preload's PE) provably the build that mapped (fb5766d1 #2)?
+        /// <para>
+        /// WHEN THE MAPPED FILE READS, ITS DEBUG DATA DECIDES: the first debug entry's bytes - for a Clarion image
+        /// the whole TSWD blob the preload will be trusted to describe - must be byte-equal to the preload's, and the
+        /// file's link time must be the one that mapped. Link time and size alone are not an identity: a rebuild can
+        /// keep the size, and a stamp can repeat.
+        /// </para>
+        /// <para>
+        /// ONLY WHEN IT DOES NOT READ, the mapped header decides, on everything the header can say: link time, size
+        /// and checksum, and the first debug entry's type, link time and data size. Every one must equal the
+        /// preload's, the link time and size must have read (non-zero), and the preload must carry a debug entry.
+        /// A debug directory that did not read is all 0, which no real entry is (its type and size are set).
+        /// </para>
+        /// </summary>
+        internal static bool SameBuild(PeImage pre, MappedBuild mapped)
+        {
+            if (pre == null || mapped == null || mapped.Stamp == 0 || mapped.Size == 0) return false;
+            if (pre.TimeDateStamp != mapped.Stamp || pre.SizeOfImage != mapped.Size) return false;
+            if (mapped.DiskPe != null)
+                return mapped.DiskPe.TimeDateStamp == mapped.Stamp && PeImage.SameFirstDebugData(pre, mapped.DiskPe);
+            PeImage.DebugEntry e;
+            if (!pre.TryReadFirstDebugEntry(out e)) return false;
+            return pre.CheckSum == mapped.CheckSum
+                && e.Type == mapped.DebugType && e.TimeDateStamp == mapped.DebugStamp && e.SizeOfData == mapped.DebugSize;
+        }
+
+        /// <summary>Read <see cref="MappedBuild"/> through <paramref name="readU32"/>, which reads a U32 at an RVA of
+        /// the mapped image (the target's memory live; a file in protocolcheck). The PE header sits at its file
+        /// offset in memory, and the debug entry at its RVA. Any field that does not read stays 0.</summary>
+        internal static MappedBuild ReadMappedBuild(Func<uint, uint> readU32, PeImage diskPe)
+        {
+            var b = new MappedBuild { DiskPe = diskPe };
+            uint hdr = PeHeaderOffset(readU32);
+            if (hdr == 0) return b;
+            uint opt = hdr + 24;
+            b.Stamp = readU32(hdr + 8);
+            b.Size = readU32(opt + 56);
+            b.CheckSum = readU32(opt + 64);
+            uint dirRva = readU32(opt + 96 + 6 * 8), dirSize = readU32(opt + 96 + 6 * 8 + 4);
+            if (dirRva != 0 && dirSize >= 28)
+            {
+                b.DebugStamp = readU32(dirRva + 4);
+                b.DebugType = readU32(dirRva + 12);
+                b.DebugSize = readU32(dirRva + 16);
+            }
+            return b;
+        }
+
+        /// <summary>The PE header's offset from the image base (e_lfanew), or 0 when it is out of range or the
+        /// "PE\0\0" signature is not there. The one header locator both remote readers use (fb5766d1 #7a).</summary>
+        internal static uint PeHeaderOffset(Func<uint, uint> readU32)
+        {
+            uint eLfanew = readU32(0x3C);
+            if (eLfanew == 0 || eLfanew > 0x1000) return 0;
+            return readU32(eLfanew) == 0x00004550 ? eLfanew : 0;
+        }
+
+        /// <summary>
+        /// Keep two LIVE entries from sharing a Path (fb5766d1 #3). A same-build claim borrows the preload's path
+        /// (<see cref="LoadedModule.PathBorrowed"/>); when <paramref name="just"/> maps and a live entry answers to
+        /// the same Path, the BORROWER takes its own mapped path, since the other one is genuinely there. Returns
+        /// the entries whose Path changed, so the caller can re-send the breakpoint list they own.
+        /// </summary>
+        internal static List<LoadedModule> YieldBorrowedPaths(IList<LoadedModule> modules, LoadedModule just)
+        {
+            var changed = new List<LoadedModule>();
+            if (just == null || just.LoadBase == 0) return changed;
+            foreach (var o in modules)
+            {
+                if (o == just || !SamePath(o.Path, just.Path)) continue;
+                LoadedModule loser = just.PathBorrowed ? just : o.PathBorrowed ? o : null;
+                if (loser == null) continue;   // neither borrowed: two genuine mappings of one path cannot coexist
+                loser.Path = loser.MappedPath;
+                if (!changed.Contains(loser)) changed.Add(loser);
+                if (loser == just) break;
+            }
+            return changed;
+        }
+
         /// <summary>Test seam: the module table as it stands (a copy), for protocolcheck's preload assertions.</summary>
         internal List<LoadedModule> ModulesForTest() { return new List<LoadedModule>(_modules); }
+
+        /// <summary>Test seam: the REAL unmap handler for the image at <paramref name="baseVa"/>; protocolcheck
+        /// sets the entry's LoadBase/MappedPath itself, since no process maps it.</summary>
+        internal void DllUnloadedForTest(uint baseVa) { OnDllUnloaded(baseVa); }
 
         /// <summary>The mapped module whose [LoadBase, LoadBase+Size) contains <paramref name="va"/>,
         /// or null. Only mapped modules (LoadBase != 0) are candidates.</summary>
@@ -122,6 +220,18 @@ namespace ClarionDbg.Cli
             if (string.IsNullOrEmpty(name)) return null;
             foreach (var m in _modules)
                 if (m.LoadBase != 0 && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
+            return null;
+        }
+
+        /// <summary>The mapped image named <paramref name="name"/> (case-insensitive) whose LoadBase is exactly
+        /// <paramref name="loadBase"/>, or null (w8-expand-base). Two same-named DLLs are told apart by base, which
+        /// <see cref="ModuleByName"/> cannot do; a base that names no mapped image of that name finds nothing,
+        /// never the first image of the name.</summary>
+        internal static LoadedModule ModuleByNameAndBase(IList<LoadedModule> modules, string name, uint loadBase)
+        {
+            if (string.IsNullOrEmpty(name) || loadBase == 0) return null;
+            foreach (var m in modules)
+                if (m.LoadBase == loadBase && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
             return null;
         }
 
@@ -506,29 +616,38 @@ namespace ClarionDbg.Cli
                     ? System.IO.Path.GetFileName(path).ToLowerInvariant()
                     : $"(0x{baseVa:x})";
 
+                // The mapped file, parsed once: the claim's build test reads it, and a new entry keeps it.
+                PeImage diskPe = null;
+                if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+                {
+                    try { diskPe = PeImage.Load(path); } catch { diskPe = null; }
+                }
+
                 // reuse a pre-loaded solution DLL entry (already has Pe/Dbg parsed): the same file, by path
-                LoadedModule m = ClaimUnmapped(_modules, path, name, ReadRemoteTimeDateStamp(baseVa), ReadRemoteSizeOfImage(baseVa));
+                LoadedModule m = ClaimUnmapped(_modules, path, name, ReadMappedBuild(rva => ReadU32(baseVa + rva), diskPe));
 
                 if (m != null)
                 {
                     m.LoadBase = baseVa;
+                    m.MappedPath = path;
                     if (m.Path == null && path != null) m.Path = path;
-                    // A same-build claim from another copy KEEPS the preloaded Path. The host has already learned
-                    // that path as the owner of every breakpoint bound here, and learns an owner once
+                    // A same-build claim from another copy KEEPS (borrows) the preloaded Path. The host has already
+                    // learned that path as the owner of every breakpoint bound here, and learns an owner once
                     // (ClarionDebuggerService.LearnBpOwner), so renaming it now would split a row from its later
-                    // bp-del. That is sound only because ClaimUnmapped proved the SAME build (link time and size,
-                    // exactly one match): the preload's TSWD and symbols describe the image that mapped.
+                    // bp-del. That is sound only because ClaimUnmapped proved the SAME build (SameBuild, exactly one
+                    // match): the preload's TSWD and symbols describe the image that mapped. The borrow ends if the
+                    // preload's own file maps too (YieldBorrowedPaths below).
                     else if (path != null && !SamePath(m.Path, path))
                         Console.WriteLine($"  module: {path} is the same build as preloaded {m.Path}; using that entry");
                 }
                 else
                 {
-                    PeImage pe = null; TswdDebugInfo dbg = null;
-                    if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+                    PeImage pe = diskPe; TswdDebugInfo dbg = null;
+                    if (pe != null)
                     {
-                        try { pe = PeImage.Load(path); dbg = TswdDebugInfo.TryFromPe(pe); } catch { pe = null; dbg = null; }
+                        try { dbg = TswdDebugInfo.TryFromPe(pe); } catch { pe = null; dbg = null; }
                     }
-                    m = new LoadedModule { Path = path, Name = name, Pe = pe, Dbg = dbg };
+                    m = new LoadedModule { Path = path, Name = name, Pe = pe, Dbg = dbg, MappedPath = path };
                     m.ResolveThreadedInfo();
                     m.Size = pe != null ? pe.SizeOfImage : ReadRemoteSizeOfImage(baseVa);
                     m.LoadBase = baseVa;
@@ -537,7 +656,15 @@ namespace ClarionDbg.Cli
                 _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
                 if (m.Size == 0) m.Size = ReadRemoteSizeOfImage(baseVa);
 
-                PlantOwnBps(m);          // bps already bound to this image (pre-loaded solution DLL)
+                // Two live entries never share a Path (fb5766d1 #3): ImageMatches, |img= narrowing and every
+                // ownerPath compare on it. A borrower that yields re-keys its breakpoints on the host through the
+                // existing bp-list event (it replaces the host's list wholesale), not through a new wire field.
+                var yielded = YieldBorrowedPaths(_modules, m);
+                foreach (var y in yielded)
+                    Console.WriteLine($"  module: {y.Path} now answers to its own path (its preload's file mapped too)");
+                if (yielded.Count > 0 && EmitJson) Console.WriteLine("@JSON " + Json.BpList(_bps));
+
+                PlantOwnBps(m);         // bps already bound to this image (pre-loaded solution DLL)
                 ResolvePendingFor(m);    // pending bps whose compiland this image carries
                 if (EmitJson) Console.WriteLine("@JSON " + Json.ModuleLoaded(m));
             }
@@ -581,27 +708,42 @@ namespace ClarionDbg.Cli
 
             // Keep the pre-loaded solution entry (Pe/Dbg) around but mark it unmapped so it re-arms on
             // reload; drop runtime-discovered DLLs so the table doesn't grow across load/unload churn.
-            if (m.Preloaded && m.Pe != null) m.LoadBase = 0;
+            // A borrowed or yielded path goes back to the preload's own, so the next mapping of that file claims
+            // it by path; its breakpoints were returned to pending or dropped above, so none still names it.
+            if (m.Preloaded && m.Pe != null)
+            {
+                m.LoadBase = 0;
+                m.MappedPath = null;
+                if (m.PreloadPath != null && !SamePath(m.Path, m.PreloadPath))
+                {
+                    m.Path = m.PreloadPath;
+                    // The host learns a row's owner once and never unlearns it (LearnBpOwner), so a row that learned
+                    // the yielded path would not match this image's next bp-set under the preload path, and would
+                    // stay behind as a row nobody can remove (2026-10-03 host audit). The full list re-sync, which the
+                    // host applies by replacement, hands it back the now-pending owner (null), to learn afresh.
+                    if (EmitJson) Console.WriteLine("@JSON " + Json.BpList(_bps));
+                }
+            }
             else _modules.Remove(m);
             _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
         }
 
-        /// <summary>The mapped image's PE link time (file header +8), or 0 when the header does not read.</summary>
-        private uint ReadRemoteTimeDateStamp(uint baseVa)
+        /// <summary>The target's mapped PE header offset for the image at <paramref name="baseVa"/>, or 0 (fb5766d1
+        /// #7a: the one locator, <see cref="PeHeaderOffset"/>, that every remote header read goes through).</summary>
+        private uint RemotePeHeaderOffset(uint baseVa)
         {
-            uint eLfanew = ReadU32(baseVa + 0x3C);
-            if (eLfanew == 0 || eLfanew > 0x1000) return 0;
-            return ReadU32(baseVa + eLfanew + 8);
+            return PeHeaderOffset(rva => ReadU32(baseVa + rva));
         }
 
         /// <summary>Read SizeOfImage straight from the target's mapped PE header (fallback when the
-        /// DLL path/file is unavailable), so VA attribution still has a valid module span.</summary>
+        /// DLL path/file is unavailable), so VA attribution still has a valid module span. The 0x10000 floor
+        /// is for ATTRIBUTION ONLY: build identity reads the real field through ReadMappedBuild, where a header
+        /// that does not read is 0 and matches nothing.</summary>
         private uint ReadRemoteSizeOfImage(uint baseVa)
         {
-            uint eLfanew = ReadU32(baseVa + 0x3C);
-            if (eLfanew == 0 || eLfanew > 0x1000) return 0x10000; // sane floor if the header looks odd
-            uint optOff = baseVa + eLfanew + 24;
-            uint size = ReadU32(optOff + 56);
+            uint hdr = RemotePeHeaderOffset(baseVa);
+            if (hdr == 0) return 0x10000; // sane floor if the header looks odd
+            uint size = ReadU32(baseVa + hdr + 24 + 56);
             return size != 0 ? size : 0x10000;
         }
     }

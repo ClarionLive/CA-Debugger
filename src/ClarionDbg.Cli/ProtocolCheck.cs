@@ -110,6 +110,8 @@ namespace ClarionDbg.Cli
                 CheckWatchAddrIsOwnStorage,
                 CheckSameNameDllsKeepTheirEntries,
                 CheckUnmappedImageIsNoDataCandidate,
+                CheckBorrowedPathsYield,
+                CheckExpandBaseNamesOneImage,
                 CheckWatchAndModuleDataReqId,
                 CheckSuggestedNamesArePasteable,
                 CheckConditionAmbiguityAndQualifiedWatch,

@@ -1,3 +1,5 @@
+# suite: live=no; args=-SelfTest
+# suite: live=yes
 # Attach to a running Clarion app and detach from it again (ticket 3f2d747f part A). LIVE: it starts the
 # Clarion example app, attaches the engine to it, and after every detach asserts that the app is still alive,
 # that no debugger is attached, and that every breakpoint byte in its memory matches the file on disk.

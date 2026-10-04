@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # The host's ONE selected thread (49538b78 item 8b, Owner decision 3, 2026-09-24).
 #
 #   pwsh -NoProfile -File tools\test-addin-selection.ps1 [-ServicePath <ClarionDebuggerService.cs>] [-HostGrantsPath <HostGrants.cs>]
@@ -88,7 +90,15 @@ if ($SelfTest) {
     @{ Id = 'W1'; File = 'web'; Why = 'OnWatch grants a found reply whatever request it answers';
        Find = 'if (w.Found && mayGrant)'; Repl = 'if (w.Found)' }
     @{ Id = 'W2'; File = 'web'; Why = 'OnSvcModuleData grants whatever request it answers';
-       Find = 'if (mayGrant) _editGrants.GrantRows(itemsJson, tid);'; Repl = '_editGrants.GrantRows(itemsJson, tid);' }
+       Find = 'if (mayGrant) mayGrant = _editGrants.GrantRows(itemsJson, tid);'; Repl = 'mayGrant = _editGrants.GrantRows(itemsJson, tid);' }
+    @{ Id = 'X1a'; File = 'web'; Why = 'OnSvcModuleData posts a malformed body it may grant verbatim (GrantRows result ignored)';
+       Find = 'if (mayGrant) mayGrant = _editGrants.GrantRows(itemsJson, tid);'; Repl = 'if (mayGrant) _editGrants.GrantRows(itemsJson, tid);' }
+    @{ Id = 'X1b'; File = 'web'; Why = 'OnSvcExpanded posts a malformed verified body verbatim (GrantRows result ignored)';
+       Find = 'if (verified) verified = _editGrants.GrantRows(itemsJson, null);'; Repl = 'if (verified) _editGrants.GrantRows(itemsJson, null);' }
+    @{ Id = 'X1c'; File = 'web'; Why = 'OnSvcFrameLocals posts a malformed verified body verbatim (GrantRows result ignored)';
+       Find = 'if (verified) verified = _editGrants.GrantRows(itemsJson, tid);'; Repl = 'if (verified) _editGrants.GrantRows(itemsJson, tid);' }
+    @{ Id = 'X1d'; File = 'grants'; Why = 'GrantRows reports success whatever the walker found';
+       Find = 'return JsonMessageReader.ForEachObject("[" + itemsJson + "]", o =>'; Repl = 'return true | JsonMessageReader.ForEachObject("[" + itemsJson + "]", o =>' }
     @{ Id = 'W3'; File = 'web'; Why = 'WatchOrExplain does not record the id it sent';
        Find = 'if (_svc.Watch(name, id)) _editGrants.ReadRequested(id);'; Repl = 'if (_svc.Watch(name, id)) { }' }
     @{ Id = 'W4'; File = 'web'; Why = 'RequestModuleData does not record the id it sent';
@@ -120,7 +130,7 @@ if ($SelfTest) {
     @{ Id = 'Y7'; File = 'grants'; Why = 'Grant does not sync, so a grant made first after a move is lost';
        Find = "public void Grant(string va, string typeCode, int size, int places, uint? tid)`n        {`n            Sync();"; Repl = "public void Grant(string va, string typeCode, int size, int places, uint? tid)`n        {" }
     @{ Id = 'Y8'; File = 'grants'; Why = 'GrantExpandable does not sync';
-       Find = "public void GrantExpandable(string module, uint typeRef, string addr)`n        {`n            Sync();"; Repl = "public void GrantExpandable(string module, uint typeRef, string addr)`n        {" }
+       Find = "public void GrantExpandable(string module, uint typeRef, string addr, string imgBase = null)`n        {`n            Sync();"; Repl = "public void GrantExpandable(string module, uint typeRef, string addr, string imgBase = null)`n        {" }
     @{ Id = 'Y9'; File = 'grants'; Why = 'ExpandForwarded does not sync';
        Find = 'public void ExpandForwarded(int reqId) { Sync(); _expands'; Repl = 'public void ExpandForwarded(int reqId) { _expands' }
     @{ Id = 'R1'; File = 'web'; Why = 'OnWatch posts the edit tuple for a reply that granted nothing';
@@ -166,8 +176,8 @@ if ($SelfTest) {
       else { Check "$($r.Id) CAUGHT: $($r.Why)" ($compiled -and (-not $passed) -and $code -ne 0) "exit=$code compiled=$compiled $fails" }
     }
   } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
-  # 38 finds + 38 mutations + 1 control
-  Assert-CheckTotal 77
+  # 42 finds + 42 mutations + 1 control
+  Assert-CheckTotal 85
   Write-Host ''
   if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
   Write-Host "ALL $($script:checks) CHECKS PASSED"
@@ -190,6 +200,8 @@ $lifted = @(
   ((Get-Method 'private void RequestStack()' $web) -replace '^private void', 'public void'),
   (Get-Method 'private void OnWatch(DebugWatch w)' $web),
   ((Get-Method 'private void OnSvcModuleData(' $web) + ');'),
+  (((Get-Method 'private void OnSvcExpanded(' $web) + ');') -replace '^private void', 'public void'),
+  (((Get-Method 'private void OnSvcFrameLocals(' $web) + ');') -replace '^private void', 'public void'),
   (Get-Statement 'private static readonly string[] EditTupleMembers' $web),
   (Get-Method 'private static string RowsAsGranted(string itemsJson, bool granted)' $web),
   (Get-Method 'private void OnSvcResumed(string mode)' $web)
@@ -273,6 +285,7 @@ namespace ClarionDebugger.Terminal
     public void ExpandableNow(string addr) { _editGrants.GrantExpandable("clbrws011.clw", 77, addr); }
     public bool ExpandIssued(string addr) { return _editGrants.IsExpandIssued("clbrws011.clw", 77, addr); }
     public void ExpandForwarded(int reqId) { _editGrants.ExpandForwarded(reqId); }
+    public void FrameLocalsForwarded(int reqId) { _editGrants.FrameLocalsForwarded(reqId); }
     public bool ExpandVerified(string reqId) { return _editGrants.ExpandVerified(reqId); }
     public bool FrameOffered() { return _editGrants.IsFrameOffered("0x402000", "0x19FF40"); }
     public bool WritePending(string va) { return _editGrants.IsWritePending(va); }
@@ -600,6 +613,34 @@ Check 'and such a reply is posted as NO rows, never as broken ones' ($GP::ReadOn
 $goodPrims = '[{"a":0,"b":-1,"c":12.5,"d":-0.25,"e":1e3,"f":2E-4,"g":6.02e+23,"h":true,"i":false,"j":null' + $tuple + '}]'
 Check 'CONTROL: every valid primitive survives the strip unchanged' `
   ($GP::Strip($goodPrims) -ceq '[{"a":0,"b":-1,"c":12.5,"d":-0.25,"e":1e3,"f":2E-4,"g":6.02e+23,"h":true,"i":false,"j":null}]') ($GP::Strip($goodPrims))
+# A REPLY THAT MAY GRANT IS STILL VALIDATED (49538b78 wave 8 X1, codex security wave 7 run 3). RowsAsGranted posts a
+# granted body verbatim, and GrantRows - which reads the whole body - used to have its "this is not JSON" answer
+# ignored, so a reply the host was entitled to grant from went to the page broken. Each of the three row replies is
+# fed a body with one bad literal, as the request it answers would have it: current, verified, verified.
+$badBody = '{"name":"G:X","type":"LONG","value":bad,"va":"0x4A2400","typeCode":"0x03","size":4,"places":0}'
+$v = New-Object ClarionDebugger.Terminal.GrantPad
+$v.D.Line((Paused 4812))
+$v.RequestModuleData(); $vid = $v._svc.LastModuleDataId
+$v.D.Line('{"event":"moduledata","module":"clbrws011.clw","items":[' + $badBody + '],"tid":4812,"reqId":"' + $vid + '"}')
+Check 'a CURRENT moduledata reply that is not well-formed is posted as no rows, and grants nothing' `
+  (((Last $v) -ceq '{"type":"moduledata","module":"clbrws011.clw","items":[],"tid":4812}') -and (-not $v.Granted('0x4A2400', 4812))) (Last $v)
+$v.RequestModuleData(); $v.D.Line((ModData 4812 $v._svc.LastModuleDataId '0x4A2404'))
+Check 'CONTROL: a current, well-formed moduledata reply is posted with its rows and grants them' `
+  (((Last $v) -cmatch '"items":\[\{"name":"G:X".*"va":"0x4A2404"') -and $v.Granted('0x4A2404', 4812)) (Last $v)
+$v.ExpandableNow('0x4B0000'); $v.ExpandForwarded(31)
+$v.OnSvcExpanded('31', $badBody)
+Check 'a VERIFIED expand reply that is not well-formed is posted as no rows' ((Last $v) -ceq '{"type":"expanded","reqId":"31","items":[]}') (Last $v)
+$v.ExpandForwarded(32)
+$v.OnSvcExpanded('32', '{"name":"F:N","type":"LONG","value":"3","va":"0x4B0004","typeCode":"0x03","size":4,"places":0}')
+Check 'CONTROL: a verified, well-formed expand reply keeps its rows'' edit tuples' ((Last $v) -cmatch '"va":"0x4B0004","typeCode":"0x03"') (Last $v)
+$v.RequestStack(); $vs = $v._svc.LastStackId
+Check 'CONTROL: the stack reply offers the frame the framelocals asks about' ($v.Offer(4812, $vs)) "id=$vs"
+$v.FrameLocalsForwarded(33)
+$v.OnSvcFrameLocals('33', $badBody, 4812)
+Check 'a VERIFIED framelocals reply that is not well-formed is posted as no rows' ((Last $v) -ceq '{"type":"framelocals","reqId":"33","items":[],"tid":4812}') (Last $v)
+$v.FrameLocalsForwarded(34)
+$v.OnSvcFrameLocals('34', '{"name":"L:N","type":"LONG","value":"1","va":"0x19FF30","typeCode":"0x03","size":4,"places":0}', 4812)
+Check 'CONTROL: a verified, well-formed framelocals reply keeps its rows'' edit tuples' ((Last $v) -cmatch '"va":"0x19FF30","typeCode":"0x03"') (Last $v)
 Check 'the pad wires the watch reply exactly as OnSvcWatch does: marshal, then OnWatch' `
   ((Get-CSharpCodeOnly $web) -match 'private void OnSvcWatch\(DebugWatch w\) => UI\(\(\) => OnWatch\(w\)\);') ''
 
@@ -636,7 +677,7 @@ Check 'GrantExpandable: an expandable row recorded first after a move is issued'
 $t = Fresh; MoveSel $t; $t.ExpandForwarded(9)
 Check 'ExpandForwarded: an expand forwarded after a move is verified' ($t.ExpandVerified('9')) ''
 
-Assert-CheckTotal 73
+Assert-CheckTotal 80
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) of $($script:checks) CHECKS FAILED"; exit 1 }
 Write-Host "ALL $($script:checks) CHECKS PASSED"

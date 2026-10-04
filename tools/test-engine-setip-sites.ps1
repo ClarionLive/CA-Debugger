@@ -1,3 +1,5 @@
+# suite: live=no
+# suite: live=no; args=-SelfTest
 # Asserts, against the ENGINE'S OWN SOURCE, that setip's observations are cut back at every resume.
 #
 #   pwsh -NoProfile -File tools\test-engine-setip-sites.ps1

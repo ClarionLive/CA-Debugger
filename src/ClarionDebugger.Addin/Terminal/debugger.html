@@ -6,7 +6,7 @@
      sha256 of its exact text, so ANY edit to that script must re-hash it here: tools/test-pad-csp.js fails
      until it does and prints the hash to paste. There are no inline on*= handlers (CSP blocks them): wire
      events from the script. Styles stay 'unsafe-inline' for the style= attributes and runtime styles. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-/wIn/pX2AIEIwVq6v/A1X65FqOh54npQJM29QDNdxt8='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-XqBWrEHhYwWal1bXHKPQ2UBeaa7qDrjIYcf5Iae3QyQ='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
 <title>CA Debugger</title>
 <style>
   :root {
@@ -1741,7 +1741,10 @@
   function requestExpand(v, cb){
     if(!v.module || v.typeRef===undefined || !v.addr){ cb([]); return; }
     const id=++_expandSeq; _expandCbs[id]=cb;
-    send('expand', id+'|'+v.module+'|'+v.typeRef+'|'+v.addr);
+    // The row's image load base goes back exactly as the engine sent it, and only when the row had one: the host
+    // grants the expand on it too, so the engine reads that image's module and not the first of the name.
+    const base=(v.imgBase===undefined || v.imgBase===null) ? '' : '|'+v.imgBase;
+    send('expand', id+'|'+v.module+'|'+v.typeRef+'|'+v.addr+base);
   }
 
   // ---- per-frame locals (Call-Stack-driven Variables): a frame's locals load lazily on expand ----
@@ -2634,14 +2637,16 @@
     (list||[]).forEach(b=>{ const k=bpLineKey(b); if(seen[k]) shared[k]=true; else seen[k]=true; });
     return shared;
   }
+  // Does the row know its image yet? The host sends null (or nothing) until it does.
+  function bpImageKnown(image){ return !(image===null || image===undefined || image===''); }
   // File name of the row's image, split on both separators; "(pending)" while the host does not know it.
   function bpImageName(image){
-    if(image===null || image===undefined || image==='') return '(pending)';
+    if(!bpImageKnown(image)) return '(pending)';
     const s=String(image), base=s.split(/[\\/]/).pop();
     return base || s;
   }
   function bpImageLabel(b){
-    const known=!(b.image===null || b.image===undefined || b.image==='');
+    const known=bpImageKnown(b.image);
     const s=document.createElement('span'); s.className='bpimg';
     s.textContent=bpImageName(b.image);
     s.title=(known ? String(b.image) : '(pending)')+' - hit counts are per image; remove/edit applies to every image';

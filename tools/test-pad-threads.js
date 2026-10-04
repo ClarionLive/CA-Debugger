@@ -1,3 +1,4 @@
+// suite: live=no
 // Regression check: the Call Stack thread picker, and what a THREAD SWITCH has to invalidate.
 //
 // The engine stops the PROCESS, so every thread is frozen and any of them can be read. The pad therefore

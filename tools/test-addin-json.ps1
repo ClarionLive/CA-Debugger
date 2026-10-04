@@ -1,4 +1,5 @@
-﻿# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
+﻿# suite: live=no
+# Regression check: the add-in's JSON number reader, which decides WHICH THREAD a reply belongs to.
 #
 # Two ways this hurts, both silent:
 #   - a "tid" read out of a nested array or a string value names the wrong thread, so good replies get
@@ -1230,7 +1231,7 @@ public sealed class FakeSvc {
   public List<string> FrameLocalsSent = new List<string>();
   public bool AcceptFrameLocals = true;
   public bool RequestFrameLocals(int reqId, string va, string ebp) { FrameLocalsSent.Add(reqId + "|" + va + "|" + ebp); return AcceptFrameLocals; }
-  public bool RequestExpand(int reqId, string module, uint typeRef, string addr) { Expands.Add(reqId + "|" + module + "|" + typeRef + "|" + addr); return AcceptExpand; }
+  public bool RequestExpand(int reqId, string module, uint typeRef, string addr, string imgBase = null) { Expands.Add(reqId + "|" + module + "|" + typeRef + "|" + addr + (imgBase != null ? "|" + imgBase : "")); return AcceptExpand; }
   public void PrimeTarget(string exe) { }
   public bool AddBreakpoint(string module, int line) { Adds.Add(module + ":" + line); return Accept; }
   public bool SetVariable(string va, string typeCode, int size, int places, string value, uint? tid) {
@@ -1320,7 +1321,7 @@ Check 'CONTROL: PushProcedures posts an empty "loading" list, then the list' `
 # either reaches both kinds of session.
 $webCode = Get-CSharpCodeOnly $web
 Check 'StartSession and AttachSession both load symbols through LoadStaticSymbols, the one reader of the globals' `
-  (((Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)) -match 'LoadStaticSymbols\(_exe\);') -and `
+  (((Get-CSharpCodeOnly (Get-Method 'private void StartSession()' $web)) -match 'LoadStaticSymbols\(_exe, relist: !listed\);') -and `
    ((Get-CSharpCodeOnly (Get-Method 'private void AttachSession(AttachableProcess target)' $web)) -match 'LoadStaticSymbols\(exe\);') -and `
    ([regex]::Matches($webCode, 'GetGlobalsJson\(').Count -eq 1)) ''
 
@@ -1422,6 +1423,9 @@ out.treeEdit = commit(tcell, '2.25');
 // Opening the reference row the host posted: the page's own expand request for it.
 const refRow = JSON.parse(INPUT.moduledata).items[0].children[1];
 wire = null; requestExpand(refRow, function(){}); out.expand = wire;
+// w8-expand-base: the same row as an engine that names the image writes it, and as one that sends a null base.
+wire = null; requestExpand(Object.assign({}, refRow, { imgBase:'0x00400000' }), function(){}); out.expandBased = wire;
+wire = null; requestExpand(Object.assign({}, refRow, { imgBase:null }), function(){}); out.expandNullBase = wire;
 
 // Opening the CALLER frame (frame 1) of the stack the host posted: the page's own framelocals request.
 const callerFrame = JSON.parse(INPUT.stack).frames[1];
@@ -1797,8 +1801,8 @@ Check 'a resume clears them, for the epoch it resumed in, read before the marsha
   ((Get-CSharpCodeOnly (Get-Method 'private void OnSvcResumed(string mode)' $web)) -match 'int epoch = _svc\.Selection\.Epoch;\s*UI\(\(\) => \{ _editGrants\.Resumed\(epoch\);') ''
 Check 'and so does the session ending' ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExited(')) -match '_editGrants\.Clear\(\)') ''
 Check 'the frame-locals and expand replies grant their rows only for a request the host verified, and post any other read-only' `
-  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'bool verified = _editGrants\.FrameLocalsVerified\(reqId, tid\);\s*if \(verified\) _editGrants\.GrantRows\(itemsJson, tid\);[\s\S]*RowsAsGranted\(itemsJson, verified\)') -and `
-   ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExpanded(')) -match 'bool verified = _editGrants\.ExpandVerified\(reqId\);\s*if \(verified\) _editGrants\.GrantRows\(itemsJson, null\);[\s\S]*RowsAsGranted\(itemsJson, verified\)')) ''
+  (((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcFrameLocals(')) -match 'bool verified = _editGrants\.FrameLocalsVerified\(reqId, tid\);\s*if \(verified\) verified = _editGrants\.GrantRows\(itemsJson, tid\);[\s\S]*RowsAsGranted\(itemsJson, verified\)') -and `
+   ((Get-CSharpCodeOnly (Get-ArrowHandler 'private void OnSvcExpanded(')) -match 'bool verified = _editGrants\.ExpandVerified\(reqId\);\s*if \(verified\) verified = _editGrants\.GrantRows\(itemsJson, null\);[\s\S]*RowsAsGranted\(itemsJson, verified\)')) ''
 
 # ---- one write per address at a time (codex security, pipeline run 2) ---------------------------------
 # The varset reply names only the ADDRESS. With two issued tuples on one va (two type or thread views of it)
@@ -1865,6 +1869,42 @@ Switched $xp 9001
 $xp._svc.Expands.Clear()
 $xp.Expand($expandData)
 Check 'after a thread switch the old reference row cannot be expanded until re-read' ($xp._svc.Expands.Count -eq 0) ($xp._svc.Expands -join ',')
+
+# ---- the expand grant names the IMAGE too (w8-expand-base, fb5766d1 #8) -------------------------------
+# Two loaded images can carry a compiland of one name. The engine now writes each expandable row's image load
+# base ("imgBase"), the page echoes it, and the engine reads that image's module and no other. The host grants
+# the expand on the base as well, so a page cannot point an issued row at another image, nor drop the base to
+# fall back to the engine's first-match name lookup. The row without a base above (an engine from before this
+# contract) is the fallback: it forwarded as a 4-argument expand ('an issued reference row is expanded').
+$basedData = if ($pageOut) { DataOf $pageOut.expandBased } else { '' }
+Check 'the page echoes a row''s imgBase unchanged as a fifth field' ($basedData -ceq '2|clbrws011.clw|77|0x4B0000|0x00400000') $basedData
+$nullBaseData = if ($pageOut) { DataOf $pageOut.expandNullBase } else { '' }
+Check 'and sends no fifth field for a row whose imgBase is null' ($nullBaseData -ceq '3|clbrws011.clw|77|0x4B0000') $nullBaseData
+$basedRows = $engineRows.Replace('"typeRef":77}', '"typeRef":77,"imgBase":"0x00400000"}')
+Check 'CONTROL: the based engine rows differ from the plain ones only by the base' ($basedRows -ne $engineRows -and $basedRows.Contains('"imgBase":"0x00400000"')) ''
+$xb = New-Object ClarionDebugger.Terminal.BridgePad
+$xb.OnSvcModuleData('clbrws011.clw', $basedRows, 4812, (AskRead $xb))
+$xb.Expand($basedData)
+Check 'an issued row is expanded with its image base as the fifth argument' `
+  (($xb._svc.Expands.Count -eq 1) -and ($xb._svc.Expands[0] -ceq '2|clbrws011.clw|77|0x4B0000|0x00400000')) ($xb._svc.Expands -join ',')
+$xb._svc.Expands.Clear(); $xb.Posts.Clear()
+$xb.Expand('4|clbrws011.clw|77|0x4B0000|0x10000000')
+Check 'BASE SWAP: the issued row pointed at another image is not forwarded' ($xb._svc.Expands.Count -eq 0) ($xb._svc.Expands -join ',')
+Check '...and is answered with a refused reply' (($xb.Posts.Count -eq 1) -and ($xb.Posts[0] -cmatch '"type":"expanded","reqId":"4","items":\[\],"refused":true')) ($xb.Posts -join ' / ')
+$xb._svc.Expands.Clear(); $xb.Expand('5|clbrws011.clw|77|0x4B0000')
+Check 'BASE DROPPED: the issued row asked for without its base (the name-only fallback) is not forwarded' ($xb._svc.Expands.Count -eq 0) ($xb._svc.Expands -join ',')
+$xb._svc.Expands.Clear(); $xb.Expand('6|clbrws011.clw|77|0x4B0000|0xZZ')
+Check 'a malformed base is not forwarded' ($xb._svc.Expands.Count -eq 0) ($xb._svc.Expands -join ',')
+$xb._svc.Expands.Clear(); $xb.Expand('7|clbrws011.clw|77|0x4B0000|0x400000')
+Check 'the base is matched by value: 0x400000 is the issued 0x00400000' (($xb._svc.Expands.Count -eq 1) -and ($xb._svc.Expands[0] -ceq '7|clbrws011.clw|77|0x4B0000|0x400000')) ($xb._svc.Expands -join ',')
+# The other way round: a row issued WITHOUT a base cannot be expanded under one the page made up.
+$xo = New-Object ClarionDebugger.Terminal.BridgePad
+$xo.OnSvcModuleData('clbrws011.clw', $engineRows, 4812, (AskRead $xo))
+$xo.Expand('8|clbrws011.clw|77|0x4B0000|0x00400000')
+Check 'BASE ADDED: a row issued with no base is not forwarded under an invented one' ($xo._svc.Expands.Count -eq 0) ($xo._svc.Expands -join ',')
+$xm = New-Object ClarionDebugger.Terminal.BridgePad
+$xm.OnSvcModuleData('clbrws011.clw', $engineRows.Replace('"typeRef":77}', '"typeRef":77,"imgBase":"0x4000000000"}'), 4812, (AskRead $xm))
+Check 'a row whose imgBase is malformed (10 hex digits) is issued as no expandable row' ($xm._editGrants.ExpandableCount -eq 0) "$($xm._editGrants.ExpandableCount)"
 
 # ---- frame locals are issued like expand (49538b78 wave 5, codex adversary) ---------------------------
 # A framelocals request names a procedure VA and an EBP, and the engine renders that procedure's locals at
@@ -2190,7 +2230,7 @@ foreach ($t in @('"size":4,"places":2', '"size":4', '"places":2', '"size":"4","p
 }
 Check 'and both read it through PageNumbers.ReadEditTuple' `
   (((Get-Method 'public static EditVarRequest Parse(string data)' $pageMsgs) -match 'PageNumbers\.ReadEditTuple\(data, out size, out places\)') -and `
-   ((Get-Method 'public void GrantRows(string itemsJson, uint? tid)' $hostGrants) -match 'PageNumbers\.ReadEditTuple\(o, out size, out places\)')) ''
+   ((Get-Method 'public bool GrantRows(string itemsJson, uint? tid)' $hostGrants) -match 'PageNumbers\.ReadEditTuple\(o, out size, out places\)')) ''
 
 # ---- the other request DTOs ---------------------------------------------------------------------------
 # These payloads are delimiter strings, parsed exactly as before and now in one place each. Checked on the
@@ -2200,6 +2240,15 @@ Check 'expand: reqId|module|typeRef|addr reads as four typed fields' `
   (($null -ne $x) -and $x.ReqId -eq 7 -and $x.Module -ceq 'clbrws011.clw' -and $x.TypeRef -eq 123 -and $x.Addr -ceq '0x4A0000') ''
 Check 'expand: a wrong field count, or a typeRef that is not a number, is dropped' `
   (($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123')) -and ($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|-1|0x1'))) ''
+# w8-expand-base: an optional fifth field, the row's image load base, kept exactly as the page sent it.
+$xb = [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|clbrws011.clw|123|0x4A0000|0x00400000')
+Check 'expand: a fifth field is the image base, kept verbatim' `
+  (($null -ne $xb) -and $xb.Module -ceq 'clbrws011.clw' -and $xb.Addr -ceq '0x4A0000' -and $xb.ImgBase -ceq '0x00400000') "$($xb.ImgBase)"
+Check 'expand: with no fifth field there is no base (the engine falls back to the name)' (($null -ne $x) -and ($null -eq $x.ImgBase)) "$($x.ImgBase)"
+$badBases = @('', '0x', '400000', '0X400000', '0x123456789', '0xG0400000', ' 0x400000', '0x400000 ', '-0x1', '0x400000|0x1')
+$badLet = @($badBases | Where-Object { $null -ne [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123|0x4A0000|' + $_) })
+Check 'expand: a fifth field that is not 0x + 1-8 hex digits rejects the request (empty, 0x, no 0x, 0X, 9 digits, G, spaces, sign, a sixth field)' `
+  ($badLet.Count -eq 0) (($badLet | ForEach-Object { "'$_'" }) -join ', ')
 $fl = [ClarionDebugger.Terminal.FrameLocalsRequest]::Parse('3|0x401000|0x19FF00')
 Check 'framelocals: reqId|va|ebp reads as three typed fields' (($null -ne $fl) -and $fl.ReqId -eq 3 -and $fl.Ebp -ceq '0x19FF00') ''
 $ml = [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('a:b.clw:12')
@@ -3067,7 +3116,7 @@ Check 'WireRules.TryUInt takes plain decimal digits in the DWORD range and nothi
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 498
+$EXPECTED_CHECKS = 512
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
