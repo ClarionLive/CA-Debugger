@@ -998,7 +998,7 @@ namespace ClarionDebugger.Services
         {
             if (!IsValidModuleName(module)) return false;
             if (string.IsNullOrEmpty(addrHex) || !Regex.IsMatch(addrHex, "^0x[0-9A-Fa-f]+$")) return false;
-            if (imgBase != null && !Regex.IsMatch(imgBase, "^0x[0-9A-Fa-f]{1,8}$")) return false;
+            if (imgBase != null && !WireRules.IsImageBase(imgBase)) return false;
             return SendCommand("expand " + reqId + " " + module + " " + typeRef + " " + addrHex + (imgBase != null ? " " + imgBase : ""));
         }
 

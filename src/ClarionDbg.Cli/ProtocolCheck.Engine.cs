@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using ClarionDbg.Core;
@@ -383,6 +384,325 @@ namespace ClarionDbg.Cli
             string o2 = SeamOutcome(() => att.ArmCallSkipForTest(tempVa, 0, entryEsp + 4, entryEsp, frameEbp, 0));
             if (o1 != null) failures.Add("temp-bp seam-guard: OnTempBpForTest " + o1 + " against an ATTACHED engine");
             if (o2 != null) failures.Add("temp-bp seam-guard: ArmCallSkipForTest " + o2 + " against an ATTACHED engine");
+        }
+
+        /// <summary>
+        /// A procedure record whose name sits at symbol-pool offset 0 still owns its locals (c4910921).
+        ///
+        /// ReadLocals skipped every +0x2C record with nameRef 0, but offset 0 is the pool's first string, a real
+        /// name. Dropping a PROCEDURE record there left the previous procedure current, so the dropped one's
+        /// locals were keyed to it (measured 2026-10-03 on fixture samename-w8: OTHERPROC's CNT2 under
+        /// SHAREDPROC). THREE CASES over one synthetic blob: (i) a nameRef-0 procedure record that a symbol
+        /// confirms (same raw name, same entry) becomes the current procedure; (ii) a nameRef-0 tag-05 record
+        /// whose entry matches no symbol does NOT change it, which is what fails a fix without the symbol
+        /// cross-check; (iii) a nameRef-0 LOCAL is still dropped, so a stray zero dword cannot invent a local
+        /// named after the pool's first string.
+        ///
+        /// NOT COVERED: that the fixture is byte-faithful to real compiler output (the live samename-w8 suite
+        /// runs a real build). It holds only the fields ReadLocals reads.
+        /// </summary>
+        private static void CheckLocalsOwnerAtPoolOffsetZero(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("locals over a PARSED +0x2C tree: a procedure record whose name is at symbol-pool offset 0 "
+                         + "owns the locals after it when a symbol has that raw name at that entry; a nameRef-0 record "
+                         + "at an entry no symbol has leaves the current procedure alone; a nameRef-0 local is dropped "
+                         + "(c4910921). Not covered: byte-faithfulness to real compiler output.");
+
+            TswdDebugInfo dbg;
+            try { dbg = new TswdDebugInfo(BuildPoolZeroLocalsBlob(), 0, 0x1000, 0x2000, 0x10000); }
+            catch (Exception ex) { failures.Add("pool-zero locals: the fixture blob did not parse - " + ex.Message); return; }
+
+            // CONTROL: the symbols the cross-check reads are the ones the fixture meant.
+            string syms = string.Join(",", dbg.Symbols.ConvertAll(s => s.RawName + "@0x" + s.EntryRva.ToString("X")));
+            if (syms != "PROCA@0x1000,PROCZ@0x1100")
+                failures.Add("pool-zero locals control: the parser found symbols [" + syms
+                             + "], expected PROCA@0x1000 and PROCZ@0x1100 (named at pool offset 0)");
+
+            var locals = dbg.ReadLocals();
+            Func<uint, string> namesAt = entry =>
+            {
+                List<LocalSym> l;
+                return locals.TryGetValue(entry, out l) ? string.Join(",", l.ConvertAll(x => x.Name)) : "(no entry)";
+            };
+            string all = "";
+            foreach (var kv in locals) all += " 0x" + kv.Key.ToString("X") + "=[" + namesAt(kv.Key) + "]";
+
+            // CONTROL: the records around the offset-0 one are read at all.
+            if (!namesAt(0x1000).StartsWith("LOCA", StringComparison.Ordinal))
+                failures.Add("pool-zero locals control: PROCA's own local LOCA was not read -" + all);
+            // (i) PROCZ (pool offset 0) owns LOCZ, and PROCA does not.
+            if (namesAt(0x1000) != "LOCA" || !namesAt(0x1100).StartsWith("LOCZ", StringComparison.Ordinal))
+                failures.Add("pool-zero locals (i): a procedure record named at pool offset 0 does not own the local "
+                             + "after it - LOCZ must be keyed to PROCZ's entry 0x1100, not PROCA's 0x1000 -" + all);
+            // (ii) the nameRef-0 record at 0x1180 (no symbol there) leaves PROCZ current: LOCN is PROCZ's too.
+            if (locals.ContainsKey(0x1180) || namesAt(0x1100) != "LOCZ,LOCN")
+                failures.Add("pool-zero locals (ii): a nameRef-0 record at an entry no symbol has changed the current "
+                             + "procedure - LOCN must stay with PROCZ (0x1100) and 0x1180 must not be a key -" + all);
+            // (iii) the nameRef-0 LOCAL (its name would read as PROCZ) is dropped everywhere.
+            foreach (var kv in locals)
+                foreach (var l in kv.Value)
+                    if (l.Name == "PROCZ")
+                        failures.Add("pool-zero locals (iii): a nameRef-0 local was kept as 'PROCZ' under 0x"
+                                     + kv.Key.ToString("X") + " - a local must never take the pool's first string -" + all);
+        }
+
+        /// <summary>
+        /// The stack walk reads the caller's CALL through our planted INT3s (1d371325).
+        ///
+        /// CallPrecedes decides whether a candidate return address follows a CALL. It read the code raw, so a
+        /// breakpoint on the caller's CALL line (our 0xCC over the E8) made the real caller fail the test: the
+        /// EBP chain ended at frame 0 and a watch on the caller's local was out of scope (measured 2026-10-03
+        /// on fixture samename-w8). Driven through the REAL BuildStack over a fake image and stack in THIS
+        /// process: CALLEE stopped, called from CALLER by `call rel32` at RVA 0x1110, return 0x1115.
+        /// FIVE CASES: a user breakpoint over the E8 and a call-skip temp over it each still give CALLER as
+        /// frame 1 with its saved EBP; the clean E8 gives the same (the fixture control); an INT3 nobody
+        /// planted is NOT a call, so the walk stops at frame 0 (the read restores only our bytes, and the
+        /// test is consulted at all); and with no EBP chain, the stack scan still finds CALLER through a
+        /// planted E8, as an uncertain frame.
+        ///
+        /// NOT COVERED: the other CALL encodings (FF /2, 9A), whose byte tests are unchanged; a real debuggee.
+        /// </summary>
+        private static void CheckStackWalkReadsCallUnderInt3(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("the stack walk's CALL-before-return test reads the code with our INT3s restored: a "
+                         + "user breakpoint or a call-skip temp over the caller's CALL leaves the caller as frame 1 "
+                         + "with its saved EBP, and the stack scan still finds it; an INT3 the engine did not plant "
+                         + "is not a CALL (1d371325). Not covered: a real debuggee.");
+
+            IntPtr region = VirtualAlloc(IntPtr.Zero, (UIntPtr)0x4000u, MemReserve | MemCommitFlag, PageReadWriteFlag);
+            if (region == IntPtr.Zero) { failures.Add("call-under-INT3 control: could not commit four pages in this process"); return; }
+            try
+            {
+                uint r = unchecked((uint)region.ToInt32());
+                TswdDebugInfo dbg;
+                try { dbg = new TswdDebugInfo(BuildCallerCalleeBlob(), 0, 0x1000, 0x2000, 0x3000); }
+                catch (Exception ex) { failures.Add("call-under-INT3: the fixture blob did not parse - " + ex.Message); return; }
+
+                uint callVa = r + 0x1110, eip = r + 0x1408, esp = r + 0x3000, ebp = r + 0x3100, callerEbp = r + 0x3200;
+                // byte opcode at the CALL; plant: 0 none, 1 user breakpoint, 2 call-skip temp. hasChain: EBP set.
+                Func<byte, int, bool, List<StackFrame>> walk = (opcode, plant, hasChain) =>
+                {
+                    var page = new byte[0x4000];
+                    for (int i = 0x1000; i < 0x2000; i++) page[i] = 0x90;
+                    page[0x1110] = opcode;                           // E8 rel32 (rel 0), return at 0x1115
+                    BitConverter.GetBytes(callerEbp).CopyTo(page, 0x3100);   // [ebp]   = caller's saved EBP
+                    BitConverter.GetBytes(r + 0x1115).CopyTo(page, 0x3104);  // [ebp+4] = return into CALLER
+                    Marshal.Copy(page, 0, region, page.Length);
+                    var eng = NewEngine();
+                    eng.SetProcessHandleForTest(System.Diagnostics.Process.GetCurrentProcess().Handle);
+                    if (plant != 0) eng.PlantForTest(callVa, 0xE8, plant == 2);
+                    var m = new LoadedModule { Name = "walk.dll", LoadBase = r, Size = 0x3000, Dbg = dbg };
+                    return eng.BuildStackForTest(m, eip, esp, hasChain ? ebp : 0);
+                };
+                Func<List<StackFrame>, string> show = fs =>
+                {
+                    var parts = new List<string>();
+                    foreach (var f in fs) parts.Add((f.Proc ?? "?") + ":" + f.Line + (f.Uncertain ? "?" : "") + "@ebp0x" + f.Ebp.ToString("X"));
+                    return "[" + string.Join(", ", parts) + "]";
+                };
+                Func<List<StackFrame>, bool, bool> callerIsFrame1 = (fs, scanned) =>
+                    fs.Count >= 2 && fs[0].Proc == "CALLEE" && fs[1].Proc == "CALLER" && fs[1].Line == 12
+                    && fs[1].Uncertain == scanned && fs[1].Ebp == (scanned ? 0u : callerEbp);
+
+                var clean = walk(0xE8, 0, true);
+                if (!callerIsFrame1(clean, false))
+                    failures.Add("call-under-INT3 control: with the CALL's own E8 in memory the walk is " + show(clean)
+                                 + ", expected CALLEE then CALLER:12 at ebp 0x" + callerEbp.ToString("X") + " - the fixture does not walk");
+                var user = walk(0xCC, 1, true);
+                if (!callerIsFrame1(user, false))
+                    failures.Add("call-under-INT3: a user breakpoint over the caller's CALL ended the walk - " + show(user)
+                                 + ", expected CALLER as frame 1 with its saved EBP");
+                var temp = walk(0xCC, 2, true);
+                if (!callerIsFrame1(temp, false))
+                    failures.Add("call-under-INT3: a call-skip temp over the caller's CALL ended the walk - " + show(temp)
+                                 + ", expected CALLER as frame 1 with its saved EBP");
+                var foreign = walk(0xCC, 0, true);
+                if (foreign.Count != 1)
+                    failures.Add("call-under-INT3: an INT3 the engine never planted was read as a CALL - " + show(foreign)
+                                 + ", expected the walk to stop at frame 0");
+                var scan = walk(0xCC, 1, false);
+                if (!callerIsFrame1(scan, true))
+                    failures.Add("call-under-INT3: with no EBP chain the stack scan missed the caller whose CALL carries "
+                                 + "a user breakpoint - " + show(scan) + ", expected CALLER:12 as an uncertain frame 1");
+            }
+            finally { VirtualFree(region, UIntPtr.Zero, MemRelease); }
+        }
+
+        /// <summary>
+        /// The disassembly names a call through a stub under our INT3 (1d371325, the audit's second raw read).
+        ///
+        /// FollowThunk decodes the instruction at a call target that has no symbol, to name what the stub jumps
+        /// to. It read the code raw, so a breakpoint on the stub decoded as int3 and the listing lost the
+        /// callee's name. Driven through the REAL NameForCodeVa over a stub in THIS process, outside the fake
+        /// image: `jmp rel32` to CALLEE. THREE CASES: the clean stub names walk.dll!CALLEE (the control); a
+        /// planted user breakpoint over the E9 still names it; an INT3 nobody planted names nothing.
+        /// NOT COVERED: the `jmp [slot]` stub form, whose slot read is data, not code.
+        /// </summary>
+        private static void CheckDisasmThunkNameUnderInt3(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("the disassembly's stub-following reads the stub with our INT3s restored: a call target "
+                         + "that is a `jmp` stub carrying a user breakpoint still names the callee it jumps to, while "
+                         + "an INT3 the engine did not plant names nothing (1d371325). Not covered: a real debuggee.");
+
+            IntPtr region = VirtualAlloc(IntPtr.Zero, (UIntPtr)0x3000u, MemReserve | MemCommitFlag, PageReadWriteFlag);
+            if (region == IntPtr.Zero) { failures.Add("thunk-under-INT3 control: could not commit three pages in this process"); return; }
+            try
+            {
+                uint r = unchecked((uint)region.ToInt32());
+                TswdDebugInfo dbg;
+                try { dbg = new TswdDebugInfo(BuildCallerCalleeBlob(), 0, 0x1000, 0x2000, 0x3000); }
+                catch (Exception ex) { failures.Add("thunk-under-INT3: the fixture blob did not parse - " + ex.Message); return; }
+
+                uint stub = r + 0x2800, callee = r + 0x1400;   // the stub sits past the image (Size 0x2000): no symbol
+                // plant: 0 none, 1 user breakpoint over the stub's opcode.
+                Func<byte, int, string> name = (opcode, plant) =>
+                {
+                    var page = new byte[0x3000];
+                    for (int i = 0x1000; i < 0x2000; i++) page[i] = 0x90;
+                    page[0x2800] = opcode;                                                  // E9 rel32 -> CALLEE
+                    BitConverter.GetBytes(unchecked(callee - (stub + 5))).CopyTo(page, 0x2801);
+                    Marshal.Copy(page, 0, region, page.Length);
+                    var eng = NewEngine();
+                    eng.SetProcessHandleForTest(System.Diagnostics.Process.GetCurrentProcess().Handle);
+                    if (plant != 0) eng.PlantForTest(stub, 0xE9, false);
+                    var m = new LoadedModule { Name = "walk.dll", LoadBase = r, Size = 0x2000, Dbg = dbg };
+                    return eng.NameForCodeVaForTest(m, stub);
+                };
+
+                string clean = name(0xE9, 0);
+                if (clean != "walk.dll!CALLEE")
+                    failures.Add("thunk-under-INT3 control: the clean stub names " + (clean ?? "nothing")
+                                 + ", expected walk.dll!CALLEE - the fixture does not follow");
+                string user = name(0xCC, 1);
+                if (user != "walk.dll!CALLEE")
+                    failures.Add("thunk-under-INT3: a user breakpoint over the stub lost the callee's name - got "
+                                 + (user ?? "nothing") + ", expected walk.dll!CALLEE");
+                string foreign = name(0xCC, 0);
+                if (foreign != null)
+                    failures.Add("thunk-under-INT3: an INT3 the engine never planted was followed as a stub - got " + foreign);
+            }
+            finally { VirtualFree(region, UIntPtr.Zero, MemRelease); }
+        }
+
+        /// <summary>
+        /// A TSWD blob for <see cref="CheckStackWalkReadsCallUnderInt3"/> and <see cref="CheckDisasmThunkNameUnderInt3"/>: one compiland (walk.clw), five +0x1C line
+        /// records and two procedures. CALLER (entry 0x1100) calls at 0x1110 and resumes at 0x1115 (line 12); CALLEE
+        /// (entry 0x1400) is where the thread stops. Text is RVA 0x1000..0x2000. No +0x2C tree.
+        /// </summary>
+        private static byte[] BuildCallerCalleeBlob()
+        {
+            const uint Back0 = 0x00C0FFEE;
+            var recs = new[]   // {rva, line}, RVA-ascending
+            {
+                new[] { 0x1100u, 10u }, new[] { 0x1110u, 11u }, new[] { 0x1115u, 12u },
+                new[] { 0x1400u, 20u }, new[] { 0x1408u, 21u },
+            };
+            var syms = new[] { Tuple.Create("CALLER@F", 0x1100u), Tuple.Create("CALLEE@F", 0x1400u) };
+            var pool = new List<byte> { 0 };
+            var nameRef = new Dictionary<string, uint>();
+            foreach (var s in syms) { nameRef[s.Item1] = (uint)pool.Count; pool.AddRange(Encoding.ASCII.GetBytes(s.Item1)); pool.Add(0); }
+            while (pool.Count % 4 != 0) pool.Add(0);
+
+            const int modArray = 0x40, modPool = 0x48, modRange = 0x60, lines = 0x70;
+            int symPool = lines + recs.Length * 8;
+            int symNameArray = symPool + pool.Count;
+            int symRecs = symNameArray + 4;
+            int t2c = symRecs + syms.Length * 12;
+            int t34 = t2c + 0x40;
+            var b = new byte[t34 + 0x40];
+
+            Action<int, uint> u32 = (at, v) => BitConverter.GetBytes(v).CopyTo(b, at);
+            Action<int, ushort> u16 = (at, v) => BitConverter.GetBytes(v).CopyTo(b, at);
+            u32(0x00, TswdDebugInfo.TswdMagic);
+            u32(0x04, 0x38);
+            u32(0x08, modArray); u32(0x0C, modPool); u32(0x10, modRange);
+            u32(0x14, lines); u32(0x18, lines); u32(0x1C, lines);
+            u32(0x20, (uint)symPool); u32(0x24, 1); u32(0x28, (uint)symNameArray); u32(0x2C, (uint)t2c);
+            u32(0x30, (uint)syms.Length); u32(0x34, (uint)t34);
+
+            u32(modArray, 0);
+            Encoding.ASCII.GetBytes("walk.clw").CopyTo(b, modPool);
+            for (int i = 0; i < recs.Length; i++)
+            {
+                u32(lines + i * 8, recs[i][0]); u16(lines + i * 8 + 4, (ushort)recs[i][1]); u16(lines + i * 8 + 6, 0);
+            }
+            pool.ToArray().CopyTo(b, symPool);
+            u32(symNameArray, Back0);
+            for (int i = 0; i < syms.Length; i++)
+            {
+                int o = symRecs + i * 12;
+                u32(o, nameRef[syms[i].Item1]); u32(o + 4, syms[i].Item2); u32(o + 8, Back0);
+            }
+            return b;
+        }
+
+        /// <summary>
+        /// A minimal TSWD blob for <see cref="CheckLocalsOwnerAtPoolOffsetZero"/>: one compiland, no line records,
+        /// two text symbols and a +0x2C tree of seven tag records, laid out as TswdDebugInfo reads them. The symbol
+        /// pool starts with PROCZ's name (offset 0, no leading NUL), as a real pool does. Text is RVA 0x1000..0x2000.
+        /// </summary>
+        private static byte[] BuildPoolZeroLocalsBlob()
+        {
+            const uint Back0 = 0x00C0FFEE;
+            var pool = new List<byte>();
+            var nameRef = new Dictionary<string, uint>();
+            foreach (var n in new[] { "PROCZ", "PROCA", "LOCA", "LOCZ", "LOCN" })
+            {
+                nameRef[n] = (uint)pool.Count; pool.AddRange(Encoding.ASCII.GetBytes(n)); pool.Add(0);
+            }
+            while (pool.Count % 4 != 0) pool.Add(0);
+            var syms = new[] { Tuple.Create("PROCZ", 0x1100u), Tuple.Create("PROCA", 0x1000u) };
+            // {tag, nameRef, 2nd field}: a .text entry RVA (a procedure) or a negative frame offset (a local).
+            var tree = new[]
+            {
+                Tuple.Create((byte)0x04, nameRef["PROCA"], 0x1000u),
+                Tuple.Create((byte)0x04, nameRef["LOCA"], unchecked((uint)-4)),
+                Tuple.Create((byte)0x04, 0u, 0x1100u),                  // (i)  PROCZ, named at pool offset 0
+                Tuple.Create((byte)0x04, nameRef["LOCZ"], unchecked((uint)-4)),
+                Tuple.Create((byte)0x05, 0u, 0x1180u),                  // (ii) offset 0, but no symbol at 0x1180
+                Tuple.Create((byte)0x04, nameRef["LOCN"], unchecked((uint)-8)),
+                Tuple.Create((byte)0x04, 0u, unchecked((uint)-12)),     // (iii) a nameRef-0 local
+            };
+
+            const int modArray = 0x40, modPool = 0x48, modRange = 0x60, lines = 0x70;
+            int symPool = lines;                              // no line records
+            int symNameArray = symPool + pool.Count;
+            int symRecs = symNameArray + 4;                   // one backref entry
+            int t2c = symRecs + syms.Length * 12;
+            const int recSize = 0x20;
+            int t34 = t2c + tree.Length * recSize + 0x20;
+            var b = new byte[t34 + 0x40];
+
+            Action<int, uint> u32 = (at, v) => BitConverter.GetBytes(v).CopyTo(b, at);
+            u32(0x00, TswdDebugInfo.TswdMagic);
+            u32(0x04, 0x38);
+            u32(0x08, modArray); u32(0x0C, modPool); u32(0x10, modRange);
+            u32(0x14, lines); u32(0x18, lines); u32(0x1C, lines);
+            u32(0x20, (uint)symPool); u32(0x24, 1); u32(0x28, (uint)symNameArray); u32(0x2C, (uint)t2c);
+            u32(0x30, (uint)syms.Length); u32(0x34, (uint)t34);
+
+            u32(modArray, 0);
+            Encoding.ASCII.GetBytes("demo.clw").CopyTo(b, modPool);
+            pool.ToArray().CopyTo(b, symPool);
+            u32(symNameArray, Back0);                         // backref value -> module index 0
+            for (int i = 0; i < syms.Length; i++)
+            {
+                int o = symRecs + i * 12;
+                u32(o, nameRef[syms[i].Item1]); u32(o + 4, syms[i].Item2); u32(o + 8, Back0);
+            }
+            for (int i = 0; i < tree.Length; i++)
+            {
+                int p = t2c + i * recSize;
+                b[p] = tree[i].Item1;                         // typeRef at +1 stays 0
+                u32(p + 5, tree[i].Item2);
+                u32(p + 9, tree[i].Item3);
+                if ((tree[i].Item3 & 0x80000000) != 0)
+                {
+                    b[p + 18] = 0x11;                         // LONG (the storage byte at +17 stays 0)
+                    u32(p + 19, 4);
+                }
+            }
+            return b;
         }
     }
 }

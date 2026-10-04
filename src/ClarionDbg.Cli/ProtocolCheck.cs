@@ -111,12 +111,16 @@ namespace ClarionDbg.Cli
                 CheckSameNameDllsKeepTheirEntries,
                 CheckUnmappedImageIsNoDataCandidate,
                 CheckBorrowedPathsYield,
+                CheckYieldRebindsImgBreakpoints,
                 CheckExpandBaseNamesOneImage,
                 CheckWatchAndModuleDataReqId,
                 CheckSuggestedNamesArePasteable,
                 CheckConditionAmbiguityAndQualifiedWatch,
                 CheckRearmHold,
                 CheckRunToCursorArmsEveryImage,
+                CheckLocalsOwnerAtPoolOffsetZero,
+                CheckStackWalkReadsCallUnderInt3,
+                CheckDisasmThunkNameUnderInt3,
             };
 
             foreach (var check in checks)

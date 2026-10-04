@@ -38,7 +38,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'engine-session.ps1')
+. (Join-Path $PSScriptRoot 'lib-engine-events.ps1')   # Read-Events, Wait-Event, Wait-Stop, Send, Show-Stop
 . (Join-Path $PSScriptRoot 'lib-check.ps1')
+$PSDefaultParameterValues = Get-EngineEventDefaults -TimeoutSec $StopTimeoutSec -Verbose2 ([bool]$Verbose2)
 $script:checks = 0
 $script:failures = 0
 
@@ -89,58 +91,12 @@ function New-Session([string] $BreakArgs) {
   return $s
 }
 
-function Read-Events($S) {
-  foreach ($l in (Read-EngineLines $S)) {
-    if ($null -eq $l) { continue }
-    [void]$S.Raw.Add($l)
-    if ($Verbose2) { Write-Host "    | $l" }
-    if ($l.StartsWith('@JSON ')) {
-      $o = $null
-      try { $o = $l.Substring(6) | ConvertFrom-Json } catch { }
-      if ($null -ne $o) { [void]$S.Events.Add($o) }
-    }
-  }
-}
-
-# The next event (from the session's cursor) that $Pred accepts, or $null on timeout / engine exit. Events
-# skipped on the way stay in $S.Events for the whole-session checks.
-function Wait-Event($S, [scriptblock] $Pred, [int] $TimeoutSec = $StopTimeoutSec) {
-  $sw = [Diagnostics.Stopwatch]::StartNew()
-  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-    Read-Events $S
-    while ($S.Seen -lt $S.Events.Count) {
-      $e = $S.Events[$S.Seen]; $S.Seen++
-      if (& $Pred $e) { return $e }
-    }
-    if ($S.Proc.HasExited) {
-      Start-Sleep -Milliseconds 200; Read-Events $S
-      if ($S.Seen -ge $S.Events.Count) { return $null }
-      continue
-    }
-    Start-Sleep -Milliseconds 100
-  }
-  return $null
-}
-
-function Wait-Stop($S) { return (Wait-Event $S { param($e) $e.event -ceq 'paused' -or $e.event -ceq 'exited' }) }
-
-function Send($S, [string] $Cmd) {
-  if ($Verbose2) { Write-Host "    > $Cmd" }
-  $S.Proc.StandardInput.WriteLine($Cmd)
-}
-
 function Close-Session($S) {
   Stop-EngineSession $S
   Start-Sleep -Milliseconds 300
   Read-Events $S
   Stop-EngineTarget $S
   Remove-EngineSession $S
-}
-
-function Show-Stop($e) {
-  if ($null -eq $e) { return '(no stop)' }
-  if ($e.event -ceq 'exited') { return "exited code $($e.code)" }
-  return "paused $($e.reason) $($e.module):$($e.line) va $($e.va)"
 }
 
 function Get-SharedMods($S) { return @($S.Events | Where-Object { $_.event -ceq 'module-loaded' -and $_.name -eq 'shared.dll' }) }

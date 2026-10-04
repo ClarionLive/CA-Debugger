@@ -281,7 +281,7 @@ namespace ClarionDbg.Core
         }
 
         /// <summary>Holds the first IMAGE_DEBUG_DIRECTORY entry.</summary>
-        public struct DebugEntry { public uint TimeDateStamp; public uint Type;public uint SizeOfData; public uint PointerToRawData; }
+        public struct DebugEntry { public uint TimeDateStamp; public uint Type; public uint SizeOfData; public uint PointerToRawData; }
 
         public DebugEntry ReadFirstDebugEntry()
         {

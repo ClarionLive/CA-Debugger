@@ -42,5 +42,24 @@ namespace ClarionDebugger.Wire
             }
             return true;
         }
+
+        /// <summary>The ONE host home of the image-base rule (w9-imgbase rule 1): an image load base on the wire is
+        /// <c>0x</c> (lowercase x) and 1-8 hex digits of either case, to the end of the string - <see cref="IsHexAddr"/>'s
+        /// grammar, so <c>0X</c>, a sign, whitespace and a trailing newline are all refused. The engine writes it
+        /// on an expandable row (<c>"imgBase":"0x%08X"</c>) and the expand command takes it back. ExpandRequest.Parse,
+        /// HostGrants.ExpandKey and ClarionDebuggerService.RequestExpand all ask here. <paramref name="value"/> is the
+        /// base by value, so two spellings of one address compare equal (rule 4).</summary>
+        internal static bool TryParseImageBase(string s, out uint value)
+        {
+            value = 0;
+            return IsHexAddr(s) && uint.TryParse(s.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out value);
+        }
+
+        /// <summary><see cref="TryParseImageBase"/> without the value.</summary>
+        internal static bool IsImageBase(string s)
+        {
+            uint v;
+            return TryParseImageBase(s, out v);
+        }
     }
 }

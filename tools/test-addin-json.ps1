@@ -1905,6 +1905,10 @@ Check 'BASE ADDED: a row issued with no base is not forwarded under an invented 
 $xm = New-Object ClarionDebugger.Terminal.BridgePad
 $xm.OnSvcModuleData('clbrws011.clw', $engineRows.Replace('"typeRef":77}', '"typeRef":77,"imgBase":"0x4000000000"}'), 4812, (AskRead $xm))
 Check 'a row whose imgBase is malformed (10 hex digits) is issued as no expandable row' ($xm._editGrants.ExpandableCount -eq 0) "$($xm._editGrants.ExpandableCount)"
+# w9-imgbase rule 2: an uppercase 0X is refused on the host's grant side too (HostGrants.ExpandKey asks WireRules).
+$xu = New-Object ClarionDebugger.Terminal.BridgePad
+$xu.OnSvcModuleData('clbrws011.clw', $engineRows.Replace('"typeRef":77}', '"typeRef":77,"imgBase":"0X00400000"}'), 4812, (AskRead $xu))
+Check 'a row whose imgBase is spelled 0X is issued as no expandable row' ($xu._editGrants.ExpandableCount -eq 0) "$($xu._editGrants.ExpandableCount)"
 
 # ---- frame locals are issued like expand (49538b78 wave 5, codex adversary) ---------------------------
 # A framelocals request names a procedure VA and an EBP, and the engine renders that procedure's locals at
@@ -2245,10 +2249,46 @@ $xb = [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|clbrws011.clw|123|0x4A0
 Check 'expand: a fifth field is the image base, kept verbatim' `
   (($null -ne $xb) -and $xb.Module -ceq 'clbrws011.clw' -and $xb.Addr -ceq '0x4A0000' -and $xb.ImgBase -ceq '0x00400000') "$($xb.ImgBase)"
 Check 'expand: with no fifth field there is no base (the engine falls back to the name)' (($null -ne $x) -and ($null -eq $x.ImgBase)) "$($x.ImgBase)"
-$badBases = @('', '0x', '400000', '0X400000', '0x123456789', '0xG0400000', ' 0x400000', '0x400000 ', '-0x1', '0x400000|0x1')
+# w9-imgbase (FROZEN 2026-10-03): these two lists are EXACTLY the engine's (ProtocolCheck.ModuleTable.cs), in
+# the same order - change both or neither. The rule they test has one host home, WireRules.TryParseImageBase.
+$badBases = @('', '0x', '0X400000', '400000', '0x123456789', '-0x400000', ' 0x400000', '0x400000 ', "0x400000`n", '0x40000G')
+$goodBases = @('0x400000', '0x00400000', '0x0040000a', '0xFFFFFFFF')
+function Show-Base { param($b) "'" + ($b -replace "`n", '\n') + "'" }
 $badLet = @($badBases | Where-Object { $null -ne [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123|0x4A0000|' + $_) })
-Check 'expand: a fifth field that is not 0x + 1-8 hex digits rejects the request (empty, 0x, no 0x, 0X, 9 digits, G, spaces, sign, a sixth field)' `
-  ($badLet.Count -eq 0) (($badLet | ForEach-Object { "'$_'" }) -join ', ')
+Check 'expand: a fifth field on the bad list rejects the request (empty, 0x, 0X, no 0x, 9 digits, sign, spaces, a trailing newline, G)' `
+  ($badLet.Count -eq 0) (($badLet | ForEach-Object { Show-Base $_ }) -join ', ')
+$goodMiss = @($goodBases | Where-Object { $p = [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123|0x4A0000|' + $_); ($null -eq $p) -or ($p.ImgBase -cne $_) })
+Check 'expand: a fifth field on the good list is accepted and kept verbatim' ($goodMiss.Count -eq 0) (($goodMiss | ForEach-Object { Show-Base $_ }) -join ', ')
+Check 'expand: a sixth field rejects the request' ($null -eq [ClarionDebugger.Terminal.ExpandRequest]::Parse('7|m|123|0x4A0000|0x400000|0x1')) ''
+
+# RequestExpand is the service-side gate on the same base, run for real over a recording SendCommand. Before
+# w9 it had its own regex ending in $, which let "0x400000<newline>" through as a second command on the
+# engine's stdin; it asks WireRules now, and the frozen lists hold it to that.
+$expandProbeSrc = @"
+using System;
+using System.Globalization;
+using System.Text.RegularExpressions;
+public class ExpandSendProbe {
+  public string Sent;
+  private bool SendCommand(string c) { Sent = c; return true; }
+  $(Get-Method 'public static bool IsValidModuleName(string module)')
+  $(Get-Method 'public bool RequestExpand(int reqId, string module, uint typeRef, string addrHex, string imgBase = null)')
+  $(Get-Method 'internal static class WireRules' $wireRulesText)
+}
+"@
+Add-Type -TypeDefinition $expandProbeSrc -Language CSharp | Out-Null
+$ep = New-Object ExpandSendProbe
+Check 'RequestExpand with no base sends four arguments' `
+  ($ep.RequestExpand(7, 'm.clw', 123, '0x4A0000', [NullString]::Value) -and $ep.Sent -ceq 'expand 7 m.clw 123 0x4A0000') (ShowVal $ep.Sent)
+$sendGood = @($goodBases | Where-Object { $ep.Sent = $null; -not ($ep.RequestExpand(7, 'm.clw', 123, '0x4A0000', $_) -and $ep.Sent -ceq ('expand 7 m.clw 123 0x4A0000 ' + $_)) })
+Check 'RequestExpand sends every base on the good list verbatim as the fifth argument' ($sendGood.Count -eq 0) (($sendGood | ForEach-Object { Show-Base $_ }) -join ', ')
+# PowerShell stores $null into a C# string field as '', so "sent nothing" is IsNullOrEmpty, not -eq $null.
+$sendBad = @($badBases | Where-Object { $ep.Sent = $null; $ep.RequestExpand(7, 'm.clw', 123, '0x4A0000', $_) -or -not [string]::IsNullOrEmpty($ep.Sent) })
+Check 'RequestExpand refuses every base on the bad list and sends nothing' ($sendBad.Count -eq 0) (($sendBad | ForEach-Object { Show-Base $_ }) -join ', ')
+Check 'the host has one image-base rule: WireRules.TryParseImageBase, and no ImageBase class beside it' `
+  (((Get-CSharpCodeOnly $pageMsgs) -notmatch 'class\s+ImageBase\b') -and `
+   ([regex]::Matches((Get-CSharpCodeOnly $wireRulesText), 'static bool TryParseImageBase\(').Count -eq 1) -and `
+   ((Get-CSharpCodeOnly (Get-Method 'public bool RequestExpand(int reqId, string module, uint typeRef, string addrHex, string imgBase = null)')) -match 'if \(imgBase != null && !WireRules\.IsImageBase\(imgBase\)\) return false;\s*return SendCommand\(')) ''
 $fl = [ClarionDebugger.Terminal.FrameLocalsRequest]::Parse('3|0x401000|0x19FF00')
 Check 'framelocals: reqId|va|ebp reads as three typed fields' (($null -ne $fl) -and $fl.ReqId -eq 3 -and $fl.Ebp -ceq '0x19FF00') ''
 $ml = [ClarionDebugger.Terminal.ModuleLineRequest]::Parse('a:b.clw:12')
@@ -3116,7 +3156,7 @@ Check 'WireRules.TryUInt takes plain decimal digits in the DWORD range and nothi
 #           assertion included. Measured: a top-level break left 69 of 222 checks reported, NO summary
 #           line, and EXIT=0. Closing that needs the script body inside Invoke-CheckSection, where the
 #           `finally` can still fire - filed as its own job rather than pretended away here.
-$EXPECTED_CHECKS = 512
+$EXPECTED_CHECKS = 519
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''

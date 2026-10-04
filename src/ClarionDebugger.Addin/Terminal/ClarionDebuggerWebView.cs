@@ -1295,7 +1295,8 @@ namespace ClarionDebugger.Terminal
         /// them to the page for the Procedures list. Clicking a row reuses the existing 'jump' handler, so
         /// no new inbound action is needed. Silent on failure (the list just stays empty).</summary>
         private int _procGen;   // generation token — discard stale async procedure pushes (EXE switch / overlapping ready+start+refresh)
-        private int _procListGen; private string _procListExe;   // the generation and EXE of the last ListProceduresForTarget push
+        private int _procListGen;      // the generation of the last ListProceduresForTarget push
+        private string _procListExe;   // and the EXE it listed
 
         /// <summary>True when the latest list action since <paramref name="gen0"/> was ListProceduresForTarget's push of
         /// <paramref name="exe"/>'s procedures, and nothing (a clear, any other push) has superseded it.</summary>

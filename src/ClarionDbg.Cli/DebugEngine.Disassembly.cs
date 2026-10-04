@@ -236,6 +236,15 @@ namespace ClarionDbg.Cli
             return funcVa != 0 ? NameForCodeVa(funcVa, depth) : null;
         }
 
+        /// <summary>Test seam (1d371325): the REAL NameForCodeVa with <paramref name="m"/> mapped for the one
+        /// lookup, reading whatever process <see cref="SetProcessHandleForTest"/> named. Read-only.</summary>
+        internal string NameForCodeVaForTest(LoadedModule m, uint va)
+        {
+            _modules.Add(m);
+            try { return NameForCodeVa(va, 2); }
+            finally { _modules.Remove(m); }
+        }
+
         /// <summary>SPIKE helper: decode the single instruction at <paramref name="va"/>; if it's an import
         /// or branch thunk (`jmp dword [slot]` / `jmp abs`), resolve what it forwards to. Clarion reaches
         /// many runtime routines through these stubs, so following one hop names the otherwise-bare
@@ -245,7 +254,7 @@ namespace ClarionDbg.Cli
             try
             {
                 var buf = new byte[16];
-                int got = ReadBlock(va, buf);
+                int got = ReadCleanBlock(va, buf);   // clean: a breakpoint on the stub decoded as int3 (1d371325)
                 if (got < 2) return null;
                 var reader = new Iced.Intel.ByteArrayCodeReader(buf, 0, got);
                 var dec = Iced.Intel.Decoder.Create(32, reader);
