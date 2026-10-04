@@ -276,7 +276,7 @@ Invoke-CheckSection '5) every harness that launches the engine cleans up THROUGH
     # A SET, not "every" and not a typed number: the harnesses this scan finds must be exactly the suites
     # whose header says live=yes, less the one-shot pair pinned above. A harness that stops naming the binary
     # drops out of the scan but not out of its header, and a new live harness is in both - so neither can
-    # change the per-harness checks below without this saying so. (2026-10-03: 6 harnesses, 8 live suites.)
+    # change the per-harness checks below without this saying so. (2026-10-03, wave 9: 7 harnesses, 9 live suites.)
     $scanned = (@($harnesses.Name) + @($oneShot.Name) | Sort-Object) -join ', '
     Check 'the scripts that launch the engine binary, plus the one-shot pair, are exactly the live=yes suites' `
         ($LIVE_SUITES.Count -gt 0 -and $scanned -ceq ($LIVE_SUITES -join ', ')) "scan: $scanned; live=yes: $($LIVE_SUITES -join ', ')"
@@ -516,8 +516,9 @@ Invoke-CheckSection '8) the pump keeps the engine''s line order, stdout and stde
 # checks with it and the run still printed a success summary and exited 0 - 42 checks reported instead of
 # 56, with nothing comparing the two.
 # The 4 per-harness checks in section 5 are counted from the live=yes headers, less the one-shot pair (pinned
-# to exactly 2 there), so adding a live harness needs no edit here. The base is everything else; 2026-10-03:
-# 52 = 76 - 4 * 6 harnesses. The history below is of the old single number.
+# to exactly 2 there), so adding a live harness needs no edit here. The base is everything else: 52, which is
+# the old single number 76 less 4 * the 6 harnesses it counted. 2026-10-03, wave 9: 9 live suites, so 7
+# harnesses and 52 + 4 * 7 = 80 checks. The history below is of the old single number.
 $EXPECTED_CHECKS = 52 + 4 * ($LIVE_SUITES.Count - 2)   # was 76: +4 test-engine-samename.ps1's per-harness checks (1be3b82e, wave 7); was 72: +3 section 8, the pump's line order (wave 5); was 69: 59, +1 the one-shot `procs` exemption (3f2d747f), +4 test-setip.ps1's per-harness checks (a77abd94), +5 test-attach.ps1's per-harness and poke-site checks (3f2d747f part A)
 Assert-CheckTotal $EXPECTED_CHECKS
 
