@@ -111,6 +111,7 @@ namespace ClarionDbg.Cli
                 CheckSameNameDllsKeepTheirEntries,
                 CheckUnmappedImageIsNoDataCandidate,
                 CheckBorrowedPathsYield,
+                CheckYieldRebindsImgBreakpoints,
                 CheckExpandBaseNamesOneImage,
                 CheckWatchAndModuleDataReqId,
                 CheckSuggestedNamesArePasteable,

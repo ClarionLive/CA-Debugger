@@ -244,6 +244,18 @@ namespace ClarionDbg.Cli
             uint baseVa = found.Owner != null ? found.Owner.LoadBase : 0;
             // Drop the logical breakpoint first so the ref-count check below sees only the survivors.
             _bps.Remove(found);
+            UnplantUnreferenced(found, baseVa);
+            Console.WriteLine($"bp: removed {canon}:{found.Line}");
+            // Echo the whole breakpoint, not just its planted line: `canon` IS found.Module here, and the
+            // host needs found.RequestedLine to know which of the lines sharing this planted record went.
+            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(found));
+        }
+
+        /// <summary>Restore the INT3s <paramref name="found"/> planted in the image at <paramref name="baseVa"/> that no
+        /// OTHER breakpoint still needs. Shared by <see cref="RemoveOne"/> (which has already dropped it from the list)
+        /// and <see cref="UnbindFromYieldedImage"/> (which has not, hence the skip of <paramref name="found"/> itself).</summary>
+        private void UnplantUnreferenced(UserBreakpoint found, uint baseVa)
+        {
             foreach (var rva in found.Rvas)
             {
                 // Ref-count the physical INT3: another breakpoint (a different gutter line that snapped
@@ -252,7 +264,7 @@ namespace ClarionDbg.Cli
                 // modules. Only unplant when nothing references it.
                 bool stillReferenced = false;
                 foreach (var b in _bps)
-                    if (b.Owner == found.Owner && b.Rvas.Contains(rva)) { stillReferenced = true; break; }
+                    if (b != found && b.Owner == found.Owner && b.Rvas.Contains(rva)) { stillReferenced = true; break; }
                 if (stillReferenced) continue;
 
                 uint va = baseVa + rva;
@@ -269,10 +281,51 @@ namespace ClarionDbg.Cli
                     _armed.Remove(va);
                 }
             }
-            Console.WriteLine($"bp: removed {canon}:{found.Line}");
-            // Echo the whole breakpoint, not just its planted line: `canon` IS found.Module here, and the
-            // host needs found.RequestedLine to know which of the lines sharing this planted record went.
-            if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(found));
+        }
+
+        /// <summary>
+        /// What a LOAD_DLL does for breakpoints once <paramref name="m"/> is in the module table: the tail of
+        /// OnDllLoaded (DebugEngine.Modules.cs), one method so the offline seam runs the same sequence.
+        /// <para>
+        /// Two live entries never share a Path (fb5766d1 #3): ImageMatches, |img= narrowing and every ownerPath
+        /// compare on it. A borrower that yields its path to <paramref name="m"/> changes what an <c>|img=</c> path
+        /// names (be6bb31c #4), so before m binds anything: a breakpoint that asked for the PRELOAD path and was bound
+        /// to the borrower leaves it (unplanted, back to pending) and binds to m below, the image now at that path;
+        /// and after m has bound, a pending breakpoint that asked for the COPY's path binds to the borrower, which
+        /// only now answers to it. The host re-keys through the existing bp-list event (it replaces the host's list
+        /// wholesale), sent AFTER the rebinding so it carries the final owners.
+        /// </para>
+        /// </summary>
+        private void ArmMappedImage(LoadedModule m)
+        {
+            var yielded = YieldBorrowedPaths(_modules, m);
+            foreach (var y in yielded)
+            {
+                Console.WriteLine($"  module: {y.Path} now answers to its own path (its preload's file mapped too)");
+                UnbindFromYieldedImage(y);
+            }
+
+            PlantOwnBps(m);         // bps already bound to this image (pre-loaded solution DLL)
+            ResolvePendingFor(m);    // pending bps whose compiland this image carries
+            foreach (var y in yielded)
+                if (y != m) ResolvePendingFor(y);   // pending |img=<its own path> bps; a repeat is a no-op
+            if (yielded.Count > 0 && EmitJson) Console.WriteLine("@JSON " + Json.BpList(_bps));
+        }
+
+        /// <summary>Return to pending every breakpoint bound to <paramref name="y"/> through an <c>|img=</c> spec that
+        /// <paramref name="y"/> no longer matches now that its path has yielded, restoring the INT3s no other
+        /// breakpoint in y still needs. An unqualified breakpoint, or one naming y by file name, stays where it is.</summary>
+        private void UnbindFromYieldedImage(LoadedModule y)
+        {
+            foreach (var bp in _bps)
+            {
+                if (bp.Owner != y || string.IsNullOrEmpty(bp.OwnerSpec) || ImageMatches(y, bp.OwnerSpec)) continue;
+                UnplantUnreferenced(bp, y.LoadBase);
+                bp.Owner = null;
+                bp.ModuleIdx = -1;
+                bp.Rvas.Clear();
+                Console.WriteLine($"bp: {bp.Module}:{bp.Line} asked for {bp.OwnerSpec}; leaving {y.Path} for the image now there");
+            }
         }
 
         /// <summary>Plant breakpoints already bound to this exact image (used when a pre-loaded
@@ -802,13 +855,23 @@ namespace ClarionDbg.Cli
             HandleBpCommand(line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries));
         }
 
-        /// <summary>What a LOAD_DLL does for breakpoints once the image is in the table (DebugEngine.Modules.cs):
-        /// plant those bound to it, then resolve pending ones and copy unqualified ones into it.</summary>
+        /// <summary>What a LOAD_DLL does for breakpoints once the image is in the table: the REAL
+        /// <see cref="ArmMappedImage"/> OnDllLoaded ends with (borrowed paths yield, then plant, bind and copy).</summary>
         internal void ImageMappedForTest(LoadedModule m)
         {
             RefuseSeamIfAttached("ImageMappedForTest");
-            PlantOwnBps(m);
-            ResolvePendingFor(m);
+            ArmMappedImage(m);
+        }
+
+        /// <summary>The VAs of the breakpoint at <paramref name="module"/>:<paramref name="requestedLine"/> bound to
+        /// <paramref name="owner"/> (owner's LoadBase + each rva); empty when there is none.</summary>
+        internal List<uint> BpVasForTest(string module, int requestedLine, LoadedModule owner)
+        {
+            var vas = new List<uint>();
+            foreach (var b in _bps)
+                if (b.Owner == owner && Eq(b.Module, module) && b.RequestedLine == requestedLine)
+                    foreach (var rva in b.Rvas) vas.Add(owner.LoadBase + rva);
+            return vas;
         }
 
         /// <summary>Each logical breakpoint as "module:requestedLine@ownerPath" ("(pending)" for no owner).</summary>

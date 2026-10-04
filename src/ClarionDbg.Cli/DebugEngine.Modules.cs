@@ -154,7 +154,7 @@ namespace ClarionDbg.Cli
             if (hdr == 0) return b;
             uint opt = hdr + 24;
             b.Stamp = readU32(hdr + 8);
-            b.Size = readU32(opt + 56);
+            b.Size = ReadSizeOfImage(readU32, hdr);
             b.CheckSum = readU32(opt + 64);
             uint dirRva = readU32(opt + 96 + 6 * 8), dirSize = readU32(opt + 96 + 6 * 8 + 4);
             if (dirRva != 0 && dirSize >= 28)
@@ -164,6 +164,14 @@ namespace ClarionDbg.Cli
                 b.DebugSize = readU32(dirRva + 16);
             }
             return b;
+        }
+
+        /// <summary>The optional header's SizeOfImage through <paramref name="readU32"/> (a U32 at an RVA of the mapped
+        /// image) for the PE header at <paramref name="hdr"/>: the one offset both readers use (be6bb31c #3). No floor
+        /// here; <see cref="ReadRemoteSizeOfImage"/> applies its own, for attribution only.</summary>
+        internal static uint ReadSizeOfImage(Func<uint, uint> readU32, uint hdr)
+        {
+            return readU32(hdr + 24 + 56);
         }
 
         /// <summary>The PE header's offset from the image base (e_lfanew), or 0 when it is out of range or the
@@ -213,19 +221,19 @@ namespace ClarionDbg.Cli
             return null;
         }
 
-        /// <summary>The mapped image by file name (e.g. school.exe), case-insensitive — used to re-resolve a
-        /// reference node's type in its owning image's TSWD for lazy `expand`. Null if not loaded.</summary>
-        private LoadedModule ModuleByName(string name)
+        /// <summary>The first mapped image in <paramref name="modules"/> by file name (e.g. school.exe), case-insensitive:
+        /// what a four-argument `expand` resolves (<see cref="ExpandImage"/>). Null if none is mapped.</summary>
+        internal static LoadedModule ModuleByName(IList<LoadedModule> modules, string name)
         {
             if (string.IsNullOrEmpty(name)) return null;
-            foreach (var m in _modules)
+            foreach (var m in modules)
                 if (m.LoadBase != 0 && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
             return null;
         }
 
         /// <summary>The mapped image named <paramref name="name"/> (case-insensitive) whose LoadBase is exactly
         /// <paramref name="loadBase"/>, or null (w8-expand-base). Two same-named DLLs are told apart by base, which
-        /// <see cref="ModuleByName"/> cannot do; a base that names no mapped image of that name finds nothing,
+        /// <see cref="ModuleByName(IList{LoadedModule}, string)"/> cannot do; a base that names no mapped image of that name finds nothing,
         /// never the first image of the name.</summary>
         internal static LoadedModule ModuleByNameAndBase(IList<LoadedModule> modules, string name, uint loadBase)
         {
@@ -656,16 +664,7 @@ namespace ClarionDbg.Cli
                 _liveSyms = null;   // SPIKE: import-symbol table is stale once the module set changes
                 if (m.Size == 0) m.Size = ReadRemoteSizeOfImage(baseVa);
 
-                // Two live entries never share a Path (fb5766d1 #3): ImageMatches, |img= narrowing and every
-                // ownerPath compare on it. A borrower that yields re-keys its breakpoints on the host through the
-                // existing bp-list event (it replaces the host's list wholesale), not through a new wire field.
-                var yielded = YieldBorrowedPaths(_modules, m);
-                foreach (var y in yielded)
-                    Console.WriteLine($"  module: {y.Path} now answers to its own path (its preload's file mapped too)");
-                if (yielded.Count > 0 && EmitJson) Console.WriteLine("@JSON " + Json.BpList(_bps));
-
-                PlantOwnBps(m);         // bps already bound to this image (pre-loaded solution DLL)
-                ResolvePendingFor(m);    // pending bps whose compiland this image carries
+                ArmMappedImage(m);       // yield borrowed paths, then plant, bind and copy breakpoints (Breakpoints.cs)
                 if (EmitJson) Console.WriteLine("@JSON " + Json.ModuleLoaded(m));
             }
             finally
@@ -743,7 +742,7 @@ namespace ClarionDbg.Cli
         {
             uint hdr = RemotePeHeaderOffset(baseVa);
             if (hdr == 0) return 0x10000; // sane floor if the header looks odd
-            uint size = ReadU32(baseVa + hdr + 24 + 56);
+            uint size = ReadSizeOfImage(rva => ReadU32(baseVa + rva), hdr);
             return size != 0 ? size : 0x10000;
         }
     }

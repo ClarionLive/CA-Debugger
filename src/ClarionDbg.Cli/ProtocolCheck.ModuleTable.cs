@@ -284,6 +284,117 @@ namespace ClarionDbg.Cli
         }
 
         /// <summary>
+        /// An <c>|img=</c> breakpoint follows the path it named across a yield (be6bb31c #4), through the REAL bp command
+        /// and the REAL <see cref="DebugEngine.ImageMappedForTest"/>, which runs OnDllLoaded's own tail. The images are
+        /// TSWD blobs protocolcheck builds (<see cref="BuildAttributionBlob"/>) at nonzero bases with no process
+        /// attached, so no byte is read or written: an INT3 is seeded with PlantForTest and its restore seen in the
+        /// armed count. NOT COVERED: the same sequence against a live two-DLL debuggee.
+        /// </summary>
+        private static void CheckYieldRebindsImgBreakpoints(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("when a preload's own file maps while a same-build copy holds the preload's path, a breakpoint added "
+                         + "with |img=<preload path> leaves the copy (its INT3 restored unless another breakpoint in the copy still "
+                         + "uses it) and binds to the image now at that path, a pending |img=<copy path> breakpoint binds to the "
+                         + "copy, the bp-list re-sync comes after both and names the final owners, and a del naming either path "
+                         + "reaches its breakpoint.");
+
+            const string Pre = @"C:\App\Dll1\shared.dll", Cpy = @"C:\App\Exe\shared.dll";
+            Func<string, string> img = p => "|img=" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(p));
+            Func<TswdDebugInfo> blob = () => new TswdDebugInfo(BuildAttributionBlob(), 0, 0x0F00, 0x2000, 0x10000);
+            Func<DebugEngine, string[], string> bps = (eng, want) =>
+            {
+                var got = eng.BpsForTest();
+                got.Sort(StringComparer.Ordinal);
+                var w = new List<string>(want);
+                w.Sort(StringComparer.Ordinal);
+                return string.Join(" ", got) == string.Join(" ", w) ? null
+                     : "[" + string.Join(" ", got) + "], expected [" + string.Join(" ", w) + "]";
+            };
+            Func<DebugEngine, LoadedModule> borrowerIn = eng =>
+            {
+                var b = eng.AddImageForTest(Pre, blob(), 0x10000000);
+                b.MappedPath = Cpy; b.Preloaded = true; b.PreloadPath = Pre;   // a same-build claim: Path borrowed
+                return b;
+            };
+            Func<DebugEngine, LoadedModule> genuineIn = eng =>
+            {
+                var g = eng.AddImageForTest(Pre, blob(), 0x20000000);
+                g.MappedPath = Pre;
+                return g;
+            };
+
+            try
+            {
+                // Case A and case B together: one |img= breakpoint per path, nothing else sharing the INT3.
+                var eng = NewEngine();
+                eng.EmitJson = true;
+                var borrower = borrowerIn(eng);
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:20" + img(Cpy)));
+                string e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:20@(pending)" });
+                if (e != null) { failures.Add("yield rebind: the fixture bound " + e); return; }
+                var vas = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (vas.Count != 1) { failures.Add("yield rebind: the fixture breakpoint has " + vas.Count + " address(es), expected 1"); return; }
+                eng.PlantForTest(vas[0], 0x90, false);
+                int armed = eng.ArmedCountForTest;
+
+                var genuine = genuineIn(eng);
+                string log = CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                if (borrower.Path != Cpy || genuine.Path != Pre)
+                    failures.Add("yield rebind: the fixture did not yield (copy=" + borrower.Path + " new=" + genuine.Path + ")");
+                e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:20@" + Cpy });
+                if (e != null) failures.Add("yield rebind: after the preload's own file mapped the breakpoints are " + e);
+                if (eng.BpVasForTest("A.CLW", 5, borrower).Count != 0 || eng.BpVasForTest("A.CLW", 5, genuine).Count != 1)
+                    failures.Add("yield rebind: the |img=<preload> breakpoint must leave the copy for the image now at " + Pre);
+                if (eng.ArmedCountForTest != armed - 1)
+                    failures.Add("yield rebind: the copy's INT3 for the |img=<preload> breakpoint was not restored (armed "
+                                 + armed + " -> " + eng.ArmedCountForTest + ")");
+
+                // The re-sync is the host's last word: after every bp-set, and naming both final owners.
+                int list = log.LastIndexOf("\"event\":\"bp-list\"", StringComparison.Ordinal);
+                int lastSet = log.LastIndexOf("\"event\":\"bp-set\"", StringComparison.Ordinal);
+                if (list < 0 || list < lastSet)
+                    failures.Add("yield rebind: the bp-list re-sync must follow the rebinding's bp-set echoes: " + log.Trim());
+                else
+                {
+                    int eol = log.IndexOf('\n', list);
+                    string line = eol < 0 ? log.Substring(list) : log.Substring(list, eol - list);
+                    if (line.IndexOf("\"ownerPath\":" + Json.Str(Pre), StringComparison.Ordinal) < 0
+                        || line.IndexOf("\"ownerPath\":" + Json.Str(Cpy), StringComparison.Ordinal) < 0
+                        || line.IndexOf("\"ownerPath\":null", StringComparison.Ordinal) >= 0)
+                        failures.Add("yield rebind: the bp-list re-sync must carry the final owners " + Pre + " and " + Cpy + ": " + line);
+                }
+
+                // A del naming each path reaches the breakpoint that asked for it, and only that one.
+                CaptureConsole(() => eng.BpCommandForTest("bp del A.CLW:5" + img(Pre)));
+                e = bps(eng, new[] { "A.CLW:20@" + Cpy });
+                if (e != null) failures.Add("yield rebind: `bp del A.CLW:5|img=<preload>` left " + e);
+                CaptureConsole(() => eng.BpCommandForTest("bp del A.CLW:20" + img(Cpy)));
+                e = bps(eng, new string[0]);
+                if (e != null) failures.Add("yield rebind: `bp del A.CLW:20|img=<copy>` left " + e);
+
+                // Ref-count: an unqualified breakpoint in the copy snapped to the same INT3 keeps it planted.
+                eng = NewEngine();
+                borrower = borrowerIn(eng);
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:5" + img(Pre)));
+                CaptureConsole(() => eng.BpCommandForTest("bp add A.CLW:4"));
+                var shared = eng.BpVasForTest("A.CLW", 4, borrower);
+                vas = eng.BpVasForTest("A.CLW", 5, borrower);
+                if (vas.Count != 1 || shared.Count != 1 || shared[0] != vas[0])
+                { failures.Add("yield rebind: the fixture's lines 4 and 5 do not share one INT3 in the copy"); return; }
+                eng.PlantForTest(vas[0], 0x90, false);
+                armed = eng.ArmedCountForTest;
+                genuine = genuineIn(eng);
+                CaptureConsole(() => eng.ImageMappedForTest(genuine));
+                e = bps(eng, new[] { "A.CLW:5@" + Pre, "A.CLW:4@" + Cpy, "A.CLW:4@" + Pre });
+                if (e != null) failures.Add("yield rebind (shared INT3): the breakpoints are " + e);
+                if (eng.ArmedCountForTest != armed)
+                    failures.Add("yield rebind (shared INT3): leaving the copy restored an INT3 an unqualified breakpoint there still uses");
+            }
+            catch (Exception ex) { failures.Add("yield rebind: " + ex.GetType().Name + ": " + ex.Message); }
+        }
+
+        /// <summary>
         /// `expand` with the row's imgBase as a 5th argument names ONE image (w8-expand-base), through the REAL
         /// <see cref="DebugEngine.ExpandImage"/> the handler resolves with, and every expandable row carries that base,
         /// through the REAL row builder. NOT COVERED: the handler's TSWD type lookup (needs a real image's types).
@@ -292,7 +403,8 @@ namespace ClarionDbg.Cli
         {
             claims.Claim("expand with a 0x-hex 5th argument resolves the mapped image with that name AND base, so two same-named "
                          + "DLLs are told apart; a base matching no mapped image of that name, another name's base, an unmapped "
-                         + "image or a malformed base resolves nothing; four arguments keep the first image of the name; and every "
+                         + "image resolves nothing; the imgBase grammar refuses every string on the frozen w9-imgbase bad list (0X "
+                         + "included) and parses every one on its good list to its value, two spellings of one base naming one image; four arguments keep the first image of the name; and every "
                          + "expandable row (by-ref group and array-of-group element) carries imgBase as 0x + 8 hex digits next to module.");
 
             var x = new LoadedModule { Name = "shared.dll", LoadBase = 0x10000000 };
@@ -307,13 +419,31 @@ namespace ClarionDbg.Cli
             if (exp(null) != x) failures.Add("expand base: four arguments must keep the first MAPPED image of the name");
             if (exp("0x20000000") != y) failures.Add("expand base: 0x20000000 did not resolve the second shared.dll");
             if (exp("0x10000000") != x) failures.Add("expand base: 0x10000000 did not resolve the first shared.dll");
-            if (exp("0X20000000") != y) failures.Add("expand base: an upper-case 0X prefix was refused");
             if (DebugEngine.ExpandImage(table, new[] { "expand", "1", "SHARED.DLL", "5", "0x400000", "0x20000000" }) != y)
                 failures.Add("expand base: the module name must match case-insensitively");
             foreach (var bad in new[] { "0x30000000", "0x40000000", "0x0", "0x00000000" })
                 if (exp(bad) != null) failures.Add("expand base: " + bad + " names no mapped shared.dll but resolved one (fail closed)");
-            foreach (var bad in new[] { "20000000", "0x", "0x123456789", "0x020000000", "1020000000", "0xZZ", "0x2000000g", "-0x1", "0x+1", "" })
-                if (exp(bad) != null) failures.Add("expand base: malformed base '" + bad + "' resolved an image");
+
+            // w9-imgbase rule 3: EXACTLY the frozen lists, in order, the same strings the host's suite holds.
+            foreach (var bad in new[] { "", "0x", "0X400000", "400000", "0x123456789", "-0x400000", " 0x400000", "0x400000 ", "0x400000\n", "0x40000G" })
+            {
+                uint v;
+                if (DebugEngine.TryParseImgBase(bad, out v))
+                    failures.Add("expand base: malformed base '" + bad.Replace("\n", "\\n") + "' parsed as 0x" + v.ToString("X"));
+            }
+            var good = new[] { "0x400000", "0x00400000", "0x0040000a", "0xFFFFFFFF" };
+            var want = new uint[] { 0x400000, 0x400000, 0x40000A, 0xFFFFFFFF };
+            for (int i = 0; i < good.Length; i++)
+            {
+                uint v;
+                if (!DebugEngine.TryParseImgBase(good[i], out v) || v != want[i])
+                    failures.Add("expand base: well-formed base '" + good[i] + "' did not parse to 0x" + want[i].ToString("X"));
+            }
+            var y4 = new LoadedModule { Name = "shared.dll", LoadBase = 0x400000 };
+            var t4 = new List<LoadedModule> { y4 };
+            foreach (var g in new[] { "0x400000", "0x00400000" })   // rule 4: two spellings of one base name one image
+                if (DebugEngine.ExpandImage(t4, new[] { "expand", "1", "shared.dll", "5", "0x400000", g }) != y4)
+                    failures.Add("expand base: '" + g + "' did not resolve the image at 0x00400000");
 
             var eng = NewEngine();
             var grp = new ClarionType { Kind = TypeKind.Group, Size = 8, TypeRef = 7, Members = new List<TypeMember>() };
