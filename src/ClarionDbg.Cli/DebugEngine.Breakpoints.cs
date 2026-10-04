@@ -244,43 +244,33 @@ namespace ClarionDbg.Cli
             uint baseVa = found.Owner != null ? found.Owner.LoadBase : 0;
             // Drop the logical breakpoint first so the ref-count check below sees only the survivors.
             _bps.Remove(found);
-            UnplantUnreferenced(found, baseVa, false);
+            UnplantUnreferenced(found, baseVa);
             Console.WriteLine($"bp: removed {canon}:{found.Line}");
             // Echo the whole breakpoint, not just its planted line: `canon` IS found.Module here, and the
             // host needs found.RequestedLine to know which of the lines sharing this planted record went.
             if (EmitJson) Console.WriteLine("@JSON " + Json.BpDel(found));
         }
 
-        /// <summary>Restore the INT3s <paramref name="found"/> planted in the image at <paramref name="baseVa"/> that no
-        /// OTHER breakpoint still needs. Shared by <see cref="RemoveOne"/> (which has already dropped it from the list)
-        /// and <see cref="UnbindFromYieldedImage"/> (which has not, hence the skip of <paramref name="found"/> itself).
-        /// <para>
-        /// <paramref name="checkedRestore"/> (the yield): the restore is checked, a VA leaves <c>_armed</c> only when its
-        /// original byte went back, and the result is false with <paramref name="failedVa"/> set at the first that did
-        /// not, so the caller can keep the breakpoint bound instead of losing track of a 0xCC (pipeline run 1, fde2387e).
-        /// Unchecked (RemoveOne): unchanged - the breakpoint is already gone from the list, and an <c>_armed</c> VA no
-        /// breakpoint references would be a hit with no owner, so it is restored best-effort and forgotten.
-        /// </para></summary>
-        private bool UnplantUnreferenced(UserBreakpoint found, uint baseVa, bool checkedRestore)
+        /// <summary>Whether another breakpoint in the SAME image still needs the INT3 at <paramref name="rva"/>.
+        /// Ref-count the physical INT3: another breakpoint (a different gutter line that snapped to the same address
+        /// in the SAME image) may still need it. Match on Owner — under multi-DLL two images can share a ModuleIdx,
+        /// so an rva-only check could alias across modules. Only unplant when nothing references it.</summary>
+        private bool RvaStillReferenced(UserBreakpoint found, uint rva)
         {
-            uint failedVa;
-            return UnplantUnreferenced(found, baseVa, checkedRestore, out failedVa);
+            bool stillReferenced = false;
+            foreach (var b in _bps)
+                if (b != found && b.Owner == found.Owner && b.Rvas.Contains(rva)) { stillReferenced = true; break; }
+            return stillReferenced;
         }
 
-        private bool UnplantUnreferenced(UserBreakpoint found, uint baseVa, bool checkedRestore, out uint failedVa)
+        /// <summary>Restore the INT3s <paramref name="found"/> planted in the image at <paramref name="baseVa"/> that no
+        /// OTHER breakpoint still needs, best-effort, and forget them. <see cref="RemoveOne"/>'s path (it has already
+        /// dropped the breakpoint from the list); the yield uses <see cref="TryUnplantForYield"/>.</summary>
+        private void UnplantUnreferenced(UserBreakpoint found, uint baseVa)
         {
-            failedVa = 0;
-            bool allRestored = true;
             foreach (var rva in found.Rvas)
             {
-                // Ref-count the physical INT3: another breakpoint (a different gutter line that snapped
-                // to the same address in the SAME image) may still need it. Match on Owner — under
-                // multi-DLL two images can share a ModuleIdx, so an rva-only check could alias across
-                // modules. Only unplant when nothing references it.
-                bool stillReferenced = false;
-                foreach (var b in _bps)
-                    if (b != found && b.Owner == found.Owner && b.Rvas.Contains(rva)) { stillReferenced = true; break; }
-                if (stillReferenced) continue;
+                if (RvaStillReferenced(found, rva)) continue;
 
                 uint va = baseVa + rva;
                 byte orig;
@@ -292,20 +282,71 @@ namespace ClarionDbg.Cli
                     foreach (var kv in _rearm)
                         if (!kv.Value.IsTemp && kv.Value.Va == va) { pendingTid = kv.Key; pending = true; break; }
                     if (pending) _rearm.Remove(pendingTid);
-                    else if (!checkedRestore) WriteByte(va, orig);
-                    else if (!RestoreByteChecked(va, orig))
-                    {
-                        if (allRestored) failedVa = va;
-                        allRestored = false;
-                        continue;   // still 0xCC in the target: it stays in _armed, so the engine still owns it
-                    }
+                    else WriteByte(va, orig);
                     _armed.Remove(va);
                 }
             }
-            return allRestored;
         }
 
-        /// <summary>protocolcheck only: replaces the checked restore's write, so a failed restore can be injected
+        /// <summary>
+        /// The yield's unplant, ALL OR NOTHING (pipeline runs 1-2, fde2387e): restore every INT3 of
+        /// <paramref name="found"/> that no other breakpoint needs, with checked writes, and only when every restore
+        /// succeeded commit it (drop the VAs from <c>_armed</c>, cancel pending re-plants) and return true. When one
+        /// fails, the VAs already restored are re-planted with checked 0xCC writes and nothing is committed, so the
+        /// breakpoint stays bound to what is still planted; a VA whose re-plant also fails is named, leaves
+        /// <c>_armed</c> and leaves <c>found.Rvas</c>, so the reported binding is never larger than what is planted.
+        /// <paramref name="failedVa"/> is the first restore that failed.
+        /// </summary>
+        private bool TryUnplantForYield(UserBreakpoint found, uint baseVa, out uint failedVa)
+        {
+            failedVa = 0;
+            var restored = new List<uint>();   // rvas whose original byte went back
+            var commit = new List<uint>();     // rvas to drop from _armed on success (restored or re-plant pending)
+            foreach (var rva in found.Rvas)
+            {
+                if (RvaStillReferenced(found, rva)) continue;
+                uint va = baseVa + rva;
+                byte orig;
+                if (baseVa == 0 || !_armed.TryGetValue(va, out orig)) continue;
+                bool pending = false;
+                foreach (var kv in _rearm)
+                    if (!kv.Value.IsTemp && kv.Value.Va == va) { pending = true; break; }
+                if (!pending)
+                {
+                    if (!WriteByteChecked(va, orig)) { failedVa = va; break; }
+                    restored.Add(rva);
+                }
+                commit.Add(rva);
+            }
+
+            if (failedVa != 0)
+            {
+                // Roll back: put back every INT3 this call took out, so the binding still describes the target.
+                foreach (var rva in restored)
+                {
+                    uint va = baseVa + rva;
+                    if (WriteByteChecked(va, 0xCC)) continue;   // _armed still holds its original byte
+                    _armed.Remove(va);
+                    found.Rvas.Remove(rva);
+                    Console.WriteLine($"bp: {found.Module}:{found.Line} could not re-plant 0x{va:X8} after a failed restore; "
+                                      + "that address is no longer armed");
+                }
+                return false;
+            }
+
+            foreach (var rva in commit)
+            {
+                uint va = baseVa + rva;
+                uint pendingTid = 0; bool pending = false;
+                foreach (var kv in _rearm)
+                    if (!kv.Value.IsTemp && kv.Value.Va == va) { pendingTid = kv.Key; pending = true; break; }
+                if (pending) _rearm.Remove(pendingTid);
+                _armed.Remove(va);
+            }
+            return true;
+        }
+
+        /// <summary>protocolcheck only: replaces the yield's checked writes (restore and re-plant), so a failed restore can be injected
         /// without a process. Null in a real session.</summary>
         private Func<uint, byte, bool> _restoreWriteHook;
 
@@ -315,9 +356,9 @@ namespace ClarionDbg.Cli
             _restoreWriteHook = hook;
         }
 
-        private bool RestoreByteChecked(uint va, byte orig)
+        private bool WriteByteChecked(uint va, byte value)
         {
-            return _restoreWriteHook != null ? _restoreWriteHook(va, orig) : TryWriteByte(va, orig);
+            return _restoreWriteHook != null ? _restoreWriteHook(va, value) : TryWriteByte(va, value);
         }
 
         /// <summary>
@@ -360,7 +401,7 @@ namespace ClarionDbg.Cli
             {
                 if (bp.Owner != y || string.IsNullOrEmpty(bp.OwnerSpec) || ImageMatches(y, bp.OwnerSpec)) continue;
                 uint failedVa;
-                if (!UnplantUnreferenced(bp, y.LoadBase, true, out failedVa))
+                if (!TryUnplantForYield(bp, y.LoadBase, out failedVa))
                 {
                     Console.WriteLine($"bp: {bp.Module}:{bp.Line} asked for {bp.OwnerSpec}, but could not restore the original byte "
                                       + $"at 0x{failedVa:X8} in {y.Path}; it stays armed there");
@@ -906,6 +947,17 @@ namespace ClarionDbg.Cli
         {
             RefuseSeamIfAttached("ImageMappedForTest");
             ArmMappedImage(m);
+        }
+
+        /// <summary>Give the breakpoint at <paramref name="module"/>:<paramref name="requestedLine"/> bound to
+        /// <paramref name="owner"/> one more RVA, as a line compiled to several code records has (the fixture blob
+        /// compiles every line once).</summary>
+        internal void AddBpRvaForTest(string module, int requestedLine, LoadedModule owner, uint rva)
+        {
+            RefuseSeamIfAttached("AddBpRvaForTest");
+            foreach (var b in _bps)
+                if (b.Owner == owner && Eq(b.Module, module) && b.RequestedLine == requestedLine) { b.Rvas.Add(rva); return; }
+            throw new InvalidOperationException("AddBpRvaForTest: no such breakpoint");
         }
 
         /// <summary>Whether <paramref name="va"/> is in the armed set (an INT3 the engine owns).</summary>
