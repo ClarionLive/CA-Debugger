@@ -10,7 +10,9 @@ namespace ClarionDebugger.Services
     /// A .cwproj (MSBuild XML) read for the CA Debugger's target: its OutputType and OutputName as MSBuild would
     /// read them for one configuration and platform, and the Conditions Clarion writes. Pure apart from
     /// <see cref="Read"/>, which loads the file; ProjectTargetService decides which project is the target.
-    /// Moved out of ProjectTargetService unchanged (fb5766d1).
+    /// Moved out of ProjectTargetService (fb5766d1) with the bodies unchanged and the names shortened, since the
+    /// class now says what is read: ReadCwproj became <see cref="Read"/> (and internal), ReadCwprojOutput
+    /// <see cref="ReadOutput"/>, ReadCwprojFirstDeclared ReadFirstDeclared.
     /// </summary>
     internal static class CwprojReader
     {
