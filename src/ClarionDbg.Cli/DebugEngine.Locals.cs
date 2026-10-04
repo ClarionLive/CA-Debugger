@@ -628,23 +628,20 @@ namespace ClarionDbg.Cli
         {
             if (parts == null || parts.Length < 5) return null;
             string name = parts[2];
-            if (parts.Length < 6)
-            {
-                foreach (var m in modules)
-                    if (m.LoadBase != 0 && string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase)) return m;
-                return null;
-            }
+            if (parts.Length < 6) return ModuleByName(modules, name);
             uint loadBase;
             if (!TryParseImgBase(parts[5], out loadBase)) return null;
             return ModuleByNameAndBase(modules, name, loadBase);
         }
 
-        /// <summary>The imgBase grammar: <c>0x</c> (either case) then 1-8 hex digits, nothing else. AllowHexSpecifier
-        /// alone admits hex digits only: no sign, no whitespace, no second prefix.</summary>
+        /// <summary>The imgBase grammar (w9-imgbase rule 1): <c>0x</c> with a LOWERCASE x, then 1-8 hex digits of either
+        /// case, nothing else; <c>0X</c> is refused, as the host refuses it. AllowHexSpecifier alone admits hex digits
+        /// only: no sign, no whitespace (a trailing newline included), no second prefix. Callers compare the parsed
+        /// value, so <c>0x400000</c> and <c>0x00400000</c> name one base.</summary>
         internal static bool TryParseImgBase(string s, out uint value)
         {
             value = 0;
-            if (s == null || s.Length < 3 || s.Length > 10 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X')) return false;
+            if (s == null || s.Length < 3 || s.Length > 10 || s[0] != '0' || s[1] != 'x') return false;
             return uint.TryParse(s.Substring(2), System.Globalization.NumberStyles.AllowHexSpecifier,
                                  System.Globalization.CultureInfo.InvariantCulture, out value);
         }

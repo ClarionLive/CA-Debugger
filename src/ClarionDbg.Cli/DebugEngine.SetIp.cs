@@ -1195,7 +1195,7 @@ namespace ClarionDbg.Cli
             {
                 // The measured list is only a proof for the ClaRUN it was measured on - and "the ClaRUN" is the
                 // module that SERVES each import the proof used, every one of them: the live IAT slot's target, whatever the image
-                // was registered as. Mapped only (LoadBase != 0), the same filter ModuleByName applies.
+                // was registered as. Mapped only (LoadBase != 0), the filter ModuleAt applies.
                 var facts = new List<RuntimeSlotFact>();
                 foreach (uint slot in measuredSlots)
                 {
