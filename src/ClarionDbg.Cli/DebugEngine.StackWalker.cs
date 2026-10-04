@@ -349,6 +349,17 @@ namespace ClarionDbg.Cli
 
         internal void ClearFrameCacheForTest() { ClearFrameCache(); }
 
+        /// <summary>Test seam (1d371325): the REAL BuildStack with <paramref name="m"/> mapped for the one walk,
+        /// over whatever process <see cref="SetProcessHandleForTest"/> named (protocolcheck uses its own). No
+        /// RefuseSeamIfAttached: like MemReadForTest it needs a process handle, and it only READS that process;
+        /// the module it adds is removed again before it returns.</summary>
+        internal List<StackFrame> BuildStackForTest(LoadedModule m, uint eip, uint esp, uint ebp)
+        {
+            _modules.Add(m);
+            try { return BuildStack(eip, esp, ebp, STACK_FRAMES_MAX); }
+            finally { _modules.Remove(m); }
+        }
+
         /// <summary>True when <paramref name="va"/> is exactly the entry of its containing procedure
         /// (prologue not yet run, so the frame's EBP is still the caller's).</summary>
         private bool AtProcEntry(LoadedModule m, uint va)
@@ -430,14 +441,15 @@ namespace ClarionDbg.Cli
         /// Checks the x86 encodings by length: E8 rel32 (5), FF /2 reg-or-[reg] (2), FF /2 disp8 or
         /// SIB (3), FF /2 disp32 or [mem] (6), FF /2 SIB+disp32 (7), 9A far (7). No decoder needed —
         /// combined with the TSWD-resolvability gate this filters nearly all stale stack noise.
+        /// The bytes are read CLEAN (<see cref="ReadCleanBlock"/>): a breakpoint on the caller's CALL line
+        /// puts our INT3 over the opcode, and a raw read saw 0xCC, rejected the caller, and ended the walk at
+        /// frame 0 (1d371325, measured 2026-10-03 on fixture samename-w8: OTHERPROC's stop lost SHAREDPROC).
         /// </summary>
         private bool CallPrecedes(uint va)
         {
             if (va < 8) return false;
             var b = new byte[8];                      // b[i] = byte at va-8+i, so byte at va-k is b[8-k]
-            int read;
-            if (!Native.ReadProcessMemory(_hProcess, Ptr(va - 8), b, 8, out read) || read != 8)
-                return false;
+            if (ReadCleanBlock(va - 8, b) != 8) return false;
             if (b[3] == 0xE8) return true;                                  // call rel32
             if (b[6] == 0xFF && (b[7] & 0x38) == 0x10) return true;         // call reg / [reg]
             if (b[5] == 0xFF && ((b[6] & 0xF8) == 0x50 || b[6] == 0x14)) return true;  // disp8 / SIB

@@ -16,6 +16,8 @@
 #          d\shared.dll, OBJ is SHAREDPROC's and CNT2 is OTHERPROC's, in the TSWD and in `framelocals` at each
 #          stop, with no phantom CNT2 under SHAREDPROC. (1) asks `framelocals` at the stopped VA too: before
 #          the fix, the one-procedure DLLs keyed OBJ to sharedmod$$$__attach_process (measured 2026-10-03).
+#          (3) also sets a breakpoint ON SHAREDPROC's CALL to OTHERPROC (1d371325): at the OTHERPROC stop the
+#          stack still has SHAREDPROC as frame 1, and `watch OBJ` answers from that caller frame.
 #   CANNOT - the page or add-in (rows are replayed, not rendered); an image that is not a byte copy; attach.
 #
 # -SelfTest (no Clarion, no debuggee): feeds the host-row replay and the (2) verdicts two recorded event
@@ -41,6 +43,9 @@ param(
   # `SharedCount += Cnt2`, after Cnt2 = 5. Breakable lines are 14-15, 17-24, 26-27 (measured 2026-10-03).
   [int]    $BpLineD1   = 19,
   [int]    $BpLineD2   = 27,
+  # d\sharedmod.clw's `OtherProc()` line: its first instruction is the CALL (E8 at RVA 0x111B, measured
+  # 2026-10-04), so its breakpoint covers the opcode the stack walk reads (1d371325).
+  [int]    $BpLineD3   = 20,
   [int]    $StopTimeoutSec = 30,
   [switch] $SelfTest,
   [switch] $Verbose2
@@ -311,10 +316,10 @@ try {
     if ($lines -match 'breakable lines:\s*(.+)') {
       foreach ($part in $matches[1].Trim().Split(',')) {
         $lh = $part.Trim().Split('-')
-        foreach ($want in $BpLineD1, $BpLineD2) { if ([int]$lh[0] -le $want -and $want -le [int]$lh[-1]) { $ok++ } }
+        foreach ($want in $BpLineD1, $BpLineD2, $BpLineD3) { if ([int]$lh[0] -le $want -and $want -le [int]$lh[-1]) { $ok++ } }
       }
     }
-    Check "d\shared.dll carries sharedmod.clw with lines $BpLineD1 and $BpLineD2 breakable" ($ok -eq 2) $lines.Trim()
+    Check "d\shared.dll carries sharedmod.clw with lines $BpLineD1, $BpLineD3 and $BpLineD2 breakable" ($ok -eq 3) $lines.Trim()
   }
 
   Invoke-CheckSection "(1) expand resolves in the image the row's imgBase names" {
@@ -394,10 +399,11 @@ try {
     Check '(3) d\shared.dll: OTHERPROC owns CNT2 and nothing else' ((@($owned['OTHERPROC']) -join ',') -eq 'CNT2') ''
 
     $pathD = Join-Path $two 'a\shared.dll'
-    $s = New-Session (Join-Path $two 'samehost.exe') "--solution-dll `"$pathD`" --bp sharedmod.clw:$BpLineD1 --bp sharedmod.clw:$BpLineD2"
+    # $BpLineD3 is the CALL itself (1d371325): its INT3 sits over the E8 that OTHERPROC returns through.
+    $s = New-Session (Join-Path $two 'samehost.exe') "--solution-dll `"$pathD`" --bp sharedmod.clw:$BpLineD1 --bp sharedmod.clw:$BpLineD3 --bp sharedmod.clw:$BpLineD2"
     $req = 300; $atShared = $null; $atOther = $null; $end = $null
     try {
-      for ($i = 0; $i -lt 6; $i++) {
+      for ($i = 0; $i -lt 8; $i++) {
         $stop = Wait-Stop $s
         if ($null -eq $stop -or $stop.event -cne 'paused') { $end = $stop; break }
         $va = U32 $stop.va
@@ -414,6 +420,9 @@ try {
             $r | Add-Member -NotePropertyName Watch -NotePropertyValue (Ask $s "watch OBJ reqid=$req" 'watch' "$req")
             $req++
             $r | Add-Member -NotePropertyName Stack -NotePropertyValue (Ask $s "stack reqid=$req" 'stack' "$req")
+            $req++
+            $slot = '0x{0:X8}' -f ((U32 $stop.regs.ebp) + 4)
+            $r | Add-Member -NotePropertyName RetSlot -NotePropertyValue (Ask $s "mem $slot 4 $req" 'mem' "$req")
           }
         }
         Send $s 'continue'
@@ -426,10 +435,24 @@ try {
     $cnt = if ($atOther) { @($atOther.Items | Where-Object { $_.name -eq 'CNT2' }) | Select-Object -First 1 }
     Check "(3) framelocals at the OTHERPROC stop (line $BpLineD2, in d) lists CNT2 = 5 and nothing else" `
       ($null -ne $atOther -and $atOther.Names -eq 'CNT2' -and "$($cnt.value)" -eq '5') "$(if ($atOther) { "$(Show-Stop $atOther.Stop): [$($atOther.Names)] CNT2=$($cnt.value)" } else { '(no stop in d)' })"
-    if ($atOther) {
-      Write-Host "  watch OBJ at the OTHERPROC stop: $($atOther.Watch | ConvertTo-Json -Compress -Depth 4)"
-      Write-Host "  stack there: $($atOther.Stack | ConvertTo-Json -Compress -Depth 5)"
+    # 1d371325: with a breakpoint on SHAREDPROC's CALL line, OTHERPROC's caller is still frame 1, and a watch on
+    # the caller's local answers from it (frame-0 locals, then globals, then caller frames).
+    $ret = $null
+    if ($atOther -and $atOther.RetSlot -and "$($atOther.RetSlot.bytes)".Length -eq 8) {
+      $hx = "$($atOther.RetSlot.bytes)"
+      $ret = [Convert]::ToUInt32($hx.Substring(6, 2) + $hx.Substring(4, 2) + $hx.Substring(2, 2) + $hx.Substring(0, 2), 16)
     }
+    $baseD = @($s.Events | Where-Object { $_.event -ceq 'module-loaded' -and $_.path -eq $pathD }) | Select-Object -Last 1
+    $callBp = @($s.Events | Where-Object { $_.event -ceq 'bp-set' -and $_.ownerPath -eq $pathD -and $_.line -eq $BpLineD3 }) | Select-Object -Last 1
+    $callVa = if ($callBp -and $baseD -and @($callBp.rvas).Count -eq 1) { (U32 $baseD.base) + (U32 @($callBp.rvas)[0]) } else { 0 }
+    Check "(3) precondition: the line-$BpLineD3 breakpoint's INT3 sits on the 5-byte CALL that OTHERPROC returns through" `
+      ($null -ne $ret -and $callVa -ne 0 -and $callVa + 5 -eq $ret) ("ret " + $(if ($null -ne $ret) { '0x{0:X8}' -f $ret } else { '?' }) + "; bp " + ($callBp | ConvertTo-Json -Compress))
+    $f1 = if ($atOther -and $atOther.Stack) { @($atOther.Stack.frames) | Where-Object { $_.frame -eq 1 } | Select-Object -First 1 }
+    Check "(3) at the OTHERPROC stop the stack's frame 1 is SHAREDPROC, chain-walked (not uncertain, with a frame base)" `
+      ($null -ne $f1 -and $f1.proc -eq 'SHAREDPROC' -and $f1.uncertain -eq $false -and (U32 $f1.ebp) -ne 0 -and (U32 $f1.va) -eq $ret) "$($atOther.Stack | ConvertTo-Json -Compress -Depth 5)"
+    $w = if ($atOther) { $atOther.Watch }
+    Check '(3) watch OBJ at the OTHERPROC stop resolves from the caller frame (frameIdx 1, SHAREDPROC)' `
+      ($null -ne $w -and $w.found -eq $true -and $w.frameIdx -eq 1 -and $w.frameProc -eq 'SHAREDPROC') "$($w | ConvertTo-Json -Compress -Depth 4)"
     Check '(3) samehost exits 0 (both CALLs worked)' ($null -ne $end -and $end.event -ceq 'exited' -and $end.code -eq 0) (Show-Stop $end)
   }
 }
@@ -439,7 +462,7 @@ finally {
 
 # The backstop for a section that returns early without throwing (lib-check.ps1, guard (b)). Update the
 # number deliberately when adding or removing a check.
-$EXPECTED_CHECKS = 38
+$EXPECTED_CHECKS = 41
 Assert-CheckTotal $EXPECTED_CHECKS
 
 Write-Host ''
