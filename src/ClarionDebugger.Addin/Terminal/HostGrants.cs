@@ -468,7 +468,7 @@ namespace ClarionDebugger.Terminal
             if (imgBase != null)
             {
                 uint v;
-                if (!ImageBase.TryParse(imgBase, out v)) return null;
+                if (!WireRules.TryParseImageBase(imgBase, out v)) return null;
                 b = v.ToString("X8", CultureInfo.InvariantCulture);
             }
             return module.ToUpperInvariant() + "|" + typeRef.ToString(CultureInfo.InvariantCulture) + "|" + addr.ToUpperInvariant() + "|" + b;
