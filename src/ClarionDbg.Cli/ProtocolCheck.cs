@@ -117,6 +117,7 @@ namespace ClarionDbg.Cli
                 CheckConditionAmbiguityAndQualifiedWatch,
                 CheckRearmHold,
                 CheckRunToCursorArmsEveryImage,
+                CheckLocalsOwnerAtPoolOffsetZero,
             };
 
             foreach (var check in checks)

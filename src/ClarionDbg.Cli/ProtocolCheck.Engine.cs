@@ -384,5 +384,134 @@ namespace ClarionDbg.Cli
             if (o1 != null) failures.Add("temp-bp seam-guard: OnTempBpForTest " + o1 + " against an ATTACHED engine");
             if (o2 != null) failures.Add("temp-bp seam-guard: ArmCallSkipForTest " + o2 + " against an ATTACHED engine");
         }
+
+        /// <summary>
+        /// A procedure record whose name sits at symbol-pool offset 0 still owns its locals (c4910921).
+        ///
+        /// ReadLocals skipped every +0x2C record with nameRef 0, but offset 0 is the pool's first string, a real
+        /// name. Dropping a PROCEDURE record there left the previous procedure current, so the dropped one's
+        /// locals were keyed to it (measured 2026-10-03 on fixture samename-w8: OTHERPROC's CNT2 under
+        /// SHAREDPROC). THREE CASES over one synthetic blob: (i) a nameRef-0 procedure record that a symbol
+        /// confirms (same raw name, same entry) becomes the current procedure; (ii) a nameRef-0 tag-05 record
+        /// whose entry matches no symbol does NOT change it, which is what fails a fix without the symbol
+        /// cross-check; (iii) a nameRef-0 LOCAL is still dropped, so a stray zero dword cannot invent a local
+        /// named after the pool's first string.
+        ///
+        /// NOT COVERED: that the fixture is byte-faithful to real compiler output (the live samename-w8 suite
+        /// runs a real build). It holds only the fields ReadLocals reads.
+        /// </summary>
+        private static void CheckLocalsOwnerAtPoolOffsetZero(List<string> failures, ClaimLog claims)
+        {
+            claims.Claim("locals over a PARSED +0x2C tree: a procedure record whose name is at symbol-pool offset 0 "
+                         + "owns the locals after it when a symbol has that raw name at that entry; a nameRef-0 record "
+                         + "at an entry no symbol has leaves the current procedure alone; a nameRef-0 local is dropped "
+                         + "(c4910921). Not covered: byte-faithfulness to real compiler output.");
+
+            TswdDebugInfo dbg;
+            try { dbg = new TswdDebugInfo(BuildPoolZeroLocalsBlob(), 0, 0x1000, 0x2000, 0x10000); }
+            catch (Exception ex) { failures.Add("pool-zero locals: the fixture blob did not parse - " + ex.Message); return; }
+
+            // CONTROL: the symbols the cross-check reads are the ones the fixture meant.
+            string syms = string.Join(",", dbg.Symbols.ConvertAll(s => s.RawName + "@0x" + s.EntryRva.ToString("X")));
+            if (syms != "PROCA@0x1000,PROCZ@0x1100")
+                failures.Add("pool-zero locals control: the parser found symbols [" + syms
+                             + "], expected PROCA@0x1000 and PROCZ@0x1100 (named at pool offset 0)");
+
+            var locals = dbg.ReadLocals();
+            Func<uint, string> namesAt = entry =>
+            {
+                List<LocalSym> l;
+                return locals.TryGetValue(entry, out l) ? string.Join(",", l.ConvertAll(x => x.Name)) : "(no entry)";
+            };
+            string all = "";
+            foreach (var kv in locals) all += " 0x" + kv.Key.ToString("X") + "=[" + namesAt(kv.Key) + "]";
+
+            // CONTROL: the records around the offset-0 one are read at all.
+            if (!namesAt(0x1000).StartsWith("LOCA", StringComparison.Ordinal))
+                failures.Add("pool-zero locals control: PROCA's own local LOCA was not read -" + all);
+            // (i) PROCZ (pool offset 0) owns LOCZ, and PROCA does not.
+            if (namesAt(0x1000) != "LOCA" || !namesAt(0x1100).StartsWith("LOCZ", StringComparison.Ordinal))
+                failures.Add("pool-zero locals (i): a procedure record named at pool offset 0 does not own the local "
+                             + "after it - LOCZ must be keyed to PROCZ's entry 0x1100, not PROCA's 0x1000 -" + all);
+            // (ii) the nameRef-0 record at 0x1180 (no symbol there) leaves PROCZ current: LOCN is PROCZ's too.
+            if (locals.ContainsKey(0x1180) || namesAt(0x1100) != "LOCZ,LOCN")
+                failures.Add("pool-zero locals (ii): a nameRef-0 record at an entry no symbol has changed the current "
+                             + "procedure - LOCN must stay with PROCZ (0x1100) and 0x1180 must not be a key -" + all);
+            // (iii) the nameRef-0 LOCAL (its name would read as PROCZ) is dropped everywhere.
+            foreach (var kv in locals)
+                foreach (var l in kv.Value)
+                    if (l.Name == "PROCZ")
+                        failures.Add("pool-zero locals (iii): a nameRef-0 local was kept as 'PROCZ' under 0x"
+                                     + kv.Key.ToString("X") + " - a local must never take the pool's first string -" + all);
+        }
+
+        /// <summary>
+        /// A minimal TSWD blob for <see cref="CheckLocalsOwnerAtPoolOffsetZero"/>: one compiland, no line records,
+        /// two text symbols and a +0x2C tree of seven tag records, laid out as TswdDebugInfo reads them. The symbol
+        /// pool starts with PROCZ's name (offset 0, no leading NUL), as a real pool does. Text is RVA 0x1000..0x2000.
+        /// </summary>
+        private static byte[] BuildPoolZeroLocalsBlob()
+        {
+            const uint Back0 = 0x00C0FFEE;
+            var pool = new List<byte>();
+            var nameRef = new Dictionary<string, uint>();
+            foreach (var n in new[] { "PROCZ", "PROCA", "LOCA", "LOCZ", "LOCN" })
+            {
+                nameRef[n] = (uint)pool.Count; pool.AddRange(Encoding.ASCII.GetBytes(n)); pool.Add(0);
+            }
+            while (pool.Count % 4 != 0) pool.Add(0);
+            var syms = new[] { Tuple.Create("PROCZ", 0x1100u), Tuple.Create("PROCA", 0x1000u) };
+            // {tag, nameRef, 2nd field}: a .text entry RVA (a procedure) or a negative frame offset (a local).
+            var tree = new[]
+            {
+                Tuple.Create((byte)0x04, nameRef["PROCA"], 0x1000u),
+                Tuple.Create((byte)0x04, nameRef["LOCA"], unchecked((uint)-4)),
+                Tuple.Create((byte)0x04, 0u, 0x1100u),                  // (i)  PROCZ, named at pool offset 0
+                Tuple.Create((byte)0x04, nameRef["LOCZ"], unchecked((uint)-4)),
+                Tuple.Create((byte)0x05, 0u, 0x1180u),                  // (ii) offset 0, but no symbol at 0x1180
+                Tuple.Create((byte)0x04, nameRef["LOCN"], unchecked((uint)-8)),
+                Tuple.Create((byte)0x04, 0u, unchecked((uint)-12)),     // (iii) a nameRef-0 local
+            };
+
+            const int modArray = 0x40, modPool = 0x48, modRange = 0x60, lines = 0x70;
+            int symPool = lines;                              // no line records
+            int symNameArray = symPool + pool.Count;
+            int symRecs = symNameArray + 4;                   // one backref entry
+            int t2c = symRecs + syms.Length * 12;
+            const int recSize = 0x20;
+            int t34 = t2c + tree.Length * recSize + 0x20;
+            var b = new byte[t34 + 0x40];
+
+            Action<int, uint> u32 = (at, v) => BitConverter.GetBytes(v).CopyTo(b, at);
+            u32(0x00, TswdDebugInfo.TswdMagic);
+            u32(0x04, 0x38);
+            u32(0x08, modArray); u32(0x0C, modPool); u32(0x10, modRange);
+            u32(0x14, lines); u32(0x18, lines); u32(0x1C, lines);
+            u32(0x20, (uint)symPool); u32(0x24, 1); u32(0x28, (uint)symNameArray); u32(0x2C, (uint)t2c);
+            u32(0x30, (uint)syms.Length); u32(0x34, (uint)t34);
+
+            u32(modArray, 0);
+            Encoding.ASCII.GetBytes("demo.clw").CopyTo(b, modPool);
+            pool.ToArray().CopyTo(b, symPool);
+            u32(symNameArray, Back0);                         // backref value -> module index 0
+            for (int i = 0; i < syms.Length; i++)
+            {
+                int o = symRecs + i * 12;
+                u32(o, nameRef[syms[i].Item1]); u32(o + 4, syms[i].Item2); u32(o + 8, Back0);
+            }
+            for (int i = 0; i < tree.Length; i++)
+            {
+                int p = t2c + i * recSize;
+                b[p] = tree[i].Item1;                         // typeRef at +1 stays 0
+                u32(p + 5, tree[i].Item2);
+                u32(p + 9, tree[i].Item3);
+                if ((tree[i].Item3 & 0x80000000) != 0)
+                {
+                    b[p + 18] = 0x11;                         // LONG (the storage byte at +17 stays 0)
+                    u32(p + 19, 4);
+                }
+            }
+            return b;
+        }
     }
 }
